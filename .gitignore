@@ -7,3 +7,5 @@
 /logs/*.log
 /logs/reference/*.txt
 __pycache__/
+/toolchain/
+/userdata/
