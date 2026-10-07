@@ -5,7 +5,8 @@
 param(
     [string]$Lang = "",
     [int]$Seconds = 150,
-    [string]$Tag = "run"
+    [string]$Tag = "run",
+    [string]$ExtraArgs = ""   # one space-separated string (arrays do not survive powershell -File)
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -28,6 +29,7 @@ public static class SspcWin {
 
 $argList = @()
 if ($Lang) { $argList += @("--lang", $Lang) }
+$argList += $ExtraArgs.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
 $p = if ($argList.Count) { Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $root -PassThru }
      else { Start-Process -FilePath $exe -WorkingDirectory $root -PassThru }
 "started pid=$($p.Id) lang='$Lang' for $Seconds s"
@@ -57,7 +59,7 @@ if (-not $exited) {
     "exited by itself, exit=$($p.ExitCode)"
 }
 
-foreach ($f in "SecondSonPC.log", "calls.json", "bridge_shadps4.log") {
+foreach ($f in "SecondSonPC.log", "calls.json", "bridge_shadps4.log", "shad_log.txt") {
     if (Test-Path "$logs\$f") { Copy-Item "$logs\$f" "$out\$f" -Force }
 }
 & python -I "$root\tools\make_calls_md.py" --calls "$out\calls.json" --run-note "tag=$Tag lang='$Lang' seconds=$Seconds"

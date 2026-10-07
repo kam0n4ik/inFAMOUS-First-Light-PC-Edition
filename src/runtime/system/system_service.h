@@ -25,7 +25,7 @@ constexpr u64 kSystemNameMax = 65;                            // 64 bytes + NUL 
 
 struct Settings {
     int language_id = 1;
-    std::string system_name = "SecondSonPC";
+    std::string system_name; // empty by default, see docs/KNOWN_ISSUES.md SSPC-001
     bool enter_button_cross = true;
 };
 

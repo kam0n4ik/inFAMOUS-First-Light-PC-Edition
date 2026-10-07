@@ -13,6 +13,7 @@
 #include <WinSock2.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -46,6 +47,7 @@
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/user_settings.h"
+#include "emulator.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/cache_storage.h"
@@ -164,6 +166,12 @@ void BuildBindingTable(Core::Linker& linker, const App::Config& cfg) {
         key.module = e.module;
         key.type = SymbolType::Function;
 
+        const bool is_observer = e.original != nullptr;
+        const bool excluded = std::find(cfg.no_bind.begin(), cfg.no_bind.end(), e.name) != cfg.no_bind.end();
+        if (excluded || (is_observer && !cfg.bind_observers) || (!is_observer && !cfg.bind_natives)) {
+            SSPC_LOG(Bridge, Warning, "DIAGNOSTIC: {} not bound (shadPS4 implementation used)", e.name);
+            continue;
+        }
         auto owner = Trace::Owner::Native;
         if (e.original != nullptr) {
             const auto* rec = shad.FindSymbol(key);
@@ -381,6 +389,22 @@ void RunGame(const App::Config& cfg) {
         window->WaitEvent();
     }
     SSPC_LOG(App, Info, "window closed");
+    std::quick_exit(0);
+}
+
+void RunStockForDiagnostics(const App::Config& cfg) {
+    SSPC_LOG(Bridge, Warning, "DIAGNOSTIC: --stock-bootstrap, running shadPS4 Core::Emulator::Run "
+                              "(no SecondSonPC exports, no call counter)");
+    std::error_code ec;
+    std::filesystem::create_directories(cfg.logs_dir, ec);
+    Common::FS::SetUserPath(Common::FS::PathType::LogDir, cfg.logs_dir);
+    Common::Log::Setup("bridge_shadps4.log");
+    KeyManager::GetInstance()->LoadFromFile();
+    EmulatorSettings.Load();
+    UserSettings.Load();
+    auto* emulator = Common::Singleton<Core::Emulator>::Instance();
+    emulator->executableName = "SecondSonPC.exe";
+    emulator->Run(cfg.game_dir / "eboot.bin");
     std::quick_exit(0);
 }
 

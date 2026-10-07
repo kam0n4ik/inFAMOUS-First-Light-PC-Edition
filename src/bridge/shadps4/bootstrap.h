@@ -12,4 +12,8 @@ namespace SecondSon::Bridge {
 /// Does not return (the session ends with std::quick_exit).
 [[noreturn]] void RunGame(const App::Config& config);
 
+/// DIAGNOSTIC ONLY (--stock-bootstrap): shadPS4's own Core::Emulator::Run inside this binary, to
+/// separate "toolchain/build" problems from "SecondSonPC bootstrap" problems. No SecondSonPC exports.
+[[noreturn]] void RunStockForDiagnostics(const App::Config& config);
+
 } // namespace SecondSon::Bridge

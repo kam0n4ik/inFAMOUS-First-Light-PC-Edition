@@ -7,7 +7,8 @@ path = 'E:\shdps4\CUSA00004'      # read-only: eboot.bin, sce_module, art are ne
 system = "ru-RU"                   # "ru-RU" (PS4 id 8) | "en-US" (PS4 id 1)
 
 [System]
-name = "SecondSonPC"               # sceSystemServiceParamGetString(SystemName)
+name = ""                          # sceSystemServiceParamGetString(SystemName); non-empty -> known
+                                   # crash in Phase 0 (docs/KNOWN_ISSUES.md, SSPC-001)
 enterButton = "cross"              # "cross" | "circle"
 
 [Paths]

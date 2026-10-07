@@ -23,7 +23,9 @@ struct Config {
     int language_id = 1;         // PS4 id, 8 = Russian
 
     // [System]
-    std::string system_name = "SecondSonPC"; // sceSystemServiceParamGetString(SystemName)
+    // sceSystemServiceParamGetString(SystemName). Empty by default: a non-empty name makes the game
+    // take a path that crashes in the Phase 0 bridge (docs/KNOWN_ISSUES.md, SSPC-001).
+    std::string system_name;
     bool enter_button_cross = true;
 
     // [Paths]
@@ -47,6 +49,11 @@ struct Config {
     // [Trace]
     bool import_counter = true;
     u32 dump_interval_s = 10;
+
+    // Diagnostics (command line only): which SecondSonPC exports are bound.
+    bool bind_natives = true;
+    bool bind_observers = true;
+    std::vector<std::string> no_bind; // export names excluded with --no-bind <name>
 };
 
 /// Parses <root>\SecondSonPC.toml. On failure returns nullopt and fills `errors`.

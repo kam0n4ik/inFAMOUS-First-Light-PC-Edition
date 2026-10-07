@@ -1,5 +1,8 @@
 // SecondSonPC — entry point.
-//   SecondSonPC.exe [--lang <locale>]      (--lang overrides [Language] system for this run)
+//   SecondSonPC.exe [--lang <locale>] [--no-counter] [--stock-bootstrap]
+//     --lang             overrides [Language] system for this run
+//     --no-counter       disables the import call counter for this run
+//     --stock-bootstrap  DIAGNOSTIC: shadPS4's own startup path inside this binary
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -36,9 +39,23 @@ int main(int argc, char* argv[]) {
         }
         return Fail(message);
     }
+    bool stock_bootstrap = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
-        if (arg == "--lang" && i + 1 < argc) {
+        if (arg == "--no-counter") {
+            config->import_counter = false;
+        } else if (arg == "--stock-bootstrap") {
+            stock_bootstrap = true; // diagnostics only
+        } else if (arg == "--no-bind" && i + 1 < argc) {
+            config->no_bind.emplace_back(argv[++i]); // diagnostics only
+        } else if (arg == "--exports" && i + 1 < argc) {
+            const std::string_view mode = argv[++i]; // diagnostics only
+            if (mode != "all" && mode != "native" && mode != "observers" && mode != "none") {
+                return Fail("--exports must be all|native|observers|none");
+            }
+            config->bind_natives = mode == "all" || mode == "native";
+            config->bind_observers = mode == "all" || mode == "observers";
+        } else if (arg == "--lang" && i + 1 < argc) {
             const auto* lang = Runtime::FindLanguageByLocale(argv[++i]);
             if (lang == nullptr) {
                 return Fail(std::string("--lang: unknown locale ") + argv[i]);
@@ -72,6 +89,16 @@ int main(int argc, char* argv[]) {
     });
     SSPC_LOG(SystemService, Info, "SystemName \"{}\", enter button {}", config->system_name,
              config->enter_button_cross ? "cross" : "circle");
+    if (!config->system_name.empty()) {
+        SSPC_LOG(SystemService, Warning,
+                 "non-empty [System] name: known crash after the settings save in Phase 0 "
+                 "(docs/KNOWN_ISSUES.md SSPC-001)");
+    }
+    SSPC_LOG(Trace, Info, "import counter {}, bind natives {}, bind observers {}",
+             config->import_counter ? "on" : "off", config->bind_natives, config->bind_observers);
 
+    if (stock_bootstrap) {
+        Bridge::RunStockForDiagnostics(*config);
+    }
     Bridge::RunGame(*config);
 }

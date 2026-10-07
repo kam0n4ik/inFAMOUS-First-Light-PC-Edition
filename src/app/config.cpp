@@ -126,8 +126,8 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     }
 
     r.String("System", "name", c.system_name);
-    if (c.system_name.empty() || c.system_name.size() > 64) {
-        r.Error("[System] name must be 1..64 bytes (PS4 system name limit)");
+    if (c.system_name.size() > 64) {
+        r.Error("[System] name must be 0..64 bytes (PS4 system name limit)");
     }
     std::string enter = "cross";
     r.String("System", "enterButton", enter);
