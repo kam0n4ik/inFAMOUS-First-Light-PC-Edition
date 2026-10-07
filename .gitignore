@@ -1,0 +1,9 @@
+# временные и тяжёлые каталоги (не часть исходников проекта)
+/third_party/shadPS4/
+/runtime/
+/tools/pydeps/
+/.tmp/
+/build/
+/logs/*.log
+/logs/reference/*.txt
+__pycache__/
