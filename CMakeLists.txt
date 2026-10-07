@@ -1,0 +1,36 @@
+# SecondSonPC — game-specific PC compatibility runtime for inFAMOUS: Second Son.
+cmake_minimum_required(VERSION 3.24)
+project(SecondSonPC LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "SecondSonPC requires clang-cl: guest code calls the host with the SysV ABI")
+endif()
+
+# TEMPORARY (Phase 0-4): build on top of the shadPS4 core. Removed in Phase 5 (see docs/AUDIT.md).
+option(SSPC_SHADPS4_BRIDGE "Temporary bootstrap on the shadPS4 core" ON)
+if(NOT SSPC_SHADPS4_BRIDGE)
+    message(FATAL_ERROR "A build without the shadPS4 bridge is the Phase 6 goal and not available yet")
+endif()
+include(cmake/shadps4_bootstrap.cmake) # provides fmt::fmt, toml11::toml11 and the bridge target
+
+# Own code. Rule: nothing outside src/bridge/ may include shadPS4 headers.
+add_library(sspc_runtime STATIC
+    src/app/config.cpp
+    src/app/paths.cpp
+    src/base/log.cpp
+    src/runtime/exports.cpp
+    src/runtime/filesystem/fs_observer.cpp
+    src/runtime/language.cpp
+    src/runtime/system/system_service.cpp
+    src/trace/import_counter.cpp
+)
+target_include_directories(sspc_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# PRIVATE: must not leak into the shadPS4 sources of the bridge target.
+target_compile_definitions(sspc_runtime PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(sspc_runtime PRIVATE /utf-8 /W4)
+target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11)
+
+sspc_attach_bootstrap(sspc_runtime)

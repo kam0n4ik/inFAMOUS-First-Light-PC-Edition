@@ -1,0 +1,33 @@
+# SecondSonPC configuration. Paths may be absolute or relative to this file's folder.
+
+[Game]
+path = 'E:\shdps4\CUSA00004'      # read-only: eboot.bin, sce_module, art are never modified
+
+[Language]
+system = "ru-RU"                   # "ru-RU" (PS4 id 8) | "en-US" (PS4 id 1)
+
+[System]
+name = "SecondSonPC"               # sceSystemServiceParamGetString(SystemName)
+enterButton = "cross"              # "cross" | "circle"
+
+[Paths]
+userData = "userdata"              # /savedata0 -> userdata\home\<user>\savedata\CUSA00004\<dir>
+logs = "logs"                      # SecondSonPC.log, calls.json, bridge_shadps4.log
+
+[Display]
+width = 1280
+height = 720
+fullscreen = false
+vblankFrequency = 60               # FPS unlock is a later stage (game timing must be checked first)
+
+[Input]                            # used from Phase 3 (keyboard/mouse backend)
+mouseSensitivity = 1.0
+invertY = false
+
+[Log]
+level = "info"                     # trace | debug | info | warning | error | critical
+bridgeFilter = "*:info"            # temporary shadPS4 core log (logs\bridge_shadps4.log)
+
+[Trace]
+importCounter = true               # count calls of every bound import -> logs\calls.json
+dumpIntervalSeconds = 10

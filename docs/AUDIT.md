@@ -303,6 +303,15 @@ Milestone считается достигнутым, только если вы�
 Минимальный «собственный» объём после переноса: около 15–25k строк вне GPU и порядка 50–60k с GPU (после урезания по покрытию). Это оценка, её уточнит счётчик вызовов в Phase 0.
 
 ## 15. Блокеры и предпосылки для Phase 0
+
+**Статус 2026-10-08: сняты.** Всё установлено на E:, на C: ничего не ставилось:
+- clang-cl/lld-link 20.1.8 → `E:\SecondSonPC\toolchain\LLVM` (официальный установщик LLVM, `/S /D=`; в реестр записан только ключ деинсталлятора);
+- Windows SDK 10.0.26100 → `E:\SecondSonPC\toolchain\winsdk` (официальные NuGet-пакеты Microsoft `Microsoft.Windows.SDK.CPP`, `.CPP.x64`, `.BuildTools`, просто распакованы; установленный корень Windows Kits на C: не используется);
+- MSVC STL/CRT 14.44, CMake 3.31.6, Ninja 1.12.1 → существующий `E:\BuildTools`;
+- сабмодули shadPS4 (54 шт., shallow) → `E:\SecondSonPC\third_party\shadPS4\externals` (~1.3 ГБ).
+Окружение: `tools\env.ps1`; воспроизведение: `tools\setup_toolchain.ps1` (SHA-256 загрузок закреплены).
+
+Исходная оценка блокеров (до установки):
 - **Тулчейн неполный:** в `E:\BuildTools` есть MSVC 14.44 и CMake 3.31.6, но **нет clang-cl** (компонент `Microsoft.VisualStudio.Component.VC.Llvm.Clang` + `ClangToolset`) и **нет Windows SDK** (`C:\Program Files (x86)\Windows Kits\10\Include` отсутствует).
 - **Сабмодули shadPS4** (`git submodule update --init --recursive`): несколько ГБ, только на E:.
 - Всё скачивается и ставится **только на диск E:** (по указанию пользователя). Windows SDK по умолчанию ставится на C:, поэтому нужен standalone-установщик с `/installpath` на E:. Кэш установщика VS тоже нужно направить на E:.

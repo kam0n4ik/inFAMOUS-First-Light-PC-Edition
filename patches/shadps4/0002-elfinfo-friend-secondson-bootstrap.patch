@@ -1,0 +1,12 @@
+diff --git a/src/common/elf_info.h b/src/common/elf_info.h
+index 69c2163c..880a653c 100644
+--- a/src/common/elf_info.h
++++ b/src/common/elf_info.h
+@@ -62,6 +62,7 @@ static_assert(sizeof(PSFAttributes) == 4);
+ 
+ class ElfInfo {
+     friend class Core::Emulator;
++    friend class SecondSonBootstrap; // SecondSonPC Phase 0-4 bridge (patches/shadps4/0002)
+ 
+     bool initialized = false;
+ 
