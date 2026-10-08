@@ -15,13 +15,16 @@ $tag = "sspc001_$Loader"
 $out = & powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\run_phase0.ps1" -Seconds $Seconds -Tag $tag `
     -ExtraArgs "--loader $Loader --system-name $Name"
 $out | ForEach-Object { $_ }
-$crashed = ($out | Select-String -SimpleMatch "exited by itself") -ne $null
+$runJson = "E:\SecondSonPC\logs\runs\$tag\run.json"
+if (-not (Test-Path $runJson)) { throw "run_phase0.ps1 wrote no $runJson" }
+$run = Get-Content -Raw -Encoding UTF8 $runJson | ConvertFrom-Json
+$crashed = $run.action -eq "none" # ended before the script tried to close it
 $log = "E:\SecondSonPC\logs\runs\$tag\SecondSonPC.log"
 $name_line = if (Test-Path $log) { Select-String -Path $log -SimpleMatch "ParamGetString(SystemName" | Select-Object -First 1 } else { $null }
 ""
 "SystemName returned to the game: $(if ($name_line) { $name_line.Line } else { '(no ParamGetString call logged)' })"
 if ($crashed) {
-    "SSPC-001: REPRODUCED (loader $Loader): the game exited before $Seconds s; evidence in logs\runs\$tag"
+    "SSPC-001: REPRODUCED (loader $Loader): the game exited before $Seconds s ($($run.how), $($run.exit_hex)); evidence in logs\runs\$tag"
     exit 1
 }
 "SSPC-001: NOT REPRODUCED (loader $Loader): the game ran $Seconds s with SystemName '$Name'"

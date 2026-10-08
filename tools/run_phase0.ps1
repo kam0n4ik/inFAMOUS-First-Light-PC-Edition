@@ -1,67 +1,88 @@
 # Phase 0 test run of SecondSonPC.exe: start, wait, screenshot, close gracefully, collect evidence.
 #   powershell -ExecutionPolicy Bypass -File E:\SecondSonPC\tools\run_phase0.ps1 [-Lang ru-RU] [-Seconds 150] [-Tag ru]
-# Stops only the process it started. Closing goes through WM_CLOSE first so the final call-counter
-# dump runs; the process is killed only if it does not exit within 15 s.
+# Stops only the process it started (tools\game_process.psm1): WM_CLOSE goes to that process's game
+# window, never to its console window (that ended runs with 0xC000013A); the process is terminated
+# only when it has no game window or does not exit within -CloseTimeout seconds, so the final
+# call-counter dump runs. logs\runs\<tag>\run.json records the pid, the window, what the script did,
+# the exit code and the classification ("how": closed-by-test, crashed, killed-close-timeout, ...).
 param(
     [string]$Lang = "",
     [int]$Seconds = 150,
     [string]$Tag = "run",
     [string]$ExtraArgs = "",  # one space-separated string (arrays do not survive powershell -File)
-    [switch]$NoReport         # do not regenerate docs\generated\CALLS.md (diagnostic runs)
+    [int]$CloseTimeout = 15,  # seconds between WM_CLOSE and TerminateProcess
+    [switch]$NoReport,        # do not regenerate docs\generated\CALLS.md (diagnostic runs)
+    # Only for tools\tests\game_process_tests.ps1 (stand-in program, scratch logs folder):
+    [string]$Exe = "E:\SecondSonPC\build\bin\SecondSonPC.exe",
+    [string]$LogsDir = "E:\SecondSonPC\logs"
 )
 $ErrorActionPreference = "Stop"
+Import-Module "$PSScriptRoot\game_process.psm1" -Force
 $root = "E:\SecondSonPC"
-$exe = "$root\build\bin\SecondSonPC.exe"
-$logs = "$root\logs"
+$logs = $LogsDir
 $out = "$logs\runs\$Tag"
 New-Item -ItemType Directory -Force $out | Out-Null
 # Outputs of an earlier session must not be mistaken for this run's.
 foreach ($f in "calls.json", "call_order.txt") { Remove-Item "$logs\$f" -ErrorAction SilentlyContinue }
 Remove-Item "$logs\shots" -Recurse -ErrorAction SilentlyContinue # --press shot@sec frames
+Remove-Item "$out\run.json", "$out\screen.png" -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.Drawing
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class SspcWin {
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
-}
-"@
 
 $argList = @()
 if ($Lang) { $argList += @("--lang", $Lang) }
 $argList += $ExtraArgs.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
-$p = if ($argList.Count) { Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $root -PassThru }
-     else { Start-Process -FilePath $exe -WorkingDirectory $root -PassThru }
+$p = Start-GameProcess -FilePath $exe -ArgumentList $argList -WorkingDirectory $root
+$started = Get-Date
 "started pid=$($p.Id) lang='$Lang' for $Seconds s"
 
-$exited = $p.WaitForExit($Seconds * 1000)
-if (-not $exited) {
-    $p.Refresh()
-    $h = $p.MainWindowHandle
-    if ($h -ne [IntPtr]::Zero) {
-        $r = New-Object SspcWin+RECT
-        [void][SspcWin]::GetWindowRect($h, [ref]$r)
-        $w = $r.Right - $r.Left; $hgt = $r.Bottom - $r.Top
-        if ($w -gt 0 -and $hgt -gt 0) {
-            $bmp = New-Object System.Drawing.Bitmap $w, $hgt
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $hdc = $g.GetHdc()
-            [void][SspcWin]::PrintWindow($h, $hdc, 2) # PW_RENDERFULLCONTENT
-            $g.ReleaseHdc($hdc); $g.Dispose()
-            $bmp.Save("$out\screen.png", [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
-            "screenshot -> $out\screen.png ($w x $hgt)"
-        }
-        [void][SspcWin]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) # WM_CLOSE
+$exitedEarly = $p.WaitForExit($Seconds * 1000)
+
+# Screenshot of the chosen game window, taken just before WM_CLOSE.
+$shot = {
+    param($w)
+    $r = New-Object SspcGameWindows+RECT
+    [void][SspcGameWindows]::GetWindowRect($w.Hwnd, [ref]$r)
+    $wd = $r.Right - $r.Left; $ht = $r.Bottom - $r.Top
+    if ($wd -gt 0 -and $ht -gt 0) {
+        $bmp = New-Object System.Drawing.Bitmap $wd, $ht
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $hdc = $g.GetHdc()
+        [void][SspcGameWindows]::PrintWindow($w.Hwnd, $hdc, 2) # PW_RENDERFULLCONTENT
+        $g.ReleaseHdc($hdc); $g.Dispose()
+        $bmp.Save("$out\screen.png", [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+        "screenshot -> $out\screen.png ($wd x $ht)" | Out-Host
     }
-    if (-not $p.WaitForExit(15000)) { Stop-Process -Id $p.Id -Force; "killed after WM_CLOSE timeout" }
-    else { "closed gracefully, exit=$($p.ExitCode)" }
-} else {
-    "exited by itself, exit=$($p.ExitCode)"
+}.GetNewClosure()
+
+$stop = Stop-GameProcess -Process $p -CloseTimeoutMs ($CloseTimeout * 1000) -OnWindow $shot
+$lifetime = $null
+try { $lifetime = [math]::Round(($p.ExitTime - $p.StartTime).TotalSeconds, 1) } catch { }
+
+$run = [ordered]@{
+    tag = $Tag; exe = $exe; args = ($argList -join ' '); started = $started.ToString("yyyy-MM-ddTHH:mm:ss")
+    run_seconds = $Seconds; close_timeout_s = $CloseTimeout; exited_before_deadline = $exitedEarly
+    lifetime_s = $lifetime
 }
+foreach ($k in $stop.Keys) { $run[$k] = $stop[$k] }
+$run | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 "$out\run.json"
+
+if ($run.window) {
+    "window: hwnd=$($run.window.hwnd) class=$($run.window.class) thread=$($run.window.thread_id) size=$($run.window.size) ($($run.window_reason))"
+} elseif (-not $exitedEarly) {
+    "window: none ($($run.window_reason))"
+}
+foreach ($c in $run.candidates) {
+    if ($c.rejected) { "  not the game window: $($c.hwnd) class=$($c.class) - $($c.rejected)" }
+}
+if ($run.close_posted) { "close: WM_CLOSE posted to $($run.window.hwnd), waited $($run.close_wait_ms) ms" }
+elseif ($run.close_error) { "close: PostMessage failed, Win32 error $($run.close_error)" }
+if ($run.kill_reason) {
+    $err = if ($run.kill_error) { "; $($run.kill_error)" } else { "" }
+    "terminate: $($run.kill_reason), waited $($run.kill_wait_ms) ms$err"
+}
+"result: how=$($run.how) exit=$($run.exit_code) ($($run.exit_hex) $($run.exit_name)) lifetime=$lifetime s"
+"  $($run.note)"
 
 foreach ($f in "SecondSonPC.log", "calls.json", "call_order.txt", "bridge_shadps4.log", "shad_log.txt") {
     if (Test-Path "$logs\$f") { Copy-Item "$logs\$f" "$out\$f" -Force }

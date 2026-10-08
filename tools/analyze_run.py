@@ -1,7 +1,10 @@
 """Summary of one SecondSonPC test run (logs\\runs\\<tag>), as one JSON line.
 
-    python -I tools/analyze_run.py <run_dir> [--exit N] [--how exited|closed|killed]
+    python -I tools/analyze_run.py <run_dir> [--exit N] [--how HOW]
                                    [--save-before FILE --save-after FILE]
+
+--how / --exit default to run_dir\\run.json (tools/run_phase0.ps1: closed-by-test, crashed,
+killed-close-timeout, ...; see tools/game_process.psm1 Get-RunOutcome).
 
 Reads SecondSonPC.log (own log: VRAM/commit samples, import-call time series, GPU allocation
 failures, crash handler), bridge_shadps4.log (pipelines, shadPS4 errors) and calls.json.
@@ -55,11 +58,13 @@ def seconds_between(a: datetime, b: datetime) -> float:
     return round(delta.total_seconds(), 1)
 
 
+def read_json(path: Path) -> dict:
+    # utf-8-sig: Windows PowerShell's Set-Content -Encoding UTF8 writes a BOM.
+    return json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+
+
 def file_hashes(path: str | None) -> dict[str, str]:
-    if not path:
-        return {}
-    p = Path(path)
-    return json.loads(p.read_text(encoding="utf-8-sig")) if p.exists() else {}
+    return read_json(Path(path)) if path else {}
 
 
 def main() -> int:
@@ -74,6 +79,9 @@ def main() -> int:
     run = Path(args.run_dir)
     own = read_lines(run / "SecondSonPC.log")
     bridge = read_lines(run / "bridge_shadps4.log")
+    # run.json: how tools/run_phase0.ps1 ended the process (absent for manual sessions).
+    stop = read_json(run / "run.json")
+    window = stop.get("window") or {}
 
     stamps = [parse_time(m.group(1)) for line in own if (m := TS_RE.match(line))]
     start = stamps[0] if stamps else None
@@ -121,8 +129,12 @@ def main() -> int:
         "loader": loader,
         "start": start.strftime("%H:%M:%S") if start else None,
         "duration_s": duration,
-        "exit": args.exit,
-        "how": args.how,
+        "exit": args.exit if args.exit is not None else stop.get("exit_code"),
+        "exit_hex": f"0x{args.exit & 0xFFFFFFFF:08X}" if args.exit is not None else stop.get("exit_hex"),
+        "how": args.how or stop.get("how", ""),
+        "exit_note": stop.get("note"),
+        "window_class": window.get("class"),
+        "window_reason": stop.get("window_reason"),
         "crash": crash,
         "alive_at_end": alive,
         "frames": series[-1][1] if series else None,

@@ -1,7 +1,8 @@
 # Series of automated game runs with a per-run summary (SSPC-001 verification, smoke tests).
 #   powershell -ExecutionPolicy Bypass -File E:\SecondSonPC\tools\smoke_runs.ps1 -Loader sspc -Runs 3 [-Seconds 150] [-Prefix smoke] [-ExtraArgs "..."]
 # Each run: SHA-256 of the isolated SecondSonPC saves before/after (read only), tools\run_phase0.ps1
-# (WM_CLOSE at the end, kill only after a 15 s timeout), tools\analyze_run.py -> one JSON line
+# (WM_CLOSE to the game window of the started pid at the end, terminate only after a 15 s timeout;
+# its logs\runs\<tag>\run.json gives "how" and the exit code), tools\analyze_run.py -> one JSON line
 # appended to logs\runs\<Prefix>_summary.jsonl. Saves are never modified or deleted by this script.
 param(
     [ValidateSet("sspc", "shadps4")] [string]$Loader = "sspc",
@@ -34,12 +35,21 @@ for ($i = 1; $i -le $Runs; ++$i) {
     if ($ExtraArgs) { $runArgs = "$runArgs $ExtraArgs" }
     $out = powershell -ExecutionPolicy Bypass -File "$root\tools\run_phase0.ps1" -Seconds $Seconds -Tag $tag -NoReport -ExtraArgs $runArgs 2>&1 | Out-String
     Save-Hashes "$tmp\$tag.after.json"
-    $how = if ($out -match "exited by itself") { "exited" } elseif ($out -match "killed") { "killed" } elseif ($out -match "closed gracefully") { "closed" } else { "?" }
-    $code = if ($out -match "exit=(-?\d+)") { $Matches[1] } else { "" }
+    # run_phase0.ps1 deletes the run's old run.json first, so a missing file means it failed.
+    $runJson = "$root\logs\runs\$tag\run.json"
+    $how = "?"; $code = $null
+    if (Test-Path $runJson) {
+        $run = Get-Content -Raw -Encoding UTF8 $runJson | ConvertFrom-Json
+        $how = $run.how
+        $code = $run.exit_code
+    } else {
+        "${tag}: run_phase0.ps1 wrote no run.json; its output:"
+        $out
+    }
     $pyArgs = @("$root\logs\runs\$tag", "--how", $how, "--save-before", "$tmp\$tag.before.json", "--save-after", "$tmp\$tag.after.json")
-    if ($code) { $pyArgs += @("--exit", $code) }
+    if ($null -ne $code) { $pyArgs += @("--exit", "$code") }
     $line = & python -I "$root\tools\analyze_run.py" @pyArgs
     Add-Content -Encoding UTF8 $summary $line
     $s = $line | ConvertFrom-Json
-    "{0}: {1} s, {2} exit={3}, alive={4}, frames={5}, crash={6}, VRAM max {7} MiB, commit max {8}/{9} MiB, pipelines {10}" -f $tag, $s.duration_s, $s.how, $s.exit, $s.alive_at_end, $s.frames, $s.crash, $s.vram_local_max_mib, $s.commit_max_mib, $s.commit_limit_mib, $s.pipelines
+    "{0}: {1} s, {2} exit={3} {4}, alive={5}, frames={6}, crash in logs={7}, VRAM max {8} MiB, commit max {9}/{10} MiB, pipelines {11}" -f $tag, $s.duration_s, $s.how, $s.exit, $s.exit_hex, $s.alive_at_end, $s.frames, $s.crash, $s.vram_local_max_mib, $s.commit_max_mib, $s.commit_limit_mib, $s.pipelines
 }
