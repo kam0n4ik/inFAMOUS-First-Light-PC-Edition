@@ -20,10 +20,22 @@ include(cmake/shadps4_bootstrap.cmake) # provides fmt::fmt, toml11::toml11 and t
 add_library(sspc_runtime STATIC
     src/app/config.cpp
     src/app/paths.cpp
+    src/base/crash.cpp
     src/base/log.cpp
+    src/loader/bindings.cpp
+    src/loader/eh_frame.cpp
+    src/loader/image_file.cpp
+    src/loader/linker.cpp
+    src/loader/module.cpp
+    src/loader/rtld.cpp
+    src/loader/snapshot.cpp
     src/runtime/exports.cpp
+    src/runtime/filesystem/directory.cpp
+    src/runtime/filesystem/file_system.cpp
     src/runtime/filesystem/fs_observer.cpp
+    src/runtime/filesystem/vfs.cpp
     src/runtime/language.cpp
+    src/runtime/sysmodule/sysmodule.cpp
     src/runtime/system/system_service.cpp
     src/trace/import_counter.cpp
 )

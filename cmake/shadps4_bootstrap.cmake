@@ -33,12 +33,19 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/shadPS4 ${CMAKE_BINARY_DIR}/sha
 function(sspc_attach_bootstrap runtime_target)
     get_target_property(_sources shadps4 SOURCES)
     list(FILTER _sources EXCLUDE REGEX "(^|/)src/main\\.cpp$")
+    # Phase 1: the TCB/TLS glue of shadPS4's pthreads is replaced by a dual-mode copy that takes
+    # TLS from SecondSonPC's Loader (src/bridge/shadps4/rtld_tcb.cpp).
+    list(FILTER _sources EXCLUDE REGEX "(^|/)src/core/libraries/kernel/threads/tcb\\.cpp$")
     set_property(TARGET shadps4 PROPERTY SOURCES ${_sources})
 
     target_sources(shadps4 PRIVATE
         ${CMAKE_SOURCE_DIR}/src/app/main.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/early_init.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/bootstrap.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/fs_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/loader_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/rtld_tcb.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp
     )
     target_link_libraries(shadps4 PRIVATE ${runtime_target})
     set_target_properties(shadps4 PROPERTIES

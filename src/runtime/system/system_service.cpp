@@ -2,6 +2,7 @@
 #include "runtime/system/system_service.h"
 
 #include <cstring>
+#include <mutex>
 #include <windows.h>
 
 #include "base/log.h"
@@ -12,6 +13,8 @@ namespace SecondSon::SystemService {
 namespace {
 
 Settings g_settings;
+std::function<void()> g_first_get_int_hook;
+std::once_flag g_first_get_int_once;
 
 // SCE_SYSTEM_PARAM_DATE_FORMAT_* / TIME_FORMAT_* / ENTER_BUTTON_ASSIGN_*
 constexpr s32 kDateYYYYMMDD = 0;
@@ -64,7 +67,14 @@ void Configure(const Settings& settings) {
     g_settings = settings;
 }
 
+void SetFirstParamGetIntHook(std::function<void()> hook) {
+    g_first_get_int_hook = std::move(hook);
+}
+
 SSPC_SYSV_ABI s32 ParamGetInt(s32 param_id, s32* value) {
+    if (g_first_get_int_hook) {
+        std::call_once(g_first_get_int_once, [] { g_first_get_int_hook(); });
+    }
     if (value == nullptr) {
         SSPC_LOG(SystemService, Error, "ParamGetInt({} {}): value == nullptr -> {:#x}", param_id,
                  ParamName(param_id), static_cast<u32>(kErrorParameter));

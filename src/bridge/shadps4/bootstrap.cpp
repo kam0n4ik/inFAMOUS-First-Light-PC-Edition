@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project (sequence from src/emulator.cpp)
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// SecondSonPC — TEMPORARY Phase 0 bridge (removed in Phase 5).
-// Startup sequence adapted from shadPS4 Core::Emulator::Run()
+// SecondSonPC — TEMPORARY bridge (removed in Phase 5).
+// Start-up sequence adapted from shadPS4 Core::Emulator::Run()
 // (third_party/shadPS4 @ 0fe263a4760dfbfa973366890061749b4af0de97). Differences:
 //  * configuration comes from SecondSonPC.toml, applied in memory (shadPS4's config.json in
 //    runtime\sspc\user is never saved by SecondSonPC);
 //  * /savedata0 lives under SecondSonPC [Paths] userData (shadPS4 "home dir"), not in any shadPS4 install;
-//  * the HLE symbol table is rebuilt: SecondSonPC exports first, shadPS4 HLE behind the call counter;
 //  * no game patches/cheats, Discord RPC, launcher IPC or play-time tracking.
+// Two loader paths (--loader):
+//  * sspc     Phase 1: SecondSonPC's Loader (src/loader) loads eboot.bin + the game's PRX, resolves
+//             imports through the static binding table (NATIVE / BRIDGE by C++ name / COMMON_STUB);
+//             shadPS4's Core::Linker, Core::Loader, SymbolsResolver/InitHLELibs and aerolib are not
+//             used. Memory, threads, CPU patches, GPU, input and audio stay BRIDGE.
+//  * shadps4  Phase 0 path, unchanged: shadPS4's Core::Linker with the HLE symbol table rebuilt
+//             (SecondSonPC Phase 0 exports first). Kept as the in-binary oracle until Phase 1 ends.
 
 #include <WinSock2.h>
 #include <windows.h>
@@ -25,7 +31,17 @@
 #include "app/config.h"
 #include "base/log.h"
 #include "bridge/shadps4/bootstrap.h"
+#include "bridge/shadps4/bridge_exports.h"
+#include "bridge/shadps4/loader_host.h"
+#include "loader/bindings.h"
+#include "loader/image_file.h"
+#include "loader/linker.h"
+#include "loader/snapshot.h"
 #include "runtime/exports.h"
+#include "runtime/filesystem/fs_host.h"
+#include "runtime/filesystem/vfs.h"
+#include "runtime/sysmodule/sysmodule.h"
+#include "runtime/system/system_service.h"
 #include "trace/import_counter.h"
 
 #include "common/elf_info.h"
@@ -105,6 +121,8 @@ namespace SecondSon::Bridge {
 
 namespace {
 
+using LoaderBackend = App::Config::LoaderBackend;
+
 Input::GameControllers* g_controllers = nullptr;
 
 void OnQuickExit() {
@@ -138,7 +156,63 @@ bool IsUnder(const std::filesystem::path& path, const std::filesystem::path& roo
     return !rel.empty() && *rel.begin() != "..";
 }
 
-void BuildBindingTable(Core::Linker& linker, const App::Config& cfg) {
+bool Listed(const std::vector<std::string>& list, std::string_view value) {
+    return std::find(list.begin(), list.end(), value) != list.end();
+}
+
+/// Host file of a guest path in /app0 (the module loader's view; the game's files go through the
+/// FileSystem). Empty if the path is not in /app0.
+std::filesystem::path HostPathOf(const App::Config& cfg, std::string_view guest) {
+    constexpr std::string_view kApp0 = "/app0/";
+    if (!guest.starts_with(kApp0)) {
+        return {};
+    }
+    auto relative = std::string(guest.substr(kApp0.size()));
+    std::replace(relative.begin(), relative.end(), '/', '\\');
+    return cfg.game_dir / relative;
+}
+
+/// Which SecondSonPC exports a loader path binds (diagnostic filters included).
+std::vector<Runtime::Export> SelectExports(const App::Config& cfg, bool phase0_path) {
+    std::vector<Runtime::Export> out;
+    for (const auto& e : Runtime::Exports()) {
+        const bool observer = e.original != nullptr;
+        const std::string_view group = e.group;
+        const bool loader_core = group == "loader" || group == "sysmodule";
+        if (phase0_path && !e.phase0) {
+            continue; // Phase 1 code: the Phase 0 path keeps shadPS4's implementation
+        }
+        if (!loader_core && ((observer && !cfg.bind_observers) || (!observer && !cfg.bind_natives) ||
+                             Listed(cfg.bridged_groups, group) || Listed(cfg.no_bind, e.name))) {
+            SSPC_LOG(Bridge, Warning, "DIAGNOSTIC: {} not bound (shadPS4 implementation used)", e.name);
+            continue;
+        }
+        out.push_back(e);
+    }
+    return out;
+}
+
+/// DIAGNOSTIC (--reloc-snapshot): writes every relocation slot at the first ParamGetInt call.
+void InstallSnapshotHook(const App::Config& cfg,
+                         std::function<std::vector<Loader::SnapshotModule>()> modules,
+                         const Loader::Bindings* bindings) {
+    if (cfg.reloc_snapshot.empty()) {
+        return;
+    }
+    SystemService::SetFirstParamGetIntHook([file = cfg.reloc_snapshot, modules, bindings] {
+        const auto list = modules();
+        std::string error;
+        if (Loader::WriteRelocationSnapshot(file, list, bindings, error)) {
+            SSPC_LOG(Loader, Info, "relocation snapshot ({} modules) -> {}", list.size(), file.string());
+        } else {
+            SSPC_LOG(Loader, Error, "relocation snapshot failed: {}", error);
+        }
+    });
+}
+
+// ------------------------------------------------------------------------------ Phase 0 path
+
+void BuildPhase0BindingTable(Core::Linker& linker, const App::Config& cfg) {
     using namespace Core::Loader;
 
     SymbolsResolver shad; // temporary shadPS4 HLE table (BRIDGE)
@@ -157,7 +231,8 @@ void BuildBindingTable(Core::Linker& linker, const App::Config& cfg) {
     }
 
     // 1) SecondSonPC exports first: SymbolsResolver::FindSymbol returns the first match.
-    for (const auto& e : Runtime::Exports()) {
+    const auto exports = SelectExports(cfg, true);
+    for (const auto& e : exports) {
         SymbolResolver key{};
         key.name = e.nid;
         key.nidName = e.name;
@@ -166,12 +241,6 @@ void BuildBindingTable(Core::Linker& linker, const App::Config& cfg) {
         key.module = e.module;
         key.type = SymbolType::Function;
 
-        const bool is_observer = e.original != nullptr;
-        const bool excluded = std::find(cfg.no_bind.begin(), cfg.no_bind.end(), e.name) != cfg.no_bind.end();
-        if (excluded || (is_observer && !cfg.bind_observers) || (!is_observer && !cfg.bind_natives)) {
-            SSPC_LOG(Bridge, Warning, "DIAGNOSTIC: {} not bound (shadPS4 implementation used)", e.name);
-            continue;
-        }
         auto owner = Trace::Owner::Native;
         if (e.original != nullptr) {
             const auto* rec = shad.FindSymbol(key);
@@ -218,12 +287,125 @@ void BuildBindingTable(Core::Linker& linker, const App::Config& cfg) {
     SSPC_LOG(Bridge, Info,
              "binding table: {} SecondSonPC exports, {} shadPS4 HLE functions (BRIDGE) + {} objects, "
              "{} counted thunks",
-             Runtime::Exports().size(), functions, objects, Trace::WrappedCount());
+             exports.size(), functions, objects, Trace::WrappedCount());
+}
+
+void RunPhase0Loader(const App::Config& cfg, Core::Linker& linker, const std::string& guest_eboot_path) {
+    BuildPhase0BindingTable(linker, cfg);
+    if (cfg.import_counter) {
+        Trace::StartPeriodicDump(cfg.logs_dir / "calls.json", cfg.dump_interval_s);
+    }
+    if (!cfg.reloc_snapshot.empty()) {
+        // Names for the snapshot only (classification); resolution is shadPS4's.
+        static Loader::Bindings names;
+        names.Build(SelectExports(cfg, true), BridgeExports(),
+                    Loader::BindingOptions{.import_counter = false, .classify_only = true});
+        InstallSnapshotHook(cfg,
+                            [&cfg, &linker] {
+                                std::vector<Loader::SnapshotModule> list;
+                                for (s32 i = 0; auto* m = linker.GetModule(i); ++i) {
+                                    list.push_back({m->name, HostPathOf(cfg, m->file.generic_string()),
+                                                    m->GetBaseAddress(), m->aligned_base_size});
+                                }
+                                return list;
+                            },
+                            &names);
+    }
+
+    if (linker.LoadModule(guest_eboot_path) == -1) {
+        Fatal(fmt::format("failed to load {}", guest_eboot_path));
+    }
+    SSPC_LOG(Loader, Info, "loaded {} (shadPS4 Core::Linker), starting guest", guest_eboot_path);
+    // Core::Linker::Execute's main-thread lambda keeps a reference to `args`: it must outlive us.
+    static const std::vector<std::string> args{guest_eboot_path};
+    linker.Execute(args);
+}
+
+// ------------------------------------------------------------------------------- sspc path
+
+/// TEMPORARY (until patch 0003 splits shadPS4's library start-up from symbol registration, see
+/// docs/MIGRATION.md "Open items"): shadPS4's RegisterLib functions also start their libraries
+/// (GnmDriver: Liverpool + Vulkan presenter/rasterizer; VideoOut: driver; Kernel: service thread,
+/// clock, semaphores, AIO; Pad: controllers; NpManager: handler, ...), writing file-static state
+/// only they can reach. BRIDGE libraries need that start-up, so InitHLELibs runs once into a
+/// throw-away table: nothing in it is used to resolve imports (the static table does that).
+void StartBridgeLibraries() {
+    Core::Loader::SymbolsResolver discarded;
+    Libraries::InitHLELibs(&discarded);
+    SSPC_LOG(Bridge, Info, "BRIDGE libraries started ({} shadPS4 symbols discarded, not used for "
+                           "resolution)",
+             discarded.GetSize());
+}
+
+/// The game's view of the file system (Vfs). /savedata0 is added by the SaveData observer when
+/// the game mounts it (SaveData is BRIDGE until Phase 3).
+void SetupFilesystem(const App::Config& cfg, const std::string& serial) {
+    static std::unique_ptr<Filesystem::FsHost> fs_host = CreateFsHost();
+    Filesystem::SetHost(fs_host.get());
+    auto& vfs = Filesystem::GetVfs();
+    std::error_code ec;
+    vfs.Mount("/app0", cfg.game_dir, true);
+    vfs.Mount("/hostapp", cfg.game_dir, true);
+    const auto temp = cfg.user_data_dir / "temp0" / serial;
+    std::filesystem::remove_all(temp, ec); // temp0 is cleared on each boot
+    std::filesystem::create_directories(temp, ec);
+    vfs.Mount("/temp0", temp, false);
+    vfs.Mount("/temp", temp, false);
+    const auto download = cfg.user_data_dir / "download0" / serial;
+    std::filesystem::create_directories(download, ec);
+    vfs.Mount("/download0", download, false);
+    const auto data = cfg.user_data_dir / "data";
+    std::filesystem::create_directories(data, ec);
+    vfs.Mount("/data", data, false);
+}
+
+void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
+                   const std::string& serial) {
+    StartBridgeLibraries();
+    SetupFilesystem(cfg, serial);
+    for (const auto& g : cfg.bridged_groups) {
+        if (g == "loader" || g == "sysmodule") {
+            Fatal(fmt::format("--bridge {} is not possible with --loader sspc: the shadPS4 "
+                              "implementation needs shadPS4's Core::Linker",
+                              g));
+        }
+    }
+    static Loader::Bindings bindings;
+    Loader::BindingOptions options;
+    options.import_counter = cfg.import_counter;
+    options.bridged_groups = cfg.bridged_groups;
+    if (!bindings.Build(SelectExports(cfg, false), BridgeExports(), options)) {
+        Fatal("binding table is inconsistent, see SecondSonPC.log");
+    }
+    bindings.LogSummary();
+
+    static std::unique_ptr<Loader::Host> host = CreateLoaderHost();
+    static Loader::Linker linker(*host, bindings,
+                                 [&cfg](std::string_view guest) { return HostPathOf(cfg, guest); });
+    if (cfg.import_counter) {
+        Trace::StartPeriodicDump(cfg.logs_dir / "calls.json", cfg.dump_interval_s);
+    }
+    InstallSnapshotHook(cfg,
+                        [] {
+                            std::vector<Loader::SnapshotModule> list;
+                            for (s32 i = 0; auto* m = linker.GetModule(i); ++i) {
+                                list.push_back({m->name, m->host_path, m->Base(), m->aligned_base_size});
+                            }
+                            return list;
+                        },
+                        &bindings);
+
+    if (linker.LoadModule(guest_eboot_path, false) < 0) {
+        Fatal(fmt::format("failed to load {}", guest_eboot_path));
+    }
+    SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
+    linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }
 
 } // namespace
 
 void RunGame(const App::Config& cfg) {
+    const bool own_loader = cfg.loader == LoaderBackend::Sspc;
     Common::SetCurrentThreadName("SecondSonPC:Main");
 
     // Equivalent of Core::Emulator::Emulator().
@@ -233,6 +415,7 @@ void RunGame(const App::Config& cfg) {
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
     std::at_quick_exit(OnQuickExit);
+    Trace::SetCallOrderCapacity(cfg.call_order);
 
     // The shadPS4 core keeps its own log file; SecondSonPC.log is written by SecondSonPC only.
     std::error_code ec;
@@ -245,7 +428,7 @@ void RunGame(const App::Config& cfg) {
         Fatal(fmt::format("shadPS4 core user dir {} is outside {} — refusing to run",
                           shad_user.string(), cfg.root.string()));
     }
-    SSPC_LOG(Bridge, Info, "shadPS4 core {} (temporary bootstrap), user dir {}", Common::g_scm_rev,
+    SSPC_LOG(Bridge, Info, "shadPS4 core {} (temporary bridge), user dir {}", Common::g_scm_rev,
              shad_user.string());
 
     KeyManager::GetInstance()->LoadFromFile();
@@ -310,7 +493,8 @@ void RunGame(const App::Config& cfg) {
         .title = title,
         .app_version = app_version,
         .firmware = fw_version,
-        .sdk = static_cast<u32>(Core::ReadCompiledSdkVersion(guest_eboot_path)),
+        .sdk = own_loader ? static_cast<u32>(Loader::ReadSdkVersion(game_folder / "eboot.bin"))
+                          : static_cast<u32>(Core::ReadCompiledSdkVersion(guest_eboot_path)),
         .attributes = psf_attributes,
         .splash = {},
         .folder = game_folder,
@@ -327,14 +511,15 @@ void RunGame(const App::Config& cfg) {
     auto* memory = Core::Memory::Instance();
     (void)memory;
     g_controllers = Common::Singleton<Input::GameControllers>::Instance();
-    auto* linker = Common::Singleton<Core::Linker>::Instance();
+    // The Phase 0 path's loader. The sspc path never creates shadPS4's Core::Linker.
+    Core::Linker* shad_linker = own_loader ? nullptr : Common::Singleton<Core::Linker>::Instance();
     VideoCore::LoadRenderDoc();
 
     Common::SecondSonBootstrap::SetTrophyIndexMap(
         Core::ExtractTrophies("/app0/sce_sys/npbind.dat", "/app0/sce_sys/trophy"));
 
-    const auto window_title =
-        fmt::format("SecondSonPC (Phase 0 bootstrap) | {} - {} <{}>", id, title, app_version);
+    const auto window_title = fmt::format("SecondSonPC (Phase 1, {} loader) | {} - {} <{}>",
+                                          own_loader ? "sspc" : "shadps4", id, title, app_version);
     auto window = std::make_unique<Frontend::WindowSDL>(
         static_cast<s32>(EmulatorSettings.GetWindowWidth()),
         static_cast<s32>(EmulatorSettings.GetWindowHeight()), g_controllers, window_title);
@@ -371,18 +556,11 @@ void RunGame(const App::Config& cfg) {
 
     Libraries::Kernel::g_environment[0] = nullptr;
 
-    BuildBindingTable(*linker, cfg);
-    if (cfg.import_counter) {
-        Trace::StartPeriodicDump(cfg.logs_dir / "calls.json", cfg.dump_interval_s);
+    if (own_loader) {
+        RunSspcLoader(cfg, guest_eboot_path, id);
+    } else {
+        RunPhase0Loader(cfg, *shad_linker, guest_eboot_path);
     }
-
-    if (linker->LoadModule(guest_eboot_path) == -1) {
-        Fatal(fmt::format("failed to load {}", guest_eboot_path));
-    }
-    SSPC_LOG(Loader, Info, "loaded {}, starting guest", guest_eboot_path);
-
-    const std::vector<std::string> args{guest_eboot_path};
-    linker->Execute(args);
 
     window->InitTimers();
     while (window->IsOpen()) {

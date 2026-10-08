@@ -43,7 +43,9 @@ std::string_view LanguageTagOf(std::string_view path) {
     return {};
 }
 
-void NoteLanguageFile(const char* path, std::string_view op, s32 result) {
+} // namespace
+
+void NoteLanguageFile(const char* path, const char* op, s32 result) {
     const auto tag = LanguageTagOf(path);
     if (tag.empty()) {
         return;
@@ -56,8 +58,6 @@ void NoteLanguageFile(const char* path, std::string_view op, s32 result) {
     }
     SSPC_LOG(Language, Info, "game {} language file: {} (tag={}, result={})", op, path, tag, result);
 }
-
-} // namespace
 
 SSPC_SYSV_ABI s32 ObserveOpen(const char* path, s32 flags, u16 mode) {
     const auto original = reinterpret_cast<OpenFn>(g_open_original);

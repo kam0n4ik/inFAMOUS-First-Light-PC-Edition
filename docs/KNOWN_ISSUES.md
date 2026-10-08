@@ -34,3 +34,20 @@
 **Что сделать.** Найти потребителей поля `+0x70` (динамически: watchpoint на запись/чтение
 `0xE171E0`), понять, где путь расходится, и устранить причину до Phase 3 (SaveData), так как она
 связана с записью `dis.dat`.
+
+**Воспроизведение.** `powershell -ExecutionPolicy Bypass -File E:\SecondSonPC\tools\repro_sspc001.ps1
+[-Loader sspc|shadps4] [-Seconds 90] [-Name PS4-SSPC001]` — запуск с непустым SystemName через флаг
+`--system-name` (TOML не меняется); итог `REPRODUCED` / `NOT REPRODUCED`, улики в
+`logs\runs\sspc001_<loader>`.
+
+**Обновление 2026-10-08 (Phase 1): тот же сбой и при пустом SystemName.** Подпись та же:
+`ErrorOutOfDeviceMemory` в `video_core` (`buffer.cpp:104`, `image.cpp:121`) или C++-исключение в
+`GpuCommandProcessor`, через 17–20 с после старта, при подгрузке уровня. Проявляется на
+**неизменённом пути Phase 0** (`--loader shadps4`, загрузчик и FS shadPS4): `logs\runs\or_1..3`,
+`fresh_oracle` — 4 падения из 4 подряд, в том числе с пустыми сохранениями (`fresh_*`; прежние
+сохранения перенесены в `userdata\savedata_backups\2026-10-08_10-04-41_before_fresh_start`). Утром
+того же дня тот же путь проходил 60 с в 3 прогонах из 3 (`m1_oracle`, `m1_oracle2`, `ru_phase0`),
+новый Loader — 4 падения из 9 до этой серии: частота плавает и от кода SecondSonPC не зависит.
+GPU: NVIDIA RTX 2060, 6 ГБ (свободно 5,4 ГБ перед прогонами). Вывод: связь с SystemName в бисекции
+Phase 0, скорее всего, случайна (малая выборка); это нехватка видеопамяти в GPU-мосте shadPS4
+(Phase 4: `video_core`), а не Loader/FileSystem/SystemService.

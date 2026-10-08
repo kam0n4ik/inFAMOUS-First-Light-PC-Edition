@@ -6,7 +6,8 @@ param(
     [string]$Lang = "",
     [int]$Seconds = 150,
     [string]$Tag = "run",
-    [string]$ExtraArgs = ""   # one space-separated string (arrays do not survive powershell -File)
+    [string]$ExtraArgs = "",  # one space-separated string (arrays do not survive powershell -File)
+    [switch]$NoReport         # do not regenerate docs\generated\CALLS.md (diagnostic runs)
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -14,6 +15,8 @@ $exe = "$root\build\bin\SecondSonPC.exe"
 $logs = "$root\logs"
 $out = "$logs\runs\$Tag"
 New-Item -ItemType Directory -Force $out | Out-Null
+# Outputs of an earlier session must not be mistaken for this run's.
+foreach ($f in "calls.json", "call_order.txt") { Remove-Item "$logs\$f" -ErrorAction SilentlyContinue }
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -59,7 +62,9 @@ if (-not $exited) {
     "exited by itself, exit=$($p.ExitCode)"
 }
 
-foreach ($f in "SecondSonPC.log", "calls.json", "bridge_shadps4.log", "shad_log.txt") {
+foreach ($f in "SecondSonPC.log", "calls.json", "call_order.txt", "bridge_shadps4.log", "shad_log.txt") {
     if (Test-Path "$logs\$f") { Copy-Item "$logs\$f" "$out\$f" -Force }
 }
-& python -I "$root\tools\make_calls_md.py" --calls "$out\calls.json" --run-note "tag=$Tag lang='$Lang' seconds=$Seconds"
+if (-not $NoReport) {
+    & python -I "$root\tools\make_calls_md.py" --calls "$out\calls.json" --run-note "tag=$Tag lang='$Lang' seconds=$Seconds"
+}

@@ -16,4 +16,7 @@ SSPC_SYSV_ABI s32 ObserveOpen(const char* path, s32 flags, u16 mode);
 // NID eV9wAD2riIA. s32 sceKernelStat(const char* path, OrbisKernelStat* sb)
 SSPC_SYSV_ABI s32 ObserveStat(const char* path, void* sb);
 
+/// Logs (once per path) when the game touches one of its per-language files.
+void NoteLanguageFile(const char* path, const char* op, s32 result);
+
 } // namespace SecondSon::Filesystem

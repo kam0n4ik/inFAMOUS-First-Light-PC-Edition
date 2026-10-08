@@ -54,6 +54,15 @@ struct Config {
     bool bind_natives = true;
     bool bind_observers = true;
     std::vector<std::string> no_bind; // export names excluded with --no-bind <name>
+
+    // Phase 1 migration (command line only).
+    // --loader: SecondSonPC's own Loader (sspc) or the Phase 0 path on shadPS4's Core::Linker,
+    // kept as the in-binary oracle until Phase 1 is complete.
+    enum class LoaderBackend { Sspc, Shadps4 };
+    LoaderBackend loader = LoaderBackend::Sspc; // default since Phase 1 milestone 1 (docs/MIGRATION.md)
+    std::vector<std::string> bridged_groups; // --bridge <group>: NATIVE group back to BRIDGE
+    u32 call_order = 0;                      // --call-order N: record the first N import calls
+    std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
 };
 
 /// Parses <root>\SecondSonPC.toml. On failure returns nullopt and fills `errors`.

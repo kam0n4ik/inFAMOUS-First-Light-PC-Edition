@@ -1,6 +1,7 @@
 // SecondSonPC — libSceSystemService (NATIVE part).
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "base/abi.h"
@@ -30,6 +31,10 @@ struct Settings {
 };
 
 void Configure(const Settings& settings);
+
+/// DIAGNOSTIC: runs once, on the guest thread, at the first ParamGetInt call (a point both loader
+/// paths reach with every module loaded and relocated; used for relocation snapshots).
+void SetFirstParamGetIntHook(std::function<void()> hook);
 
 // NID fZo48un7LK4. s32 sceSystemServiceParamGetInt(s32 paramId, s32* value)
 SSPC_SYSV_ABI s32 ParamGetInt(s32 param_id, s32* value);
