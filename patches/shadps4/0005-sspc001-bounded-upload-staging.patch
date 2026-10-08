@@ -1,0 +1,54 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -341,7 +341,49 @@
+         copies.emplace_back(total_size_bytes, addr, size);
+         total_size_bytes += size;
+     });
+-    if (!copies.empty()) {
++    // SecondSonPC (SSPC-001): an upload larger than this goes through one bounded staging buffer
++    // in pieces, each copied by the GPU before the next piece reuses the memory. Uploading the whole
++    // range at once needs a host-visible staging buffer as large as the range (2.5 GiB for a
++    // 2.4 GiB texel buffer during Second Son's level load), which together with the arena backing
++    // of the same range exhausted the system commit limit (docs/KNOWN_ISSUES.md, SSPC-001).
++    static constexpr u64 MaxUploadStaging = 64_MB;
++    if (total_size_bytes > MaxUploadStaging) {
++        boost::container::small_vector<vk::BufferCopy, 8> pieces;
++        u64 pieces_bytes = 0;
++        const auto upload_pieces = [&] {
++            const auto staging = staging_pool.Request(pieces_bytes, MemoryType::HostUncached);
++            u64 staging_offset = 0;
++            for (auto& piece : pieces) {
++                // srcOffset holds the guest address until the piece is staged.
++                memory->CopySparseMemory(piece.srcOffset, staging.mapped + staging_offset,
++                                         piece.size);
++                piece.srcOffset = staging.offset + staging_offset;
++                staging_offset += piece.size;
++            }
++            staging.Flush();
++            runtime.CopyBuffer(staging.buffer, arena, pieces);
++            scheduler.Finish();
++            pieces.clear();
++            pieces_bytes = 0;
++        };
++        for (const auto& copy : copies) {
++            VAddr guest_addr = copy.dstOffset;
++            u64 remaining = copy.size;
++            while (remaining != 0) {
++                const u64 piece_size = std::min(remaining, MaxUploadStaging - pieces_bytes);
++                pieces.emplace_back(guest_addr, guest_addr - arena->cpu_addr, piece_size);
++                pieces_bytes += piece_size;
++                guest_addr += piece_size;
++                remaining -= piece_size;
++                if (pieces_bytes == MaxUploadStaging) {
++                    upload_pieces();
++                }
++            }
++        }
++        if (!pieces.empty()) {
++            upload_pieces();
++        }
++    } else if (!copies.empty()) {
+         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+         for (auto& copy : copies) {
+             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
