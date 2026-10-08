@@ -995,6 +995,21 @@ void TestInput(Totals& t) {
             !s.motion.active && std::abs(s.motion.orientation.w - 1.0f) < 1e-5f &&
                 std::abs(s.motion.acceleration.y - Input::kGravity) < 1e-5f,
             fmt::format("active {} w {:.6f}", s.motion.active, s.motion.orientation.w));
+    // Walking ends the motion mode: after graffiti the mouse turns the camera again without G.
+    km.OnEvent(KeyEvent(SDL_SCANCODE_G, true));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_G, false));
+    s = read();
+    km.OnEvent(KeyEvent(SDL_SCANCODE_W, true));
+    km.OnEvent(MotionEvent(15.0f, 0.0f));
+    s = read();
+    c.Check("W ends the motion mode: the mouse moves the right stick again",
+            !s.info.motion_mode && s.rx == 255 && s.ly == 0, sticks(s));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_W, false));
+    for (int i = 0; i < 100; ++i) {
+        s = read();
+    }
+    c.Check("after walking out of motion mode: sticks centred, controller at rest",
+            s.lx == 128 && s.ly == 128 && s.rx == 128 && s.ry == 128 && !s.motion.active, sticks(s));
 
     // Focus loss (Alt+Tab) without test mode: nothing stays pressed, no mouse piles up.
     Input::KeyboardMouse real;
@@ -1010,6 +1025,48 @@ void TestInput(Totals& t) {
     real.OnEvent(MotionEvent(500.0f, 0.0f)); // not captured: ignored
     s2 = real.Read(t2 += 10'000);
     c.Check("after focus loss nothing is held and the mouse is ignored", s2.ly == 128 && s2.rx == 128, sticks(s2));
+    // Back in the window (Alt+Tab back): captured again without a click.
+    SDL_Event gained{};
+    gained.type = SDL_EVENT_WINDOW_FOCUS_GAINED;
+    gained.window.timestamp = 1'000'000'000;
+    real.OnEvent(gained);
+    real.OnEvent(MotionEvent(15.0f, 0.0f));
+    s2 = real.Read(t2 += 10'000);
+    c.Check("focus back: the mouse is captured and turns the camera", s2.info.captured && s2.rx == 255, sticks(s2));
+    // The click that brought the window to the front is not R2 (it would fire in the game).
+    SDL_Event focus_click = ButtonEvent(SDL_BUTTON_LEFT, true);
+    focus_click.button.timestamp = gained.window.timestamp + 50'000'000;
+    real.OnEvent(focus_click);
+    s2 = real.Read(t2 += 10'000);
+    c.Check("the click that focused the window is not R2", (s2.buttons & Button::R2) == 0 && s2.r2 == 0,
+            fmt::format("{:#x} r2 {}", s2.buttons, s2.r2));
+    real.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, false));
+    real.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, true));
+    s2 = real.Read(t2 += 10'000);
+    c.Check("a later click is R2", (s2.buttons & Button::R2) != 0 && s2.r2 == 255,
+            fmt::format("{:#x} r2 {}", s2.buttons, s2.r2));
+    real.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, false));
+    // Esc: Options for the game (pause menu) and the cursor is given back; focus changes while in
+    // the menu do not take it; Esc again (menu closed): captured again.
+    real.OnEvent(KeyEvent(SDL_SCANCODE_ESCAPE, true));
+    real.OnEvent(MotionEvent(15.0f, 0.0f));
+    s2 = real.Read(t2 += 10'000);
+    c.Check("Esc: Options pressed, mouse given back", (s2.buttons & Button::Options) != 0 && !s2.info.captured &&
+                                                          s2.rx == 128,
+            fmt::format("{:#x} captured {} {}", s2.buttons, s2.info.captured, sticks(s2)));
+    real.OnEvent(KeyEvent(SDL_SCANCODE_ESCAPE, false));
+    real.OnEvent(lost);
+    real.OnEvent(gained);
+    real.OnEvent(MotionEvent(15.0f, 0.0f));
+    s2 = real.Read(t2 += 10'000);
+    c.Check("in the menu Alt+Tab back does not take the mouse", !s2.info.captured && s2.rx == 128, sticks(s2));
+    real.OnEvent(KeyEvent(SDL_SCANCODE_ESCAPE, true));
+    real.OnEvent(KeyEvent(SDL_SCANCODE_ESCAPE, false));
+    real.OnEvent(MotionEvent(15.0f, 0.0f));
+    s2 = real.Read(t2 += 10'000);
+    c.Check("Esc again: captured, the mouse turns the camera", s2.info.captured && s2.rx == 255, sticks(s2));
+    s2 = real.Read(t2 += 10'000);
+    c.Check("mouse stops: right stick back to centre (no sticking)", s2.rx == 128 && s2.ry == 128, sticks(s2));
     c.Summary();
 }
 

@@ -55,6 +55,9 @@ public:
     virtual bool ReportsTouchTime() = 0;
 };
 void SetHost(Host* host);
+/// [Debug] inputLog: once a second while player 1's right stick or mouse is active, what
+/// scePadReadState hands the game and what the game's stick filter made of it.
+void SetInputLog(bool on);
 
 std::span<const Runtime::Export> PadExports();
 

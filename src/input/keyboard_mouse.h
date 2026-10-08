@@ -42,6 +42,15 @@ struct Touch {
     u8 id = 0;
 };
 
+/// What a reading was made of ([Debug] inputLog).
+struct ReadInfo {
+    double mouse_dx = 0.0, mouse_dy = 0.0; // mouse counts this reading used up
+    double dt = 0.0;                        // s since the previous reading
+    bool repeated = false;                  // a second read within kMinReadIntervalUs
+    bool captured = false;
+    bool motion_mode = false;
+};
+
 /// One reading of the virtual controller.
 struct PadState {
     u32 buttons = 0;
@@ -50,6 +59,7 @@ struct PadState {
     MotionState motion;
     bool touch_active = false; // a virtual finger is on the touch pad: it wins over a real one
     std::array<Touch, 2> touch{};
+    ReadInfo info;
 };
 
 class KeyboardMouse {
@@ -61,7 +71,9 @@ public:
     };
 
     void Configure(const Settings& settings);
-    /// The window the mouse is captured in (a click captures it, Esc and focus loss release it).
+    /// The window the mouse is captured in: captured (hidden, kept inside the window, raw
+    /// movement) whenever the window gets focus; Esc gives it back (pause menu) and takes it again,
+    /// a click takes it too; focus loss (Alt+Tab) gives it back until the window has focus again.
     /// `test_mode` (automated runs): mouse events count as captured, the system cursor is never
     /// grabbed and focus changes are ignored, so injected input is not disturbed.
     void AttachWindow(SDL_Window* window, bool test_mode);
@@ -100,7 +112,9 @@ private:
     SDL_Window* window_ = nullptr;
     bool test_mode_ = false;
     bool captured_ = false;
-    u8 swallowed_button_ = 0; // the click that captured the mouse: its release is not a press
+    bool want_capture_ = true; // playing: captured whenever the window has focus; Esc toggles it
+    u64 focus_gained_ns_ = 0;  // a click right after the window got focus only focuses it
+    u8 swallowed_button_ = 0;  // the click that captured the mouse: its release is not a press
     double mouse_dx_ = 0.0, mouse_dy_ = 0.0;
 
     bool motion_mode_ = false;

@@ -4,11 +4,13 @@
 #include "runtime/pad/pad.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 
 #include "base/log.h"
 #include "input/keyboard_mouse.h"
@@ -126,8 +128,9 @@ u32 Deflection(u8 x, u8 y) {
 }
 
 /// The controller of a slot now (g_mutex held). Player 1: keyboard/mouse merged with a real
-/// controller; the other slots: a real controller or nothing.
-void Fill(PadData& d, s32 slot) {
+/// controller; the other slots: a real controller or nothing. `info`: what the keyboard/mouse
+/// reading was made of (diagnostics), when player 1's keyboard/mouse was read.
+void Fill(PadData& d, s32 slot, Input::ReadInfo* info = nullptr) {
     std::memset(&d, 0, sizeof(d));
     d.orientation[3] = 1.0f;
     Host* host = g_host;
@@ -153,6 +156,9 @@ void Fill(PadData& d, s32 slot) {
     Input::PadState v;
     if (keyboard) {
         v = Input::Player1().Read(now);
+        if (info != nullptr) {
+            *info = v.info;
+        }
     }
     u32 buttons = v.buttons;
     u8 lx = v.lx, ly = v.ly, rx = v.rx, ry = v.ry, l2 = v.l2, r2 = v.r2;
@@ -222,6 +228,132 @@ void Fill(PadData& d, s32 slot) {
     if (host->ReportsTouchTime()) {
         d.time_since_touch_held_down = held_us;
     }
+}
+
+// ---- diagnostics ([Debug] inputLog)
+//
+// Once a second while player 1's sticks or mouse are active, one line: what scePadReadState handed
+// the game and what the game made of it. The game half is specific to inFAMOUS Second Son 01.07
+// (CUSA00004 eboot): the game reads the pad at one call site (0x24B178) into a ScePadData inside its
+// pad object (object + 0xD0); after each read its stick filter (0x249170) stores the sticks it uses,
+// floats -1..1: left x, y, magnitude at object + 0x08, 0x0C, 0x10, right at + 0x14, 0x18, 0x1C.
+// They are read only when the return address is that call site (its code is compared first), so
+// another caller (the self-test) is never misread; at a read they hold the previous read's result.
+
+constexpr u8 kGameReadSite[] = {0x85, 0xC0, 0x75, 0x2F, 0x0F, 0xB6, 0x83, 0x38, 0x01, 0x00, 0x00};
+constexpr size_t kGamePadDataOffset = 0xD0;
+
+struct GameSticks {
+    bool known = false;
+    float lx = 0.0f, ly = 0.0f, lmag = 0.0f;
+    float rx = 0.0f, ry = 0.0f, rmag = 0.0f;
+};
+
+GameSticks ReadGameSticks(const void* return_address, const PadData* data) {
+    GameSticks g;
+    if (std::memcmp(return_address, kGameReadSite, sizeof(kGameReadSite)) != 0) {
+        return g;
+    }
+    const auto* object = reinterpret_cast<const u8*>(data) - kGamePadDataOffset;
+    const auto at = [object](size_t offset) {
+        float v;
+        std::memcpy(&v, object + offset, sizeof(v));
+        return v;
+    };
+    g.known = true;
+    g.lx = at(0x08);
+    g.ly = at(0x0C);
+    g.lmag = at(0x10);
+    g.rx = at(0x14);
+    g.ry = at(0x18);
+    g.rmag = at(0x1C);
+    return g;
+}
+
+template <typename T>
+struct Range {
+    T lo{}, hi{};
+    bool any = false;
+    void Add(T v) {
+        lo = any ? std::min(lo, v) : v;
+        hi = any ? std::max(hi, v) : v;
+        any = true;
+    }
+};
+
+struct InputLog {
+    bool enabled = false;
+    bool site_reported = false;
+    u64 start_us = 0;
+    u32 reads = 0, repeated = 0, captured = 0, motion_mode = 0;
+    double mouse_dx = 0.0, mouse_dy = 0.0;
+    Range<double> dt_ms;
+    u32 right_sent = 0; // reads with the right stick away from 128
+    Range<int> rx, ry;
+    u32 game_reads = 0, game_right = 0, game_left = 0; // game filter: reads, non-zero sticks
+    Range<float> game_rx, game_ry;
+    float game_rmag = 0.0f, game_lmag = 0.0f;
+};
+InputLog g_log;
+
+void LogInput(const PadData& d, const Input::ReadInfo& info, const GameSticks& game, u64 now) {
+    InputLog& l = g_log;
+    if (game.known && !l.site_reported) {
+        l.site_reported = true;
+        SSPC_LOG(Input, Info, "input log: scePadReadState is called from the game's pad object "
+                              "(eboot 0x24B178); its filtered sticks are logged");
+    }
+    if (l.reads == 0) {
+        l.start_us = now;
+    }
+    ++l.reads;
+    l.repeated += info.repeated ? 1 : 0;
+    l.captured += info.captured ? 1 : 0;
+    l.motion_mode += info.motion_mode ? 1 : 0;
+    if (!info.repeated) {
+        l.mouse_dx += info.mouse_dx;
+        l.mouse_dy += info.mouse_dy;
+        l.dt_ms.Add(info.dt * 1000.0);
+    }
+    if (d.right_x != 128 || d.right_y != 128) {
+        ++l.right_sent;
+    }
+    l.rx.Add(d.right_x);
+    l.ry.Add(d.right_y);
+    if (game.known) {
+        ++l.game_reads;
+        l.game_right += std::abs(game.rmag) > 0.01f ? 1 : 0;
+        l.game_left += std::abs(game.lmag) > 0.01f ? 1 : 0;
+        l.game_rx.Add(game.rx);
+        l.game_ry.Add(game.ry);
+        l.game_rmag = std::max(l.game_rmag, std::abs(game.rmag));
+        l.game_lmag = std::max(l.game_lmag, std::abs(game.lmag));
+    }
+    if (now - l.start_us < 1'000'000) {
+        return;
+    }
+    const bool active = l.right_sent != 0 || l.mouse_dx != 0.0 || l.mouse_dy != 0.0 ||
+                        l.game_right != 0 || l.game_left != 0;
+    if (active) {
+        const std::string game_part =
+            l.game_reads == 0
+                ? std::string("not read (caller is not the game's pad read site)")
+                : fmt::format("right non-zero {}/{}, x {:+.2f}..{:+.2f}, y {:+.2f}..{:+.2f}, max |r| "
+                              "{:.2f}; left non-zero {}/{}, max |l| {:.2f}",
+                              l.game_right, l.game_reads, l.game_rx.lo, l.game_rx.hi, l.game_ry.lo,
+                              l.game_ry.hi, l.game_rmag, l.game_left, l.game_reads, l.game_lmag);
+        SSPC_LOG(Input, Info,
+                 "input {:.1f} s: {} reads (dt {:.1f}..{:.1f} ms, {} repeated); mouse {:+.0f}/{:+.0f} "
+                 "counts, captured {}/{}, motion mode {}/{}; sent right stick: away from centre {}/{}, "
+                 "x {}..{}, y {}..{} | game filter: {}",
+                 (now - l.start_us) / 1e6, l.reads, l.dt_ms.lo, l.dt_ms.hi, l.repeated, l.mouse_dx,
+                 l.mouse_dy, l.captured, l.reads, l.motion_mode, l.reads, l.right_sent, l.reads,
+                 l.rx.lo, l.rx.hi, l.ry.lo, l.ry.hi, game_part);
+    }
+    const bool enabled = l.enabled, reported = l.site_reported;
+    l = {};
+    l.enabled = enabled;
+    l.site_reported = reported;
 }
 
 // ---- exports
@@ -299,12 +431,20 @@ SSPC_SYSV_ABI s32 ReadState(s32 handle, PadData* data) {
     if (data == nullptr) {
         return ORBIS_PAD_ERROR_INVALID_ARG;
     }
+    const void* caller = __builtin_return_address(0);
     std::scoped_lock lock{g_mutex};
     const s32 slot = SlotOf(handle);
     if (slot == kNoHandle) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
-    Fill(*data, slot);
+    if (!g_log.enabled || slot != 0 || g_host == nullptr) {
+        Fill(*data, slot);
+        return ORBIS_OK;
+    }
+    const GameSticks game = ReadGameSticks(caller, data); // the previous read's filter result
+    Input::ReadInfo info;
+    Fill(*data, slot, &info);
+    LogInput(*data, info, game, g_host->ProcessTimeUs());
     return ORBIS_OK;
 }
 
@@ -399,6 +539,12 @@ const Runtime::Export kExports[] = {
 void SetHost(Host* host) {
     std::scoped_lock lock{g_mutex};
     g_host = host;
+}
+
+void SetInputLog(bool on) {
+    std::scoped_lock lock{g_mutex};
+    g_log = {};
+    g_log.enabled = on;
 }
 
 std::span<const Runtime::Export> PadExports() {

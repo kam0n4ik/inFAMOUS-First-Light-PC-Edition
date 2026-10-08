@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <string>
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_video.h>
+#include <windows.h>
 
 #include "base/log.h"
 
@@ -26,6 +28,38 @@ constexpr u64 kMinReadIntervalUs = 2000;
 
 u8 Axis(double v) {
     return static_cast<u8>(std::clamp(std::lround(127.5 + v * 127.5), 0L, 255L));
+}
+
+/// The program that took the focus away (focus-loss log): its executable name and process id only
+/// (window titles of other programs can be private: chats, documents).
+std::string ForegroundWindowName() {
+    HWND w = GetForegroundWindow();
+    if (w == nullptr) {
+        return "no window";
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId()) {
+        return fmt::format("SecondSonPC itself, process {}", pid);
+    }
+    std::string exe = "?";
+    if (HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid); p != nullptr) {
+        wchar_t path[MAX_PATH] = {};
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(p, 0, path, &size)) {
+            const wchar_t* name = path;
+            for (const wchar_t* c = path; *c != L'\0'; ++c) {
+                if (*c == L'\\' || *c == L'/') {
+                    name = c + 1;
+                }
+            }
+            char utf8[MAX_PATH * 3] = {};
+            WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+            exe = utf8;
+        }
+        CloseHandle(p);
+    }
+    return fmt::format("{}, process {}", exe, pid);
 }
 
 struct ButtonOf {
@@ -70,7 +104,8 @@ void KeyboardMouse::AttachWindow(SDL_Window* window, bool test_mode) {
     }
     SSPC_LOG(Input, Info, "keyboard/mouse controller attached ({})",
              test_mode ? "test mode: mouse counts as captured, system cursor never grabbed"
-                       : "click in the window captures the mouse, Esc releases it");
+                       : "the window captures the mouse while it has focus; Esc gives it back and "
+                         "takes it again, a click takes it too");
 }
 
 bool KeyboardMouse::Pressed(Action a) const {
@@ -97,16 +132,20 @@ void KeyboardMouse::SetCapture(bool captured) {
     SDL_Window* window;
     {
         std::scoped_lock lock{mutex_};
-        if (test_mode_ || captured_ == captured || window_ == nullptr ||
-            (captured && !settings_.capture_mouse)) {
+        if (test_mode_ || captured_ == captured || (captured && !settings_.capture_mouse)) {
             return;
         }
         captured_ = captured;
         mouse_dx_ = mouse_dy_ = 0.0;
-        window = window_;
+        window = window_; // none in the self-test: the logical state only
     }
-    if (!SDL_SetWindowRelativeMouseMode(window, captured)) {
+    // Relative mode hides the cursor and reports raw movement; the grab also keeps the cursor
+    // inside the window, so a click can never land on another window and take the focus away.
+    if (window != nullptr && !SDL_SetWindowRelativeMouseMode(window, captured)) {
         SSPC_LOG(Input, Error, "mouse {} failed: {}", captured ? "capture" : "release", SDL_GetError());
+    }
+    if (window != nullptr && !SDL_SetWindowMouseGrab(window, captured)) {
+        SSPC_LOG(Input, Error, "mouse {} failed: {}", captured ? "grab" : "ungrab", SDL_GetError());
     }
     SSPC_LOG(Input, Info, "mouse {}", captured ? "captured" : "released");
 }
@@ -142,7 +181,7 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         if (sc >= key_down_.size()) {
             break;
         }
-        bool release = false;
+        bool toggle_capture = false, capture = false;
         {
             std::scoped_lock lock{mutex_};
             key_down_[sc] = down;
@@ -153,20 +192,32 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
                         action_seq_[a] = ++seq_;
                     }
                 }
-                if ((actions & Bit(Action::MotionMode)) != 0) {
+                constexpr u32 kMove = Bit(Action::MoveForward) | Bit(Action::MoveBack) |
+                                      Bit(Action::MoveLeft) | Bit(Action::MoveRight);
+                const bool toggle = (actions & Bit(Action::MotionMode)) != 0;
+                // Walking ends the motion mode: the mouse goes back to the camera after graffiti
+                // even when G was not pressed again (the character never walks while spraying).
+                if (toggle || (motion_mode_ && (actions & kMove) != 0)) {
                     motion_mode_ = !motion_mode_;
                     motion_.SetSideways(motion_mode_, settings_.sideways_right_up);
                     mouse_dx_ = mouse_dy_ = 0.0;
-                    SSPC_LOG(Input, Info, "motion mode {} (controller {})", motion_mode_ ? "on" : "off",
+                    SSPC_LOG(Input, Info, "motion mode {} (controller {}){}", motion_mode_ ? "on" : "off",
                              motion_mode_ ? (settings_.sideways_right_up ? "sideways, right side up"
                                                                          : "sideways, left side up")
-                                          : "back to rest");
+                                          : "back to rest",
+                             toggle ? "" : ": a movement key, the mouse turns the camera again");
                 }
-                release = (actions & Bit(Action::ReleaseMouse)) != 0;
+                // Esc gives the cursor back (the pause menu opens with it) and takes it again
+                // (the menu closes).
+                if ((actions & Bit(Action::ReleaseMouse)) != 0 && !test_mode_) {
+                    toggle_capture = true;
+                    want_capture_ = !captured_;
+                    capture = want_capture_;
+                }
             }
         }
-        if (release) {
-            SetCapture(false);
+        if (toggle_capture) {
+            SetCapture(capture);
         }
         break;
     }
@@ -181,10 +232,17 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         bool capture = false;
         {
             std::scoped_lock lock{mutex_};
-            if (down && !captured_ && settings_.capture_mouse) {
+            // A click that only brings the window to the front (it captured the mouse on focus).
+            constexpr u64 kFocusClickNs = 300'000'000;
+            const bool focus_click =
+                down && focus_gained_ns_ != 0 && e.button.timestamp >= focus_gained_ns_ &&
+                e.button.timestamp - focus_gained_ns_ < kFocusClickNs;
+            focus_gained_ns_ = 0;
+            if (down && ((!captured_ && settings_.capture_mouse) || focus_click)) {
                 // The click that captures the mouse is not a press for the game.
                 swallowed_button_ = button;
-                capture = true;
+                capture = !captured_;
+                want_capture_ = true;
             } else if (!down && swallowed_button_ == button) {
                 swallowed_button_ = 0;
             } else {
@@ -218,6 +276,20 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
     case SDL_EVENT_MOUSE_WHEEL:
         result.consumed = true;
         break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED: {
+        // Back in the game (start, Alt+Tab back): the mouse is captured again unless Esc gave it
+        // back on purpose.
+        bool capture;
+        {
+            std::scoped_lock lock{mutex_};
+            capture = !test_mode_ && want_capture_ && settings_.capture_mouse;
+            focus_gained_ns_ = capture ? e.window.timestamp : 0;
+        }
+        if (capture) {
+            SetCapture(true);
+        }
+        break;
+    }
     case SDL_EVENT_WINDOW_FOCUS_LOST: {
         // Alt+Tab: nothing stays pressed, no movement piles up, the cursor is given back.
         bool test;
@@ -230,7 +302,8 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         }
         if (!test) {
             SetCapture(false);
-            SSPC_LOG(Input, Info, "window lost focus: keys released");
+            SSPC_LOG(Input, Info, "window lost focus: keys released (now in front: {})",
+                     ForegroundWindowName());
         }
         break;
     }
@@ -243,7 +316,9 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
 PadState KeyboardMouse::Read(u64 now_us) {
     std::scoped_lock lock{mutex_};
     if (has_last_ && now_us >= last_read_us_ && now_us - last_read_us_ < kMinReadIntervalUs) {
-        return last_;
+        PadState again = last_;
+        again.info.repeated = true;
+        return again;
     }
     const double dt =
         has_last_ ? std::clamp((now_us - last_read_us_) / 1e6, 0.002, 0.1) : 1.0 / 60.0;
@@ -282,6 +357,7 @@ PadState KeyboardMouse::Read(u64 now_us) {
 
     const double mdx = mouse_dx_, mdy = mouse_dy_;
     mouse_dx_ = mouse_dy_ = 0.0;
+    s.info = {mdx, mdy, dt, false, captured_, motion_mode_};
 
     // Touch pad: a held TouchDrag puts a finger down at the centre and the mouse drags it; the
     // TouchPad button touches the centre while held (a real click presses a finger on the pad).

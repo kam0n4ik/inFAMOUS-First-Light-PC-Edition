@@ -40,7 +40,7 @@ device = ""                        # output device name; "" = system default
 mouseSensitivity = 1.0             # camera speed for a given mouse speed
 invertY = false
 mouseDeadzone = 0.10               # right-stick deflection a moving mouse starts from (0..0.9)
-captureMouse = true                # a click captures the mouse, Esc / Alt+Tab release it
+captureMouse = true                # captured while the window has focus; Esc releases / takes it again
 motionSensitivity = 1.0            # motion mode (G): controller rotation per mouse movement
 sideways = "right-up"              # motion mode: "right-up" | "left-up" (which side points up)
 
@@ -68,7 +68,8 @@ moveLeft = "A"
 moveRight = "D"
 walk = "Left Ctrl"                 # left stick at half deflection
 releaseMouse = "Escape"            # gives the cursor back
-motionMode = "G"                   # controller held sideways, the mouse moves it (graffiti)
+motionMode = "G"                   # controller held sideways, the mouse moves it (graffiti);
+                                   # a movement key also ends it (the mouse turns the camera again)
 shake = "X"                        # shakes the controller while held (spray can)
 touchDrag = "T"                    # while held the mouse drags a finger on the touch pad
 
@@ -76,9 +77,11 @@ touchDrag = "T"                    # while held the mouse drags a finger on the 
 level = "info"                     # trace | debug | info | warning | error | critical
 bridgeFilter = "*:info"            # temporary shadPS4 core log (logs\bridge_shadps4.log)
 
-[Debug]                            # diagnostics of the temporary Vulkan bridge
+[Debug]                            # diagnostics of the temporary Vulkan bridge and of the input
 vulkanValidation = false           # Khronos validation layer (slow; needs the Vulkan SDK)
 vulkanCrashDiagnostic = false      # crash diagnostic layer
+inputLog = true                    # once a second while the mouse/sticks move: what the game is
+                                   # sent and what its stick filter reads (SecondSonPC.log, [Input])
 
 [Trace]
 importCounter = true               # count calls of every bound import -> logs\calls.json

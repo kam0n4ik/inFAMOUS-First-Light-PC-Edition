@@ -52,9 +52,10 @@ struct Config {
     u32 volume = 100;         // 0..100, applied on top of the game's own volume
     std::string audio_device; // output device name; empty = system default
 
-    // [Debug] — diagnostics of the temporary Vulkan bridge (Phase 0-4)
+    // [Debug] — diagnostics of the temporary Vulkan bridge (Phase 0-4) and of the input
     bool vulkan_validation = false;
     bool vulkan_crash_diagnostic = false;
+    bool input_log = false; // keyboard/mouse -> libScePad -> the game's stick filter, once a second
 
     // [Input] + [Keyboard]: the keyboard/mouse controller of player 1 (docs/INPUT_MAPPING.md)
     Input::Settings input = Input::DefaultSettings();

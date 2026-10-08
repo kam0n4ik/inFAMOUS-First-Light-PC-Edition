@@ -116,6 +116,7 @@ void StartControllers() {
 void InstallNativeInput(const App::Config& cfg, SDL_Window* window, bool test_mode) {
     static PadHostImpl host;
     Pad::SetHost(&host);
+    Pad::SetInputLog(cfg.input_log);
     Input::Player1().Configure(cfg.input);
     Input::Player1().AttachWindow(window, test_mode);
     Frontend::SetEventInterceptor(&InterceptWindowEvent);
