@@ -338,15 +338,20 @@ LONG WINAPI FirstChanceFilter(EXCEPTION_POINTERS* info) {
     FaultFacts f{rec->ExceptionCode, rec->ExceptionInformation[0], rec->ExceptionInformation[1], ctx->Rip,
                  false, false};
     if (f.access != 8 && f.address != f.rip) {
-        // Data access: the bridge handles faults on committed (protected) pages; host code is left
-        // to the unhandled exception filter. Two VirtualQuery calls, only for access violations.
-        const auto code = Query(f.rip);
-        f.rip_in_image = code.ok && code.type == MEM_IMAGE;
-        if (f.rip_in_image) {
+        // Data access: the bridge handles faults on committed (protected) pages — the frequent case
+        // (GPU write tracking) — and host code is left to the unhandled exception filter. Cheapest
+        // test first: rip in SecondSonPC.exe (no system call), then one VirtualQuery of the address;
+        // rip is queried only for the rare access to uncommitted memory.
+        if (InImage(f.rip)) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         const auto target = Query(f.address);
         f.address_committed = target.ok && target.state == MEM_COMMIT;
+        if (f.address_committed) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const auto code = Query(f.rip);
+        f.rip_in_image = code.ok && code.type == MEM_IMAGE;
     }
     const auto kind = ClassifyFault(f);
     if (kind != FaultKind::Ignore) {
