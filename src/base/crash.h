@@ -1,10 +1,58 @@
-// SecondSonPC — crash report in SecondSonPC.log (unhandled exceptions).
+// SecondSonPC — crash diagnostics in SecondSonPC.log.
 #pragma once
+
+#include <filesystem>
+
+#include "base/abi.h"
 
 namespace SecondSon::Base {
 
-/// Logs the code, address, registers and the return addresses found on the stack of an unhandled
-/// exception (as exe+offset, for llvm-symbolizer with SecondSonPC.pdb), then flushes the log.
-void InstallCrashLogger();
+/// Installs both crash recorders:
+///  - a first-chance vectored handler, called before the bridge's (SSPC-002, docs/KNOWN_ISSUES.md):
+///    for an execute fault, or for guest code touching memory that is not committed, it logs the
+///    registers, the jump evidence and the stack, and writes a minidump to dump_dir (once per
+///    process, when write_dump). It never handles the exception: the bridge's handler and the
+///    game see it exactly as before;
+///  - an unhandled exception filter: code, address, registers and the return addresses found on
+///    the stack (as exe+offset, for llvm-symbolizer with SecondSonPC.pdb).
+void InstallCrashLogger(const std::filesystem::path& dump_dir, bool write_dump);
+
+/// What the first-chance recorder does with an exception.
+enum class FaultKind : u8 {
+    Ignore,              // not an access violation, or one the bridge handles (protected pages)
+    Execute,             // instruction fetch failed: a jump/call/return to a bad address
+    GuestUnmappedAccess, // code outside any PE image read/wrote memory that is not committed
+};
+
+struct FaultFacts {
+    u32 code;               // ExceptionCode
+    u64 access;             // ExceptionInformation[0]: 0 read, 1 write, 8 execute
+    u64 address;            // ExceptionInformation[1]: the inaccessible address
+    u64 rip;
+    bool rip_in_image;      // RIP lies in a PE image (host code: exe, system DLLs, drivers)
+    bool address_committed; // the inaccessible address is committed memory
+};
+
+FaultKind ClassifyFault(const FaultFacts& facts);
+
+/// The last fault the first-chance recorder recorded (for --fault-test).
+struct FaultRecord {
+    u32 serial = 0; // 1, 2, ...; 0 = nothing recorded yet
+    FaultKind kind = FaultKind::Ignore;
+    u64 rip = 0;
+    u64 address = 0;
+    u64 stack_top = 0;      // [rsp]: return address of a call to a bad target
+    u64 popped = 0;         // [rsp-8]: equals rip after a ret to a bad address
+    u32 regs_equal_rip = 0; // bit i: register i holds rip (x86 encoding order: rax rcx rdx rbx
+                            // rsp rbp rsi rdi r8 ... r15)
+    bool dump_written = false;
+};
+
+FaultRecord LastFaultRecord();
+
+/// --fault-test: provokes faults in its own code (execute faults through call, ret and jmp reg,
+/// a read of reserved memory from private code, host and protected-page faults that must be
+/// ignored) under __try, and checks what the recorder logged. No game, no bridge.
+int RunFaultSelfTest(const std::filesystem::path& logs_dir);
 
 } // namespace SecondSon::Base

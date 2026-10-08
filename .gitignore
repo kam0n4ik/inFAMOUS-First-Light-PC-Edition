@@ -14,3 +14,4 @@ __pycache__/
 /logs/calls.json
 /logs/*.txt
 /logs/*.tmp
+/logs/crash/

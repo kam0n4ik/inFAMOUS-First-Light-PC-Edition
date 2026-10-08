@@ -82,6 +82,8 @@ vulkanValidation = false           # Khronos validation layer (slow; needs the V
 vulkanCrashDiagnostic = false      # crash diagnostic layer
 inputLog = true                    # once a second while the mouse/sticks move: what the game is
                                    # sent and what its stick filter reads (SecondSonPC.log, [Input])
+crashDump = true                   # a jump to a bad address (SSPC-002): minidump -> logs\crash
+                                   # (the report in SecondSonPC.log is always written)
 
 [Trace]
 importCounter = true               # count calls of every bound import -> logs\calls.json

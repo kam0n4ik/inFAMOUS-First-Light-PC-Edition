@@ -4,11 +4,13 @@
 //     --loader sspc|shadps4    sspc: SecondSonPC's own Loader (Phase 1);
 //                              shadps4: Phase 0 path on shadPS4's Core::Linker (in-binary oracle)
 //     --system-name <name>     overrides [System] name
+//     --user-data <dir>        overrides [Paths] userData (test runs on a copy of the saves)
 //   diagnostics:
 //     --no-counter             disables the import call counter
 //     --call-order <N>         records the first N import calls -> logs\call_order.txt
 //     --reloc-snapshot <file>  writes every relocation slot at the first ParamGetInt call
 //     --selftest               NATIVE vs BRIDGE subsystem self-test -> logs\selftest.txt, no game
+//     --fault-test             first-chance crash recorder test -> logs\faulttest.txt, no game
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
 //     --press <key@sec,...>    automated runs: key presses (SDL key names, e.g. n = cross in the
 //                              bridge's default keyboard layout) pushed into the window's event
@@ -97,6 +99,10 @@ int main(int argc, char* argv[]) {
             config->reloc_snapshot = std::filesystem::absolute(argv[++i]);
         } else if (arg == "--system-name" && has_value) {
             config->system_name = argv[++i];
+        } else if (arg == "--user-data" && has_value) {
+            config->user_data_dir = std::filesystem::absolute(argv[++i]);
+        } else if (arg == "--fault-test") {
+            config->fault_test = true;
         } else if (arg == "--selftest") {
             config->selftest = true;
             config->import_counter = false;
@@ -115,7 +121,10 @@ int main(int argc, char* argv[]) {
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
     }
-    Base::InstallCrashLogger();
+    Base::InstallCrashLogger(config->logs_dir / "crash", config->crash_dump);
+    if (config->fault_test) {
+        return Base::RunFaultSelfTest(config->logs_dir); // before any bridge code: no other handlers
+    }
     Base::StartVramLog(vram_log_seconds);
     const bool own_loader = config->loader == App::Config::LoaderBackend::Sspc;
     SSPC_LOG(App, Info, "SecondSonPC Phase 1 — loader: {}",

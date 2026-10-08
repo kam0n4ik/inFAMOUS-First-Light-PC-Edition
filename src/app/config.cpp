@@ -234,6 +234,7 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     r.Bool("Debug", "vulkanValidation", c.vulkan_validation);
     r.Bool("Debug", "vulkanCrashDiagnostic", c.vulkan_crash_diagnostic);
     r.Bool("Debug", "inputLog", c.input_log);
+    r.Bool("Debug", "crashDump", c.crash_dump);
 
     auto& in = c.input;
     r.Number("Input", "mouseSensitivity", in.mouse_sensitivity, 0.01, 100.0);

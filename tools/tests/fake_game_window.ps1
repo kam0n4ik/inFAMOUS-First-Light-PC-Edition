@@ -10,7 +10,9 @@
 param(
     [ValidateSet('normal', 'ignore-close', 'crash-on-close', 'exit-early', 'two-windows', 'no-window')]
     [string]$Mode = 'normal',
-    [uint32]$ExitCode = 0  # decimal: 0xC0000005 = 3221225477
+    [uint32]$ExitCode = 0, # decimal: 0xC0000005 = 3221225477
+    # SecondSonPC.exe arguments a calling script passes on (--loader, --user-data, ...): ignored.
+    [Parameter(ValueFromRemainingArguments = $true)] [string[]]$GameArgs = @()
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"

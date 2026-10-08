@@ -30,7 +30,11 @@ PIPELINE_RE = re.compile(r"Get(?:Graphics|Compute)Pipeline: Compiling")
 OPEN_SSPC_RE = re.compile(r"\[Filesystem\] .* open \[[^\]]*\] (\S+) flags")
 OPEN_BRIDGE_RE = re.compile(r"file_system\.cpp:\d+ open: path = (\S+) flags")
 LANG_RE = re.compile(r"game opened language file: (\S+) \(tag=(\w+)")
+MINIDUMP_RE = re.compile(r"  minidump: (\S+\.dmp) \(")
+FIRST_CHANCE_RE = re.compile(r"first-chance fault #\d+")
 CRASH_PATTERNS = [
+    # src/base/crash.cpp first-chance recorder: the original fault, before the bridge's handler.
+    ("first-chance", re.compile(r"first-chance fault #1 \(SSPC-002 recorder\): (.*)$")),
     ("gpu-alloc", re.compile(r"SSPC-001 allocation failure: (.*)$")),
     ("unhandled", re.compile(r"unhandled exception (0x[0-9a-f]+ at 0x[0-9a-f]+ \S+)")),
 ]
@@ -133,6 +137,8 @@ def main() -> int:
         "exit_hex": f"0x{args.exit & 0xFFFFFFFF:08X}" if args.exit is not None else stop.get("exit_hex"),
         "how": args.how or stop.get("how", ""),
         "exit_note": stop.get("note"),
+        "minidump": next((m.group(1) for line in own if (m := MINIDUMP_RE.search(line))), None),
+        "first_chance_faults": sum(1 for line in own if FIRST_CHANCE_RE.search(line)),
         "window_class": window.get("class"),
         "window_reason": stop.get("window_reason"),
         "crash": crash,

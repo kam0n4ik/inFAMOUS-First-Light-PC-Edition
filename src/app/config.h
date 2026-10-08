@@ -56,6 +56,7 @@ struct Config {
     bool vulkan_validation = false;
     bool vulkan_crash_diagnostic = false;
     bool input_log = false; // keyboard/mouse -> libScePad -> the game's stick filter, once a second
+    bool crash_dump = true; // minidump of the first execute fault -> logs\crash (SSPC-002)
 
     // [Input] + [Keyboard]: the keyboard/mouse controller of player 1 (docs/INPUT_MAPPING.md)
     Input::Settings input = Input::DefaultSettings();
@@ -81,6 +82,7 @@ struct Config {
     std::vector<std::string> bridged_groups; // --bridge <group>: NATIVE group back to BRIDGE
     u32 call_order = 0;                      // --call-order N: record the first N import calls
     bool selftest = false;                   // --selftest: NATIVE vs BRIDGE subsystem test, no game
+    bool fault_test = false;                 // --fault-test: crash recorder test, no game, no bridge
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input
 };

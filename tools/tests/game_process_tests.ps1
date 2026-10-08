@@ -238,6 +238,36 @@ if (-not $SkipLive) {
             }
         }
         Remove-Item $scratch -Recurse -ErrorAction SilentlyContinue
+
+        # L11. tools\sspc002_runs.ps1 on the stand-in, in a scratch root with its own logs\ and
+        # userdata\home\ (the real saves and logs are not touched).
+        $root = Join-Path ([IO.Path]::GetTempPath()) "sspc_sspc002_test"
+        Remove-Item $root -Recurse -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force "$root\userdata\home\1000\savedata" | Out-Null
+        Set-Content -Encoding ASCII "$root\userdata\home\1000\savedata\dis.dat" "save"
+        $prefixArgs = "-NoProfile -ExecutionPolicy Bypass -File $fake -Mode normal"
+        $text = & "$tools\sspc002_runs.ps1" -Root $root -Exe 'powershell.exe' -ExeArgsPrefix $prefixArgs -Runs 2 `
+            -Seconds 20 -Loaders 'sspc,shadps4' 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        $lines = @(Get-Content "$root\logs\runs\sspc002_summary.jsonl" -ErrorAction SilentlyContinue)
+        Check 'sspc002_runs: 2 clean runs -> exit 0, both loaders, saves unchanged' ($code -eq 0 -and
+            $text -match 'sspc002_sspc_1: closed-by-test' -and $text -match 'sspc002_shadps4_2: closed-by-test' -and
+            $text -match 'real saves unchanged: yes' -and $lines.Count -eq 2) "exit $code`n$text"
+        Check 'sspc002_runs: profile copy removed, snapshot kept' (-not (Test-Path "$root\userdata\sspc002\run") -and
+            @(Get-ChildItem "$root\userdata\sspc002" -Directory -Filter 'snapshot_*').Count -eq 1)
+        $prefixArgs = "-NoProfile -ExecutionPolicy Bypass -File $fake -Mode exit-early -ExitCode 3221225477"
+        $text = & "$tools\sspc002_runs.ps1" -Root $root -Exe 'powershell.exe' -ExeArgsPrefix $prefixArgs -Runs 3 `
+            -Seconds 20 -Loaders 'sspc' -Prefix 'crashing' 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        Check 'sspc002_runs: crash -> stops after run 1, exit 2, profile kept' ($code -eq 2 -and
+            $text -match 'crashing_sspc_1: crashed' -and $text -notmatch 'crashing_sspc_2' -and
+            (Test-Path "$root\userdata\sspc002\crash_crashing_sspc_1\home\1000\savedata\dis.dat")) "exit $code`n$text"
+        $text = & "$tools\sspc002_runs.ps1" -Root $root -Runs 51 -DryRun 2>&1 | Out-String
+        Check 'sspc002_runs: more than 50 runs refused' ($LASTEXITCODE -eq 1 -and $text -match 'Runs must be 1\.\.50')
+        $text = & "$tools\sspc002_runs.ps1" -Root $root -Exe 'powershell.exe' -Runs 3 -Loaders 'sspc,shadps4' -DryRun 2>&1 | Out-String
+        Check 'sspc002_runs: dry run starts nothing' ($LASTEXITCODE -eq 0 -and $text -match 'run 3: sspc002_sspc_3' -and
+            -not (Test-Path "$root\logs\runs\sspc002_sspc_3"))
+        Remove-Item $root -Recurse -ErrorAction SilentlyContinue
     } finally {
         foreach ($q in $started) {
             if (-not $q.HasExited) { "cleanup: terminating test process $($q.Id)"; $q.Kill() }
