@@ -4,12 +4,15 @@
 // exactly as the game gets them. The game is not started; the report goes to logs\selftest.txt.
 //   FileSystem: two scratch folders (userdata\selftest\{native,bridge}) mounted as /sspctest,
 //               plus read-only /app0 (the game folder);
-//   PlayGo, AppContent, SystemService, UserService: return values, output buffers, error paths.
+//   PlayGo, AppContent, SystemService, UserService: return values, output buffers, error paths;
+//   ParamSfo: SecondSonPC's param.sfo reader against shadPS4's PSF (not an import: start-up data).
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -20,12 +23,14 @@
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
 #include "common/singleton.h"
+#include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/user_settings.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/vfs.h"
+#include "runtime/psf/param_sfo.h"
 #include "runtime/user/user_service.h"
 
 namespace SecondSon::Bridge {
@@ -558,8 +563,115 @@ void TestUserService(Totals& t) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------- param.sfo (PSF)
+
+/// SecondSonPC's PSF reader against shadPS4's PSF on the game's param.sfo: the same value for
+/// every key (each queried as text, integer and binary, plus a missing key). Damaged images are
+/// checked on SecondSonPC's side only: shadPS4's reader has no bounds checks.
+void TestParamSfo(Totals& t, const App::Config& cfg) {
+    const auto path = cfg.game_dir / "sce_sys" / "param.sfo";
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<u8> image{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+
+    Side own{"NATIVE", true}, shad{"BRIDGE", false};
+    Psf::ParamSfo sfo;
+    std::string error;
+    own.Line("open {}", sfo.Parse(image, error));
+    PSF psf;
+    shad.Line("open {}", psf.Open(image));
+    // shadPS4's getters ASSERT when asked for another format than the key has, so each key is read
+    // with the getter of its format on both sides; the missing key with all three.
+    const auto hex = [](std::span<const u8> b) { return Hex(b.data(), b.size()); };
+    for (const auto& e : sfo.Entries()) {
+        switch (e.format) {
+        case Psf::Format::Text: {
+            const auto a = sfo.GetString(e.key);
+            const auto b = psf.GetString(e.key);
+            own.Line("{}: text {}", e.key, a ? *a : "<none>");
+            shad.Line("{}: text {}", e.key, b ? std::string(*b) : "<none>");
+            break;
+        }
+        case Psf::Format::Integer: {
+            const auto a = sfo.GetInteger(e.key);
+            const auto b = psf.GetInteger(e.key);
+            own.Line("{}: int {}", e.key, a ? fmt::format("{:#x}", *a) : "<none>");
+            shad.Line("{}: int {}", e.key, b ? fmt::format("{:#x}", static_cast<u32>(*b)) : "<none>");
+            break;
+        }
+        case Psf::Format::Binary: {
+            const auto a = sfo.GetBinary(e.key);
+            const auto b = psf.GetBinary(e.key);
+            own.Line("{}: binary {}", e.key, a ? hex(*a) : "<none>");
+            shad.Line("{}: binary {}", e.key, b ? hex(*b) : "<none>");
+            break;
+        }
+        }
+    }
+    constexpr std::string_view kMissing = "SSPC_NO_SUCH_KEY";
+    own.Line("missing key: {} {} {}", sfo.GetString(kMissing).has_value(),
+             sfo.GetInteger(kMissing).has_value(), sfo.GetBinary(kMissing).has_value());
+    shad.Line("missing key: {} {} {}", psf.GetString(kMissing).has_value(),
+              psf.GetInteger(kMissing).has_value(), psf.GetBinary(kMissing).has_value());
+    Compare(t, "ParamSfo", own, shad);
+
+    // SecondSonPC's getters answer "nothing" for a key of another format (shadPS4 asserts).
+    int wrong_type_ok = 0;
+    for (const auto& e : sfo.Entries()) {
+        const bool other_empty =
+            (e.format == Psf::Format::Text || !sfo.GetString(e.key).has_value()) &&
+            (e.format == Psf::Format::Integer || !sfo.GetInteger(e.key).has_value()) &&
+            (e.format == Psf::Format::Binary || !sfo.GetBinary(e.key).has_value());
+        ++t.checks;
+        if (other_empty) {
+            ++wrong_type_ok;
+        } else {
+            ++t.failures;
+            t.report.push_back(fmt::format("  DIFF  ParamSfo: {} answers a getter of another format", e.key));
+        }
+    }
+    t.report.push_back(fmt::format("{:14} {:4} checks, {} keys answer only their own format",
+                                   "ParamSfo(type)", sfo.Entries().size(), wrong_type_ok));
+
+    // Damaged copies must be rejected without reading outside the image.
+    struct Damage {
+        const char* what;
+        std::vector<u8> bytes;
+    };
+    std::vector<Damage> damaged;
+    damaged.push_back({"truncated header", std::vector<u8>(image.begin(), image.begin() + 12)});
+    auto bad_magic = image;
+    bad_magic[1] ^= 0xFF;
+    damaged.push_back({"bad magic", bad_magic});
+    auto bad_count = image;
+    bad_count[16] = 0xFF;
+    bad_count[17] = 0xFF;
+    damaged.push_back({"entry count past end", bad_count});
+    auto bad_data = image;
+    bad_data[20 + 12] = 0xFF;
+    bad_data[20 + 13] = 0xFF;
+    bad_data[20 + 14] = 0xFF;
+    damaged.push_back({"data offset past end", bad_data});
+    damaged.push_back({"truncated data", std::vector<u8>(image.begin(), image.end() - 64)});
+    int rejected = 0;
+    for (const auto& d : damaged) {
+        Psf::ParamSfo probe;
+        std::string why;
+        ++t.checks;
+        if (probe.Parse(d.bytes, why)) {
+            ++t.failures;
+            t.report.push_back(fmt::format("  DIFF  ParamSfo: damaged image accepted ({})", d.what));
+        } else {
+            ++rejected;
+        }
+    }
+    t.report.push_back(fmt::format("{:14} {:4} checks, {} damaged images rejected - {}",
+                                   "ParamSfo(bad)", damaged.size(), rejected,
+                                   rejected == static_cast<int>(damaged.size()) ? "PASS" : "FAIL"));
+}
+
 int RunSelfTest(const App::Config& cfg) {
     Totals t;
+    TestParamSfo(t, cfg);
     TestFileSystem(t, cfg);
     TestPlayGo(t);
     TestAppContent(t);

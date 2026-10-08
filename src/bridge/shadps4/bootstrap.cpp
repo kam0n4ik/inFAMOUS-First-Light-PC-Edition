@@ -20,13 +20,22 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_keyboard.h>
+#include <SDL3/SDL_timer.h>
 
 #include "app/config.h"
 #include "base/log.h"
@@ -40,6 +49,7 @@
 #include "runtime/exports.h"
 #include "runtime/filesystem/fs_host.h"
 #include "runtime/filesystem/vfs.h"
+#include "runtime/psf/param_sfo.h"
 #include "runtime/sysmodule/sysmodule.h"
 #include "runtime/system/system_service.h"
 #include "trace/import_counter.h"
@@ -73,6 +83,32 @@ extern Frontend::WindowSDL* g_window; // defined in shadPS4 src/emulator.cpp
 
 namespace Libraries::Kernel {
 extern char const* g_environment[64];
+}
+
+// shadPS4 library entry points started explicitly on the sspc path (StartBridgeLibraries).
+namespace Libraries::GnmDriver {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::VideoOut {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::Pad {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::Np::NpManager {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::SystemService {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::UserService {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::AppContent {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+}
+namespace Libraries::PlayGo {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
 }
 
 namespace Core { // defined in shadPS4 src/emulator.cpp
@@ -323,18 +359,70 @@ void RunPhase0Loader(const App::Config& cfg, Core::Linker& linker, const std::st
 
 // ------------------------------------------------------------------------------- sspc path
 
-/// TEMPORARY (until patch 0003 splits shadPS4's library start-up from symbol registration, see
-/// docs/MIGRATION.md "Open items"): shadPS4's RegisterLib functions also start their libraries
-/// (GnmDriver: Liverpool + Vulkan presenter/rasterizer; VideoOut: driver; Kernel: service thread,
-/// clock, semaphores, AIO; Pad: controllers; NpManager: handler, ...), writing file-static state
-/// only they can reach. BRIDGE libraries need that start-up, so InitHLELibs runs once into a
-/// throw-away table: nothing in it is used to resolve imports (the static table does that).
-void StartBridgeLibraries() {
+/// Life cycle of the shadPS4 libraries that still serve the game (BRIDGE). shadPS4 has no separate
+/// start-up entry point: its RegisterLib functions register symbols *and* start the library,
+/// writing file-static state only they can reach. The sspc path resolves imports through its own
+/// static table, so it calls RegisterLib only for the start-up, into a throw-away resolver, and only
+/// for the libraries below — those whose RegisterLib starts something (docs/MIGRATION.md, "BRIDGE
+/// library start-up") and that still have at least one BRIDGE import. shadPS4's InitHLELibs (about
+/// 70 libraries, LLE sys_modules lookup, libraries SecondSonPC implements itself) is not used.
+/// Order = InitHLELibs order. A library leaves this list when its last import becomes NATIVE.
+struct BridgeLibrary {
+    std::string_view module; // module column of the import table
+    void (*start)(Core::Loader::SymbolsResolver*);
+    std::string_view start_up; // what RegisterLib starts besides registering symbols
+};
+
+constexpr std::array kBridgeLibraries{
+    BridgeLibrary{"libkernel", Libraries::Kernel::RegisterLib,
+                  "service thread, process clock, AIO queues, semaphore table, Net kernel hooks"},
+    BridgeLibrary{"libSceGnmDriver", Libraries::GnmDriver::RegisterLib,
+                  "Liverpool command processor, Vulkan presenter"},
+    BridgeLibrary{"libSceVideoOut", Libraries::VideoOut::RegisterLib, "VideoOut driver"},
+    BridgeLibrary{"libScePad", Libraries::Pad::RegisterLib,
+                  "SDL game controllers (they also log users in)"},
+    BridgeLibrary{"libSceNpManager", Libraries::Np::NpManager::RegisterLib,
+                  "NP state callback, SDK version"},
+};
+
+/// --selftest runs NATIVE and BRIDGE implementations side by side; the shadPS4 side of these reads
+/// globals set by RegisterLib (SDK version, ...), so it is started for the comparison only.
+constexpr std::array kSelftestLibraries{
+    BridgeLibrary{"libSceSystemService", Libraries::SystemService::RegisterLib, "SDK version"},
+    BridgeLibrary{"libSceUserService", Libraries::UserService::RegisterLib, "shadNet flag"},
+    BridgeLibrary{"libSceAppContentUtil", Libraries::AppContent::RegisterLib, "SDK version"},
+    BridgeLibrary{"libScePlayGo", Libraries::PlayGo::RegisterLib, "-"},
+};
+
+bool HasBridgeImport(const Loader::Bindings& bindings, std::string_view module) {
+    return std::ranges::any_of(bindings.All(), [module](const Loader::Binding& b) {
+        return b.owner == Loader::Owner::Bridge && b.info->module == module;
+    });
+}
+
+void StartBridgeLibraries(const Loader::Bindings& bindings, bool selftest) {
     Core::Loader::SymbolsResolver discarded;
-    Libraries::InitHLELibs(&discarded);
-    SSPC_LOG(Bridge, Info, "BRIDGE libraries started ({} shadPS4 symbols discarded, not used for "
-                           "resolution)",
-             discarded.GetSize());
+    u32 started = 0;
+    const auto start = [&](const BridgeLibrary& lib, const char* why) {
+        lib.start(&discarded);
+        ++started;
+        SSPC_LOG(Bridge, Info, "BRIDGE library started: {} ({}; {})", lib.module, lib.start_up, why);
+    };
+    for (const auto& lib : kBridgeLibraries) {
+        if (HasBridgeImport(bindings, lib.module)) {
+            start(lib, "has BRIDGE imports");
+        } else {
+            SSPC_LOG(Bridge, Info, "BRIDGE library not started: {} (no BRIDGE imports)", lib.module);
+        }
+    }
+    if (selftest) {
+        for (const auto& lib : kSelftestLibraries) {
+            start(lib, "--selftest comparison");
+        }
+    }
+    SSPC_LOG(Bridge, Info, "{} shadPS4 libraries started ({} shadPS4 symbols discarded, not used "
+                           "for resolution); InitHLELibs not used",
+             started, discarded.GetSize());
 }
 
 /// The game's view of the file system (Vfs). /savedata0 is added by the SaveData observer when
@@ -361,11 +449,6 @@ void SetupFilesystem(const App::Config& cfg, const std::string& serial) {
 
 void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                    const std::string& serial) {
-    StartBridgeLibraries();
-    SetupFilesystem(cfg, serial);
-    if (cfg.selftest) {
-        std::quick_exit(RunSelfTest(cfg));
-    }
     for (const auto& g : cfg.bridged_groups) {
         if (g == "loader" || g == "sysmodule") {
             Fatal(fmt::format("--bridge {} is not possible with --loader sspc: the shadPS4 "
@@ -373,12 +456,19 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                               g));
         }
     }
+    // The table decides which shadPS4 libraries are still needed, so it is built first (BRIDGE
+    // entries are addresses of shadPS4 functions; nothing has to be started to take them).
     static Loader::Bindings bindings;
     Loader::BindingOptions options;
-    options.import_counter = cfg.import_counter;
+    options.import_counter = cfg.import_counter && !cfg.selftest;
     options.bridged_groups = cfg.bridged_groups;
     if (!bindings.Build(SelectExports(cfg, false), BridgeExports(), options)) {
         Fatal("binding table is inconsistent, see SecondSonPC.log");
+    }
+    StartBridgeLibraries(bindings, cfg.selftest);
+    SetupFilesystem(cfg, serial);
+    if (cfg.selftest) {
+        std::quick_exit(RunSelfTest(cfg));
     }
     bindings.LogSummary();
 
@@ -403,6 +493,134 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     }
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
+}
+
+/// --press: input for automated runs (tools/smoke_runs.ps1). Each key goes into the window's SDL
+/// event queue as key-down, 150 ms later key-up — the events a real keyboard produces, handled by
+/// the bridge's input layer (default layout: n = cross); the window does not need focus.
+void StartTestInput(const std::string& spec) {
+    struct Press {
+        SDL_Keycode key;
+        std::string name;
+        double at;
+    };
+    std::vector<Press> presses;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        const size_t end = std::min(spec.find(',', pos), spec.size());
+        const std::string token = spec.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t at = token.find('@');
+        const std::string name = token.substr(0, at);
+        const SDL_Keycode key = SDL_GetKeyFromName(name.c_str());
+        if (at == std::string::npos || key == SDLK_UNKNOWN) {
+            Fatal(fmt::format("--press: '{}' is not key@seconds with an SDL key name", token));
+        }
+        presses.push_back({key, name, std::strtod(token.c_str() + at + 1, nullptr)});
+    }
+    std::ranges::sort(presses, {}, &Press::at);
+    std::thread([presses] {
+        const auto push = [](SDL_Keycode key, bool down) {
+            SDL_Event e{};
+            e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+            e.key.timestamp = SDL_GetTicksNS();
+            e.key.key = key;
+            e.key.scancode = SDL_GetScancodeFromKey(key, nullptr);
+            e.key.down = down;
+            SDL_PushEvent(&e);
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        for (const auto& p : presses) {
+            std::this_thread::sleep_until(t0 + std::chrono::duration<double>(p.at));
+            push(p.key, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            push(p.key, false);
+            SSPC_LOG(App, Info, "test input: '{}' pressed at {:.1f} s", p.name, p.at);
+        }
+    }).detach();
+}
+
+/// Title metadata from /app0/sce_sys.
+struct GameMetadata {
+    std::string id;
+    std::string title = "Unknown title";
+    std::string app_version = "Unknown version";
+    u32 fw_version = 0x4700000;
+    u32 attributes = 0;
+    std::vector<u8> splash; // pic1.png
+    std::vector<u8> icon;   // icon0.png
+};
+
+std::vector<u8> ReadHostFile(const std::filesystem::path& file) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+/// sspc path: SecondSonPC's PSF reader on the host files behind /app0 (no shadPS4 mount table).
+GameMetadata ReadGameMetadata(const std::filesystem::path& game_dir) {
+    const auto sce_sys = game_dir / "sce_sys";
+    Psf::ParamSfo sfo;
+    std::string error;
+    if (!sfo.Load(sce_sys / "param.sfo", error)) {
+        Fatal(fmt::format("cannot read /app0/sce_sys/param.sfo: {}", error));
+    }
+    GameMetadata m;
+    const auto content_id = sfo.GetString("CONTENT_ID");
+    if (content_id.has_value() && content_id->size() > 7) {
+        m.id = content_id->substr(7, 9);
+    } else if (const auto title_id = sfo.GetString("TITLE_ID")) {
+        m.id = *title_id;
+    }
+    m.title = sfo.GetString("TITLE").value_or(m.title);
+    m.fw_version = sfo.GetInteger("SYSTEM_VER").value_or(m.fw_version);
+    m.app_version = sfo.GetString("APP_VER").value_or(m.app_version);
+    m.attributes = sfo.GetInteger("ATTRIBUTE").value_or(0);
+    m.splash = ReadHostFile(sce_sys / "pic1.png");
+    m.icon = ReadHostFile(sce_sys / "icon0.png");
+    SSPC_LOG(Loader, Info, "param.sfo: {} entries (SecondSonPC reader)", sfo.Entries().size());
+
+    // BRIDGE SaveData reads INSTALL_DIR_SAVEDATA from shadPS4's PSF singleton (savedata.cpp); it
+    // is filled from the same host file, without the mount table, until SaveData is NATIVE.
+    if (!Common::Singleton<PSF>::Instance()->Open(sce_sys / "param.sfo")) {
+        Fatal("shadPS4's PSF cannot parse /app0/sce_sys/param.sfo (needed by BRIDGE SaveData)");
+    }
+    return m;
+}
+
+/// shadps4 path (oracle), unchanged: shadPS4's mount table and PSF.
+GameMetadata ReadGameMetadataShad(Core::FileSys::MntPoints& mnt) {
+    GameMetadata m;
+    if (auto psf_handle = mnt.Open("/app0/sce_sys/param.sfo", /*writable=*/false)) {
+        auto* param_sfo = Common::Singleton<PSF>::Instance();
+        if (!param_sfo->Open(psf_handle)) {
+            Fatal("cannot parse /app0/sce_sys/param.sfo");
+        }
+        const auto content_id = param_sfo->GetString("CONTENT_ID");
+        const auto title_id = param_sfo->GetString("TITLE_ID");
+        if (content_id.has_value() && !content_id->empty()) {
+            m.id = std::string(*content_id, 7, 9);
+        } else if (title_id.has_value()) {
+            m.id = *title_id;
+        }
+        m.title = param_sfo->GetString("TITLE").value_or(m.title);
+        m.fw_version = param_sfo->GetInteger("SYSTEM_VER").value_or(m.fw_version);
+        m.app_version = param_sfo->GetString("APP_VER").value_or(m.app_version);
+        if (const auto raw_attributes = param_sfo->GetInteger("ATTRIBUTE")) {
+            m.attributes = *raw_attributes;
+        }
+    } else {
+        Fatal("/app0/sce_sys/param.sfo not found");
+    }
+    if (auto splash = mnt.ReadFile("/app0/sce_sys/pic1.png")) {
+        m.splash = std::move(*splash);
+    }
+    if (auto icon = mnt.ReadFile("/app0/sce_sys/icon0.png")) {
+        m.icon = std::move(*icon);
+    }
+    return m;
 }
 
 } // namespace
@@ -438,38 +656,21 @@ void RunGame(const App::Config& cfg) {
     EmulatorSettings.Load();
     UserSettings.Load();
 
-    // Mount /app0 and read param.sfo.
+    // /app0 in shadPS4's mount table: on the shadps4 path it is the game's file system; on the sspc
+    // path only BRIDGE code reads through it (SaveData: /app0/sce_sys/save_data.png; the trophy
+    // table below). The game's own file access on the sspc path goes through SecondSonPC's Vfs.
     const auto& game_folder = cfg.game_dir;
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     mnt->Mount(game_folder, "/app0", true);
     mnt->Mount(game_folder, "/hostapp", true);
 
-    std::string id;
-    std::string title = "Unknown title";
-    std::string app_version = "Unknown version";
-    u32 fw_version = 0x4700000;
+    const GameMetadata meta = own_loader ? ReadGameMetadata(game_folder) : ReadGameMetadataShad(*mnt);
+    const std::string& id = meta.id;
+    const std::string& title = meta.title;
+    const std::string& app_version = meta.app_version;
+    const u32 fw_version = meta.fw_version;
     Common::PSFAttributes psf_attributes{};
-    if (auto psf_handle = mnt->Open("/app0/sce_sys/param.sfo", /*writable=*/false)) {
-        auto* param_sfo = Common::Singleton<PSF>::Instance();
-        if (!param_sfo->Open(psf_handle)) {
-            Fatal("cannot parse /app0/sce_sys/param.sfo");
-        }
-        const auto content_id = param_sfo->GetString("CONTENT_ID");
-        const auto title_id = param_sfo->GetString("TITLE_ID");
-        if (content_id.has_value() && !content_id->empty()) {
-            id = std::string(*content_id, 7, 9);
-        } else if (title_id.has_value()) {
-            id = *title_id;
-        }
-        title = param_sfo->GetString("TITLE").value_or(title);
-        fw_version = param_sfo->GetInteger("SYSTEM_VER").value_or(fw_version);
-        app_version = param_sfo->GetString("APP_VER").value_or(app_version);
-        if (const auto raw_attributes = param_sfo->GetInteger("ATTRIBUTE")) {
-            psf_attributes.raw = *raw_attributes;
-        }
-    } else {
-        Fatal("/app0/sce_sys/param.sfo not found");
-    }
+    psf_attributes.raw = meta.attributes;
 
     // Per-game overrides of the bridge core (runtime\sspc\user\custom_configs\<id>.json, normally
     // absent), then SecondSonPC.toml on top. Nothing is written back.
@@ -499,12 +700,9 @@ void RunGame(const App::Config& cfg) {
         .sdk = own_loader ? static_cast<u32>(Loader::ReadSdkVersion(game_folder / "eboot.bin"))
                           : static_cast<u32>(Core::ReadCompiledSdkVersion(guest_eboot_path)),
         .attributes = psf_attributes,
-        .splash = {},
+        .splash = meta.splash,
         .folder = game_folder,
     };
-    if (auto splash = mnt->ReadFile("/app0/sce_sys/pic1.png")) {
-        info.splash = std::move(*splash);
-    }
     SSPC_LOG(Loader, Info, "eboot SDK version {:#x}", info.sdk);
     Common::SecondSonBootstrap::Fill(std::move(info));
 
@@ -531,35 +729,40 @@ void RunGame(const App::Config& cfg) {
         static_cast<s32>(EmulatorSettings.GetWindowWidth()),
         static_cast<s32>(EmulatorSettings.GetWindowHeight()), g_controllers, window_title);
     g_window = window.get();
-    if (auto icon = mnt->ReadFile("/app0/sce_sys/icon0.png")) {
-        window->SetIcon(*icon);
-    } else {
-        window->SetIcon({});
+    window->SetIcon(meta.icon);
+    if (!cfg.test_presses.empty()) {
+        StartTestInput(cfg.test_presses);
     }
 
     using Common::FS::GetUserPath;
     using Common::FS::PathType;
-    mnt->Mount(GetUserPath(PathType::GameDataDir), "/data");
-    const auto temp_dir = GetUserPath(PathType::TempDataDir) / id;
-    std::filesystem::remove_all(temp_dir, ec); // temp0 is cleared on each boot
-    std::filesystem::create_directory(temp_dir, ec);
-    mnt->Mount(temp_dir, "/temp0");
-    mnt->Mount(temp_dir, "/temp");
-    const auto download_dir = GetUserPath(PathType::DownloadDir) / id;
-    std::filesystem::create_directory(download_dir, ec);
-    mnt->Mount(download_dir, "/download0");
+    if (!own_loader) {
+        // The game's /data, /temp0, /download0 and the system fonts in shadPS4's mount table. On the
+        // sspc path the game reaches them through SecondSonPC's Vfs (SetupFilesystem) and no BRIDGE
+        // library the game imports uses them (all libkernel file functions are NATIVE, libSceFont
+        // is not imported), so they are not mounted there.
+        mnt->Mount(GetUserPath(PathType::GameDataDir), "/data");
+        const auto temp_dir = GetUserPath(PathType::TempDataDir) / id;
+        std::filesystem::remove_all(temp_dir, ec); // temp0 is cleared on each boot
+        std::filesystem::create_directory(temp_dir, ec);
+        mnt->Mount(temp_dir, "/temp0");
+        mnt->Mount(temp_dir, "/temp");
+        const auto download_dir = GetUserPath(PathType::DownloadDir) / id;
+        std::filesystem::create_directory(download_dir, ec);
+        mnt->Mount(download_dir, "/download0");
+
+        const auto fonts_dir = EmulatorSettings.GetFontsDir();
+        std::filesystem::create_directory(fonts_dir, ec);
+        std::string guest_font_dir = "/";
+        guest_font_dir.append(Libraries::Kernel::sceKernelGetFsSandboxRandomWord()).append("/common/font");
+        std::filesystem::create_directory(fonts_dir / "font", ec);
+        std::filesystem::create_directory(fonts_dir / "font2", ec);
+        mnt->Mount(fonts_dir / "font", guest_font_dir);
+        mnt->Mount(fonts_dir / "font2", guest_font_dir + "2");
+    }
     const auto captures_dir = GetUserPath(PathType::CapturesDir);
     std::filesystem::create_directory(captures_dir, ec);
     VideoCore::SetOutputDir(captures_dir, id);
-
-    const auto fonts_dir = EmulatorSettings.GetFontsDir();
-    std::filesystem::create_directory(fonts_dir, ec);
-    std::string guest_font_dir = "/";
-    guest_font_dir.append(Libraries::Kernel::sceKernelGetFsSandboxRandomWord()).append("/common/font");
-    std::filesystem::create_directory(fonts_dir / "font", ec);
-    std::filesystem::create_directory(fonts_dir / "font2", ec);
-    mnt->Mount(fonts_dir / "font", guest_font_dir);
-    mnt->Mount(fonts_dir / "font2", guest_font_dir + "2");
 
     Libraries::Kernel::g_environment[0] = nullptr;
 

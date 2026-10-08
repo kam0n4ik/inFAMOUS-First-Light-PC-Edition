@@ -64,6 +64,7 @@ struct Config {
     u32 call_order = 0;                      // --call-order N: record the first N import calls
     bool selftest = false;                   // --selftest: NATIVE vs BRIDGE subsystem test, no game
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
+    std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input
 };
 
 /// Parses <root>\SecondSonPC.toml. On failure returns nullopt and fills `errors`.

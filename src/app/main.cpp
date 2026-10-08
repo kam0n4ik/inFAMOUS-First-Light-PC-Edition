@@ -10,6 +10,9 @@
 //     --reloc-snapshot <file>  writes every relocation slot at the first ParamGetInt call
 //     --selftest               NATIVE vs BRIDGE subsystem self-test -> logs\selftest.txt, no game
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
+//     --press <key@sec,...>    automated runs: key presses (SDL key names, e.g. n = cross in the
+//                              bridge's default keyboard layout) pushed into the window's event
+//                              queue <sec> seconds after the window opens; no window focus needed
 //     --bridge <group>         sends a NATIVE group back to BRIDGE (fs, system, ...)
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
@@ -99,6 +102,8 @@ int main(int argc, char* argv[]) {
             config->import_counter = false;
         } else if (arg == "--vram-log" && has_value) {
             vram_log_seconds = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--press" && has_value) {
+            config->test_presses = argv[++i];
         } else {
             return Fail(std::string("unknown argument: ") + std::string(arg));
         }

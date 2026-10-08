@@ -38,6 +38,7 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/vfs.cpp
     src/runtime/language.cpp
     src/runtime/playgo/playgo.cpp
+    src/runtime/psf/param_sfo.cpp
     src/runtime/sysmodule/sysmodule.cpp
     src/runtime/system/system_service.cpp
     src/runtime/user/user_service.cpp

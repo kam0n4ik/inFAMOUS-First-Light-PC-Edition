@@ -142,18 +142,103 @@ Phase 2), инвалидация GPU-страниц перед чтением (M
 - `libSceSysmodule` (M1); `libSceSystemService` (все 6 импортов), `libSceUserService` (все 5),
   `libScePlayGo` (все 10), `libSceAppContentUtil` (все 2) (M3).
 
-## Открытые пункты (до финала Phase 1)
+## Phase 1 — финальный этап: SSPC-001, жизненный цикл BRIDGE-библиотек, свой param.sfo (2026-10-08)
 
-1. **Старт BRIDGE-библиотек.** `RegisterLib` shadPS4 не только регистрирует символы, но и запускает
-   библиотеки (GnmDriver: Liverpool + Vulkan presenter/rasterizer; VideoOut: драйвер; Kernel:
-   служебный поток, часы, семафоры, AIO; Pad: контроллеры; NpManager: обработчик). Состояние
-   `static` в их `.cpp`, извне недоступно. Временно путь `sspc` вызывает `InitHLELibs` в
-   выбрасываемую таблицу (`StartBridgeLibraries` в `bootstrap.cpp`) — для разрешения она не
-   используется. Убрать: патч `0003`, выделяющий старт библиотек из регистрации.
-2. EmulatorSettings/UserSettings/config.json ядра ещё загружаются (общая часть bootstrap); от них
-   зависят BRIDGE-подсистемы (GPU, Input, SaveData). `UserManagement` нужен BRIDGE-вводу для логина.
-3. `RunGame` ещё монтирует пути в `MntPoints` и читает `param.sfo` через `PSF` shadPS4 — для
-   BRIDGE-библиотек (SaveData, трофеи) и заполнения `ElfInfo`. Перевести чтение `param.sfo` на свой
-   код, `MntPoints` оставить только для BRIDGE-SaveData.
-4. **Сбой GPU (SSPC-001, `docs\KNOWN_ISSUES.md`)**: без стабильного игрового прогона финальный
-   критерий Phase 1 (≥150 с вступления на русском) не проверить. Сбой одинаков на обоих путях.
+Счётчики привязок не меняются (это инфраструктура старта, а не импорты): NATIVE 54, OBSERVED 2,
+BRIDGE 341, COMMON_STUB 18, UNRESOLVED 2, LLE 147.
+
+**SSPC-001 устранён** (`docs\KNOWN_ISSUES.md`): исчерпание системного commit при загрузке уровня;
+патч `0005` (загрузка в арену порциями ≤ 64 МиБ), диагностика — патч `0004` +
+`src\bridge\shadps4\gpu_alloc_diag.cpp`. Коммиты `439010a`, `ef90f92`.
+
+**Жизненный цикл BRIDGE-библиотек (`StartBridgeLibraries`, `bootstrap.cpp`).** Путь `sspc` больше
+не вызывает `InitHLELibs`. У shadPS4 нет отдельной точки старта библиотеки — `RegisterLib`
+регистрирует символы и одновременно стартует библиотеку (состояние `static` в её `.cpp`). Поэтому:
+- регистрация функций — не нужна: импорты разрешает своя статическая таблица (с M1);
+- старт — явный список библиотек, у которых `RegisterLib` что-то запускает, в порядке `InitHLELibs`,
+  и только если у библиотеки остался хотя бы один BRIDGE-импорт (символы уходят в выбрасываемую
+  таблицу, в лог — что и почему стартовало):
+
+  | Модуль | Что стартует `RegisterLib` |
+  |---|---|
+  | libkernel | служебный поток, часы процесса, очереди AIO, таблица семафоров, сетевые хуки ядра |
+  | libSceGnmDriver | Liverpool (командный процессор), Vulkan presenter |
+  | libSceVideoOut | драйвер VideoOut |
+  | libScePad | SDL-контроллеры (они же логинят пользователей) |
+  | libSceNpManager | колбэк состояния NP, версия SDK |
+
+- `--selftest`: дополнительно SystemService, UserService, AppContent, PlayGo — их shadPS4-сторона в
+  сравнении читает глобальные из `RegisterLib` (версия SDK);
+- больше не регистрируются и не стартуют на пути `sspc`: ~65 библиотек, которые игра не импортирует
+  (Camera, Hmd, Usbd, Audio3d, Fiber, Ime, …), и библиотеки, которые SecondSonPC реализует сам
+  (SystemService, UserService, AppContent, PlayGo, Sysmodule); поиск LLE-модулей в
+  `sys_modules\<serial>` (часть `InitHLELibs`) — тоже. Библиотека без побочных эффектов старта
+  (AudioOut, Ajm, Http, Net, NetCtl, NpTrophy, SaveData, Videodec, диалоги) работает и без
+  `RegisterLib`. Проверено: в логе моста нет «Initializing HLE libraries», 5 библиотек стартовали.
+- Остаётся: те 5 `RegisterLib` всё ещё регистрируют символы (лишняя работа, без влияния). Полностью
+  уйдёт, когда каждая из 5 подсистем станет NATIVE (Kernel — Phase 2, Pad — Phase 3, Gnm/VideoOut —
+  Phase 4) или патчем, выделяющим их старт, если понадобится раньше.
+- Известный разрыв: BRIDGE `NpHandler` кладёт событие приглашения в сессию (`np_handler.cpp:686`) в
+  очередь SystemService **shadPS4**, а на пути `sspc` игра читает очередь SystemService SecondSonPC.
+  Возникает только с онлайн-сервисом shadNet (выключен) — оставлено до Phase 3 (NP офлайн).
+
+**Свой param.sfo (`src\runtime\psf\param_sfo.{h,cpp}`).** Разбор PSF (версии 1.0/1.1; форматы
+текст 0x0204, целое 0x0404, двоичный 0x0004 — как у shadPS4; полная проверка границ). Путь `sspc`
+читает `param.sfo`, `pic1.png`, `icon0.png` с хоста напрямую (`[Game] path\sce_sys`), без
+`MntPoints` и без `PSF` shadPS4; путь `shadps4` — без изменений. Синглтон `PSF` shadPS4 на пути
+`sspc` наполняется из того же файла по пути на хосте только для BRIDGE-SaveData
+(`INSTALL_DIR_SAVEDATA`). `MntPoints` на пути `sspc`: только `/app0` и `/hostapp` — их читает
+BRIDGE-SaveData (`/app0/sce_sys/save_data.png`) и таблица трофеев; `/data`, `/temp0`, `/temp`,
+`/download0` и шрифты больше не монтируются (все файловые функции libkernel — NATIVE, libSceFont игра
+не импортирует). Самотест: 26 значений `param.sfo` совпадают с `PSF` shadPS4, 24 проверки «чужой
+формат → пусто», 5 повреждённых образов отвергнуты (у `PSF` shadPS4 проверок границ нет).
+
+**Проверки этапа.**
+
+| Проверка | Результат |
+|---|---|
+| `--selftest` | **251 проверка, 0 расхождений** (196 + 55 ParamSfo), 9 известных отличий |
+| 150-с прогоны после 0005 (`f2_*`) | 4/4: 2 × `shadps4`, 2 × `sspc`; штатное закрытие, игра жива до конца (~8700 кадров), пик VRAM 4200 МиБ, пик commit 29,6–29,8 ГБ, 275 пайплайнов |
+| 150-с прогоны после 5.1 + 5.3 (`m4_*`) | `sspc` 2/2 (8648 и 8708 кадров, commit 30,1–30,3 ГБ, 275/277 пайплайнов); `shadps4` — см. сводку `logs\runs\m4_summary.jsonl` |
+| Язык | 8 русских файлов локализации открываются (`lang_russian_*`, `russian_*.psarc`); на снимке экрана титульный экран «✕ Продолжить» и вступительный текст — на русском |
+
+Оговорка о прогонах: без нажатий игра доходит до титульного экрана «✕ Продолжить» и ждёт; критерий
+«≥ 150 с вступления» требует нажатия ✕. Для этого добавлен `--press key@сек,…` (нажатия кладутся в
+очередь событий окна, фокус не нужен; в раскладке моста по умолчанию ✕ = `n`).
+
+## Карта зависимостей от EmulatorSettings (пункт открыт; 2026-10-08)
+
+Мост читает ~70 разных настроек `EmulatorSettings` (`runtime\sspc\user\config.json`, плюс то, что
+выставляет `bootstrap.cpp` из `SecondSonPC.toml`). По подсистемам (число разных геттеров):
+`video_core` 23 (present mode, пайплайн-кэш, readbacks, FSR/RCAS, маркеры и validation Vulkan,
+HDR, внутреннее разрешение…), NP 14 (shadNet, сеть, трофеи), аудио 7 (бэкенд, устройства,
+громкость), память 3 (`neo_mode`, extra dmem/fmem), ввод 3, ядро 2, SaveData 2 (домашняя папка),
+Pad 2. Уже задаются из `SecondSonPC.toml`: язык, домашняя папка (сохранения), окно, полноэкранный
+режим, vblank, сеть выкл., фильтр лога.
+Порядок переноса (без копирования `EmulatorSettings` целиком):
+1. Параметры, определяющие эмулируемую консоль и влияющие на поведение игры — `neo_mode`,
+   `dev_kit_mode`, `extra_dmem/fmem`, язык, имя системы — секция `[Console]` в `SecondSonPC.toml`,
+   выставляются SecondSonPC явно (сейчас в `config.json`: все выключены/0 — совпадают с умолчаниями).
+2. Ввод — с Phase 3 (свой бэкенд ввода), аудио — Phase 3, SaveData — Phase 3, GPU — Phase 4
+   (свой Vulkan-бэкенд, секция `[Graphics]`).
+3. После этого `config.json` перестаёт загружаться; `EmulatorSettings` получает значения только от
+   SecondSonPC до удаления моста (Phase 5).
+
+## Открытые пункты Phase 1 и следующие milestones
+
+1. ~~Старт BRIDGE-библиотек~~ — сделано (выше); остаточная регистрация 5 библиотек — до их NATIVE.
+2. **EmulatorSettings/UserSettings/config.json** ещё загружаются — карта и порядок выше; шаг 1
+   (`[Console]`) — следующий.
+3. ~~param.sfo через PSF/MntPoints~~ — сделано; `MntPoints` на `sspc` только для BRIDGE-SaveData и
+   трофеев.
+4. ~~SSPC-001~~ — устранён. Новый редкий SSPC-002 (`docs\KNOWN_ISSUES.md`) — наблюдать.
+5. Финальный критерий Phase 1 — «вступление на русском ≥ 150 с без общей инфраструктуры
+   загрузчика/конфига/ФС/системных сервисов shadPS4»: загрузчик, ФС, системные сервисы — свои;
+   **конфиг (п. 2) — ещё нет**, поэтому Phase 1 формально не закрыта. Игровая часть — автопрогоны с
+   `--press` + ручной тест (`docs\MANUAL_TEST_PLAN.md`).
+
+Следующие milestones — строго по `docs\AUDIT.md` §12, без изменения плана: закрыть п. 2 (Phase 1),
+затем **Phase 2 — Kernel / Thread / Memory**: время и часы (`clock_gettime`, `sceKernelGetProcessTime`,
+`usleep`…), примитивы синхронизации (mutex/cond/rwlock, sema, event flag, equeue), потоки, затем
+direct/flexible-память и свой обработчик исключений/патчер TCB; выход — все функции libkernel
+NATIVE и 30 минут игры без падений.
