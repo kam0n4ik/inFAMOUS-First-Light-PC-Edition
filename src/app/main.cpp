@@ -8,6 +8,8 @@
 //     --no-counter             disables the import call counter
 //     --call-order <N>         records the first N import calls -> logs\call_order.txt
 //     --reloc-snapshot <file>  writes every relocation slot at the first ParamGetInt call
+//     --selftest               NATIVE vs BRIDGE subsystem self-test -> logs\selftest.txt, no game
+//     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
 //     --bridge <group>         sends a NATIVE group back to BRIDGE (fs, system, ...)
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
@@ -22,6 +24,7 @@
 #include "app/paths.h"
 #include "base/crash.h"
 #include "base/log.h"
+#include "base/vram_monitor.h"
 #include "bridge/shadps4/bootstrap.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
@@ -50,6 +53,7 @@ int main(int argc, char* argv[]) {
         return Fail(message);
     }
     bool stock_bootstrap = false;
+    u32 vram_log_seconds = 0; // --vram-log <seconds>: video memory budget/usage samples (SSPC-001)
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         const bool has_value = i + 1 < argc;
@@ -90,15 +94,24 @@ int main(int argc, char* argv[]) {
             config->reloc_snapshot = std::filesystem::absolute(argv[++i]);
         } else if (arg == "--system-name" && has_value) {
             config->system_name = argv[++i];
+        } else if (arg == "--selftest") {
+            config->selftest = true;
+            config->import_counter = false;
+        } else if (arg == "--vram-log" && has_value) {
+            vram_log_seconds = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else {
             return Fail(std::string("unknown argument: ") + std::string(arg));
         }
     }
 
+    if (config->selftest && config->loader != App::Config::LoaderBackend::Sspc) {
+        return Fail("--selftest compares SecondSonPC's subsystems with shadPS4's; it needs --loader sspc");
+    }
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
     }
     Base::InstallCrashLogger();
+    Base::StartVramLog(vram_log_seconds);
     const bool own_loader = config->loader == App::Config::LoaderBackend::Sspc;
     SSPC_LOG(App, Info, "SecondSonPC Phase 1 — loader: {}",
              own_loader ? "SecondSonPC (sspc)" : "Phase 0 path on the shadPS4 core (shadps4, oracle)");

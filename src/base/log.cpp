@@ -12,7 +12,7 @@ namespace SecondSon::Log {
 namespace {
 
 constexpr std::array<std::string_view, static_cast<size_t>(Category::Count)> kCategoryNames{
-    "App",   "Loader",   "Kernel",   "SystemService", "Filesystem", "Input", "Audio",
+    "App",   "Loader",   "Kernel",   "SystemService", "User", "Filesystem", "Input", "Audio",
     "GPU",   "Shader",   "SaveData", "Language",      "Bridge",     "Trace",
 };
 constexpr std::array<std::string_view, 7> kLevelNames{"Trace", "Debug",    "Info", "Warning",

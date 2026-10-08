@@ -1,0 +1,37 @@
+diff --git a/src/core/libraries/system/userservice.cpp b/src/core/libraries/system/userservice.cpp
+index d7924797..73608698 100644
+--- a/src/core/libraries/system/userservice.cpp
++++ b/src/core/libraries/system/userservice.cpp
+@@ -117,8 +117,17 @@ int PS4_SYSV_ABI sceUserServiceGetDiscPlayerFlag() {
+ }
+ 
+ std::queue<OrbisUserServiceEvent> user_service_event_queue = {};
++static UserServiceEventSink g_event_sink = nullptr; // SecondSonPC patch 0003
++
++void SetUserServiceEventSink(UserServiceEventSink sink) {
++    g_event_sink = sink;
++}
+ 
+ void AddUserServiceEvent(const OrbisUserServiceEvent e) {
++    if (g_event_sink != nullptr) {
++        g_event_sink(e);
++        return;
++    }
+     LOG_DEBUG(Lib_UserService, "Event added to queue: {} {}", (u8)e.event, e.userId);
+     user_service_event_queue.push(e);
+ }
+diff --git a/src/core/libraries/system/userservice.h b/src/core/libraries/system/userservice.h
+index 799bf89b..f920cc22 100644
+--- a/src/core/libraries/system/userservice.h
++++ b/src/core/libraries/system/userservice.h
+@@ -58,6 +58,10 @@ struct OrbisUserServiceEvent {
+ };
+ 
+ void AddUserServiceEvent(const OrbisUserServiceEvent e);
++// SecondSonPC patch 0003: when set, login/logout events go to this sink instead of the queue of
++// sceUserServiceGetEvent (SecondSonPC's native UserService). nullptr restores the queue.
++using UserServiceEventSink = void (*)(const OrbisUserServiceEvent& e);
++void SetUserServiceEventSink(UserServiceEventSink sink);
+ 
+ int PS4_SYSV_ABI sceUserServiceInitializeForShellCore();
+ int PS4_SYSV_ABI sceUserServiceTerminateForShellCore();

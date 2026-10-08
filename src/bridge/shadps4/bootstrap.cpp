@@ -363,6 +363,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                    const std::string& serial) {
     StartBridgeLibraries();
     SetupFilesystem(cfg, serial);
+    if (cfg.selftest) {
+        std::quick_exit(RunSelfTest(cfg));
+    }
     for (const auto& g : cfg.bridged_groups) {
         if (g == "loader" || g == "sysmodule") {
             Fatal(fmt::format("--bridge {} is not possible with --loader sspc: the shadPS4 "
@@ -520,6 +523,10 @@ void RunGame(const App::Config& cfg) {
 
     const auto window_title = fmt::format("SecondSonPC (Phase 1, {} loader) | {} - {} <{}>",
                                           own_loader ? "sspc" : "shadps4", id, title, app_version);
+    // The window's first controller check logs in the user of slot 1.
+    if (own_loader && std::ranges::find(cfg.bridged_groups, "user") == cfg.bridged_groups.end()) {
+        InstallUserHost();
+    }
     auto window = std::make_unique<Frontend::WindowSDL>(
         static_cast<s32>(EmulatorSettings.GetWindowWidth()),
         static_cast<s32>(EmulatorSettings.GetWindowHeight()), g_controllers, window_title);

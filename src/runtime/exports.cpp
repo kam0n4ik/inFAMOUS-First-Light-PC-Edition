@@ -7,6 +7,7 @@
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/fs_observer.h"
 #include "runtime/system/system_service.h"
+#include "runtime/user/user_service.h"
 
 namespace SecondSon::Loader {
 std::span<const Runtime::Export> RtldExports(); // loader/rtld.cpp
@@ -16,6 +17,12 @@ namespace SecondSon::Runtime {
 
 namespace Sysmodule {
 std::span<const Export> SysmoduleExports(); // runtime/sysmodule/sysmodule.cpp
+}
+namespace PlayGo {
+std::span<const Export> PlayGoExports(); // runtime/playgo/playgo.cpp
+}
+namespace AppContent {
+std::span<const Export> AppContentExports(); // runtime/app_content/app_content.cpp
 }
 
 namespace {
@@ -30,6 +37,14 @@ const Export kSystemExports[] = {
      Fn(&SystemService::ParamGetInt), nullptr, "system", true},
     {"SsC-m-S9JTA", "libSceSystemService", "libSceSystemService", "sceSystemServiceParamGetString",
      Fn(&SystemService::ParamGetString), nullptr, "system", true},
+    {"rPo6tV8D9bM", "libSceSystemService", "libSceSystemService", "sceSystemServiceGetStatus",
+     Fn(&SystemService::GetStatus), nullptr, "system"},
+    {"656LMQSrg6U", "libSceSystemService", "libSceSystemService", "sceSystemServiceReceiveEvent",
+     Fn(&SystemService::ReceiveEvent), nullptr, "system"},
+    {"Vo5V8KAwCmk", "libSceSystemService", "libSceSystemService", "sceSystemServiceHideSplashScreen",
+     Fn(&SystemService::HideSplashScreen), nullptr, "system"},
+    {"1n37q1Bvc5Y", "libSceSystemService", "libSceSystemService", "sceSystemServiceGetDisplaySafeAreaInfo",
+     Fn(&SystemService::GetDisplaySafeAreaInfo), nullptr, "system"},
 };
 
 // Observers in front of the BRIDGE file functions (called by the game's libSceFios2.prx). They
@@ -47,6 +62,8 @@ std::vector<Export> Collect() {
     // observers of the same functions, which stay for --loader shadps4 / --bridge fs).
     for (const auto group : {std::span<const Export>(kSystemExports), Loader::RtldExports(),
                              Sysmodule::SysmoduleExports(), Filesystem::FileSystemExports(),
+                             UserService::UserServiceExports(), PlayGo::PlayGoExports(),
+                             AppContent::AppContentExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());
     }

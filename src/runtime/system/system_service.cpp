@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <mutex>
+#include <queue>
 #include <windows.h>
 
 #include "base/log.h"
@@ -146,6 +147,74 @@ SSPC_SYSV_ABI s32 ParamGetString(s32 param_id, char* buf, u64 buf_size) {
     SSPC_LOG(SystemService, Info, "ParamGetString(SystemName, buf={}, size={}) -> \"{}\" ({} bytes{}) ret=0",
              static_cast<void*>(buf), buf_size, std::string_view(buf, copied), copied,
              copied < name.size() ? ", truncated" : "");
+    return kOk;
+}
+
+// --- status, events, splash, safe area (oracle: shadPS4 systemservice.cpp @ 0fe263a) -------
+
+namespace {
+constexpr s32 kErrorNoEvent = static_cast<s32>(0x80A10004); // SCE_SYSTEM_SERVICE_ERROR_NO_EVENT
+std::mutex g_event_mutex;
+std::queue<Event> g_events;
+
+/// OrbisSystemServiceStatus (fields the console fills; the reserved tail is left as is).
+struct Status {
+    s32 event_num;
+    bool is_system_ui_overlaid;
+    bool is_in_background_execution;
+    bool is_cpu_mode7_cpu_normal;
+    bool is_game_live_streaming_on_air;
+    bool is_out_of_vr_play_area;
+};
+} // namespace
+
+void PushEvent(const Event& event) {
+    std::scoped_lock lock{g_event_mutex};
+    g_events.push(event);
+    SSPC_LOG(SystemService, Info, "system event {:#x} queued ({} pending)", event.type, g_events.size());
+}
+
+SSPC_SYSV_ABI s32 GetStatus(void* status) {
+    if (status == nullptr) {
+        return kErrorParameter;
+    }
+    auto* s = static_cast<Status*>(status);
+    std::scoped_lock lock{g_event_mutex};
+    s->event_num = static_cast<s32>(g_events.size());
+    s->is_system_ui_overlaid = false;
+    s->is_in_background_execution = false;
+    s->is_cpu_mode7_cpu_normal = true;
+    s->is_game_live_streaming_on_air = false;
+    s->is_out_of_vr_play_area = false;
+    return kOk;
+}
+
+SSPC_SYSV_ABI s32 ReceiveEvent(Event* event) {
+    if (event == nullptr) {
+        return kErrorParameter;
+    }
+    std::scoped_lock lock{g_event_mutex};
+    if (g_events.empty()) {
+        return kErrorNoEvent;
+    }
+    *event = g_events.front();
+    g_events.pop();
+    SSPC_LOG(SystemService, Info, "system event {:#x} delivered ({} pending)", event->type, g_events.size());
+    return kOk;
+}
+
+SSPC_SYSV_ABI s32 HideSplashScreen() {
+    // SecondSonPC shows no splash screen of its own (the oracle's is disabled by default too).
+    SSPC_LOG(SystemService, Info, "sceSystemServiceHideSplashScreen");
+    return kOk;
+}
+
+SSPC_SYSV_ABI s32 GetDisplaySafeAreaInfo(void* info) {
+    if (info == nullptr) {
+        return kErrorParameter;
+    }
+    float ratio = 1.0f; // OrbisSystemServiceDisplaySafeAreaInfo::ratio: the whole screen is safe
+    std::memcpy(info, &ratio, sizeof(ratio));
     return kOk;
 }
 

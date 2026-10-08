@@ -7,6 +7,7 @@
 
 #include "base/abi.h"
 #include "base/log.h"
+#include "base/vram_monitor.h"
 
 namespace SecondSon::Base {
 
@@ -48,6 +49,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
             }
         }
     }
+    LogVramSample("crash", false);
     Log::Flush();
     return EXCEPTION_CONTINUE_SEARCH;
 }

@@ -62,6 +62,7 @@ struct Config {
     LoaderBackend loader = LoaderBackend::Sspc; // default since Phase 1 milestone 1 (docs/MIGRATION.md)
     std::vector<std::string> bridged_groups; // --bridge <group>: NATIVE group back to BRIDGE
     u32 call_order = 0;                      // --call-order N: record the first N import calls
+    bool selftest = false;                   // --selftest: NATIVE vs BRIDGE subsystem test, no game
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
 };
 

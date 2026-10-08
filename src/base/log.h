@@ -14,6 +14,7 @@ enum class Category : unsigned char {
     Loader,
     Kernel,
     SystemService,
+    User,
     Filesystem,
     Input,
     Audio,

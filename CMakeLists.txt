@@ -22,6 +22,7 @@ add_library(sspc_runtime STATIC
     src/app/paths.cpp
     src/base/crash.cpp
     src/base/log.cpp
+    src/base/vram_monitor.cpp
     src/loader/bindings.cpp
     src/loader/eh_frame.cpp
     src/loader/image_file.cpp
@@ -29,20 +30,23 @@ add_library(sspc_runtime STATIC
     src/loader/module.cpp
     src/loader/rtld.cpp
     src/loader/snapshot.cpp
+    src/runtime/app_content/app_content.cpp
     src/runtime/exports.cpp
     src/runtime/filesystem/directory.cpp
     src/runtime/filesystem/file_system.cpp
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
     src/runtime/language.cpp
+    src/runtime/playgo/playgo.cpp
     src/runtime/sysmodule/sysmodule.cpp
     src/runtime/system/system_service.cpp
+    src/runtime/user/user_service.cpp
     src/trace/import_counter.cpp
 )
 target_include_directories(sspc_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # PRIVATE: must not leak into the shadPS4 sources of the bridge target.
 target_compile_definitions(sspc_runtime PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(sspc_runtime PRIVATE /utf-8 /W4)
-target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11)
+target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi)
 
 sspc_attach_bootstrap(sspc_runtime)

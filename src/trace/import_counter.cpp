@@ -349,6 +349,7 @@ void StartPeriodicDump(const std::filesystem::path& file, u32 seconds) {
                 Sleep(100);
             }
             DumpJson(file);
+            DumpCallOrder(file.parent_path() / "call_order.txt"); // survives a crash (SSPC-001)
         }
     });
 }

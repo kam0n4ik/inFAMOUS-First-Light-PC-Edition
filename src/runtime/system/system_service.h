@@ -44,4 +44,20 @@ SSPC_SYSV_ABI s32 ParamGetInt(s32 param_id, s32* value);
 // result without initializing the buffer first, so the buffer must always be written.
 SSPC_SYSV_ABI s32 ParamGetString(s32 param_id, char* buf, u64 buf_size);
 
+/// OrbisSystemServiceEvent (type + 8 KiB of parameters).
+struct Event {
+    u32 type;
+    char param[8192];
+};
+static_assert(sizeof(Event) == 8196);
+
+/// Queues a system event for sceSystemServiceReceiveEvent (producers: SecondSonPC subsystems).
+void PushEvent(const Event& event);
+
+// sceSystemServiceGetStatus / ReceiveEvent / HideSplashScreen / GetDisplaySafeAreaInfo
+SSPC_SYSV_ABI s32 GetStatus(void* status);
+SSPC_SYSV_ABI s32 ReceiveEvent(Event* event);
+SSPC_SYSV_ABI s32 HideSplashScreen();
+SSPC_SYSV_ABI s32 GetDisplaySafeAreaInfo(void* info);
+
 } // namespace SecondSon::SystemService

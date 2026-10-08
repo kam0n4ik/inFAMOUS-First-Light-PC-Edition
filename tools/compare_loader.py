@@ -121,12 +121,18 @@ def compare_calls(a: Path, b: Path) -> int:
     called_a = {k for k, (_, c) in ca.items() if c}
     called_b = {k for k, (_, c) in cb.items() if c}
     print(f"  calls.json: {len(called_a)} functions called (oracle), {len(called_b)} (candidate)")
+    # The Phase 0 path does not count COMMON_STUB imports (shadPS4 binds its own stub without our
+    # thunk), the sspc path does: such calls exist on both paths but are seen only on one.
+    stubs = {k for k, (o, _) in cb.items() if o == "COMMON_STUB"}
     only_a = sorted(called_a - called_b)
-    only_b = sorted(called_b - called_a)
+    only_b = sorted(called_b - called_a - stubs)
+    only_b_stubs = sorted((called_b - called_a) & stubs)
     if only_a:
         print(f"    called only by the oracle: {', '.join(only_a)}")
     if only_b:
         print(f"    called only by the candidate: {', '.join(only_b)}")
+    if only_b_stubs:
+        print(f"    COMMON_STUB calls (counted on the sspc path only): {', '.join(only_b_stubs)}")
     owners = Counter(o for k, (o, c) in cb.items())
     print(f"    candidate owners (listed): {dict(owners)}")
     return 0
