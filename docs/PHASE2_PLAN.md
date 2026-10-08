@@ -86,6 +86,8 @@ BRIDGE: его нативная версия свелась бы к вызову
 
 ## P2.3 — Memory Runtime — **план (не реализовано)**
 
+Детальный план (механизмы, что нельзя до своего GPU-рантайма, порядок, тесты, критерии готовности): `docs\PHASE2_P23_P24_PLAN.md`.
+
 Состояние: всё адресное пространство гостя ведёт `Core::MemoryManager` моста. Свой загрузчик
 обращается к нему только через `Loader::Host` (`src\bridge\shadps4\loader_host.cpp`):
 `ReserveModule`, `MapTrampoline`, `MapSegment`, `SetupMemoryRegions`, `MapPrimaryTls`,
@@ -128,6 +130,8 @@ BRIDGE: его нативная версия свелась бы к вызову
 размеры ради commit (SSPC-001 решён порционной загрузкой, патч `0005` остаётся).
 
 ## P2.4 — Thread Runtime — **план (не реализовано)**
+
+Детальный план (механизмы, что нельзя до своего GPU-рантайма, порядок, тесты, критерии готовности): `docs\PHASE2_P23_P24_PLAN.md`.
 
 Состояние: гостевые потоки — `Libraries::Kernel::Thread`/pthread моста; TCB/TLS гостя с Phase 1
 даёт наш загрузчик (`src\bridge\shadps4\rtld_tcb.cpp` заменяет `tcb.cpp` моста); FS-сегмент
