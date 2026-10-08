@@ -66,7 +66,7 @@ std::vector<Export> Collect() {
                              Sysmodule::SysmoduleExports(), Filesystem::FileSystemExports(),
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
                              AppContent::AppContentExports(), Pad::PadExports(),
-                             Kernel::KernelExports(),
+                             Kernel::KernelExports(), Kernel::SemaphoreExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());
     }

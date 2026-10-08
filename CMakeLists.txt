@@ -39,6 +39,7 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/file_system.cpp
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
+    src/runtime/kernel/semaphore.cpp
     src/runtime/kernel/time.cpp
     src/runtime/language.cpp
     src/runtime/pad/pad.cpp

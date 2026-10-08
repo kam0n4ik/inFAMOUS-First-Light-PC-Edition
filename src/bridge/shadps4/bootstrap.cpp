@@ -533,10 +533,10 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         SSPC_LOG(Bridge, Warning, "libScePad is BRIDGE: shadPS4's keyboard layout and controllers");
     }
     SetupFilesystem(cfg, serial);
+    bindings.LogSummary(); // also for --selftest: the NATIVE/BRIDGE split without running the game
     if (cfg.selftest) {
         std::quick_exit(RunSelfTest(cfg));
     }
-    bindings.LogSummary();
 
     static std::unique_ptr<Loader::Host> host = CreateLoaderHost();
     static Loader::Linker linker(*host, bindings,

@@ -1,10 +1,13 @@
-// SecondSonPC — TEMPORARY bridge for the native libkernel time functions (Phase 2, P2.2): the guest
+// SecondSonPC — TEMPORARY bridge for the native libkernel functions (Phase 2, P2.2): the guest
 // errno and the process clock are still shadPS4's (shared with BRIDGE functions and with the
-// VideoOut/AudioOut timestamps).
+// VideoOut/AudioOut timestamps), and so are the guest threads whose priority orders waiters.
+#include <limits>
+
 #include "app/config.h"
 #include "base/log.h"
 #include "bridge/shadps4/loader_host.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/time.h"
 #include "runtime/kernel/kernel.h"
 
@@ -19,6 +22,11 @@ public:
     }
     u64 ProcessTimeUs() override {
         return Libraries::Kernel::sceKernelGetProcessTime();
+    }
+    s32 CurrentThreadPriority() override {
+        // A host thread (no guest pthread) waits behind every guest thread; the oracle would crash.
+        const auto* thread = Libraries::Kernel::g_curthread;
+        return thread != nullptr ? thread->attr.prio : std::numeric_limits<s32>::max();
     }
 };
 

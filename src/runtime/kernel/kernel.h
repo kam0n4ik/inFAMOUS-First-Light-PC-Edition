@@ -1,6 +1,7 @@
-// SecondSonPC — libkernel (Phase 2, P2.2). First NATIVE group: time — clocks, sleeps, TSC
-// frequency — and sceKernelIsNeoMode. Synchronisation, threads and memory stay BRIDGE
-// (docs/PHASE2_PLAN.md, docs/generated/KERNEL_AUDIT.md).
+// SecondSonPC — libkernel (Phase 2, P2.2). NATIVE groups: time — clocks, sleeps, TSC frequency —
+// and sceKernelIsNeoMode ("kernel"); semaphores ("kernel-sema", docs/KERNEL_SYNC.md). The other
+// synchronisation objects, threads and memory stay BRIDGE (docs/PHASE2_PLAN.md,
+// docs/generated/KERNEL_AUDIT.md).
 #pragma once
 
 #include <span>
@@ -22,8 +23,12 @@ public:
     /// The bridge's process clock (CLOCK_PROCTIME): VideoOut/AudioOut timestamps the game compares
     /// with it are BRIDGE until Phase 4.
     virtual u64 ProcessTimeUs() = 0;
+    /// Scheduling priority of the calling guest thread (lower value = more urgent): the wake order
+    /// of priority-ordered waits. Threads are BRIDGE until P2.4.
+    virtual s32 CurrentThreadPriority() = 0;
 };
 void SetHost(Host* host);
+Host* GetHost();
 
 /// neo: [Console] neoMode; title_supports_neo: param.sfo ATTRIBUTE bit 23.
 void Configure(bool neo, bool title_supports_neo);
@@ -32,5 +37,14 @@ void Configure(bool neo, bool title_supports_neo);
 void Start();
 
 std::span<const Runtime::Export> KernelExports();
+std::span<const Runtime::Export> SemaphoreExports();
+
+/// Self-test access to the native semaphores (functions the game does not import, and state).
+namespace SemaphoreTest {
+s32 Poll(u32 sem, s32 need);
+s32 Cancel(u32 sem, s32 set_count, s32* waiter_count);
+s32 Tokens(u32 sem);  // -1: no such semaphore
+s32 Waiters(u32 sem); // -1: no such semaphore
+} // namespace SemaphoreTest
 
 } // namespace SecondSon::Kernel

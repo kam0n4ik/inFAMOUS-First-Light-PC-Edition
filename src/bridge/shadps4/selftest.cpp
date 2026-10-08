@@ -7,6 +7,7 @@
 //   PlayGo, AppContent, SystemService, UserService: return values, output buffers, error paths;
 //   ParamSfo: SecondSonPC's param.sfo reader against shadPS4's PSF (not an import: start-up data).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -14,8 +15,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -36,6 +39,7 @@
 #include "runtime/exports.h"
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/vfs.h"
+#include "runtime/kernel/kernel.h"
 #include "runtime/psf/param_sfo.h"
 #include "runtime/user/user_service.h"
 
@@ -1070,6 +1074,322 @@ void TestInput(Totals& t) {
     c.Summary();
 }
 
+// ---------------------------------------------------------------------------- libkernel semaphores
+
+constexpr const char* kSemaCreate = "188x57JYp0g";
+constexpr const char* kSemaWait = "Zxa0VhQVTsk";
+constexpr const char* kSemaSignal = "4czppHBiriw";
+constexpr const char* kSemaDelete = "R1Jvn8bSCW8";
+
+/// NATIVE and BRIDGE on the paths that do not block: the oracle's blocking wait reads the guest
+/// thread (g_curthread), which a self-test thread does not have.
+void SemaScript(Side& s) {
+    const auto create = s.F(kSemaCreate), wait = s.F(kSemaWait), signal = s.F(kSemaSignal), del = s.F(kSemaDelete);
+    const void* none = nullptr;
+    u32* no_timeout = nullptr;
+    const char* no_name = nullptr;
+    u32 h = 0xDEAD;
+    s.Line("Create null name -> {}", Code(Call<s32>(create, &h, no_name, 1u, 0, 1, none)));
+    s.Line("Create attr 3 -> {}", Code(Call<s32>(create, &h, "st", 3u, 0, 1, none)));
+    s.Line("Create init -1 -> {}", Code(Call<s32>(create, &h, "st", 1u, -1, 1, none)));
+    s.Line("Create max 0 -> {}", Code(Call<s32>(create, &h, "st", 1u, 0, 0, none)));
+    s.Line("Create init > max -> {}", Code(Call<s32>(create, &h, "st", 1u, 3, 2, none)));
+    s.Line("handle untouched by failures -> {:#x}", h);
+    u32 a = 0, b = 0, c = 0;
+    s.Line("Create fifo 1/3 -> {}", Code(Call<s32>(create, &a, "selftest-a", 1u, 1, 3, none)));
+    s.Line("Create attr 0 0/2 -> {}", Code(Call<s32>(create, &b, "selftest-b", 0u, 0, 2, none)));
+    s.Line("Create prio 0x7fffffff/0x7fffffff -> {}",
+           Code(Call<s32>(create, &c, "selftest-c", 2u, 0x7fffffff, 0x7fffffff, none)));
+    s.Line("handles distinct -> {}", a != b && b != c && a != c);
+    s.Line("Wait 1 with a token -> {}", Code(Call<s32>(wait, a, 1, no_timeout)));
+    u32 t = 0;
+    s.Line("Wait 1 empty, timeout 0 -> {} (left {})", Code(Call<s32>(wait, a, 1, &t)), t);
+    s.Line("Signal 2 -> {}", Code(Call<s32>(signal, a, 2)));
+    s.Line("Signal 2 over max -> {}", Code(Call<s32>(signal, a, 2)));
+    s.Line("Signal 1 -> {}", Code(Call<s32>(signal, a, 1)));
+    t = 1000;
+    s.Line("Wait 3 with 3 tokens, timeout 1000 -> {} (left {})", Code(Call<s32>(wait, a, 3, &t)), t);
+    t = 0;
+    s.Line("Wait 1 empty again, timeout 0 -> {} (left {})", Code(Call<s32>(wait, a, 1, &t)), t);
+    s.Line("Wait 0 on empty -> {}", Code(Call<s32>(wait, a, 0, no_timeout)));
+    s.Line("Signal 0 -> {}", Code(Call<s32>(signal, a, 0)));
+    s.Line("Signal 1 at max 0x7fffffff -> {}", Code(Call<s32>(signal, c, 1)));
+    s.Line("Wait bad handle 0xffff -> {}", Code(Call<s32>(wait, 0xffffu, 1, no_timeout)));
+    s.Line("Signal bad handle 0xffff -> {}", Code(Call<s32>(signal, 0xffffu, 1)));
+    s.Line("Delete bad handle 0x7fffffff -> {}", Code(Call<s32>(del, 0x7fffffffu)));
+    s.Line("Delete b -> {}", Code(Call<s32>(del, b)));
+    s.Line("Delete b again -> {}", Code(Call<s32>(del, b)));
+    t = 0;
+    s.Line("Wait deleted -> {}", Code(Call<s32>(wait, b, 1, &t)));
+    s.Line("Signal deleted -> {}", Code(Call<s32>(signal, b, 1)));
+    u32 d = 0xDEAD;
+    s.Line("Create after a delete reuses the freed handle -> {} {}", Code(Call<s32>(create, &d, "selftest-d", 1u, 0, 1, none)),
+           d == b);
+    s.Line("Delete a, c, d -> {} {} {}", Code(Call<s32>(del, a)), Code(Call<s32>(del, c)), Code(Call<s32>(del, d)));
+}
+
+thread_local s32 t_sema_priority = 0;
+
+/// Gives each test thread the guest priority it sets in t_sema_priority (self-test threads are not
+/// guest threads); everything else goes to the real host.
+class SemaTestHost final : public Kernel::Host {
+public:
+    explicit SemaTestHost(Kernel::Host* real) : real_{real} {}
+    s32* Errno() override {
+        return real_->Errno();
+    }
+    u64 ProcessTimeUs() override {
+        return real_->ProcessTimeUs();
+    }
+    s32 CurrentThreadPriority() override {
+        return t_sema_priority;
+    }
+
+private:
+    Kernel::Host* real_;
+};
+
+/// A thread blocked in the native sceKernelWaitSema.
+struct SemaWaiter {
+    std::thread thread;
+    std::atomic<bool> done{false};
+    s32 result = 0;
+    u32 left = 0;
+    int order = 0; // 1 = first to return
+};
+
+template <typename P>
+bool WaitUntil(P predicate, int ms = 3000) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() > end) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+/// NATIVE vs BRIDGE where both can run, then the blocking semantics on the native side only,
+/// against expected values.
+void TestKernelSema(Totals& t) {
+    Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+    SemaScript(native);
+    SemaScript(bridge);
+    // The oracle's s32 sum overflows (UB) and accepts the signal; libkernel and NATIVE refuse it.
+    Compare(t, "KernelSema", native, bridge, {"Signal 1 at max 0x7fffffff"});
+
+    InputChecks c(t, "KernelSema(n)");
+    Kernel::Host* real_host = Kernel::GetHost();
+    SemaTestHost test_host{real_host};
+    Kernel::SetHost(&test_host);
+    const void* create = NativeOf(kSemaCreate);
+    const void* wait = NativeOf(kSemaWait);
+    const void* signal = NativeOf(kSemaSignal);
+    const void* del = NativeOf(kSemaDelete);
+    const void* none = nullptr;
+    constexpr s32 kOk = 0;
+    constexpr s32 kEacces = static_cast<s32>(0x8002000D);
+    constexpr s32 kEbusy = static_cast<s32>(0x80020010);
+    constexpr s32 kEtimedout = static_cast<s32>(0x8002003C);
+    constexpr s32 kEcanceled = static_cast<s32>(0x80020055);
+    constexpr s32 kEsrch = static_cast<s32>(0x80020003);
+    std::atomic<int> sequence{0};
+
+    const auto make = [&](const char* name, u32 attr, s32 init, s32 max) {
+        u32 h = 0;
+        Call<s32>(create, &h, name, attr, init, max, none);
+        return h;
+    };
+    const auto start = [&](SemaWaiter& w, u32 h, s32 need, s32 priority, std::optional<u32> timeout_us) {
+        w.thread = std::thread([&w, &sequence, wait, h, need, priority, timeout_us] {
+            t_sema_priority = priority;
+            u32 left = timeout_us.value_or(0);
+            w.result = Call<s32>(wait, h, need, timeout_us ? &left : static_cast<u32*>(nullptr));
+            w.left = left;
+            w.order = ++sequence;
+            w.done = true;
+        });
+    };
+    const auto waiters = [](u32 h) { return Kernel::SemaphoreTest::Waiters(h); };
+    // Wakes whoever is still blocked (the semaphore is deleted) and joins: no test can hang.
+    const auto finish = [&](u32 h, std::initializer_list<SemaWaiter*> list) {
+        Call<s32>(del, h);
+        for (auto* w : list) {
+            if (w->thread.joinable()) {
+                w->thread.join();
+            }
+        }
+    };
+
+    {   // several waiters, one token at a time
+        const u32 h = make("st-many", 1, 0, 10);
+        SemaWaiter w1, w2;
+        start(w1, h, 1, 0, std::nullopt);
+        start(w2, h, 1, 0, std::nullopt);
+        const bool blocked = WaitUntil([&] { return waiters(h) == 2; });
+        Call<s32>(signal, h, 1);
+        const bool one = WaitUntil([&] { return w1.done || w2.done; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        c.Check("2 waiters, Signal 1 wakes exactly one", blocked && one && (w1.done != w2.done) && waiters(h) == 1,
+                fmt::format("blocked {} done {} {} waiting {}", blocked, w1.done.load(), w2.done.load(), waiters(h)));
+        Call<s32>(signal, h, 1);
+        const bool both = WaitUntil([&] { return w1.done && w2.done; });
+        c.Check("Signal 1 more wakes the other, both OK, no token left",
+                both && w1.result == kOk && w2.result == kOk && Kernel::SemaphoreTest::Tokens(h) == 0, "");
+        finish(h, {&w1, &w2});
+    }
+    {   // FIFO semaphore: arrival order, whatever the priorities
+        const u32 h = make("st-fifo", 1, 0, 10);
+        SemaWaiter w1, w2;
+        start(w1, h, 1, 700, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        start(w2, h, 1, 256, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 2; });
+        Call<s32>(signal, h, 1);
+        WaitUntil([&] { return w1.done || w2.done; });
+        c.Check("FIFO semaphore: the first to wait wakes first", w1.done && !w2.done, "");
+        finish(h, {&w1, &w2});
+        c.Check("FIFO: deleting wakes the remaining waiter with EACCES", w2.result == kEacces,
+                fmt::format("{:#x}", static_cast<u32>(w2.result)));
+    }
+    {   // priority semaphore: lower value first, FIFO among equals
+        const u32 h = make("st-prio", 2, 0, 10);
+        SemaWaiter a, b, d, e;
+        start(a, h, 1, 700, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        start(b, h, 1, 500, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 2; });
+        start(d, h, 1, 600, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 3; });
+        start(e, h, 1, 600, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 4; });
+        for (int i = 0; i < 4; ++i) {
+            const int before = sequence;
+            Call<s32>(signal, h, 1);
+            WaitUntil([&] { return sequence == before + 1; });
+        }
+        c.Check("priority semaphore: 500, 600, 600 (first come), 700",
+                b.order < d.order && d.order < e.order && e.order < a.order && a.done,
+                fmt::format("orders 700:{} 500:{} 600:{} 600:{}", a.order, b.order, d.order, e.order));
+        finish(h, {&a, &b, &d, &e});
+    }
+    {   // a waiter needing more is skipped, not waited for
+        const u32 h = make("st-need", 2, 0, 10);
+        SemaWaiter big, small;
+        start(big, h, 3, 256, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        start(small, h, 1, 767, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 2; });
+        Call<s32>(signal, h, 1);
+        WaitUntil([&] { return small.done.load(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        c.Check("need 3 (urgent) skipped by need 1 when 1 token arrives",
+                small.done && !big.done && small.result == kOk, "");
+        Call<s32>(signal, h, 3);
+        WaitUntil([&] { return big.done.load(); });
+        c.Check("then 3 tokens wake the need-3 waiter",
+                big.done && big.result == kOk && Kernel::SemaphoreTest::Tokens(h) == 0, "");
+        finish(h, {&big, &small});
+    }
+    {   // timeouts
+        const u32 h = make("st-timeout", 1, 0, 10);
+        u32 left = 30'000;
+        const auto t0 = std::chrono::steady_clock::now();
+        const s32 r = Call<s32>(wait, h, 1, &left);
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        c.Check("30 ms timeout expires: ETIMEDOUT, 0 left, nobody left waiting",
+                r == kEtimedout && left == 0 && ms >= 25 && waiters(h) == 0,
+                fmt::format("{:#x} left {} after {} ms", static_cast<u32>(r), left, ms));
+        SemaWaiter w;
+        start(w, h, 1, 0, 2'000'000u);
+        WaitUntil([&] { return waiters(h) == 1; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        Call<s32>(signal, h, 1);
+        WaitUntil([&] { return w.done.load(); });
+        c.Check("signal within a 2 s timeout: OK, the time left is written back",
+                w.result == kOk && w.left > 1'000'000u && w.left < 1'990'000u, fmt::format("left {}", w.left));
+        left = 0;
+        c.Check("waiting again after a timeout and a success: timeout 0 -> ETIMEDOUT",
+                Call<s32>(wait, h, 1, &left) == kEtimedout, "");
+        finish(h, {&w});
+    }
+    {   // deletion and cancellation while threads wait
+        const u32 h = make("st-delete", 2, 0, 10);
+        SemaWaiter w1, w2;
+        start(w1, h, 1, 500, std::nullopt);
+        start(w2, h, 2, 600, 5'000'000u);
+        WaitUntil([&] { return waiters(h) == 2; });
+        const s32 r = Call<s32>(del, h);
+        const bool woke = WaitUntil([&] { return w1.done && w2.done; });
+        c.Check("delete while 2 wait: Delete OK, both return EACCES, the timed one with 0 left",
+                r == kOk && woke && w1.result == kEacces && w2.result == kEacces && w2.left == 0,
+                fmt::format("{:#x} {:#x} left {}", static_cast<u32>(w1.result), static_cast<u32>(w2.result), w2.left));
+        c.Check("the deleted handle is invalid",
+                Call<s32>(wait, h, 1, static_cast<u32*>(nullptr)) == kEsrch && Call<s32>(signal, h, 1) == kEsrch, "");
+        finish(h, {&w1, &w2});
+
+        const u32 k = make("st-cancel", 1, 2, 10);
+        Call<s32>(wait, k, 2, static_cast<u32*>(nullptr));
+        SemaWaiter w3;
+        start(w3, k, 1, 0, std::nullopt);
+        WaitUntil([&] { return waiters(k) == 1; });
+        s32 count = -1;
+        const s32 rc = Kernel::SemaphoreTest::Cancel(k, 5, &count);
+        WaitUntil([&] { return w3.done.load(); });
+        c.Check("cancel: the waiter gets ECANCELED, count 1, tokens set to 5",
+                rc == kOk && w3.result == kEcanceled && count == 1 && Kernel::SemaphoreTest::Tokens(k) == 5, "");
+        Kernel::SemaphoreTest::Cancel(k, -1, &count);
+        c.Check("cancel with -1 restores the initial count", Kernel::SemaphoreTest::Tokens(k) == 2 && count == 0, "");
+        c.Check("poll: OK with tokens, EBUSY without",
+                Kernel::SemaphoreTest::Poll(k, 2) == kOk && Kernel::SemaphoreTest::Poll(k, 1) == kEbusy, "");
+        finish(k, {&w3});
+    }
+    {   // no lost wake-ups: 4 producers x 4 consumers, 5000 tokens each
+        const u32 h = make("st-stress", 1, 0, 0x7fffffff);
+        constexpr int kThreads = 4, kEach = 5000;
+        std::atomic<int> consumed{0}, failed{0};
+        std::vector<std::thread> threads;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kThreads; ++i) {
+            threads.emplace_back([&, h] {
+                for (int n = 0; n < kEach; ++n) {
+                    u32 left = 5'000'000;
+                    if (Call<s32>(wait, h, 1, &left) == kOk) {
+                        ++consumed;
+                    } else {
+                        ++failed;
+                    }
+                }
+            });
+            threads.emplace_back([&, h] {
+                for (int n = 0; n < kEach; ++n) {
+                    Call<s32>(signal, h, 1);
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        c.Check("4 producers / 4 consumers x 5000: every token consumed, none left, nobody waiting",
+                consumed == kThreads * kEach && failed == 0 && Kernel::SemaphoreTest::Tokens(h) == 0 && waiters(h) == 0,
+                fmt::format("consumed {} failed {} tokens {} in {} ms", consumed.load(), failed.load(),
+                            Kernel::SemaphoreTest::Tokens(h), ms));
+        Call<s32>(del, h);
+    }
+    {   // the process must still exit while a thread is blocked forever (checked by the self-test
+        // ending at all: RunSelfTest ends with quick_exit, which does not wait for it)
+        const u32 h = make("st-left-blocked", 1, 0, 1);
+        std::thread([wait, h] { Call<s32>(wait, h, 1, static_cast<u32*>(nullptr)); }).detach();
+        c.Check("a waiter left blocked at exit", WaitUntil([&] { return waiters(h) == 1; }), "");
+    }
+    Kernel::SetHost(real_host);
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -1189,6 +1509,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestPad(t);
     TestInput(t);
     TestKernelTime(t);
+    TestKernelSema(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

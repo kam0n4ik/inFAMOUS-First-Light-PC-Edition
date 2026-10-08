@@ -326,6 +326,10 @@ void SetHost(Host* host) {
     g_host = host;
 }
 
+Host* GetHost() {
+    return g_host;
+}
+
 void Configure(bool neo, bool title_supports_neo) {
     g_neo = neo;
     g_title_neo = title_supports_neo;
