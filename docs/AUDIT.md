@@ -197,6 +197,10 @@
 - Игра читает геймпад через `scePadReadState` (не `scePadRead`) для двух хэндлов (user 1000/1001), обновляет `SetLightBar`/`SetVibration` каждый кадр.
 - `libSceMouse` объявлен, но **ни одной функции из него не импортировано**: игра не использует PS4 USB-мышь.
 - В движке есть строки `CCmMouse`, `SCmMouseData`, `MOUSE_CAMERA`, `MOUSE_CAMERA_DATA` (вероятно, отладочная камера с мышью) и UI-события `MouseMove/MouseLeftDown/.../MouseWheel/MouseCaptured`. Это кандидаты на нативную мышь (этап 4): найти, где формируются yaw/pitch камеры, и подавать туда дельту мыши напрямую. Пока не проверено.
+- **Phase 2 P2.1 (2026-10-08):** фактически игра открывает один хэндл (user 1000, `scePadOpen` — 1 вызов) и
+  читает его раз в кадр (12 248 `scePadReadState` на 12 246 кадров). `libScePad` — NATIVE (7/7), клавиатура/мышь —
+  `src\input`, датчики движения виртуального DS4 согласованы; обучение граффити («контроллер боком» →
+  «потрясите баллончик» → «R2 — баллончик») проходится с клавиатуры и мыши (`docs\INPUT_MAPPING.md`).
 
 ## 10. Целевая архитектура и политика зависимости от shadPS4
 
@@ -226,7 +230,7 @@ SecondSonPC.exe
 | # | Компонент shadPS4 (строк) | Зачем Second Son | Временно? | Удаляется в | Замена в SecondSonPC | Проверка удаления |
 |---|---|---|---|---|---|---|
 | 1 | `main.cpp`, `emulator.cpp`, `sdl_window.cpp` (frontend/bootstrap) | запуск, окно | да | Phase 0→1 | `src\app\main.cpp`, `src\app\window_win32.cpp` | наш `main`, в Phase 1 без `Core::Emulator` |
-| 2 | `core\emulator_settings*`, `user_settings*`, `config.json` | настройки | да | Phase 1 | `SecondSonPC.toml` + `src\app\config.*` | в `src\` нет `EmulatorSettings` |
+| 2 | `core\emulator_settings*`, `user_settings*`, `config.json` | настройки | да | Phase 1 | `SecondSonPC.toml` + `src\app\config.*` | в `src\` нет `EmulatorSettings` — **P2.0 (`e7ee32b`): путь `sspc` не читает `config.json`/`users.json`/`keys.json`; объект `EmulatorSettings` моста заполняется только из toml (`bootstrap.cpp`)** |
 | 3 | `common\logging` | лог | да | Phase 1 | `src\common\log.*` (spdlog), категории Loader/Kernel/SystemService/Filesystem/Input/Audio/GPU/Shader/SaveData/Language | `SecondSonPC.log` пишет наш логгер |
 | 4 | `core\loader`, `module.cpp`, `linker.cpp`, `tls.cpp` (~5k) | загрузка eboot+prx, релокации, TLS, init | да | Phase 1 | `src\loader\*` (C++ порт `tools\ps4elf.py`) | eboot и 2 prx грузит наш Loader |
 | 5 | `libraries\libs.cpp`, `SymbolsResolver`, `aerolib` (171k) | разрешение NID | да | Phase 1 | `src\loader\bindings.*`: статическая таблица 417 NID (генерируется из `docs\generated\*.csv`) | aerolib не линкуется |
@@ -236,7 +240,7 @@ SecondSonPC.exe
 | 9 | `core\memory.cpp`, `address_space.cpp`, `kernel\memory.cpp` | direct/flexible память, маппинг | да | Phase 2 | `src\runtime\memory\*` (VirtualAlloc2/MapViewOfFile3, плейсхолдеры) | 0 BRIDGE в memory; GPU-bridge работает через адаптер (риск, см. ниже) |
 | 10 | `cpu_patches.cpp`, `signals.cpp` | FS-патчи TCB, обработка исключений | да | Phase 2 | `src\runtime\threading\tcb_patcher.*` (Zydis+xbyak), VEH | 782 патча ставит наш код |
 | 11 | `kernel\threads\*`, `equeue`, `time`, `libc_internal` | потоки, синхронизация, время, libc для Fios2 | да | Phase 2 | `src\runtime\kernel\*`, `src\runtime\threading\*` | 147 функций libkernel — NATIVE |
-| 12 | `pad`, `src\input` (SDL3) | геймпад | да | Phase 3 | `src\runtime\input\*` (XInput, RawInput, DualSense/DS4) | `scePadReadState` — NATIVE |
+| 12 | `pad`, `src\input` (SDL3) | геймпад | да | Phase 3 | `src\runtime\input\*` (XInput, RawInput, DualSense/DS4) | `scePadReadState` — NATIVE — **P2.1: `libScePad` NATIVE (`src\runtime\pad`), клавиатура/мышь — `src\input`; реальные контроллеры пока через `Input::GameControllers` моста (Phase 3)** |
 | 13 | `audio` (SDL3/OpenAL) | вывод звука | да | Phase 3 | `src\runtime\audio\wasapi_*` | NATIVE |
 | 14 | `ajm` (+LibAtrac9) | ATRAC9 для Wwise | да (код), LibAtrac9 остаётся | Phase 3 | `src\runtime\audio\ajm_*` | NATIVE |
 | 15 | `videodec` (+FFmpeg) | ролики | да (код) | Phase 3 | `src\runtime\media\*` | ролики идут |
@@ -266,7 +270,7 @@ SecondSonPC.exe
 - `emulator.cpp`/`Linker`/`aerolib`/`EmulatorSettings` больше не используются.
 - **Выход:** игра доходит до меню. Порядок `open()` и маска PlayGo совпадают с oracle-логом; BRIDGE ≤ 417 − (FS + System + PlayGo).
 
-**Phase 2 — Kernel / Thread / Memory.** Своё адресное пространство, direct/flexible-память, TCB/FS-патчер, VEH, pthread/sync/equeue/eventflag/sema/time, libc_internal для Fios2. GPU-bridge работает через адаптер памяти. **Выход:** все функции libkernel — NATIVE, 30 минут игры без падений.
+**Phase 2 — Kernel / Thread / Memory.** Своё адресное пространство, direct/flexible-память, TCB/FS-патчер, VEH, pthread/sync/equeue/eventflag/sema/time, libc_internal для Fios2. GPU-bridge работает через адаптер памяти. **Выход:** все функции libkernel — NATIVE, 30 минут игры без падений. Состояние и план по шагам — `docs\PHASE2_PLAN.md` (2026-10-08: P2.0 конфигурация, P2.1 ввод, P2.2 время libkernel; память и потоки — план).
 
 **Phase 3 — Input / Audio / Save (+ offline-сервисы).** XInput/RawInput/DualSense, нативная мышь (исследование `CCmMouse`/камеры), WASAPI, Ajm ATRAC9, Videodec, SaveData и диалоги, NP/Net/Trophy офлайн. **Выход:** BRIDGE остаётся только в Gnm/VideoOut/video_core/shader.
 

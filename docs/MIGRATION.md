@@ -26,6 +26,9 @@
 | Phase 1 M1 (2026-10-08) | 12 | 2 | 382 | 19 | 2 | 147 | свой Loader: +8 rtld/процесс (`__tls_get_addr`, `_sceKernelRtldSetApplicationHeapAPI`, `sceKernelGetProcParam`, `sceKernelGetModuleInfoForUnwind`, `sceKernelGetModuleInfoFromAddr`, `__stack_chk_fail`, `__stack_chk_guard`, `__progname`), +2 Sysmodule (`sceSysmoduleLoadModule`, `sceSysmoduleUnloadModule`) |
 | Phase 1 M2 (2026-10-08, 3d43006) | 33 | 2 | 362 | 18 | 2 | 147 | FileSystem: +21 (17 функций файлов libkernel, `_read`/`_write`, 2 DiscMap); `sceKernelOpen`/`sceKernelStat` из OBSERVED → NATIVE, `sceKernelTruncate` из COMMON_STUB → NATIVE; наблюдатели `sceSaveDataMount2`/`sceSaveDataUmount` — новые OBSERVED |
 | Phase 1 M3 (2026-10-08) | 54 | 2 | 341 | 18 | 2 | 147 | +4 SystemService (`GetStatus`, `ReceiveEvent`, `HideSplashScreen`, `GetDisplaySafeAreaInfo`; `ParamGetInt`/`ParamGetString` — NATIVE с Phase 0), +5 UserService (все импорты), +10 PlayGo (все), +2 AppContent (все) |
+| Phase 2 P2.0 (2026-10-08, `e7ee32b`) | 54 | 2 | 341 | 18 | 2 | 147 | конфигурация (не импорты): путь `sspc` не читает `config.json`/`users.json`/`keys.json` |
+| Phase 2 P2.1 (2026-10-08) | 61 | 2 | 334 | 18 | 2 | 147 | +7 `libScePad` (все импорты): клавиатура/мышь + реальные контроллеры |
+| Phase 2 P2.2 (2026-10-08) | 71 | 2 | 324 | 18 | 2 | 147 | +10 libkernel «время»: `clock_gettime` ×2, `sceKernelClockGettime`, `gettimeofday` ×2, `sceKernelGettimeofday`, `nanosleep`, `sceKernelUsleep`, `sceKernelGetTscFrequency`, `sceKernelIsNeoMode` |
 
 ## Phase 1 — milestone 1: свой Loader — **достигнут**
 
@@ -218,7 +221,9 @@ BRIDGE-SaveData (`/app0/sce_sys/save_data.png`) и таблица трофеев
 условие финала Phase 1 — конфигурация (п. 2 ниже). Разница в числе пайплайнов — компиляция по мере
 появления эффектов в разные моменты (кадры совпадают), отдельно не исследовалась.
 
-## Карта зависимостей от EmulatorSettings (пункт открыт; 2026-10-08)
+## Карта зависимостей от EmulatorSettings — **закрыто в P2.0** (см. ниже «Phase 2 — P2.0»)
+
+Исходная оценка (до P2.0):
 
 Мост читает ~70 разных настроек `EmulatorSettings` (`runtime\sspc\user\config.json`, плюс то, что
 выставляет `bootstrap.cpp` из `SecondSonPC.toml`). По подсистемам (число разных геттеров):
@@ -236,21 +241,67 @@ Pad 2. Уже задаются из `SecondSonPC.toml`: язык, домашня
 3. После этого `config.json` перестаёт загружаться; `EmulatorSettings` получает значения только от
    SecondSonPC до удаления моста (Phase 5).
 
-## Открытые пункты Phase 1 и следующие milestones
+## Открытые пункты Phase 1 — **все закрыты** (2026-10-08)
 
-1. ~~Старт BRIDGE-библиотек~~ — сделано (выше); остаточная регистрация 5 библиотек — до их NATIVE.
-2. **EmulatorSettings/UserSettings/config.json** ещё загружаются — карта и порядок выше; шаг 1
-   (`[Console]`) — следующий.
+1. ~~Старт BRIDGE-библиотек~~ — сделано (выше); остаточная регистрация символов 4 библиотек
+   (libkernel, Gnm, VideoOut, NpManager) — до их NATIVE. `libScePad` с P2.1 не стартует вовсе:
+   реальные контроллеры открывает `StartControllers` (то, что делал его `RegisterLib`).
+2. ~~EmulatorSettings/UserSettings/config.json~~ — **сделано в P2.0** (ниже).
 3. ~~param.sfo через PSF/MntPoints~~ — сделано; `MntPoints` на `sspc` только для BRIDGE-SaveData и
    трофеев.
-4. ~~SSPC-001~~ — устранён. Новый редкий SSPC-002 (`docs\KNOWN_ISSUES.md`) — наблюдать.
+4. ~~SSPC-001~~ — устранён. Редкий SSPC-002 (`docs\KNOWN_ISSUES.md`) — наблюдать.
 5. Финальный критерий Phase 1 — «вступление на русском ≥ 150 с без общей инфраструктуры
-   загрузчика/конфига/ФС/системных сервисов shadPS4»: загрузчик, ФС, системные сервисы — свои;
-   **конфиг (п. 2) — ещё нет**, поэтому Phase 1 формально не закрыта. Игровая часть — автопрогоны с
-   `--press` + ручной тест (`docs\MANUAL_TEST_PLAN.md`).
+   загрузчика/конфига/ФС/системных сервисов shadPS4»: загрузчик, ФС, системные сервисы и
+   конфигурация — свои; прогон `p20_sspc_1` (210 с, 12 302 кадра, 8 русских файлов) — **Phase 1
+   закрыта**.
 
-Следующие milestones — строго по `docs\AUDIT.md` §12, без изменения плана: закрыть п. 2 (Phase 1),
-затем **Phase 2 — Kernel / Thread / Memory**: время и часы (`clock_gettime`, `sceKernelGetProcessTime`,
-`usleep`…), примитивы синхронизации (mutex/cond/rwlock, sema, event flag, equeue), потоки, затем
-direct/flexible-память и свой обработчик исключений/патчер TCB; выход — все функции libkernel
-NATIVE и 30 минут игры без падений.
+## Phase 2 — P2.0: своя конфигурация (2026-10-08, `e7ee32b`)
+
+**Что сделано.** `SecondSonPC.toml` — единственная конфигурация пути `sspc`.
+- Новые секции: `[Console]` (`neoMode`, `devKit`, `extraDirectMemoryMiB`, `extraFlexibleMemoryMiB`),
+  `[Audio]` (`volume`, `device`), `[Debug]` (`vulkanValidation`, `vulkanCrashDiagnostic`); в
+  `[Display]` — `presentMode`, `fullscreenMode`, `showFps`. Ошибочная таблица/ключ — ошибка запуска.
+- `ApplyBridgeSettings` (`bootstrap.cpp`) выставляет мосту все значения, которые решает SecondSonPC;
+  на пути `sspc` `config.json`, `custom_configs\<id>.json`, `users.json`, `keys.json` не читаются
+  (и не пишутся): пользователи моста — четыре стандартных в памяти (id 1000–1003, как у
+  UserService), ключ трофеев пуст (как и был в `keys.json`). Путь `shadps4` грузит файлы как в
+  Phase 0, затем получает те же значения из toml.
+
+**Разделение ~95 геттеров `EmulatorSettings` (по фактическим вызовам в коде моста):**
+
+| Группа | Геттеры | Решение |
+|---|---|---|
+| Консоль (влияет на игру) | `IsNeo`, `IsDevKit`, `Get{ExtraDmem,ExtraFmem}InMBytes`, `GetConsoleLanguage`, `GetHomeDir` | `[Console]`, `[Language]`, `[Paths]` |
+| Вывод | `IsFullScreen`, `GetFullScreenMode`, `GetWindow{Width,Height}`, `GetVblankFrequency`, `GetPresentMode`, `IsShowFpsCounter` | `[Display]` |
+| Аудио | `GetVolumeSlider`, `GetAudioBackend`, `GetSDLMainOutputDevice` | `[Audio]` (бэкенд — SDL) |
+| Сеть/NP | `IsConnectedToNetwork`, `IsShadNetEnabled` | всегда выкл. (офлайн; NP — Phase 3) |
+| Диагностика Vulkan моста | `IsVkValidationEnabled`, `IsVkCrashDiagnosticEnabled` | `[Debug]` |
+| Внутренности моста | readbacks, DMA, copy GPU buffers, null GPU, patch/dump shaders, inline fetch, userfaultfd, pipeline cache, маркеры Vulkan, остальная валидация, RCAS/FSR/HDR, internal resolution, `GetGpuId`, детали лога | встроенные значения shadPS4 (= нынешний `config.json`) |
+| Не используется игрой | камера, IME, USB, мышь/клавиатура PS4, special pad, трофейные попапы, big picture, Discord, каталоги установки/модулей/шрифтов/аддонов, UPnP/P2P/https, `debug_dump`, red zone | по умолчанию |
+
+**Остаток.** Раскладка **геймпадов** моста (`input_config`, читает конструктор окна) — до своего
+бэкенда контроллеров (Phase 3); клавиатуру она с P2.1 не обслуживает.
+
+**Проверки.** `--selftest` 251/0; прогоны `p20_*` (210 с): `sspc` 12 302 кадра, `shadps4` 12 304,
+штатное закрытие, VRAM 4122/4121 МиБ, commit 29 637/29 606 МиБ; файлы конфигурации моста не
+изменены (время изменения до/после совпадает).
+
+## Phase 2 — P2.1: ввод (2026-10-08)
+
+`docs\INPUT_MAPPING.md`. NATIVE `libScePad` (7/7): `src\runtime\pad\pad.cpp`; клавиатура/мышь:
+`src\input\`; мост: `src\bridge\shadps4\input_host.cpp` (реальные контроллеры через
+`Input::GameControllers`, часы процесса, перехват событий окна — патч `0006`). Самотест: `Pad`
+23 проверки (NATIVE = BRIDGE побайтно, кроме метки времени), `Input` 30 проверок. Игровые прогоны
+и снимки — `docs\PHASE2_TEST_RESULTS.md`.
+
+## Phase 2 — P2.2: libkernel, время (2026-10-08)
+
+Аудит — `docs\generated\KERNEL_AUDIT.md`; план — `docs\PHASE2_PLAN.md`. NATIVE (группа `kernel`,
+`src\runtime\kernel\time.cpp`): часы, сон, частота TSC, `sceKernelIsNeoMode` — 10 импортов. От моста:
+guest errno и часы процесса (`Kernel::Host`, `src\bridge\shadps4\kernel_host.cpp`). Самотест
+`KernelTime` 18 проверок.
+
+Следующие milestones — `docs\PHASE2_PLAN.md`: P2.2 дальше (семафоры → event flags →
+mutex+cond+rwlock), P2.3 память (адаптер `MemoryForGpu` → свой `AddressSpace`/`MemoryManager`),
+P2.4 потоки и свой VEH/патчер TCB; выход Phase 2 — все функции libkernel NATIVE и 30 минут игры
+без падений.
