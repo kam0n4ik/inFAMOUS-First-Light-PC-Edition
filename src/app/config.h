@@ -23,10 +23,16 @@ struct Config {
     int language_id = 1;         // PS4 id, 8 = Russian
 
     // [System]
-    // sceSystemServiceParamGetString(SystemName). Empty by default: a non-empty name makes the game
-    // take a path that crashes in the Phase 0 bridge (docs/KNOWN_ISSUES.md, SSPC-001).
+    // sceSystemServiceParamGetString(SystemName). Empty by default (the Phase 0 value). The early
+    // "non-empty name crashes" finding was SSPC-001, the commit-limit failure (docs/KNOWN_ISSUES.md).
     std::string system_name;
     bool enter_button_cross = true;
+
+    // [Console] — the emulated PS4; the game sees these (sceKernelIsNeoMode, memory budget).
+    bool neo_mode = false;     // PS4 Pro
+    bool dev_kit = false;      // development kit memory budget
+    u32 extra_dmem_mib = 0;    // direct memory added to the retail budget
+    u32 extra_fmem_mib = 0;    // flexible memory added to the retail budget
 
     // [Paths]
     std::filesystem::path user_data_dir; // /savedata0 lives under here (never the shadPS4 install)
@@ -37,6 +43,17 @@ struct Config {
     u32 window_height = 720;
     bool fullscreen = false;
     u32 vblank_hz = 60;
+    std::string present_mode = "Mailbox"; // Vulkan present mode, spelled as the bridge expects
+    bool exclusive_fullscreen = false;    // false: borderless window over the desktop
+    bool show_fps = false;                // FPS counter of the bridge overlay (F10 toggles)
+
+    // [Audio]
+    u32 volume = 100;         // 0..100, applied on top of the game's own volume
+    std::string audio_device; // output device name; empty = system default
+
+    // [Debug] — diagnostics of the temporary Vulkan bridge (Phase 0-4)
+    bool vulkan_validation = false;
+    bool vulkan_crash_diagnostic = false;
 
     // [Input] (Phase 3, parsed and validated now)
     double mouse_sensitivity = 1.0;

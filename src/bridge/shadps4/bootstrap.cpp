@@ -4,8 +4,9 @@
 // SecondSonPC — TEMPORARY bridge (removed in Phase 5).
 // Start-up sequence adapted from shadPS4 Core::Emulator::Run()
 // (third_party/shadPS4 @ 0fe263a4760dfbfa973366890061749b4af0de97). Differences:
-//  * configuration comes from SecondSonPC.toml, applied in memory (shadPS4's config.json in
-//    runtime\sspc\user is never saved by SecondSonPC);
+//  * configuration comes from SecondSonPC.toml (ApplyBridgeSettings). On the sspc path shadPS4's
+//    config.json, custom_configs\<id>.json, users.json and keys.json in runtime\sspc\user are not
+//    read; the shadps4 path loads them as Phase 0 did and then gets the same SecondSonPC values;
 //  * /savedata0 lives under SecondSonPC [Paths] userData (shadPS4 "home dir"), not in any shadPS4 install;
 //  * no game patches/cheats, Discord RPC, launcher IPC or play-time tracking.
 // Two loader paths (--loader):
@@ -194,6 +195,55 @@ bool IsUnder(const std::filesystem::path& path, const std::filesystem::path& roo
 
 bool Listed(const std::vector<std::string>& list, std::string_view value) {
     return std::find(list.begin(), list.end(), value) != list.end();
+}
+
+/// Every EmulatorSettings value the bridge reads on the game's path that SecondSonPC decides
+/// (docs/MIGRATION.md, "EmulatorSettings"). On the sspc path nothing else is loaded, so the other
+/// values are shadPS4's built-in defaults: bridge internals SecondSonPC keeps as they are (GPU
+/// accuracy knobs, log details) or features this game does not use (camera, IME, USB, trophy
+/// pop-up layout, launcher). The same values are applied on the shadps4 path after its
+/// config.json, so both loaders run with identical settings.
+void ApplyBridgeSettings(const App::Config& cfg) {
+    auto& s = EmulatorSettings;
+    // [Console]: the emulated PS4 (sceKernelIsNeoMode, the direct/flexible memory budget).
+    s.SetNeo(cfg.neo_mode);
+    s.SetDevKit(cfg.dev_kit);
+    s.SetExtraDmemInMBytes(static_cast<int>(cfg.extra_dmem_mib));
+    s.SetExtraFmemInMBytes(static_cast<int>(cfg.extra_fmem_mib));
+    // shadPS4-internal users of the language (trophy XML, save locale); the game asks ours.
+    s.SetConsoleLanguage(cfg.language_id);
+    // [Paths]: /savedata0 and trophies of the BRIDGE SaveData/NpTrophy live under userData\home.
+    s.SetHomeDir(cfg.user_data_dir / "home");
+    // [Display]
+    s.SetFullScreen(cfg.fullscreen);
+    // shadPS4's spelling: anything but "Fullscreen" means borderless (its default is "Windowed").
+    s.SetFullScreenMode(cfg.exclusive_fullscreen ? "Fullscreen" : "Windowed");
+    s.SetWindowWidth(cfg.window_width);
+    s.SetWindowHeight(cfg.window_height);
+    s.SetVblankFrequency(cfg.vblank_hz);
+    s.SetPresentMode(cfg.present_mode);
+    s.SetShowFpsCounter(cfg.show_fps);
+    // [Audio]
+    s.SetAudioBackend(AudioBackend::SDL);
+    s.SetVolumeSlider(static_cast<int>(cfg.volume));
+    s.SetSDLMainOutputDevice(cfg.audio_device.empty() ? "Default Device" : cfg.audio_device);
+    // Offline console: no network, no shadNet (NP offline is Phase 3).
+    s.SetConnectedToNetwork(false);
+    s.SetShadNetEnabled(false);
+    // [Debug]
+    s.SetVkValidationEnabled(cfg.vulkan_validation);
+    s.SetVkCrashDiagnosticEnabled(cfg.vulkan_crash_diagnostic);
+    // [Log]
+    s.SetLogFilter(cfg.bridge_log_filter);
+    SSPC_LOG(Bridge, Info,
+             "bridge settings from SecondSonPC.toml: neo {}, devkit {}, extra dmem/fmem {}/{} MiB, "
+             "window {}x{}{}, vblank {} Hz, present {}, volume {}, audio device \"{}\", "
+             "vk validation {}, crash diagnostic {}",
+             cfg.neo_mode, cfg.dev_kit, cfg.extra_dmem_mib, cfg.extra_fmem_mib, cfg.window_width,
+             cfg.window_height,
+             cfg.fullscreen ? (cfg.exclusive_fullscreen ? " fullscreen" : " borderless") : "",
+             cfg.vblank_hz, cfg.present_mode, cfg.volume, cfg.audio_device, cfg.vulkan_validation,
+             cfg.vulkan_crash_diagnostic);
 }
 
 /// Host file of a guest path in /app0 (the module loader's view; the game's files go through the
@@ -652,9 +702,20 @@ void RunGame(const App::Config& cfg) {
     SSPC_LOG(Bridge, Info, "shadPS4 core {} (temporary bridge), user dir {}", Common::g_scm_rev,
              shad_user.string());
 
-    KeyManager::GetInstance()->LoadFromFile();
-    EmulatorSettings.Load();
-    UserSettings.Load();
+    if (own_loader) {
+        // The bridge's users (controller slots, save/trophy folders by user id) live in memory
+        // only: the four default users 1000..1003, the ids SecondSonPC's UserService uses.
+        UserManagement.GetUsers() = UserManagement.CreateDefaultUsers();
+        SSPC_LOG(Bridge, Info,
+                 "bridge configuration from SecondSonPC.toml only; config.json, custom_configs, "
+                 "users.json and keys.json in {} are not read",
+                 shad_user.string());
+    } else {
+        // Phase 0 path (oracle): shadPS4's own files, then SecondSonPC.toml on top (below).
+        KeyManager::GetInstance()->LoadFromFile();
+        EmulatorSettings.Load();
+        UserSettings.Load();
+    }
 
     // /app0 in shadPS4's mount table: on the shadps4 path it is the game's file system; on the sspc
     // path only BRIDGE code reads through it (SaveData: /app0/sce_sys/save_data.png; the trophy
@@ -672,19 +733,12 @@ void RunGame(const App::Config& cfg) {
     Common::PSFAttributes psf_attributes{};
     psf_attributes.raw = meta.attributes;
 
-    // Per-game overrides of the bridge core (runtime\sspc\user\custom_configs\<id>.json, normally
-    // absent), then SecondSonPC.toml on top. Nothing is written back.
-    EmulatorSettings.Load(id);
-    EmulatorSettings.SetConsoleLanguage(cfg.language_id); // shadPS4-internal users only (trophy
-                                                          // XML, save locale); the game asks ours
+    if (!own_loader) {
+        // Per-game overrides of the Phase 0 path (custom_configs\<id>.json, normally absent).
+        EmulatorSettings.Load(id);
+    }
     std::filesystem::create_directories(cfg.user_data_dir / "home", ec);
-    EmulatorSettings.SetHomeDir(cfg.user_data_dir / "home");
-    EmulatorSettings.SetFullScreen(cfg.fullscreen);
-    EmulatorSettings.SetWindowWidth(cfg.window_width);
-    EmulatorSettings.SetWindowHeight(cfg.window_height);
-    EmulatorSettings.SetVblankFrequency(cfg.vblank_hz);
-    EmulatorSettings.SetConnectedToNetwork(false);
-    EmulatorSettings.SetLogFilter(cfg.bridge_log_filter);
+    ApplyBridgeSettings(cfg);
     Common::Log::Switch("bridge_shadps4.log", false); // applies the filter
 
     SSPC_LOG(Bridge, Info, "game {} \"{}\" v{} fw {:#x}", id, title, app_version, fw_version);

@@ -1,6 +1,10 @@
 // SecondSonPC — SecondSonPC.toml parser. Wrong types are errors, never silent defaults.
 #include "app/config.h"
 
+#include <algorithm>
+#include <set>
+#include <utility>
+
 #include <fmt/format.h>
 #include <toml.hpp>
 
@@ -19,6 +23,7 @@ public:
     Reader(const toml::value& root, std::vector<std::string>& errors) : root_{root}, errors_{errors} {}
 
     const toml::value* Find(const char* table, const char* key) const {
+        known_.emplace(table, key);
         if (!root_.is_table() || !root_.contains(table)) {
             return nullptr;
         }
@@ -82,6 +87,31 @@ public:
         errors_.push_back(std::move(message));
     }
 
+    /// Every table/key of the file must have been asked for: a misspelt key is an error, not a
+    /// silently ignored line.
+    void ReportUnknown() const {
+        if (!root_.is_table()) {
+            return;
+        }
+        for (const auto& [table, value] : root_.as_table()) {
+            const bool known_table = std::ranges::any_of(
+                known_, [&](const auto& k) { return k.first == table; });
+            if (!known_table) {
+                errors_.push_back(fmt::format("unknown table [{}]", table));
+                continue;
+            }
+            if (!value.is_table()) {
+                errors_.push_back(fmt::format("[{}] must be a table", table));
+                continue;
+            }
+            for (const auto& [key, unused] : value.as_table()) {
+                if (!known_.contains({table, key})) {
+                    errors_.push_back(fmt::format("[{}] unknown key {}", table, key));
+                }
+            }
+        }
+    }
+
 private:
     void Bad(const char* table, const char* key, std::string_view expected) const {
         errors_.push_back(fmt::format("[{}] {} must be {}", table, key, expected));
@@ -89,6 +119,7 @@ private:
 
     const toml::value& root_;
     std::vector<std::string>& errors_;
+    mutable std::set<std::pair<std::string, std::string>> known_;
 };
 
 } // namespace
@@ -137,6 +168,11 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
         r.Error("[System] enterButton must be \"cross\" or \"circle\"");
     }
 
+    r.Bool("Console", "neoMode", c.neo_mode);
+    r.Bool("Console", "devKit", c.dev_kit);
+    r.UInt("Console", "extraDirectMemoryMiB", c.extra_dmem_mib, 0, 4096);
+    r.UInt("Console", "extraFlexibleMemoryMiB", c.extra_fmem_mib, 0, 4096);
+
     std::string user_data = "userdata";
     std::string logs = "logs";
     r.String("Paths", "userData", user_data);
@@ -152,6 +188,27 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     r.UInt("Display", "height", c.window_height, 360, 4320);
     r.Bool("Display", "fullscreen", c.fullscreen);
     r.UInt("Display", "vblankFrequency", c.vblank_hz, 30, 360);
+    std::string present = "mailbox";
+    r.String("Display", "presentMode", present);
+    if (present == "mailbox" || present == "fifo" || present == "immediate") {
+        c.present_mode = present == "mailbox" ? "Mailbox" : present == "fifo" ? "Fifo" : "Immediate";
+    } else {
+        r.Error("[Display] presentMode must be \"mailbox\", \"fifo\" or \"immediate\"");
+    }
+    std::string fullscreen_mode = "borderless";
+    r.String("Display", "fullscreenMode", fullscreen_mode);
+    if (fullscreen_mode == "borderless" || fullscreen_mode == "exclusive") {
+        c.exclusive_fullscreen = fullscreen_mode == "exclusive";
+    } else {
+        r.Error("[Display] fullscreenMode must be \"borderless\" or \"exclusive\"");
+    }
+    r.Bool("Display", "showFps", c.show_fps);
+
+    r.UInt("Audio", "volume", c.volume, 0, 100);
+    r.String("Audio", "device", c.audio_device);
+
+    r.Bool("Debug", "vulkanValidation", c.vulkan_validation);
+    r.Bool("Debug", "vulkanCrashDiagnostic", c.vulkan_crash_diagnostic);
 
     r.Number("Input", "mouseSensitivity", c.mouse_sensitivity, 0.01, 100.0);
     r.Bool("Input", "invertY", c.invert_y);
@@ -168,6 +225,7 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     r.Bool("Trace", "importCounter", c.import_counter);
     r.UInt("Trace", "dumpIntervalSeconds", c.dump_interval_s, 1, 3600);
 
+    r.ReportUnknown();
     if (!errors.empty()) {
         return std::nullopt;
     }

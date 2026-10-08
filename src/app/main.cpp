@@ -3,7 +3,7 @@
 //     --lang <locale>          overrides [Language] system for this run
 //     --loader sspc|shadps4    sspc: SecondSonPC's own Loader (Phase 1);
 //                              shadps4: Phase 0 path on shadPS4's Core::Linker (in-binary oracle)
-//     --system-name <name>     overrides [System] name (reproduces SSPC-001 when non-empty)
+//     --system-name <name>     overrides [System] name
 //   diagnostics:
 //     --no-counter             disables the import call counter
 //     --call-order <N>         records the first N import calls -> logs\call_order.txt
@@ -138,11 +138,6 @@ int main(int argc, char* argv[]) {
     });
     SSPC_LOG(SystemService, Info, "SystemName \"{}\", enter button {}", config->system_name,
              config->enter_button_cross ? "cross" : "circle");
-    if (!config->system_name.empty()) {
-        SSPC_LOG(SystemService, Warning,
-                 "non-empty SystemName: known crash after the settings save (docs/KNOWN_ISSUES.md "
-                 "SSPC-001, reproducer tools/repro_sspc001.ps1)");
-    }
     SSPC_LOG(Trace, Info, "import counter {}, call order {}, bind natives {}, bind observers {}",
              config->import_counter ? "on" : "off", config->call_order, config->bind_natives,
              config->bind_observers);

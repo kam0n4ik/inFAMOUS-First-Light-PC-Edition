@@ -1,4 +1,7 @@
 # SecondSonPC configuration. Paths may be absolute or relative to this file's folder.
+# Every setting SecondSonPC and its temporary shadPS4 bridge use comes from this file; with the
+# default loader (sspc) shadPS4's runtime\sspc\user\config.json is not read (docs\MIGRATION.md).
+# A misspelt table or key is an error at start-up.
 
 [Game]
 path = 'E:\shdps4\CUSA00004'      # read-only: eboot.bin, sce_module, art are never modified
@@ -7,9 +10,14 @@ path = 'E:\shdps4\CUSA00004'      # read-only: eboot.bin, sce_module, art are ne
 system = "ru-RU"                   # "ru-RU" (PS4 id 8) | "en-US" (PS4 id 1)
 
 [System]
-name = ""                          # sceSystemServiceParamGetString(SystemName); non-empty -> known
-                                   # crash in Phase 0 (docs/KNOWN_ISSUES.md, SSPC-001)
+name = ""                          # sceSystemServiceParamGetString(SystemName)
 enterButton = "cross"              # "cross" | "circle"
+
+[Console]                          # the emulated PS4 (the game sees these)
+neoMode = false                    # PS4 Pro (sceKernelIsNeoMode, memory budget)
+devKit = false                     # development kit memory budget
+extraDirectMemoryMiB = 0           # added to the retail direct memory budget
+extraFlexibleMemoryMiB = 0         # added to the retail flexible memory budget
 
 [Paths]
 userData = "userdata"              # /savedata0 -> userdata\home\<user>\savedata\CUSA00004\<dir>
@@ -18,8 +26,15 @@ logs = "logs"                      # SecondSonPC.log, calls.json, bridge_shadps4
 [Display]
 width = 1280
 height = 720
-fullscreen = false
+fullscreen = false                 # F11 toggles while playing
+fullscreenMode = "borderless"      # "borderless" | "exclusive"
 vblankFrequency = 60               # FPS unlock is a later stage (game timing must be checked first)
+presentMode = "mailbox"            # "mailbox" | "fifo" (vsync) | "immediate"
+showFps = false                    # FPS counter overlay at start-up (F10 toggles)
+
+[Audio]
+volume = 100                       # 0..100, on top of the game's own volume settings
+device = ""                        # output device name; "" = system default
 
 [Input]                            # used from Phase 3 (keyboard/mouse backend)
 mouseSensitivity = 1.0
@@ -28,6 +43,10 @@ invertY = false
 [Log]
 level = "info"                     # trace | debug | info | warning | error | critical
 bridgeFilter = "*:info"            # temporary shadPS4 core log (logs\bridge_shadps4.log)
+
+[Debug]                            # diagnostics of the temporary Vulkan bridge
+vulkanValidation = false           # Khronos validation layer (slow; needs the Vulkan SDK)
+vulkanCrashDiagnostic = false      # crash diagnostic layer
 
 [Trace]
 importCounter = true               # count calls of every bound import -> logs\calls.json
