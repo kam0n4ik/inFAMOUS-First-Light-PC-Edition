@@ -36,9 +36,41 @@ showFps = false                    # FPS counter overlay at start-up (F10 toggle
 volume = 100                       # 0..100, on top of the game's own volume settings
 device = ""                        # output device name; "" = system default
 
-[Input]                            # used from Phase 3 (keyboard/mouse backend)
-mouseSensitivity = 1.0
+[Input]                            # keyboard/mouse controller (docs\INPUT_MAPPING.md)
+mouseSensitivity = 1.0             # camera speed for a given mouse speed
 invertY = false
+mouseDeadzone = 0.10               # right-stick deflection a moving mouse starts from (0..0.9)
+captureMouse = true                # a click captures the mouse, Esc / Alt+Tab release it
+motionSensitivity = 1.0            # motion mode (G): controller rotation per mouse movement
+sideways = "right-up"              # motion mode: "right-up" | "left-up" (which side points up)
+
+[Keyboard]                         # action = "Key" or ["Key", "Mouse Left", ...]; [] = unbound.
+                                   # Key names are SDL scancode names (layout independent).
+cross = "Space"
+circle = "E"
+square = "V"
+triangle = "F"
+l1 = "Q"
+r1 = "R"
+l2 = "Mouse Right"
+r2 = "Mouse Left"
+l3 = "Left Shift"
+r3 = ["Mouse Middle", "Z"]
+options = ["Return", "Escape"]
+touchPad = "Tab"                   # touch pad click (a finger at the centre while held)
+dpadUp = "Up"
+dpadDown = "Down"
+dpadLeft = "Left"
+dpadRight = "Right"
+moveForward = "W"
+moveBack = "S"
+moveLeft = "A"
+moveRight = "D"
+walk = "Left Ctrl"                 # left stick at half deflection
+releaseMouse = "Escape"            # gives the cursor back
+motionMode = "G"                   # controller held sideways, the mouse moves it (graffiti)
+shake = "X"                        # shakes the controller while held (spray can)
+touchDrag = "T"                    # while held the mouse drags a finger on the touch pad
 
 [Log]
 level = "info"                     # trace | debug | info | warning | error | critical

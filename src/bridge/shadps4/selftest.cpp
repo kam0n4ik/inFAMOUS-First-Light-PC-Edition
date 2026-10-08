@@ -16,9 +16,14 @@
 #include <string>
 #include <vector>
 
+#include <cmath>
+
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_mouse.h>
 #include <fmt/format.h>
 
 #include "app/config.h"
+#include "input/keyboard_mouse.h"
 #include "base/log.h"
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
@@ -561,6 +566,322 @@ void TestUserService(Totals& t) {
     t.failures += ok2 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------- Pad
+
+/// Pad data line without the timestamp (bytes 80..87): the two sides read the clock at different
+/// moments.
+std::string PadDataLine(const u8* d) {
+    float f[10];
+    std::memcpy(f, d + 12, sizeof(f));
+    u32 buttons;
+    std::memcpy(&buttons, d, sizeof(buttons));
+    return fmt::format("buttons {:#x} sticks {} {} {} {} l2/r2 {} {} q ({:.4f} {:.4f} {:.4f} {:.4f}) "
+                       "a ({:.4f} {:.4f} {:.4f}) w ({:.4f} {:.4f} {:.4f}) touch {} connected {} count {} "
+                       "rest {}{}",
+                       buttons, d[4], d[5], d[6], d[7], d[8], d[9], f[0], f[1], f[2], f[3], f[4], f[5],
+                       f[6], f[7], f[8], f[9], d[52], d[76], d[104], Hex(d + 52, 28), Hex(d + 88, 32));
+}
+
+void PadScript(Side& s) {
+    const auto init = s.F("hv1luiJrqQM"), open = s.F("xk0AcarP3V4"), close = s.F("6ncge5+l5Qs"),
+               read = s.F("YndgXqQVV7c"), info = s.F("gjP9-KQzoUk"), light = s.F("RR4novUEENY"),
+               vibration = s.F("yFVnOdGxvZY");
+    const void* none = nullptr;
+    s.Line("Open before Init -> {}", Code(Call<s32>(open, 1000, 0, 0, none)));
+    s.Line("Init -> {}", Code(Call<s32>(init)));
+    const s32 h = Call<s32>(open, 1000, 0, 0, none);
+    s.Line("Open user 1000 standard -> {}", Code(h));
+    s.Line("Open again -> {}", Code(Call<s32>(open, 1000, 0, 0, none)));
+    s.Line("Open user -1 -> {}", Code(Call<s32>(open, -1, 0, 0, none)));
+    s.Line("Open user 5000 -> {}", Code(Call<s32>(open, 5000, 0, 0, none)));
+    s.Line("Open system user standard -> {}", Code(Call<s32>(open, 255, 0, 0, none)));
+    s.Line("Open user 1000 remote control -> {}", Code(Call<s32>(open, 1000, 16, 0, none)));
+    u8 ci[28];
+    std::memset(ci, 0xAB, sizeof(ci));
+    s.Line("GetControllerInformation -> {} {}", Code(Call<s32>(info, h, static_cast<void*>(ci))), Hex(ci, sizeof(ci)));
+    u8 data[120];
+    std::memset(data, 0xAB, sizeof(data));
+    s.Line("ReadState -> {}", Code(Call<s32>(read, h, static_cast<void*>(data))));
+    s.Line("  {}", PadDataLine(data));
+    s.Line("ReadState null -> {}", Code(Call<s32>(read, h, static_cast<void*>(nullptr))));
+    s.Line("ReadState bad handle -> {}", Code(Call<s32>(read, 9999, static_cast<void*>(data))));
+    const u8 dark[4] = {0, 0, 0, 0}, blue[4] = {0, 0, 255, 0};
+    s.Line("SetLightBar dark -> {}", Code(Call<s32>(light, h, static_cast<const void*>(dark))));
+    s.Line("SetLightBar blue -> {}", Code(Call<s32>(light, h, static_cast<const void*>(blue))));
+    s.Line("SetLightBar null -> {}", Code(Call<s32>(light, h, none)));
+    s.Line("SetLightBar bad handle -> {}", Code(Call<s32>(light, 9999, static_cast<const void*>(blue))));
+    const u8 still[2] = {0, 0};
+    s.Line("SetVibration 0 -> {}", Code(Call<s32>(vibration, h, static_cast<const void*>(still))));
+    s.Line("SetVibration null -> {}", Code(Call<s32>(vibration, h, none)));
+    s.Line("SetVibration bad handle -> {}", Code(Call<s32>(vibration, 9999, static_cast<const void*>(still))));
+    s.Line("Close -> {}", Code(Call<s32>(close, h)));
+    s.Line("Close again -> {}", Code(Call<s32>(close, h)));
+    s.Line("GetControllerInformation closed -> {}", Code(Call<s32>(info, h, static_cast<void*>(ci))));
+}
+
+void TestPad(Totals& t) {
+    Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+    PadScript(native);
+    PadScript(bridge);
+    Compare(t, "Pad", native, bridge);
+}
+
+// ---------------------------------------------------------------------------- Input (native)
+
+/// Behaviour of the keyboard/mouse controller against expected values (there is no BRIDGE
+/// counterpart: shadPS4's keyboard layer is a different design).
+class InputChecks {
+public:
+    explicit InputChecks(Totals& t) : t_{t} {}
+    void Check(const std::string& what, bool ok, const std::string& detail) {
+        ++t_.checks;
+        ++checks_;
+        if (!ok) {
+            ++t_.failures;
+            ++failures_;
+            t_.report.push_back(fmt::format("  DIFF  Input: {}: {}", what, detail));
+        }
+    }
+    void Summary() {
+        t_.report.push_back(fmt::format("{:14} {:4} checks, {} different, 0 known differences - {}",
+                                        "Input", checks_, failures_, failures_ == 0 ? "PASS" : "FAIL"));
+    }
+
+private:
+    Totals& t_;
+    int checks_ = 0;
+    int failures_ = 0;
+};
+
+SDL_Event KeyEvent(SDL_Scancode sc, bool down, bool repeat = false) {
+    SDL_Event e{};
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.key.scancode = sc;
+    e.key.down = down;
+    e.key.repeat = repeat;
+    return e;
+}
+
+SDL_Event MotionEvent(float dx, float dy) {
+    SDL_Event e{};
+    e.type = SDL_EVENT_MOUSE_MOTION;
+    e.motion.xrel = dx;
+    e.motion.yrel = dy;
+    return e;
+}
+
+SDL_Event ButtonEvent(u8 button, bool down) {
+    SDL_Event e{};
+    e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+    e.button.button = button;
+    e.button.down = down;
+    return e;
+}
+
+/// shadPS4's gyro integration (input/controller.cpp, CalculateOrientation): q += q * omega / 2 * dt.
+Input::Quat IntegrateLikeBridge(Input::Quat q, const Input::Vec3& w, float dt) {
+    const Input::Quat d = Input::Multiply(q, Input::Quat{w.x, w.y, w.z, 0.0f});
+    q = {q.x + 0.5f * d.x * dt, q.y + 0.5f * d.y * dt, q.z + 0.5f * d.z * dt, q.w + 0.5f * d.w * dt};
+    const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return {q.x / n, q.y / n, q.z / n, q.w / n};
+}
+
+void TestInput(Totals& t) {
+    namespace Button = Input::Button;
+    InputChecks c{t};
+    Input::KeyboardMouse km;
+    km.Configure(Input::DefaultSettings());
+    km.AttachWindow(nullptr, true); // logical capture: mouse events count
+    u64 now = 1'000'000;
+    const auto read = [&](u64 step_us = 10'000) {
+        now += step_us;
+        return km.Read(now);
+    };
+    const auto sticks = [](const Input::PadState& s) {
+        return fmt::format("l {} {} r {} {}", s.lx, s.ly, s.rx, s.ry);
+    };
+
+    auto s = read();
+    c.Check("rest", s.buttons == 0 && s.lx == 128 && s.ly == 128 && s.rx == 128 && s.ry == 128 &&
+                        s.l2 == 0 && s.r2 == 0 && !s.motion.active && s.motion.acceleration.y == Input::kGravity &&
+                        s.motion.orientation.w == 1.0f && !s.touch_active,
+            sticks(s));
+
+    km.OnEvent(KeyEvent(SDL_SCANCODE_W, true));
+    s = read();
+    c.Check("W = left stick up", s.lx == 128 && s.ly == 0, sticks(s));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_D, true));
+    s = read();
+    c.Check("W+D = diagonal on the circle", s.lx == 218 && s.ly == 37, sticks(s));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_A, true));
+    s = read();
+    c.Check("A after D: last pressed wins", s.lx == 37 && s.ly == 37, sticks(s));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_A, false));
+    s = read();
+    c.Check("A released: D again", s.lx == 218, sticks(s));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_LCTRL, true));
+    s = read();
+    c.Check("walk = half deflection", s.lx == 173 && s.ly == 82, sticks(s));
+    for (auto sc : {SDL_SCANCODE_LCTRL, SDL_SCANCODE_W, SDL_SCANCODE_D}) {
+        km.OnEvent(KeyEvent(sc, false));
+    }
+    s = read();
+    c.Check("all released", s.lx == 128 && s.ly == 128, sticks(s));
+
+    km.OnEvent(KeyEvent(SDL_SCANCODE_SPACE, true));
+    s = read();
+    c.Check("Space = cross", s.buttons == Button::Cross, fmt::format("{:#x}", s.buttons));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_SPACE, false));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_SPACE, true, true)); // auto-repeat of a released key
+    s = read();
+    c.Check("key repeat is not a press", s.buttons == 0, fmt::format("{:#x}", s.buttons));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_RETURN, true));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_ESCAPE, true));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_RETURN, false));
+    s = read();
+    c.Check("Enter released, Esc held: options stays", s.buttons == Button::Options,
+            fmt::format("{:#x}", s.buttons));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_ESCAPE, false));
+
+    km.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, true));
+    km.OnEvent(ButtonEvent(SDL_BUTTON_RIGHT, true));
+    s = read();
+    c.Check("mouse buttons = R2 + L2", s.buttons == (Button::R2 | Button::L2) && s.r2 == 255 && s.l2 == 255,
+            fmt::format("{:#x} {} {}", s.buttons, s.l2, s.r2));
+    km.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, false));
+    km.OnEvent(ButtonEvent(SDL_BUTTON_RIGHT, false));
+
+    // Mouse -> right stick: speed over the read interval.
+    s = read();
+    km.OnEvent(MotionEvent(15.0f, 0.0f)); // 1500 counts/s over 10 ms: full deflection
+    s = read();
+    c.Check("fast mouse = full right", s.rx == 255 && s.ry == 128, sticks(s));
+    km.OnEvent(MotionEvent(3.0f, 0.0f)); // 300 counts/s: 0.2 -> 0.1 + 0.9 * 0.2 = 0.28
+    s = read();
+    c.Check("slow mouse starts past the dead zone", s.rx == 163, sticks(s));
+    s = read();
+    c.Check("no movement = centre (no smoothing tail)", s.rx == 128 && s.ry == 128, sticks(s));
+    km.OnEvent(MotionEvent(0.0f, -6.0f)); // up, 600 counts/s: 0.46
+    s = read();
+    c.Check("mouse up = right stick up", s.rx == 128 && s.ry == 69, sticks(s));
+    // The same 30 counts at 30 and at 60 frames per second turn the camera equally far.
+    const auto turned = [&](int frames, u64 frame_us) {
+        double sum = 0.0;
+        for (int i = 0; i < frames; ++i) {
+            km.OnEvent(MotionEvent(30.0f / frames, 0.0f));
+            const auto r = read(frame_us);
+            sum += (r.rx - 127.5) / 127.5 * frame_us / 1e6;
+        }
+        read(frame_us); // let the stick return
+        return sum;
+    };
+    const double at30 = turned(1, 33'333), at60 = turned(2, 16'667);
+    c.Check("camera turn independent of frame rate", std::abs(at30 - at60) < 0.01 * at30,
+            fmt::format("30 fps {:.5f}, 60 fps {:.5f}", at30, at60));
+    // A second read in the same frame does not see a near-zero interval.
+    km.OnEvent(MotionEvent(15.0f, 0.0f));
+    const auto first = read();
+    const auto second = read(100);
+    c.Check("two reads in one frame agree", first.rx == second.rx, fmt::format("{} {}", first.rx, second.rx));
+
+    // Touch pad.
+    s = read();
+    km.OnEvent(KeyEvent(SDL_SCANCODE_TAB, true));
+    s = read();
+    c.Check("Tab = touch pad click at the centre",
+            s.buttons == Button::TouchPad && s.touch_active && s.touch[0].down && s.touch[0].x == 960 &&
+                s.touch[0].y == 471,
+            fmt::format("{:#x} {} {} {}", s.buttons, s.touch_active, s.touch[0].x, s.touch[0].y));
+    const u8 tap_id = s.touch[0].id;
+    km.OnEvent(KeyEvent(SDL_SCANCODE_TAB, false));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_T, true));
+    s = read();
+    km.OnEvent(MotionEvent(100.0f, -20.0f));
+    s = read();
+    c.Check("T + mouse drags a finger",
+            s.touch_active && s.touch[0].x == 1160 && s.touch[0].y == 431 && s.touch[0].id != tap_id &&
+                s.rx == 128,
+            fmt::format("{} {} {} id {} rx {}", s.touch_active, s.touch[0].x, s.touch[0].y, s.touch[0].id, s.rx));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_T, false));
+    s = read();
+    c.Check("finger lifted", !s.touch_active, "");
+
+    // Motion mode: the controller turns sideways (right side up) in 0.25 s.
+    km.OnEvent(KeyEvent(SDL_SCANCODE_G, true));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_G, false));
+    Input::Quat integrated{};
+    float max_wz = 0.0f;
+    for (int i = 0; i < 40; ++i) { // 0.4 s at 10 ms
+        s = read();
+        integrated = IntegrateLikeBridge(integrated, s.motion.angular_velocity, 0.01f);
+        max_wz = std::max(max_wz, s.motion.angular_velocity.z);
+    }
+    const auto& a = s.motion.acceleration;
+    c.Check("sideways: gravity along +X", std::abs(a.x - Input::kGravity) < 1e-3f && std::abs(a.y) < 1e-3f &&
+                                               std::abs(a.z) < 1e-3f,
+            fmt::format("({:.4f} {:.4f} {:.4f})", a.x, a.y, a.z));
+    const auto& q = s.motion.orientation;
+    c.Check("sideways: orientation = 90 deg about Z",
+            std::abs(q.z - 0.70711f) < 1e-3f && std::abs(q.w - 0.70711f) < 1e-3f && s.motion.active,
+            fmt::format("({:.4f} {:.4f} {:.4f} {:.4f})", q.x, q.y, q.z, q.w));
+    c.Check("sideways: turn rate while turning", std::abs(max_wz - 6.2832f) < 0.01f,
+            fmt::format("max wz {:.4f}", max_wz));
+    // Aim with the mouse while sideways; the bridge's integration of the reported gyro must give the
+    // reported orientation (conventions agree).
+    for (int i = 0; i < 50; ++i) {
+        km.OnEvent(MotionEvent(i < 25 ? 8.0f : -3.0f, i < 25 ? -5.0f : 4.0f));
+        s = read();
+        integrated = IntegrateLikeBridge(integrated, s.motion.angular_velocity, 0.01f);
+    }
+    const auto& r = s.motion.orientation;
+    const float dot = std::abs(r.x * integrated.x + r.y * integrated.y + r.z * integrated.z + r.w * integrated.w);
+    c.Check("gyro integrates to the reported orientation", dot > 0.9995f,
+            fmt::format("dot {:.6f} reported ({:.4f} {:.4f} {:.4f} {:.4f}) integrated ({:.4f} {:.4f} {:.4f} {:.4f})",
+                        dot, r.x, r.y, r.z, r.w, integrated.x, integrated.y, integrated.z, integrated.w));
+    c.Check("motion mode: mouse does not move the right stick", s.rx == 128 && s.ry == 128, sticks(s));
+    const Input::Vec3 g = Input::Rotate(r, s.motion.acceleration); // back to the reference frame
+    c.Check("gravity stays vertical in the reference frame",
+            std::abs(g.y - Input::kGravity) < 1e-3f && std::abs(g.x) < 1e-3f && std::abs(g.z) < 1e-3f,
+            fmt::format("({:.4f} {:.4f} {:.4f})", g.x, g.y, g.z));
+    // Shake: the vertical acceleration swings by +-1.5 g around 1 g.
+    km.OnEvent(KeyEvent(SDL_SCANCODE_X, true));
+    float lo = 1e9f, hi = -1e9f;
+    for (int i = 0; i < 30; ++i) {
+        s = read();
+        const float up = Input::Rotate(s.motion.orientation, s.motion.acceleration).y;
+        lo = std::min(lo, up);
+        hi = std::max(hi, up);
+    }
+    km.OnEvent(KeyEvent(SDL_SCANCODE_X, false));
+    c.Check("shake swings the accelerometer", hi - lo > 2.5f, fmt::format("vertical {:.3f}..{:.3f}", lo, hi));
+    // Motion mode off: back to rest.
+    km.OnEvent(KeyEvent(SDL_SCANCODE_G, true));
+    km.OnEvent(KeyEvent(SDL_SCANCODE_G, false));
+    for (int i = 0; i < 100; ++i) {
+        s = read();
+    }
+    c.Check("motion mode off: back to rest",
+            !s.motion.active && std::abs(s.motion.orientation.w - 1.0f) < 1e-5f &&
+                std::abs(s.motion.acceleration.y - Input::kGravity) < 1e-5f,
+            fmt::format("active {} w {:.6f}", s.motion.active, s.motion.orientation.w));
+
+    // Focus loss (Alt+Tab) without test mode: nothing stays pressed, no mouse piles up.
+    Input::KeyboardMouse real;
+    real.Configure(Input::DefaultSettings());
+    real.AttachWindow(nullptr, false);
+    u64 t2 = 5'000'000;
+    real.OnEvent(KeyEvent(SDL_SCANCODE_W, true));
+    auto s2 = real.Read(t2 += 10'000);
+    c.Check("before focus loss W is held", s2.ly == 0, sticks(s2));
+    SDL_Event lost{};
+    lost.type = SDL_EVENT_WINDOW_FOCUS_LOST;
+    real.OnEvent(lost);
+    real.OnEvent(MotionEvent(500.0f, 0.0f)); // not captured: ignored
+    s2 = real.Read(t2 += 10'000);
+    c.Check("after focus loss nothing is held and the mouse is ignored", s2.ly == 128 && s2.rx == 128, sticks(s2));
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -677,6 +998,8 @@ int RunSelfTest(const App::Config& cfg) {
     TestAppContent(t);
     TestSystemService(t);
     TestUserService(t);
+    TestPad(t);
+    TestInput(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

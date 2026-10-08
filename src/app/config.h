@@ -8,6 +8,7 @@
 
 #include "base/abi.h"
 #include "base/log.h"
+#include "input/settings.h"
 
 namespace SecondSon::App {
 
@@ -55,9 +56,8 @@ struct Config {
     bool vulkan_validation = false;
     bool vulkan_crash_diagnostic = false;
 
-    // [Input] (Phase 3, parsed and validated now)
-    double mouse_sensitivity = 1.0;
-    bool invert_y = false;
+    // [Input] + [Keyboard]: the keyboard/mouse controller of player 1 (docs/INPUT_MAPPING.md)
+    Input::Settings input = Input::DefaultSettings();
 
     // [Log]
     Log::Level log_level = Log::Level::Info;

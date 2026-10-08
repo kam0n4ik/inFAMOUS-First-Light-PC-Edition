@@ -17,6 +17,7 @@ $out = "$logs\runs\$Tag"
 New-Item -ItemType Directory -Force $out | Out-Null
 # Outputs of an earlier session must not be mistaken for this run's.
 foreach ($f in "calls.json", "call_order.txt") { Remove-Item "$logs\$f" -ErrorAction SilentlyContinue }
+Remove-Item "$logs\shots" -Recurse -ErrorAction SilentlyContinue # --press shot@sec frames
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -64,6 +65,10 @@ if (-not $exited) {
 
 foreach ($f in "SecondSonPC.log", "calls.json", "call_order.txt", "bridge_shadps4.log", "shad_log.txt") {
     if (Test-Path "$logs\$f") { Copy-Item "$logs\$f" "$out\$f" -Force }
+}
+if (Test-Path "$logs\shots") {
+    Remove-Item "$out\shots" -Recurse -ErrorAction SilentlyContinue
+    Copy-Item "$logs\shots" "$out\shots" -Recurse -Force
 }
 if (-not $NoReport) {
     & python -I "$root\tools\make_calls_md.py" --calls "$out\calls.json" --run-note "tag=$Tag lang='$Lang' seconds=$Seconds"

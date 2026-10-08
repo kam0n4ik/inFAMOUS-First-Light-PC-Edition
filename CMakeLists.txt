@@ -23,6 +23,9 @@ add_library(sspc_runtime STATIC
     src/base/crash.cpp
     src/base/log.cpp
     src/base/vram_monitor.cpp
+    src/input/keyboard_mouse.cpp
+    src/input/motion.cpp
+    src/input/settings.cpp
     src/loader/bindings.cpp
     src/loader/eh_frame.cpp
     src/loader/image_file.cpp
@@ -37,6 +40,7 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
     src/runtime/language.cpp
+    src/runtime/pad/pad.cpp
     src/runtime/playgo/playgo.cpp
     src/runtime/psf/param_sfo.cpp
     src/runtime/sysmodule/sysmodule.cpp
@@ -48,6 +52,8 @@ target_include_directories(sspc_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # PRIVATE: must not leak into the shadPS4 sources of the bridge target.
 target_compile_definitions(sspc_runtime PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(sspc_runtime PRIVATE /utf-8 /W4)
-target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi)
+# SDL3: SecondSonPC's own input layer (src/input) reads SDL events; the library comes from the
+# bridge's externals until SecondSonPC has its own window (Phase 4).
+target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi SDL3::SDL3)
 
 sspc_attach_bootstrap(sspc_runtime)

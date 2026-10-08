@@ -6,6 +6,7 @@
 
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/fs_observer.h"
+#include "runtime/pad/pad.h"
 #include "runtime/system/system_service.h"
 #include "runtime/user/user_service.h"
 
@@ -63,7 +64,7 @@ std::vector<Export> Collect() {
     for (const auto group : {std::span<const Export>(kSystemExports), Loader::RtldExports(),
                              Sysmodule::SysmoduleExports(), Filesystem::FileSystemExports(),
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
-                             AppContent::AppContentExports(),
+                             AppContent::AppContentExports(), Pad::PadExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());
     }

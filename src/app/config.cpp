@@ -83,6 +83,30 @@ public:
         }
     }
 
+    /// A string or an array of strings. Returns whether the key is present.
+    bool Strings(const char* table, const char* key, std::vector<std::string>& out) const {
+        const auto* v = Find(table, key);
+        if (v == nullptr) {
+            return false;
+        }
+        if (v->is_string()) {
+            out.push_back(v->as_string());
+            return true;
+        }
+        if (v->is_array()) {
+            for (const auto& item : v->as_array()) {
+                if (!item.is_string()) {
+                    Bad(table, key, "a string or an array of strings");
+                    return false;
+                }
+                out.push_back(item.as_string());
+            }
+            return true;
+        }
+        Bad(table, key, "a string or an array of strings");
+        return false;
+    }
+
     void Error(std::string message) const {
         errors_.push_back(std::move(message));
     }
@@ -210,8 +234,40 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     r.Bool("Debug", "vulkanValidation", c.vulkan_validation);
     r.Bool("Debug", "vulkanCrashDiagnostic", c.vulkan_crash_diagnostic);
 
-    r.Number("Input", "mouseSensitivity", c.mouse_sensitivity, 0.01, 100.0);
-    r.Bool("Input", "invertY", c.invert_y);
+    auto& in = c.input;
+    r.Number("Input", "mouseSensitivity", in.mouse_sensitivity, 0.01, 100.0);
+    r.Bool("Input", "invertY", in.invert_y);
+    r.Number("Input", "mouseDeadzone", in.mouse_deadzone, 0.0, 0.9);
+    r.Bool("Input", "captureMouse", in.capture_mouse);
+    r.Number("Input", "motionSensitivity", in.motion_sensitivity, 0.01, 100.0);
+    std::string sideways = "right-up";
+    r.String("Input", "sideways", sideways);
+    if (sideways == "right-up" || sideways == "left-up") {
+        in.sideways_right_up = sideways == "right-up";
+    } else {
+        r.Error("[Input] sideways must be \"right-up\" or \"left-up\"");
+    }
+    // [Keyboard]: action = "Key" or ["Key", "Mouse Left", ...]; a listed action replaces its
+    // default binding, [] leaves it unbound.
+    for (size_t a = 0; a < Input::kActionCount; ++a) {
+        const std::string key(Input::ActionName(static_cast<Input::Action>(a)));
+        std::vector<std::string> names;
+        if (!r.Strings("Keyboard", key.c_str(), names)) {
+            continue;
+        }
+        std::vector<Input::InputCode> codes;
+        for (const auto& n : names) {
+            Input::InputCode code;
+            if (Input::ParseInput(n, code)) {
+                codes.push_back(code);
+            } else {
+                r.Error(fmt::format("[Keyboard] {}: unknown key \"{}\" (SDL key names, e.g. \"Space\", "
+                                    "\"W\", \"Left Shift\", \"Return\", or \"Mouse Left\")",
+                                    key, n));
+            }
+        }
+        in.bindings[a] = std::move(codes);
+    }
 
     std::string level = "info";
     r.String("Log", "level", level);

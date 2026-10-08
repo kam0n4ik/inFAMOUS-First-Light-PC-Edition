@@ -1,0 +1,42 @@
+diff --git a/src/sdl_window.cpp b/src/sdl_window.cpp
+index a7d36502..29dfacda 100644
+--- a/src/sdl_window.cpp
++++ b/src/sdl_window.cpp
+@@ -201,6 +201,12 @@ void WindowSDL::SetIcon(std::span<const u8> png_data) {
+     SetWindowIcon(window, std::vector<u8>(png_data.begin(), png_data.end()));
+ }
+ 
++static EventInterceptor g_event_interceptor = nullptr;
++
++void SetEventInterceptor(EventInterceptor interceptor) {
++    g_event_interceptor = interceptor;
++}
++
+ void WindowSDL::WaitEvent() {
+     // Called on main thread
+     SDL_Event event;
+@@ -209,6 +215,10 @@ void WindowSDL::WaitEvent() {
+         return;
+     }
+ 
++    if (g_event_interceptor != nullptr && g_event_interceptor(event)) {
++        return;
++    }
++
+     if (Libraries::Mouse::PushSDLEvent(event) || Libraries::Keyboard::PushSDLEvent(event)) {
+         return;
+     }
+diff --git a/src/sdl_window.h b/src/sdl_window.h
+index 5f82bf6e..be6c9dec 100644
+--- a/src/sdl_window.h
++++ b/src/sdl_window.h
+@@ -98,4 +98,9 @@ private:
+ void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png);
+ void SetDefaultWindowIcon(SDL_Window* window);
+ 
++// SecondSonPC patch 0006: the embedding application sees every window event first, on the main
++// thread, before shadPS4's input handling; returning true consumes the event.
++using EventInterceptor = bool (*)(const SDL_Event& event);
++void SetEventInterceptor(EventInterceptor interceptor);
++
+ } // namespace Frontend

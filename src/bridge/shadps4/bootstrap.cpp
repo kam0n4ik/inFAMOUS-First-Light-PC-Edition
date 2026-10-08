@@ -24,6 +24,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -36,6 +37,7 @@
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keyboard.h>
+#include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_timer.h>
 
 #include "app/config.h"
@@ -160,7 +162,7 @@ namespace {
 
 using LoaderBackend = App::Config::LoaderBackend;
 
-Input::GameControllers* g_controllers = nullptr;
+::Input::GameControllers* g_controllers = nullptr; // shadPS4's (not SecondSon::Input)
 
 void OnQuickExit() {
     Trace::FinalDump();
@@ -473,6 +475,13 @@ void StartBridgeLibraries(const Loader::Bindings& bindings, bool selftest) {
     SSPC_LOG(Bridge, Info, "{} shadPS4 libraries started ({} shadPS4 symbols discarded, not used "
                            "for resolution); InitHLELibs not used",
              started, discarded.GetSize());
+    if (!HasBridgeImport(bindings, "libScePad")) {
+        // libScePad is NATIVE: real controllers still come from shadPS4's SDL controller layer,
+        // which its (not started) RegisterLib would have opened.
+        StartControllers();
+        SSPC_LOG(Bridge, Info, "real controllers opened on the bridge's SDL controller layer "
+                               "(libScePad is NATIVE)");
+    }
 }
 
 /// The game's view of the file system (Vfs). /savedata0 is added by the SaveData observer when
@@ -516,6 +525,12 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         Fatal("binding table is inconsistent, see SecondSonPC.log");
     }
     StartBridgeLibraries(bindings, cfg.selftest);
+    if (!HasBridgeImport(bindings, "libScePad")) {
+        // Automated runs (--press) inject input; the system cursor must not be grabbed by them.
+        InstallNativeInput(cfg, g_window->GetSDLWindow(), !cfg.test_presses.empty());
+    } else {
+        SSPC_LOG(Bridge, Warning, "libScePad is BRIDGE: shadPS4's keyboard layout and controllers");
+    }
     SetupFilesystem(cfg, serial);
     if (cfg.selftest) {
         std::quick_exit(RunSelfTest(cfg));
@@ -545,47 +560,150 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }
 
-/// --press: input for automated runs (tools/smoke_runs.ps1). Each key goes into the window's SDL
-/// event queue as key-down, 150 ms later key-up — the events a real keyboard produces, handled by
-/// the bridge's input layer (default layout: n = cross); the window does not need focus.
-void StartTestInput(const std::string& spec) {
-    struct Press {
-        SDL_Keycode key;
-        std::string name;
+/// --press: input for automated runs (tools/smoke_runs.ps1). Comma-separated "what@seconds[:hold]",
+/// timed from the window opening; the events go into the window's SDL event queue (the window
+/// does not need focus) — the events a real keyboard and mouse produce:
+///   <SDL key name>    key down, `hold` s later (default 0.15) key up, by scancode (space, w, g,
+///                     return, ...). Layouts: --loader sspc = SecondSonPC's (space = cross),
+///                     --loader shadps4 = the bridge's (n = cross).
+///   mouse_left | mouse_right | mouse_middle   the same for a mouse button
+///   move:<dx>:<dy>    relative mouse movement spread evenly over `hold` s (10 ms steps)
+///   shot              one frame of the game -> <logs>\shots\<seconds>s.png (bridge screenshot)
+void StartTestInput(const std::string& spec, const std::filesystem::path& logs_dir) {
+    enum class Kind { KeyDown, KeyUp, ButtonDown, ButtonUp, Move, Shot };
+    struct Event {
         double at;
+        Kind kind;
+        SDL_Scancode scancode = SDL_SCANCODE_UNKNOWN;
+        u8 button = 0;
+        float dx = 0.0f, dy = 0.0f;
+        std::string label;
     };
-    std::vector<Press> presses;
+    std::vector<Event> timeline;
     size_t pos = 0;
     while (pos < spec.size()) {
         const size_t end = std::min(spec.find(',', pos), spec.size());
         const std::string token = spec.substr(pos, end - pos);
         pos = end + 1;
-        const size_t at = token.find('@');
-        const std::string name = token.substr(0, at);
-        const SDL_Keycode key = SDL_GetKeyFromName(name.c_str());
-        if (at == std::string::npos || key == SDLK_UNKNOWN) {
-            Fatal(fmt::format("--press: '{}' is not key@seconds with an SDL key name", token));
+        const size_t at_pos = token.find('@');
+        if (at_pos == std::string::npos) {
+            Fatal(fmt::format("--press: '{}' is not what@seconds[:hold]", token));
         }
-        presses.push_back({key, name, std::strtod(token.c_str() + at + 1, nullptr)});
+        const std::string what = token.substr(0, at_pos);
+        char* rest = nullptr;
+        const double at = std::strtod(token.c_str() + at_pos + 1, &rest);
+        const bool has_hold = rest != nullptr && *rest == ':';
+        const double hold = has_hold ? std::strtod(rest + 1, nullptr) : 0.15;
+        if (what == "shot") {
+            timeline.push_back({at, Kind::Shot, {}, 0, 0, 0, fmt::format("{:g}s", at)});
+        } else if (what.starts_with("move:")) {
+            float dx = 0.0f, dy = 0.0f;
+            if (std::sscanf(what.c_str(), "move:%f:%f", &dx, &dy) != 2) {
+                Fatal(fmt::format("--press: '{}' is not move:<dx>:<dy>", what));
+            }
+            const double span = has_hold ? hold : 0.0;
+            const int steps = std::max(1, static_cast<int>(std::lround(span / 0.01)));
+            for (int i = 0; i < steps; ++i) {
+                timeline.push_back({at + span * i / steps, Kind::Move, {}, 0, dx / steps, dy / steps,
+                                    i == 0 ? what : ""});
+            }
+        } else if (what == "mouse_left" || what == "mouse_right" || what == "mouse_middle") {
+            const u8 b = what == "mouse_left" ? SDL_BUTTON_LEFT
+                                              : (what == "mouse_right" ? SDL_BUTTON_RIGHT : SDL_BUTTON_MIDDLE);
+            timeline.push_back({at, Kind::ButtonDown, {}, b, 0, 0, what});
+            timeline.push_back({at + hold, Kind::ButtonUp, {}, b, 0, 0, ""});
+        } else {
+            const SDL_Scancode sc = SDL_GetScancodeFromName(what.c_str());
+            if (sc == SDL_SCANCODE_UNKNOWN) {
+                Fatal(fmt::format("--press: '{}' is not an SDL key name", what));
+            }
+            timeline.push_back({at, Kind::KeyDown, sc, 0, 0, 0, what});
+            timeline.push_back({at + hold, Kind::KeyUp, sc, 0, 0, 0, ""});
+        }
     }
-    std::ranges::sort(presses, {}, &Press::at);
-    std::thread([presses] {
-        const auto push = [](SDL_Keycode key, bool down) {
-            SDL_Event e{};
-            e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
-            e.key.timestamp = SDL_GetTicksNS();
-            e.key.key = key;
-            e.key.scancode = SDL_GetScancodeFromKey(key, nullptr);
-            e.key.down = down;
-            SDL_PushEvent(&e);
-        };
+    std::ranges::stable_sort(timeline, {}, &Event::at);
+    const auto shots = logs_dir / "shots";
+    std::thread([timeline, shots] {
         const auto t0 = std::chrono::steady_clock::now();
-        for (const auto& p : presses) {
-            std::this_thread::sleep_until(t0 + std::chrono::duration<double>(p.at));
-            push(p.key, true);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            push(p.key, false);
-            SSPC_LOG(App, Info, "test input: '{}' pressed at {:.1f} s", p.name, p.at);
+        for (const auto& ev : timeline) {
+            std::this_thread::sleep_until(t0 + std::chrono::duration<double>(ev.at));
+            SDL_Event e{};
+            switch (ev.kind) {
+            case Kind::KeyDown:
+            case Kind::KeyUp:
+                e.type = ev.kind == Kind::KeyDown ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+                e.key.timestamp = SDL_GetTicksNS();
+                e.key.scancode = ev.scancode;
+                e.key.key = SDL_GetKeyFromScancode(ev.scancode, SDL_KMOD_NONE, false);
+                e.key.down = ev.kind == Kind::KeyDown;
+                SDL_PushEvent(&e);
+                break;
+            case Kind::ButtonDown:
+            case Kind::ButtonUp:
+                e.type = ev.kind == Kind::ButtonDown ? SDL_EVENT_MOUSE_BUTTON_DOWN
+                                                     : SDL_EVENT_MOUSE_BUTTON_UP;
+                e.button.timestamp = SDL_GetTicksNS();
+                e.button.button = ev.button;
+                e.button.down = ev.kind == Kind::ButtonDown;
+                e.button.clicks = 1;
+                SDL_PushEvent(&e);
+                break;
+            case Kind::Move:
+                e.type = SDL_EVENT_MOUSE_MOTION;
+                e.motion.timestamp = SDL_GetTicksNS();
+                e.motion.xrel = ev.dx;
+                e.motion.yrel = ev.dy;
+                SDL_PushEvent(&e);
+                break;
+            case Kind::Shot: {
+                // The bridge saves the next presented frame into its screenshots folder; the new
+                // file is copied next to the logs under the requested time once it is complete.
+                // The bridge's file is left alone: right after writing it the bridge reads it
+                // back for its on-screen notification, and its texture manager crashes on an
+                // empty image (no check of stbi's result) — removing it here caused exactly that.
+                const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
+                std::error_code ec;
+                std::vector<std::filesystem::path> before;
+                for (const auto& f : std::filesystem::directory_iterator(dir, ec)) {
+                    before.push_back(f.path());
+                }
+                VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+                std::thread([before, dir, shots, label = ev.label] {
+                    for (int i = 0; i < 100; ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        std::error_code ec2;
+                        for (const auto& f : std::filesystem::directory_iterator(dir, ec2)) {
+                            if (f.path().extension() != ".png" ||
+                                std::ranges::find(before, f.path()) != before.end()) {
+                                continue;
+                            }
+                            // Complete = non-empty and the same size half a second later.
+                            u64 size = 0;
+                            for (int k = 0; k < 20; ++k) {
+                                const u64 now_size = std::filesystem::file_size(f.path(), ec2);
+                                if (!ec2 && now_size != 0 && now_size == size) {
+                                    break;
+                                }
+                                size = ec2 ? 0 : now_size;
+                                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            }
+                            std::filesystem::create_directories(shots, ec2);
+                            const auto target = shots / (label + ".png");
+                            std::filesystem::copy_file(f.path(), target,
+                                                       std::filesystem::copy_options::overwrite_existing, ec2);
+                            SSPC_LOG(App, Info, "test input: frame at {} -> {} ({} bytes)", label,
+                                     target.string(), size);
+                            return;
+                        }
+                    }
+                    SSPC_LOG(App, Warning, "test input: frame at {} was not saved", label);
+                }).detach();
+                break;
+            }
+            }
+            if (!ev.label.empty() && ev.kind != Kind::Shot) {
+                SSPC_LOG(App, Info, "test input: '{}' at {:.2f} s", ev.label, ev.at);
+            }
         }
     }).detach();
 }
@@ -765,7 +883,7 @@ void RunGame(const App::Config& cfg) {
     // Reserves the guest address space. Must precede Trace::Init (thunks are host allocations).
     auto* memory = Core::Memory::Instance();
     (void)memory;
-    g_controllers = Common::Singleton<Input::GameControllers>::Instance();
+    g_controllers = Common::Singleton<::Input::GameControllers>::Instance();
     // The Phase 0 path's loader. The sspc path never creates shadPS4's Core::Linker.
     Core::Linker* shad_linker = own_loader ? nullptr : Common::Singleton<Core::Linker>::Instance();
     VideoCore::LoadRenderDoc();
@@ -785,7 +903,7 @@ void RunGame(const App::Config& cfg) {
     g_window = window.get();
     window->SetIcon(meta.icon);
     if (!cfg.test_presses.empty()) {
-        StartTestInput(cfg.test_presses);
+        StartTestInput(cfg.test_presses, cfg.logs_dir);
     }
 
     using Common::FS::GetUserPath;

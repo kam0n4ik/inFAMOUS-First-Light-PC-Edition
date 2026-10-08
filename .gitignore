@@ -10,6 +10,7 @@ __pycache__/
 /toolchain/
 /userdata/
 /logs/runs/
+/logs/shots/
 /logs/calls.json
 /logs/*.txt
 /logs/*.tmp

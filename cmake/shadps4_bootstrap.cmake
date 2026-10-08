@@ -44,6 +44,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/bootstrap.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/fs_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/user_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/input_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/loader_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/rtld_tcb.cpp

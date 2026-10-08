@@ -6,6 +6,8 @@
 
 #include "loader/host.h"
 
+struct SDL_Window;
+
 namespace SecondSon::Filesystem {
 class FsHost;
 }
@@ -23,6 +25,15 @@ std::unique_ptr<Filesystem::FsHost> CreateFsHost();
 /// Native UserService: routes the input layer's logins to it, passes taken events on to NpManager
 /// (src/bridge/shadps4/user_host.cpp). Must run before the first controller check (window).
 void InstallUserHost();
+
+/// Opens the real controllers on shadPS4's SDL controller layer; the first check logs in the user
+/// of slot 1 (src/bridge/shadps4/input_host.cpp). Needed when libScePad is NATIVE (its BRIDGE
+/// RegisterLib, which does this, is then not started).
+void StartControllers();
+
+/// Native libScePad: its host (real controllers, clock) and SecondSonPC's keyboard/mouse on the
+/// bridge window (patch 0006). `test_mode`: automated runs (see Input::KeyboardMouse).
+void InstallNativeInput(const App::Config& cfg, SDL_Window* window, bool test_mode);
 
 /// --selftest (src/bridge/shadps4/selftest.cpp): exit code 0 = every check passed.
 int RunSelfTest(const App::Config& cfg);
