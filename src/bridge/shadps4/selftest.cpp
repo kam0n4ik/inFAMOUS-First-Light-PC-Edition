@@ -7,6 +7,8 @@
 //   PlayGo, AppContent, SystemService, UserService: return values, output buffers, error paths;
 //   ParamSfo: SecondSonPC's param.sfo reader against shadPS4's PSF (not an import: start-up data).
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -14,9 +16,8 @@
 #include <iterator>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
-
-#include <cmath>
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_mouse.h>
@@ -628,30 +629,160 @@ void TestPad(Totals& t) {
 
 // ---------------------------------------------------------------------------- Input (native)
 
-/// Behaviour of the keyboard/mouse controller against expected values (there is no BRIDGE
-/// counterpart: shadPS4's keyboard layer is a different design).
+/// Checks against expected values or tolerances (where the two sides cannot give equal text:
+/// clocks, or the keyboard/mouse layer, whose BRIDGE counterpart is a different design).
 class InputChecks {
 public:
-    explicit InputChecks(Totals& t) : t_{t} {}
+    explicit InputChecks(Totals& t, const char* group = "Input") : t_{t}, group_{group} {}
     void Check(const std::string& what, bool ok, const std::string& detail) {
         ++t_.checks;
         ++checks_;
         if (!ok) {
             ++t_.failures;
             ++failures_;
-            t_.report.push_back(fmt::format("  DIFF  Input: {}: {}", what, detail));
+            t_.report.push_back(fmt::format("  DIFF  {}: {}: {}", group_, what, detail));
         }
     }
     void Summary() {
         t_.report.push_back(fmt::format("{:14} {:4} checks, {} different, 0 known differences - {}",
-                                        "Input", checks_, failures_, failures_ == 0 ? "PASS" : "FAIL"));
+                                        group_, checks_, failures_, failures_ == 0 ? "PASS" : "FAIL"));
     }
 
 private:
     Totals& t_;
+    const char* group_;
     int checks_ = 0;
     int failures_ = 0;
 };
+
+// ---------------------------------------------------------------------------- libkernel time
+
+struct KTimespec {
+    s64 sec;
+    s64 nsec;
+    double Seconds() const {
+        return static_cast<double>(sec) + static_cast<double>(nsec) / 1e9;
+    }
+};
+
+/// Native and BRIDGE libkernel time functions on the same clocks: values within a tolerance (the
+/// two calls happen at different instants), error results and errno exactly.
+void TestKernelTime(Totals& t) {
+    InputChecks c{t, "KernelTime"};
+    const void* n_clock = NativeOf("lLMT9vJAck0");
+    const void* b_clock = BridgeOf("lLMT9vJAck0");
+    const void* n_sce_clock = NativeOf("QBi7HCK03hw");
+    const void* b_sce_clock = BridgeOf("QBi7HCK03hw");
+    const auto both = [&](u32 id, KTimespec& n1, KTimespec& b, KTimespec& n2, s32 rets[3]) {
+        rets[0] = Call<s32>(n_clock, id, static_cast<void*>(&n1));
+        rets[1] = Call<s32>(b_clock, id, static_cast<void*>(&b));
+        rets[2] = Call<s32>(n_clock, id, static_cast<void*>(&n2));
+    };
+    struct ClockCase {
+        u32 id;
+        const char* name;
+        double tolerance; // s
+        bool ordered;     // n1 <= b <= n2 (same monotonic source)
+    };
+    for (const ClockCase& k : {ClockCase{0, "REALTIME", 0.05, false}, ClockCase{4, "MONOTONIC", 0.05, true},
+                               ClockCase{5, "UPTIME", 0.05, true}, ClockCase{13, "SECOND", 0.05, false},
+                               ClockCase{14, "THREAD_CPUTIME", 0.1, false}, ClockCase{15, "PROCTIME", 0.05, true},
+                               ClockCase{16, "EXT_NETWORK", 1.0, false}}) {
+        KTimespec n1{}, b{}, n2{};
+        s32 r[3];
+        both(k.id, n1, b, n2, r);
+        const double d = std::abs(b.Seconds() - n1.Seconds());
+        const bool order_ok = !k.ordered || (n1.Seconds() <= b.Seconds() && b.Seconds() <= n2.Seconds());
+        c.Check(fmt::format("clock_gettime {}", k.name), r[0] == 0 && r[1] == 0 && r[2] == 0 &&
+                                                              d < k.tolerance && order_ok,
+                fmt::format("ret {} {} {} native {:.6f} bridge {:.6f} native {:.6f}", r[0], r[1], r[2],
+                            n1.Seconds(), b.Seconds(), n2.Seconds()));
+    }
+    // Error paths: result and errno must be identical.
+    const auto err_case = [&](const char* what, u32 id, bool null_ts) {
+        KTimespec ts{};
+        void* p = null_ts ? nullptr : static_cast<void*>(&ts);
+        *Libraries::Kernel::__Error() = 0;
+        const s32 rn = Call<s32>(n_clock, id, p);
+        const s32 en = Errno();
+        *Libraries::Kernel::__Error() = 0;
+        const s32 rb = Call<s32>(b_clock, id, p);
+        const s32 eb = Errno();
+        c.Check(fmt::format("clock_gettime {}", what), rn == rb && en == eb && rn == -1,
+                fmt::format("native {} errno {}, bridge {} errno {}", rn, en, rb, eb));
+        const s32 sn = Call<s32>(n_sce_clock, id, p);
+        const s32 sb = Call<s32>(b_sce_clock, id, p);
+        c.Check(fmt::format("sceKernelClockGettime {}", what), sn == sb && sn < 0,
+                fmt::format("native {} bridge {}", Code(sn), Code(sb)));
+    };
+    err_case("null pointer", 4, true);
+    err_case("unknown clock 99", 99, false);
+
+    struct KTimeval {
+        s64 sec;
+        s64 usec;
+    } tv_n{}, tv_b{};
+    struct KTimezone {
+        s32 minuteswest;
+        s32 dst;
+    } tz_n{-1, -1}, tz_b{-1, -1};
+    const s32 gn = Call<s32>(NativeOf("n88vx3C5nW8"), static_cast<void*>(&tv_n), static_cast<void*>(&tz_n));
+    const s32 gb = Call<s32>(BridgeOf("n88vx3C5nW8"), static_cast<void*>(&tv_b), static_cast<void*>(&tz_b));
+    const double dtv = std::abs((tv_n.sec - tv_b.sec) + (tv_n.usec - tv_b.usec) / 1e6);
+    c.Check("gettimeofday", gn == 0 && gb == 0 && dtv < 0.05 && tz_n.minuteswest == tz_b.minuteswest &&
+                                tz_n.dst == tz_b.dst,
+            fmt::format("ret {} {} delta {:.6f} s tz {}/{} vs {}/{}", gn, gb, dtv, tz_n.minuteswest, tz_n.dst,
+                        tz_b.minuteswest, tz_b.dst));
+    c.Check("sceKernelGettimeofday",
+            Call<s32>(NativeOf("ejekcaNQNq0"), static_cast<void*>(&tv_n)) ==
+                Call<s32>(BridgeOf("ejekcaNQNq0"), static_cast<void*>(&tv_b)),
+            "");
+
+    // Sleeps: same results, and they really sleep.
+    const auto timed = [](auto f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const s32 r = f();
+        return std::pair{r, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()};
+    };
+    // A waitable timer fires on a system tick, so one sleep can end a little early or late: the
+    // two implementations (the same timer call) are compared over 10 sleeps each.
+    s32 usleep_results = 0;
+    double tn = 0.0, tb = 0.0;
+    for (int i = 0; i < 10; ++i) {
+        const auto [un, dn] = timed([] { return Call<s32>(NativeOf("1jfXLRVzisc"), 2000u); });
+        const auto [ub, db] = timed([] { return Call<s32>(BridgeOf("1jfXLRVzisc"), 2000u); });
+        usleep_results |= un | ub;
+        tn += dn / 10;
+        tb += db / 10;
+    }
+    c.Check("sceKernelUsleep(2000) x10", usleep_results == 0 && tn >= 0.0015 && tb >= 0.0015 &&
+                                              std::abs(tn - tb) < 0.5 * tb,
+            fmt::format("mean native {:.4f} s, bridge {:.4f} s", tn, tb));
+    KTimespec bad{0, 2'000'000'000};
+    *Libraries::Kernel::__Error() = 0;
+    const s32 nn = Call<s32>(NativeOf("yS8U2TGCe1A"), static_cast<void*>(&bad), static_cast<void*>(nullptr));
+    const s32 nen = Errno();
+    *Libraries::Kernel::__Error() = 0;
+    const s32 nb = Call<s32>(BridgeOf("yS8U2TGCe1A"), static_cast<void*>(&bad), static_cast<void*>(nullptr));
+    const s32 neb = Errno();
+    c.Check("nanosleep invalid", nn == nb && nen == neb && nn == -1,
+            fmt::format("native {} errno {}, bridge {} errno {}", nn, nen, nb, neb));
+    KTimespec ms{0, 1'000'000}, rem_n{-1, -1}, rem_b{-1, -1};
+    const s32 sn = Call<s32>(NativeOf("yS8U2TGCe1A"), static_cast<void*>(&ms), static_cast<void*>(&rem_n));
+    const s32 sb = Call<s32>(BridgeOf("yS8U2TGCe1A"), static_cast<void*>(&ms), static_cast<void*>(&rem_b));
+    c.Check("nanosleep 1 ms", sn == 0 && sb == 0 && rem_n.sec == 0 && rem_b.sec == 0,
+            fmt::format("native {} rem {}.{:09}, bridge {} rem {}.{:09}", sn, rem_n.sec, rem_n.nsec, sb,
+                        rem_b.sec, rem_b.nsec));
+
+    const u64 fn = Call<u64>(NativeOf("1j3S3n-tTW4"));
+    const u64 fb = Call<u64>(BridgeOf("1j3S3n-tTW4"));
+    const double rel = fb != 0 ? std::abs(static_cast<double>(fn) - static_cast<double>(fb)) / fb : 1.0;
+    c.Check("sceKernelGetTscFrequency", rel < 0.001, fmt::format("native {} bridge {} ({:.5f}%)", fn, fb, rel * 100));
+    const s32 neo_n = Call<s32>(NativeOf("WslcK1FQcGI"));
+    const s32 neo_b = Call<s32>(BridgeOf("WslcK1FQcGI"));
+    c.Check("sceKernelIsNeoMode", neo_n == neo_b, fmt::format("native {} bridge {}", neo_n, neo_b));
+    c.Summary();
+}
 
 SDL_Event KeyEvent(SDL_Scancode sc, bool down, bool repeat = false) {
     SDL_Event e{};
@@ -1000,6 +1131,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestUserService(t);
     TestPad(t);
     TestInput(t);
+    TestKernelTime(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

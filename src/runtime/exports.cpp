@@ -6,6 +6,7 @@
 
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/fs_observer.h"
+#include "runtime/kernel/kernel.h"
 #include "runtime/pad/pad.h"
 #include "runtime/system/system_service.h"
 #include "runtime/user/user_service.h"
@@ -65,6 +66,7 @@ std::vector<Export> Collect() {
                              Sysmodule::SysmoduleExports(), Filesystem::FileSystemExports(),
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
                              AppContent::AppContentExports(), Pad::PadExports(),
+                             Kernel::KernelExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());
     }

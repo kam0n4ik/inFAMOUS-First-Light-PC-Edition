@@ -507,7 +507,7 @@ void SetupFilesystem(const App::Config& cfg, const std::string& serial) {
 }
 
 void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
-                   const std::string& serial) {
+                   const std::string& serial, u32 psf_attributes) {
     for (const auto& g : cfg.bridged_groups) {
         if (g == "loader" || g == "sysmodule") {
             Fatal(fmt::format("--bridge {} is not possible with --loader sspc: the shadPS4 "
@@ -525,6 +525,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         Fatal("binding table is inconsistent, see SecondSonPC.log");
     }
     StartBridgeLibraries(bindings, cfg.selftest);
+    InstallKernelHost(cfg, psf_attributes);
     if (!HasBridgeImport(bindings, "libScePad")) {
         // Automated runs (--press) inject input; the system cursor must not be grabbed by them.
         InstallNativeInput(cfg, g_window->GetSDLWindow(), !cfg.test_presses.empty());
@@ -939,7 +940,7 @@ void RunGame(const App::Config& cfg) {
     Libraries::Kernel::g_environment[0] = nullptr;
 
     if (own_loader) {
-        RunSspcLoader(cfg, guest_eboot_path, id);
+        RunSspcLoader(cfg, guest_eboot_path, id, meta.attributes);
     } else {
         RunPhase0Loader(cfg, *shad_linker, guest_eboot_path);
     }

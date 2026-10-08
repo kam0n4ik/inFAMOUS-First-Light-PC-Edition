@@ -35,6 +35,10 @@ void StartControllers();
 /// bridge window (patch 0006). `test_mode`: automated runs (see Input::KeyboardMouse).
 void InstallNativeInput(const App::Config& cfg, SDL_Window* window, bool test_mode);
 
+/// Native libkernel time functions: guest errno and process clock from the bridge, [Console]
+/// neoMode with the title's PS4 Pro attribute (src/bridge/shadps4/kernel_host.cpp).
+void InstallKernelHost(const App::Config& cfg, u32 psf_attributes);
+
 /// --selftest (src/bridge/shadps4/selftest.cpp): exit code 0 = every check passed.
 int RunSelfTest(const App::Config& cfg);
 
