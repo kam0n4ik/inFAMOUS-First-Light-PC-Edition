@@ -1,0 +1,137 @@
+diff --git a/src/video_core/buffer_cache/buffer.cpp b/src/video_core/buffer_cache/buffer.cpp
+index 9924556f..783476e6 100644
+--- a/src/video_core/buffer_cache/buffer.cpp
++++ b/src/video_core/buffer_cache/buffer.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <vk_mem_alloc.h>
+ 
++#include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++
+ namespace VideoCore {
+ 
+ std::string_view BufferTypeName(MemoryType type) {
+@@ -99,8 +101,13 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+ 
+         const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
+         VkBuffer unsafe_buffer{};
++        const u64 sspc_fail_seq = SecondSon::GpuDiag::ThreadFailureSeq();
+         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                           &allocation, out_alloc_info);
++        if (result != VK_SUCCESS) {
++            SecondSon::GpuDiag::ReportBufferFailure(allocator, buffer_ci_unsafe, alloc_ci, result,
++                                                    static_cast<u32>(mem_type), sspc_fail_seq);
++        }
+         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+                    vk::to_string(vk::Result{result}));
+         buffer = vk::Buffer{unsafe_buffer};
+@@ -131,7 +138,11 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
+         .sharingMode = vk::SharingMode::eExclusive,
+     };
+     VmaAllocationInfo alloc_info{};
+-    buffer.Create(buffer_ci, mem_type, &alloc_info);
++    {
++        const SecondSon::GpuDiag::ContextScope sspc_ctx{false, cpu_addr, size_bytes,
++                                                        static_cast<u32>(mem_type), debug_name};
++        buffer.Create(buffer_ci, mem_type, &alloc_info);
++    }
+ 
+     const auto device = instance.GetDevice();
+     if (!debug_name.empty()) {
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index ea290f58..4abbba8e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -20,6 +20,8 @@
+ 
+ #include <vk_mem_alloc.h>
+ 
++#include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++
+ namespace VideoCore {
+ 
+ static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+@@ -169,6 +171,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+ 
+ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
+                                                         bool is_written, bool is_texel_buffer) {
++    const SecondSon::GpuDiag::RequestScope sspc_req{device_addr, size, is_written, is_texel_buffer};
+     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index 9be82207..d3e728c9 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include <vk_mem_alloc.h>
+ 
++#include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++
+ namespace Vulkan {
+ 
+ namespace {
+@@ -634,10 +636,13 @@ bool Instance::CreateDevice() {
+ }
+ 
+ void Instance::CreateAllocator() {
+-    const VmaVulkanFunctions functions = {
++    VmaVulkanFunctions functions = {
+         .vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
+     };
++    // SecondSonPC SSPC-001 diagnostics: allocation ledger and failed-call capture (observation only).
++    SecondSon::GpuDiag::Install(*instance, physical_device, *device, functions,
++                                supports_memory_budget);
+ 
+     const VmaAllocatorCreateInfo allocator_info = {
+         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+@@ -653,6 +658,7 @@ void Instance::CreateAllocator() {
+         UNREACHABLE_MSG("Failed to initialize VMA with error {}",
+                         vk::to_string(vk::Result{result}));
+     }
++    SecondSon::GpuDiag::SetAllocator(allocator);
+ }
+ 
+ void Instance::CollectDeviceParameters() {
+diff --git a/src/video_core/texture_cache/image.cpp b/src/video_core/texture_cache/image.cpp
+index 38f76d7f..836d2c60 100644
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <vk_mem_alloc.h>
+ 
++#include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++
+ namespace VideoCore {
+ 
+ using namespace Vulkan;
+@@ -115,8 +117,13 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
+     VkImage unsafe_image{};
+     VmaAllocationInfo alloc_info{};
++    const u64 sspc_fail_seq = SecondSon::GpuDiag::ThreadFailureSeq();
+     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                      &allocation, &alloc_info);
++    if (result != VK_SUCCESS) {
++        SecondSon::GpuDiag::ReportImageFailure(allocator, image_ci_unsafe, alloc_ci, result,
++                                               sspc_fail_seq);
++    }
+     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
+                vk::to_string(vk::Result{result}));
+     image = vk::Image{unsafe_image};
+@@ -192,7 +199,11 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
+     backing = &backing_images.emplace_back();
+     backing->num_samples = info.num_samples;
+     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+-    backing->image.Create(image_ci);
++    {
++        const SecondSon::GpuDiag::ContextScope sspc_ctx{true, info.guest_address, info.guest_size,
++                                                        0, "image"};
++        backing->image.Create(image_ci);
++    }
+ 
+     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
+                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,

@@ -277,6 +277,21 @@ void DumpJson(const std::filesystem::path& file) {
     }
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.calls > b.calls; });
 
+    // Time series for automated runs: calls by owner and presented frames (the game is alive and
+    // not hung while the frame count keeps growing).
+    u64 calls_by_owner[4]{};
+    u64 frames = 0;
+    for (const Row& row : rows) {
+        calls_by_owner[static_cast<size_t>(row.entry->owner)] += row.calls;
+        if (row.entry->name == "sceGnmSubmitAndFlipCommandBuffers") {
+            frames = row.calls;
+        }
+    }
+    SSPC_LOG(Trace, Info,
+             "import calls: NATIVE {} OBSERVED {} BRIDGE {} COMMON_STUB {}; frames "
+             "(sceGnmSubmitAndFlipCommandBuffers) {}",
+             calls_by_owner[0], calls_by_owner[1], calls_by_owner[2], calls_by_owner[3], frames);
+
     SYSTEMTIME st;
     GetLocalTime(&st);
     std::string out = fmt::format(
