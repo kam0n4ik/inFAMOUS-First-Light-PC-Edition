@@ -41,6 +41,7 @@
 #include <SDL3/SDL_timer.h>
 
 #include "app/config.h"
+#include "base/crash.h"
 #include "base/log.h"
 #include "bridge/shadps4/bootstrap.h"
 #include "bridge/shadps4/bridge_exports.h"
@@ -74,7 +75,9 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
+#include "core/debug_state.h"
 #include "core/memory.h"
+#include "core/signals.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "input/controller.h"
@@ -561,6 +564,60 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }
 
+/// --frame-log (diagnostics, tools/perf_runs.ps1): one row per presented frame -> <logs>\frametimes.csv
+/// ("t_s,frame_ms": seconds since start, time since the previous frame). The bridge's flip counter
+/// (DebugState, raised after vkQueuePresent) is polled every millisecond by a high-resolution
+/// waitable timer, so the system timer resolution stays as it is; frames between two polls share
+/// the interval. Rows are flushed in batches: the last few frames before quick_exit may be lost.
+void StartFrameLog(const std::filesystem::path& file) {
+    std::thread([file] {
+        Common::SetCurrentThreadName("SecondSonPC:FrameLog");
+        std::ofstream out(file, std::ios::trunc);
+        if (!out) {
+            SSPC_LOG(App, Error, "--frame-log: cannot write {}", file.string());
+            return;
+        }
+        out << "t_s,frame_ms\n";
+        const HANDLE timer =
+            CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        SSPC_LOG(App, Info, "--frame-log: presented frames -> {} ({})", file.string(),
+                 timer != nullptr ? "1 ms high-resolution timer" : "Sleep(1) fallback");
+        LARGE_INTEGER freq{}, start{}, last{};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+        u32 frames = DebugState.GetFrameNum();
+        u64 rows = 0;
+        for (;;) {
+            if (timer != nullptr) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -10000; // 1 ms, relative
+                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+                WaitForSingleObject(timer, INFINITE);
+            } else {
+                Sleep(1);
+            }
+            const u32 now_frames = DebugState.GetFrameNum();
+            if (now_frames == frames) {
+                continue;
+            }
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            if (last.QuadPart != 0) {
+                const double t = double(now.QuadPart - start.QuadPart) / freq.QuadPart;
+                const double ms = double(now.QuadPart - last.QuadPart) * 1000.0 / freq.QuadPart / (now_frames - frames);
+                for (u32 i = frames; i != now_frames; ++i) {
+                    out << fmt::format("{:.3f},{:.3f}\n", t, ms);
+                }
+                if ((rows += now_frames - frames) % 32 < now_frames - frames) {
+                    out.flush();
+                }
+            }
+            last = now;
+            frames = now_frames;
+        }
+    }).detach();
+}
+
 /// --press: input for automated runs (tools/smoke_runs.ps1). Comma-separated "what@seconds[:hold]",
 /// timed from the window opening; the events go into the window's SDL event queue (the window
 /// does not need focus) — the events a real keyboard and mouse produce:
@@ -906,6 +963,9 @@ void RunGame(const App::Config& cfg) {
     if (!cfg.test_presses.empty()) {
         StartTestInput(cfg.test_presses, cfg.logs_dir);
     }
+    if (cfg.frame_log) {
+        StartFrameLog(cfg.logs_dir / "frametimes.csv");
+    }
 
     using Common::FS::GetUserPath;
     using Common::FS::PathType;
@@ -938,6 +998,13 @@ void RunGame(const App::Config& cfg) {
     VideoCore::SetOutputDir(captures_dir, id);
 
     Libraries::Kernel::g_environment[0] = nullptr;
+
+    // The bridge's vectored exception handler (GPU write tracking, JIT patches, guest signals) is
+    // registered when its dispatcher is first used; create it now, before any game code, and put
+    // the crash recorder's data-fault half behind it: the faults the bridge resolves (~1000 a
+    // second in gameplay) then never reach it (P0 FPS regression).
+    (void)Core::Signals::Instance();
+    Base::InstallLateFaultRecorder();
 
     if (own_loader) {
         RunSspcLoader(cfg, guest_eboot_path, id, meta.attributes);

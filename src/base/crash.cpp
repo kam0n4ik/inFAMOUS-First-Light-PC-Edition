@@ -131,6 +131,17 @@ SRWLOCK g_record_lock = SRWLOCK_INIT;
 FaultRecord g_record{};
 thread_local bool t_recording = false;
 
+// What the recorder costs (LogFirstChanceStats): the bridge's GPU write tracking raises an access
+// violation for every guest write to a protected page.
+bool g_first_chance_installed = false;
+PVOID g_late_handler = nullptr;       // DataFaultFilter, after the bridge's handler
+std::atomic<u64> g_av_count{0};       // access violations seen first (all of them)
+std::atomic<u64> g_av_late{0};        // data accesses nobody before DataFaultFilter handled
+std::atomic<u64> g_av_host{0};        // ... of them from SecondSonPC.exe (no system call)
+std::atomic<u64> g_av_queried{0};     // ... that cost a VirtualQuery of the address
+std::atomic<u64> g_query_ticks{0};    // QueryPerformanceCounter ticks spent in those queries
+std::atomic<u64> g_query_max_ticks{0};
+
 constexpr const char* kRegNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
 
@@ -286,13 +297,13 @@ void Record(EXCEPTION_POINTERS* info, const FaultFacts& f, FaultKind kind) {
         StoreRecord(r);
         return;
     }
-    // Uncommitted-memory accesses from code outside the images may still be handled (the bridge's
-    // SRT walker patches its own JIT code, the game may have a signal handler); an execute fault
-    // is never handled, so only it gets a minidump.
+    // An uncommitted-memory access reaches the recorder only after the bridge and the game's signal
+    // handler declined it (the unhandled exception filter may still follow); only an execute fault
+    // gets a minidump.
     const char* what = kind == FaultKind::Execute
                            ? "execute fault"
-                           : "access to uncommitted memory from code outside the images (fatal unless "
-                             "the bridge or the game handles it)";
+                           : "access to uncommitted memory from code outside the images, not handled by "
+                             "the bridge or the game";
     const char* access = f.access == 0 ? "read" : f.access == 1 ? "write" : f.access == 8 ? "execute" : "?";
     if (r.serial > kFullReports) {
         SSPC_LOG(App, Error, "first-chance fault #{}: {}, {} of {:#x}, rip {:#x}, [rsp] {:#x}, thread {}", r.serial,
@@ -329,27 +340,64 @@ void Record(EXCEPTION_POINTERS* info, const FaultFacts& f, FaultKind kind) {
     StoreRecord(r);
 }
 
-LONG WINAPI FirstChanceFilter(EXCEPTION_POINTERS* info) {
+FaultFacts Facts(const EXCEPTION_POINTERS* info) {
     const auto* rec = info->ExceptionRecord;
-    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2 || t_recording) {
+    return {rec->ExceptionCode, rec->ExceptionInformation[0], rec->ExceptionInformation[1],
+            info->ContextRecord->Rip, false, false};
+}
+
+bool IsAccessViolation(const EXCEPTION_POINTERS* info) {
+    const auto* rec = info->ExceptionRecord;
+    return rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2 && !t_recording;
+}
+
+/// Registered first (before the bridge's handler): records execute faults, which the bridge's
+/// handler turns into a second fault of its own (SSPC-002). Every other access violation leaves at
+/// once, without a system call: the bridge's GPU write tracking raises one for each guest write to
+/// a protected page — hundreds to thousands per second in gameplay. A VirtualQuery here for each of
+/// them (up to 1 ms in this process's ~1 TB address space) cut gameplay from ~25 to ~5 FPS.
+LONG WINAPI FirstChanceFilter(EXCEPTION_POINTERS* info) {
+    if (!IsAccessViolation(info)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    const auto* ctx = info->ContextRecord;
-    FaultFacts f{rec->ExceptionCode, rec->ExceptionInformation[0], rec->ExceptionInformation[1], ctx->Rip,
-                 false, false};
-    if (f.access != 8 && f.address != f.rip) {
-        // Data access: the bridge handles faults on committed (protected) pages — the frequent case
-        // (GPU write tracking) — and host code is left to the unhandled exception filter. Cheapest
-        // test first: rip in SecondSonPC.exe (no system call), then one VirtualQuery of the address;
-        // rip is queried only for the rare access to uncommitted memory.
-        if (InImage(f.rip)) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        const auto target = Query(f.address);
-        f.address_committed = target.ok && target.state == MEM_COMMIT;
-        if (f.address_committed) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
+    g_av_count.fetch_add(1, std::memory_order_relaxed);
+    const FaultFacts f = Facts(info);
+    if (ClassifyFault(f) == FaultKind::Execute) {
+        t_recording = true;
+        Record(info, f, FaultKind::Execute);
+        t_recording = false;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/// Registered after the bridge's handler (InstallLateFaultRecorder): sees only the data accesses
+/// that neither the bridge nor the game's signal handler resolved, and records guest code touching
+/// memory that is not committed. Host code is left to the unhandled exception filter.
+LONG WINAPI DataFaultFilter(EXCEPTION_POINTERS* info) {
+    if (!IsAccessViolation(info)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    FaultFacts f = Facts(info);
+    if (ClassifyFault(f) == FaultKind::Execute) {
+        return EXCEPTION_CONTINUE_SEARCH; // recorded by FirstChanceFilter
+    }
+    g_av_late.fetch_add(1, std::memory_order_relaxed);
+    if (InImage(f.rip)) {
+        g_av_host.fetch_add(1, std::memory_order_relaxed);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    LARGE_INTEGER q0, q1;
+    QueryPerformanceCounter(&q0);
+    const auto target = Query(f.address);
+    QueryPerformanceCounter(&q1);
+    const u64 ticks = static_cast<u64>(q1.QuadPart - q0.QuadPart);
+    g_av_queried.fetch_add(1, std::memory_order_relaxed);
+    g_query_ticks.fetch_add(ticks, std::memory_order_relaxed);
+    for (u64 max = g_query_max_ticks.load(std::memory_order_relaxed);
+         ticks > max && !g_query_max_ticks.compare_exchange_weak(max, ticks, std::memory_order_relaxed);) {
+    }
+    f.address_committed = target.ok && target.state == MEM_COMMIT;
+    if (!f.address_committed) {
         const auto code = Query(f.rip);
         f.rip_in_image = code.ok && code.type == MEM_IMAGE;
     }
@@ -420,7 +468,64 @@ FaultRecord LastFaultRecord() {
     return r;
 }
 
-void InstallCrashLogger(const std::filesystem::path& dump_dir, bool write_dump) {
+void LogFirstChanceStats(const char* reason) {
+    if (!g_first_chance_installed) {
+        SSPC_LOG(App, Info, "first-chance stats {}: recorder off (--no-fault-recorder)", reason);
+        return;
+    }
+    static LARGE_INTEGER freq{};
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static u64 last_count = 0, last_late = 0, last_queried = 0, last_ticks = 0;
+    static LARGE_INTEGER last_time{};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const u64 count = g_av_count.load(std::memory_order_relaxed);
+    const u64 late = g_av_late.load(std::memory_order_relaxed);
+    const u64 host = g_av_host.load(std::memory_order_relaxed);
+    const u64 queried = g_av_queried.load(std::memory_order_relaxed);
+    const u64 ticks = g_query_ticks.load(std::memory_order_relaxed);
+    const double max_us = g_query_max_ticks.load(std::memory_order_relaxed) * 1e6 / freq.QuadPart;
+    AcquireSRWLockExclusive(&lock);
+    const double dt = last_time.QuadPart != 0 ? double(now.QuadPart - last_time.QuadPart) / freq.QuadPart : 0.0;
+    const u64 d_count = count - last_count;
+    const u64 d_late = late - last_late;
+    const u64 d_queried = queried - last_queried;
+    const double d_query_ms = double(ticks - last_ticks) * 1e3 / freq.QuadPart;
+    last_count = count;
+    last_late = late;
+    last_queried = queried;
+    last_ticks = ticks;
+    last_time = now;
+    ReleaseSRWLockExclusive(&lock);
+    SSPC_LOG(App, Info,
+             "first-chance stats {}: access violations {} (+{} in {:.1f} s = {:.0f}/s); not handled by the "
+             "bridge/game {} (+{}{}), from exe {}, VirtualQuery {} (+{}), query time {:.1f} ms (+{:.1f} ms), "
+             "max {:.0f} us; recorded {}",
+             reason, count, d_count, dt, dt > 0 ? d_count / dt : 0.0, late, d_late,
+             g_late_handler != nullptr ? "" : ", data-fault recorder not installed yet", host, queried, d_queried,
+             double(ticks) * 1e3 / freq.QuadPart, d_query_ms, max_us, g_serial.load());
+}
+
+void InstallLateFaultRecorder() {
+    if (!g_first_chance_installed) {
+        return;
+    }
+    // Re-added at the end of the handler list: behind every handler registered so far.
+    if (g_late_handler != nullptr) {
+        RemoveVectoredExceptionHandler(g_late_handler);
+    }
+    g_late_handler = AddVectoredExceptionHandler(0, &DataFaultFilter);
+    if (g_late_handler == nullptr) {
+        SSPC_LOG(App, Error, "data-fault recorder: AddVectoredExceptionHandler failed");
+        return;
+    }
+    SSPC_LOG(App, Info, "crash diagnostics: data-fault recorder after the bridge's exception handler");
+}
+
+void InstallCrashLogger(const std::filesystem::path& dump_dir, bool write_dump, bool first_chance) {
     const auto* base = reinterpret_cast<const u8*>(GetModuleHandleW(nullptr));
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
@@ -436,11 +541,19 @@ void InstallCrashLogger(const std::filesystem::path& dump_dir, bool write_dump) 
         g_thread_description =
             reinterpret_cast<GetThreadDescriptionFn>(GetProcAddress(kernel, "GetThreadDescription"));
     }
-    // First = 1: runs before the bridge's handler, which is added later with First = 0.
+    SetUnhandledExceptionFilter(&CrashFilter);
+    if (!first_chance) {
+        SSPC_LOG(App, Warning, "DIAGNOSTIC: --no-fault-recorder: first-chance fault recorder off "
+                               "(unhandled exception filter only)");
+        return;
+    }
+    // First = 1: runs before the bridge's handler, which is added later with First = 0. The
+    // data-fault half follows the bridge's handler: InstallLateFaultRecorder().
     if (AddVectoredExceptionHandler(1, &FirstChanceFilter) == nullptr) {
         SSPC_LOG(App, Error, "first-chance fault recorder: AddVectoredExceptionHandler failed");
+    } else {
+        g_first_chance_installed = true;
     }
-    SetUnhandledExceptionFilter(&CrashFilter);
     SSPC_LOG(App, Info, "crash diagnostics: first-chance fault recorder on; minidump of an execute fault {}",
              write_dump && g_mini_dump != nullptr ? "-> " + dump_dir.string() : std::string("off"));
 }
@@ -465,6 +578,23 @@ volatile u64 g_host_target = 0;
 
 __declspec(noinline) void HostRead() {
     (void)*reinterpret_cast<volatile u64*>(g_host_target);
+}
+
+/// Stands in for the bridge's GPU write tracking: a write to the tracked page makes it writable and
+/// the write is retried.
+u8* volatile g_tracked_page = nullptr;
+
+LONG WINAPI TrackingHandler(EXCEPTION_POINTERS* info) {
+    const auto* rec = info->ExceptionRecord;
+    u8* page = g_tracked_page;
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2 &&
+        rec->ExceptionInformation[0] == 1 && page != nullptr &&
+        rec->ExceptionInformation[1] - reinterpret_cast<u64>(page) < 0x1000) {
+        DWORD old = 0;
+        VirtualProtect(page, 0x1000, PAGE_READWRITE, &old);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /// Emits `mov rax, imm64` at p; returns the next byte.
@@ -590,12 +720,35 @@ void RunLiveFaults(FaultChecks& c, const std::filesystem::path& logs_dir, u8* re
     c.Check("write to a read-only committed page: not recorded", !returned && LastFaultRecord().serial == before);
     returned = CallGuarded(reinterpret_cast<TestFn>(int3_stub));
     c.Check("int3: not recorded", !returned && LastFaultRecord().serial == before);
+
+    // 9. P0 FPS regression: a fault the bridge's handler resolves (GPU write tracking, ~1000/s in
+    // gameplay) must cost the recorder no system call. As in the game, the data-fault half sits
+    // behind that handler and never sees it; the first half only counts it.
+    const PVOID tracking = AddVectoredExceptionHandler(0, &TrackingHandler);
+    InstallLateFaultRecorder();
+    g_tracked_page = data_ro;
+    const u64 seen = g_av_count.load(), late = g_av_late.load(), queried = g_av_queried.load();
+    returned = CallGuarded(reinterpret_cast<TestFn>(write_ro_stub));
+    c.Check("write tracked by the bridge's handler: resumed, seen first, no VirtualQuery, not recorded",
+            returned && g_av_count.load() == seen + 1 && g_av_late.load() == late &&
+                g_av_queried.load() == queried && LastFaultRecord().serial == before,
+            fmt::format("returned {}, seen +{}, late +{}, queried +{}", returned, g_av_count.load() - seen,
+                        g_av_late.load() - late, g_av_queried.load() - queried));
+    g_tracked_page = nullptr;
+    // A fault the tracking handler does not take still reaches the data-fault recorder behind it.
+    before = LastFaultRecord().serial;
+    returned = CallGuarded(reinterpret_cast<TestFn>(read_stub));
+    r = LastFaultRecord();
+    c.Check("behind the bridge's handler: read of reserved memory still recorded",
+            !returned && r.serial == before + 1 && r.kind == FaultKind::GuestUnmappedAccess && r.address == bad);
+    RemoveVectoredExceptionHandler(tracking);
 }
 
 } // namespace
 
 int RunFaultSelfTest(const std::filesystem::path& logs_dir) {
     FaultChecks c;
+    InstallLateFaultRecorder(); // no bridge here: directly behind FirstChanceFilter
     constexpr u32 kAv = EXCEPTION_ACCESS_VIOLATION;
     c.Check("classify: execute fault (access 8)",
             ClassifyFault({kAv, 8, 0x1000, 0x1000, false, false}) == FaultKind::Execute);

@@ -9,13 +9,27 @@ namespace SecondSon::Base {
 
 /// Installs both crash recorders:
 ///  - a first-chance vectored handler, called before the bridge's (SSPC-002, docs/KNOWN_ISSUES.md):
-///    for an execute fault, or for guest code touching memory that is not committed, it logs the
-///    registers, the jump evidence and the stack, and writes a minidump to dump_dir (once per
-///    process, when write_dump). It never handles the exception: the bridge's handler and the
-///    game see it exactly as before;
+///    for an execute fault it logs the registers, the jump evidence and the stack, and writes a
+///    minidump to dump_dir (once per process, when write_dump). Every other exception leaves it
+///    without a system call (the bridge's GPU write tracking raises ~1000 access violations a
+///    second). Guest code touching memory that is not committed is recorded the same way (no
+///    minidump) by the data-fault half, which InstallLateFaultRecorder() puts behind the bridge's
+///    handler. Neither ever handles the exception: the bridge and the game see it as before;
 ///  - an unhandled exception filter: code, address, registers and the return addresses found on
 ///    the stack (as exe+offset, for llvm-symbolizer with SecondSonPC.pdb).
-void InstallCrashLogger(const std::filesystem::path& dump_dir, bool write_dump);
+/// first_chance = false (--no-fault-recorder, diagnostics) installs the unhandled filter only.
+void InstallCrashLogger(const std::filesystem::path& dump_dir, bool write_dump, bool first_chance = true);
+
+/// Adds the data-fault half of the recorder at the end of the vectored handler list. Call it once
+/// the bridge's handler exists (bootstrap), so the faults that handler resolves never reach it; no
+/// effect without the first-chance recorder.
+void InstallLateFaultRecorder();
+
+/// One line in SecondSonPC.log: access violations the recorder has seen (total and per second since
+/// the previous line), how many reached the data-fault half (not handled by the bridge or the
+/// game), how many cost a VirtualQuery and the time spent in those queries. Called with every
+/// VRAM/commit sample.
+void LogFirstChanceStats(const char* reason);
 
 /// What the first-chance recorder does with an exception.
 enum class FaultKind : u8 {

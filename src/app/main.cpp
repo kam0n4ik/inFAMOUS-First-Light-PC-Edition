@@ -11,6 +11,8 @@
 //     --reloc-snapshot <file>  writes every relocation slot at the first ParamGetInt call
 //     --selftest               NATIVE vs BRIDGE subsystem self-test -> logs\selftest.txt, no game
 //     --fault-test             first-chance crash recorder test -> logs\faulttest.txt, no game
+//     --no-fault-recorder      no first-chance crash recorder (A/B performance diagnostics)
+//     --frame-log              presented frame times -> logs\frametimes.csv (tools\perf_runs.ps1)
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
 //     --press <key@sec,...>    automated runs: key presses (SDL key names, e.g. n = cross in the
 //                              bridge's default keyboard layout) pushed into the window's event
@@ -103,6 +105,10 @@ int main(int argc, char* argv[]) {
             config->user_data_dir = std::filesystem::absolute(argv[++i]);
         } else if (arg == "--fault-test") {
             config->fault_test = true;
+        } else if (arg == "--no-fault-recorder") {
+            config->fault_recorder = false; // diagnostics only
+        } else if (arg == "--frame-log") {
+            config->frame_log = true; // diagnostics only
         } else if (arg == "--selftest") {
             config->selftest = true;
             config->import_counter = false;
@@ -121,7 +127,8 @@ int main(int argc, char* argv[]) {
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
     }
-    Base::InstallCrashLogger(config->logs_dir / "crash", config->crash_dump);
+    Base::InstallCrashLogger(config->logs_dir / "crash", config->crash_dump,
+                             config->fault_recorder || config->fault_test);
     if (config->fault_test) {
         return Base::RunFaultSelfTest(config->logs_dir); // before any bridge code: no other handlers
     }

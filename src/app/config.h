@@ -83,6 +83,8 @@ struct Config {
     u32 call_order = 0;                      // --call-order N: record the first N import calls
     bool selftest = false;                   // --selftest: NATIVE vs BRIDGE subsystem test, no game
     bool fault_test = false;                 // --fault-test: crash recorder test, no game, no bridge
+    bool fault_recorder = true;              // --no-fault-recorder: no first-chance handler (A/B diagnostics)
+    bool frame_log = false;                  // --frame-log: presented frame times -> logs\frametimes.csv
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input
 };

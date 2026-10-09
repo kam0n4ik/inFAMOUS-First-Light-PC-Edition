@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include "base/crash.h"
 #include "base/log.h"
 
 namespace SecondSon::Base {
@@ -84,6 +85,7 @@ void LogVramSample(const char* reason, bool allow_init) {
                  system.CommitLimit * page / kMiB, system.CommitPeak * page / kMiB,
                  system.PhysicalAvailable * page / kMiB);
     }
+    LogFirstChanceStats(reason);
     if (const VramSampleHook hook = g_hook.load(); hook != nullptr) {
         hook(reason);
     }
