@@ -11,8 +11,10 @@
 //   NativeMem(D20)   the aliases the bridge asserts on, on the manager (on the bridge too with the environment
 //                    variable SSPC_SELFTEST_BRIDGE_D20=1: the self-test then ends in the bridge's assert)
 //   NativeMem(mt)    the adapters under threads, the listener querying from its callbacks; 60 s watchdog
+//   NativeMem(perf)  map/protect/unmap latencies and the GPU's hot paths, the same calls on both sides (INFO)
 #include "bridge/shadps4/selftest_vmm.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -849,6 +851,84 @@ void TestThreads(TestGroup& g, u32 sdk) {
                        listener.writes.load()));
 }
 
+// ---------------------------------------------------------------------------- NativeMem(perf) (informational)
+
+std::string Percentiles(std::vector<double>& v) {
+    std::sort(v.begin(), v.end());
+    const auto at = [&](double q) { return v[static_cast<size_t>(q * static_cast<double>(v.size() - 1))]; };
+    return fmt::format("{:.1f}/{:.1f}/{:.1f}", at(0.5), at(0.95), at(0.99));
+}
+
+/// ns per call, best of 3 runs of n calls.
+template <typename F>
+double BestNs(int n, F&& f) {
+    double best = 1e30;
+    for (int run = 0; run < 3; ++run) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n; ++i) {
+            f(i);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        best = std::min(best, std::chrono::duration<double, std::nano>(t1 - t0).count() / n);
+    }
+    return best;
+}
+
+/// The same calls through the same interfaces on both sides: map/protect/unmap latencies and the GPU's hot
+/// paths (the access violation handler's ProtectTracking among them).
+void MeasureBoth(TestGroup& g, u32 sdk) {
+    Pair pair;
+    if (!pair.Open(g, sdk)) {
+        pair.Close();
+        return;
+    }
+    for (Side* s : {pair.b.get(), pair.n.get()}) {
+        Alloc(*s, 0x10000, 0, &s->pa);
+        std::vector<double> map_us, protect_us, unmap_us;
+        for (int i = 0; i < 2000; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            MapOp(*s, 0, 0x10000, kRw, MemoryMapFlags::Fixed, VMAType::Direct, "perf", s->pa);
+            const auto t1 = std::chrono::steady_clock::now();
+            s->v.Protect(s->w, kPage, i % 2 == 0 ? kRead : kRw);
+            const auto t2 = std::chrono::steady_clock::now();
+            s->v.Unmap(s->w, 0x10000);
+            const auto t3 = std::chrono::steady_clock::now();
+            map_us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            protect_us.push_back(std::chrono::duration<double, std::micro>(t2 - t1).count());
+            unmap_us.push_back(std::chrono::duration<double, std::micro>(t3 - t2).count());
+        }
+        s->rec->Take();
+        // The GPU's paths on a mapped view; the listener is out of the way.
+        MapOp(*s, 0, 0x10000, kRw, MemoryMapFlags::Fixed, VMAType::Direct, "perf", s->pa);
+        std::array<u8, 64> buffer{};
+        const double copy = BestNs(100000, [&](int i) {
+            s->g.CopySparseMemory(s->w + (i & 0xFF) * 64, buffer.data(), buffer.size());
+        });
+        const double write = BestNs(100000, [&](int i) {
+            (void)s->g.TryWriteBacking(s->At((i & 0xFF) * 64), buffer.data(), buffer.size());
+        });
+        const double clamp = BestNs(100000, [&](int) { (void)s->g.ClampRangeSize(s->w, 1ull << 30); });
+        const double track = BestNs(20000, [&](int i) {
+            s->g.ProtectTracking(s->w + (i & 3) * kPage, kPage, MemoryPermission::ReadWrite);
+        });
+        s->v.Unmap(s->w, 0x10000);
+        s->p.ReleaseDirect(s->pb + s->pa, 0x10000, true);
+        s->rec->Take();
+        g.Info(fmt::format("{}: P50/P95/P99 us (2000 x 64 KiB direct view): map {}, protect {}, unmap {}; ns per "
+                           "call (best of 3): CopySparseMemory 64 B {:.1f}, TryWriteBacking 64 B {:.1f}, "
+                           "ClampRangeSize 1 GiB {:.1f}, ProtectTracking 16 KiB {:.0f}; areas in use {}",
+                           s->name, Percentiles(map_us), Percentiles(protect_us), Percentiles(unmap_us), copy, write,
+                           clamp, track, s->v.Areas().size()));
+    }
+    const auto stats = pair.native.vm->GetStats();
+    g.Info(fmt::format("manager: maps {} unmaps {} protects {}; areas split {} merged {}; host views {} unmaps {} "
+                       "splits {} coalesces {} protect failures {} coalesce failures {}",
+                       stats.maps, stats.unmaps, stats.protects, stats.vma.splits, stats.vma.merges, stats.host.views,
+                       stats.host.unmaps, stats.host.splits, stats.host.coalesces, stats.host.protect_failures,
+                       stats.host.coalesce_failures));
+    pair.Close();
+}
+
 } // namespace
 
 std::vector<TestGroup> TestNativeMemoryAdapters(u32 sdk_version, std::string* diff_transcript) {
@@ -867,6 +947,7 @@ std::vector<TestGroup> TestNativeMemoryAdapters(u32 sdk_version, std::string* di
     Run("NativeMem(rand)", TestRandom);
     Run("NativeMem(D20)", TestAliases);
     Run("NativeMem(mt)", TestThreads);
+    Run("NativeMem(perf)", MeasureBoth);
     *diff_transcript = std::move(transcript);
     return groups;
 }
