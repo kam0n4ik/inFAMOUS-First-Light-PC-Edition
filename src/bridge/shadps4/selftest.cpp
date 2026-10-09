@@ -3907,25 +3907,28 @@ void GpuMemoryScenario(Totals& t, InputChecks& c, bool native) {
                 fmt::format("{} {} {} {} {} {}", wrote, part, in_hole, in_reserved, in_anonymous, same));
     }
     {
-        // A write across two physical areas (B -> C), through GpuMemory and through the manager.
+        // A write across two physical areas (B -> C), through GpuMemory and through the manager: B's last 8
+        // bytes get the first half of the data, C's first 8 bytes the second half (SSPC-005/D11, fixed by patch
+        // 0010; before it C got the first half again), the 8 bytes on each side stay as they were.
         const auto Across = [&](auto&& write) {
             write();
-            std::array<u8, 16> got{};
-            std::memcpy(got.data(), reinterpret_cast<const void*>(w + 0x6FFF8), 16);
-            Fill(0x6FFF8, 0x70008);
+            std::array<u8, 32> got{};
+            std::memcpy(got.data(), reinterpret_cast<const void*>(w + 0x6FFF0), 32);
+            Fill(0x6FFF0, 0x70010);
             return got;
         };
         const auto via_gm =
             Across([&] { gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x6FFF8), data.data(), 16); });
         const auto via_mm =
             Across([&] { mm->TryWriteBacking(reinterpret_cast<void*>(w + 0x6FFF8), data.data(), 16); });
-        std::array<u8, 16> d11{};
-        std::memcpy(d11.data(), data.data(), 8);
-        std::memcpy(d11.data() + 8, data.data(), 8);
-        c.Check("TryWriteBacking across two physical areas writes what the manager writes: D11 reproduced (the "
-                "second area gets the start of the data again), not fixed in P2.3.2",
-                via_gm == via_mm && via_gm == d11,
-                fmt::format("{} / {}", Hex(via_gm.data(), 16), Hex(via_mm.data(), 16)));
+        std::array<u8, 32> expected{};
+        for (u64 i = 0; i < 32; ++i) {
+            expected[i] = i >= 8 && i < 24 ? data[i - 8] : Pattern(w + 0x6FFF0 + i);
+        }
+        c.Check("TryWriteBacking across two physical areas (SSPC-005, patch 0010): the second area gets the rest of "
+                "the data, both areas exact, the bytes around untouched; the same through GpuMemory and the manager",
+                via_gm == via_mm && via_gm == expected,
+                fmt::format("{} / {} want {}", Hex(via_gm.data(), 32), Hex(via_mm.data(), 32), Hex(expected.data(), 32)));
     }
     {
         gm.ProtectTracking(w, 0x80000, MemoryPermission::None);
