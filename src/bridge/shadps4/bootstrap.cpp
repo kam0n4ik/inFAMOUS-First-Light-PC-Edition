@@ -47,6 +47,7 @@
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/memory_host.h"
+#include "bridge/shadps4/native_memory.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
 #include "loader/linker.h"
@@ -523,6 +524,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         }
     }
     for (const auto& g : cfg.native_groups) {
+        if (g == "memory") {
+            continue; // not exports: the memory manager, selected in RunGame (P2.3.4)
+        }
         if (std::ranges::none_of(Runtime::Exports(),
                                  [&g](const Runtime::Export& e) { return e.experimental && g == e.group; })) {
             Fatal(fmt::format("--native {}: SecondSonPC has no experimental group of that name", g));
@@ -553,7 +557,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     SetupFilesystem(cfg, serial);
     bindings.LogSummary(); // also for --selftest: the NATIVE/BRIDGE split without running the game
     if (cfg.selftest) {
-        std::quick_exit(RunSelfTest(cfg));
+        // The self-test compares with the bridge's manager; with --native memory there is none: the native
+        // manager's own start-up test runs instead.
+        std::quick_exit(Listed(cfg.native_groups, "memory") ? RunNativeMemorySelfTest(cfg) : RunSelfTest(cfg));
     }
 
     static std::unique_ptr<Loader::Host> host = CreateLoaderHost();
@@ -953,6 +959,12 @@ void RunGame(const App::Config& cfg) {
 
     Common::Singleton<Core::FileSys::HandleTable>::Instance()->CreateStdHandles();
 
+    // The guest memory's manager, chosen before anything reaches it (patch 0012): the bridge's by default,
+    // SecondSonPC's own with --native memory (P2.3.4), which takes the address space right here.
+    if (own_loader && Listed(cfg.native_groups, "memory") &&
+        !InstallNativeMemory(cfg, Common::ElfInfo::Instance().CompiledSdkVer(), meta.attributes)) {
+        Fatal("--native memory: SecondSonPC's memory manager could not take the guest memory, see SecondSonPC.log");
+    }
     // Reserves the guest address space. Must precede Trace::Init (thunks are host allocations).
     Core::GetGuestVirtualMemory().Reserve();
     g_controllers = Common::Singleton<::Input::GameControllers>::Instance();

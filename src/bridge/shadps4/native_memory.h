@@ -1,8 +1,8 @@
-// SecondSonPC — the bridge's memory interfaces over SecondSonPC's own memory manager (Phase 2, P2.3.3c;
-// EXPERIMENTAL: only the self-test creates these, the game runs on the bridge's MemoryManager until P2.3.4;
-// docs/PHASE2_P233_NATIVE_VMM.md).
+// SecondSonPC — the bridge's memory interfaces over SecondSonPC's own memory manager (Phase 2, P2.3.3c; the game
+// runs on it with --native memory since P2.3.4, EXPERIMENTAL; the bridge's MemoryManager is the default;
+// docs/PHASE2_P233_NATIVE_VMM.md, docs/PHASE2_P234_NATIVE_MEMORY.md).
 //
-// Core::GuestVirtualMemory, Core::GuestPhysicalMemory and Core::GuestWriteNotifier (patch 0009) and
+// Core::GuestVirtualMemory, Core::GuestPhysicalMemory and Core::GuestWriteNotifier (patches 0009, 0012) and
 // Core::GpuMemory with its Core::GpuMemoryListener (patch 0008) over a Memory::VirtualMemory. No state but the
 // listener and the budget's console part: each call is the manager's call with the same arguments, the way
 // the bridge's adapters (memory.cpp) call its MemoryManager.
@@ -10,6 +10,7 @@
 
 #include <atomic>
 
+#include "app/config.h"
 #include "core/gpu_memory.h"
 #include "core/guest_memory.h"
 #include "runtime/memory/virtual_memory.h"
@@ -100,5 +101,25 @@ private:
     Forward forward_;
     std::atomic<Core::GpuMemoryListener*> listener_{nullptr};
 };
+
+/// The game's guest memory on SecondSonPC's manager (--native memory, P2.3.4).
+struct NativeGame {
+    Memory::VirtualMemory* vm = nullptr;
+    NativeGuestMemory* guest = nullptr;
+    NativeGpuMemory* gpu = nullptr;
+};
+
+/// --native memory: SecondSonPC's manager takes the game's address space the way the bridge's would (GameLayout over
+/// the host's free regions now, the 8448 MiB section; commit upfront, or on demand with --memory-commit on-demand)
+/// and becomes the guest memory (Core::SelectGuestMemory). At start-up, before anything reaches the guest memory.
+/// false, with the reason in the log, when the host refuses or the selection is closed; the bridge's manager stays.
+bool InstallNativeMemory(const App::Config& cfg, s32 sdk_version, u32 psf_attributes);
+
+/// What InstallNativeMemory installed; all null without --native memory. Lives until the process ends.
+NativeGame GetNativeGame();
+
+/// --selftest --native memory: the manager the game would run on, started as for the game, through the bridge's
+/// libkernel functions and the interfaces (docs/PHASE2_P234_NATIVE_MEMORY.md). Exit code 0 when everything passed.
+int RunNativeMemorySelfTest(const App::Config& cfg);
 
 } // namespace SecondSon::Bridge

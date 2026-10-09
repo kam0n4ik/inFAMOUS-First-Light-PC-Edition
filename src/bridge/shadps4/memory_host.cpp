@@ -18,6 +18,7 @@
 
 #include "app/config.h"
 #include "base/log.h"
+#include "bridge/shadps4/native_memory.h"
 #include "common/thread.h"
 #include "core/memory.h"
 #include "runtime/kernel/kernel.h"
@@ -235,6 +236,30 @@ static std::string VmaText(const std::vector<Core::GuestArea>& areas) {
 }
 
 std::string MemoryMapText() {
+    if (const NativeGame game = GetNativeGame(); game.vm != nullptr) {
+        // --native memory: the bridge's manager does not exist (creating it would take the address space again).
+        std::string out = "# virtual memory areas (SecondSonPC's manager, --native memory; free areas left out)\n";
+        out += "# start          end            size         type     prot  [phys first (slices)] \"name\"\n";
+        out += VmaText(Core::GetGuestVirtualMemory().Areas());
+        const auto& dmem = game.vm->Direct();
+        out += fmt::format("# direct memory: SecondSonPC's manager, size {:#x}\n", dmem.Size());
+        for (const auto& a : dmem.Snapshot()) {
+            out += fmt::format("{:#012x} {:#012x} {:#11x} {:<9} type {:2} views {}\n", a.base, a.base + a.size,
+                               a.size, StateName(a.state), a.memory_type, a.mappings);
+        }
+        const auto stats = game.vm->GetStats();
+        out += fmt::format("# flexible memory: {:#x} of {:#x} in use; section {:#x} bytes, commit {}\n",
+                           game.vm->FlexibleUsed(), game.vm->FlexibleBudget(), game.vm->Host().BackingSize(),
+                           game.vm->Host().Commit() == Memory::CommitMode::OnDemand ? "on demand" : "upfront");
+        out += fmt::format("# manager: maps {} unmaps {} protects {} failures {}; GPU unmap {} register {} map {} "
+                           "write {}; host views {} private {} remaps {} protection restores {} protect failures "
+                           "{} commits {}\n",
+                           stats.maps, stats.unmaps, stats.protects, stats.failures, stats.gpu_unmap,
+                           stats.gpu_register, stats.gpu_map, stats.gpu_write, stats.host.views, stats.host.privates,
+                           stats.host.remaps, stats.host.protect_restores, stats.host.protect_failures,
+                           stats.host.commits);
+        return out;
+    }
     auto& m = *Core::Memory::Instance();
     std::string out = "# virtual memory areas (the bridge's vma_map; free areas left out)\n";
     out += "# start          end            size         type     prot  [phys first (slices)] \"name\"\n";

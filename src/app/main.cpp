@@ -19,7 +19,10 @@
 //                              queue <sec> seconds after the window opens; no window focus needed
 //     --bridge <group>         sends a NATIVE group back to BRIDGE (fs, system, ...)
 //     --native <group>         enables an EXPERIMENTAL group, BRIDGE by default (kernel-dmem: direct
-//                              memory, P2.3.1; --loader sspc only)
+//                              memory, P2.3.1; memory: SecondSonPC's memory manager instead of the
+//                              bridge's, P2.3.4; --loader sspc only)
+//     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
+//                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
@@ -101,6 +104,12 @@ int main(int argc, char* argv[]) {
             config->bridged_groups.emplace_back(argv[++i]);
         } else if (arg == "--native" && has_value) {
             config->native_groups.emplace_back(argv[++i]); // experimental groups only
+        } else if (arg == "--memory-commit" && has_value) {
+            const std::string_view mode = argv[++i];
+            if (mode != "upfront" && mode != "on-demand") {
+                return Fail("--memory-commit must be upfront|on-demand");
+            }
+            config->memory_commit_on_demand = mode == "on-demand";
         } else if (arg == "--memory-map" && has_value) {
             config->memory_map_s = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--call-order" && has_value) {
@@ -140,6 +149,16 @@ int main(int argc, char* argv[]) {
             config->bridged_groups.end()) {
             return Fail("--native " + g + " and --bridge " + g + " contradict each other");
         }
+    }
+    const auto native = [&config](std::string_view g) {
+        return std::find(config->native_groups.begin(), config->native_groups.end(), g) != config->native_groups.end();
+    };
+    if (native("memory") && native("kernel-dmem")) {
+        return Fail("--native memory and --native kernel-dmem: SecondSonPC's memory manager keeps the direct memory "
+                    "itself; kernel-dmem accounts it beside the bridge's manager");
+    }
+    if (config->memory_commit_on_demand && !native("memory")) {
+        return Fail("--memory-commit on-demand is a mode of SecondSonPC's memory manager: it needs --native memory");
     }
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());

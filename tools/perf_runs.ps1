@@ -6,6 +6,8 @@
 # Phase 2.2.3 groups:          N0 none of them (as before the phase)  N1 + Tier 1 (kernel-util,
 #                              net-util, libc-mem)  N2 + kernel-mutex (mutexes, condvars)  N3 + kernel-rwlock
 # Phase 2.3.1 memory:          M0 default (bridge direct memory)  M1 --native kernel-dmem (experimental)
+# Phase 2.3.4 memory manager:  M2 --native memory (SecondSonPC's manager, commit upfront as the bridge)
+#                              M3 --native memory --memory-commit on-demand
 # A mode may be listed more than once (M0,M1,M1,M0): its runs go to <mode>_1, <mode>_2, ...
 # Two builds in one session (P2.3.2: before/after a refactoring): -Exes "before=E:\...\SecondSonPC.exe"
 # names extra builds; a mode written <name>:<mode> (before:M0) runs that build, a plain mode runs
@@ -47,6 +49,8 @@ $modeArgs = @{
     # Phase 2.3.1: M0 = default (direct memory accounted by the bridge), M1 = experimental native
     # direct memory. Alternate them (-Modes M0,M1,M1,M0): a mode listed twice gets M0_1, M0_2, ...
     M0 = ""; M1 = "--native kernel-dmem"
+    # Phase 2.3.4: the guest memory on SecondSonPC's manager (M2), with commit on demand (M3).
+    M2 = "--native memory"; M3 = "--native memory --memory-commit on-demand"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
@@ -81,7 +85,7 @@ function Get-SaveHashes {
 }
 
 if (-not $modeList.Count -or @($modeList | Where-Object { -not $modeArgs.ContainsKey($_) }).Count) {
-    Fail "-Modes must list A, B, C, D (sema/event flags), N0..N3 (Phase 2.2.3 groups) and/or M0, M1 (P2.3.1 memory)"
+    Fail "-Modes must list A, B, C, D (sema/event flags), N0..N3 (Phase 2.2.3 groups) and/or M0..M3 (P2.3 memory)"
 }
 if ($Seconds -lt 30 -or $Seconds -gt 300) { Fail "-Seconds must be 30..300 (short runs only)" }
 if ($Press -match '\s') { Fail "-Press must not contain spaces" }

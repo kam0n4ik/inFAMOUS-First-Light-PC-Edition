@@ -75,6 +75,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_vmm.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_native.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_native_start.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/native_memory.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/loader_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/memory_host.cpp

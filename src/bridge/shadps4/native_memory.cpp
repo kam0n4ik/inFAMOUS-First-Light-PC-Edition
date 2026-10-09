@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
+
+#include <windows.h>
 
 #include "base/log.h"
 #include "core/libraries/kernel/memory.h"
@@ -385,6 +388,92 @@ void NativeGpuMemory::Forward::OnGuestWrite(u64 addr, u64 size) {
     if (auto* listener = owner_->listener_.load(std::memory_order_acquire)) {
         listener->OnGuestWrite(addr, size);
     }
+}
+
+// ---------------------------------------------------------------------------- the game's guest memory (P2.3.4)
+
+namespace {
+
+NativeGame g_game; // set once at start-up; never destroyed (guest and GPU threads use it until the process ends)
+
+u32 HostWindowsBuild() {
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    const auto rtl = reinterpret_cast<RtlGetVersionFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")));
+    OSVERSIONINFOW info{};
+    info.dwOSVersionInfoSize = sizeof(info);
+    return rtl != nullptr && rtl(&info) == 0 ? info.dwBuildNumber : 0;
+}
+
+/// The host's regions from the system managed minimum on, queried the way the bridge's AddressSpace walks them
+/// (address_space.cpp: VirtualQuery at each region's end aligned up to the allocation granularity), so that
+/// GameLayout finds the same free regions the bridge would take at this moment.
+std::vector<Memory::HostRegionInfo> HostRegions(u64 granularity) {
+    std::vector<Memory::HostRegionInfo> out;
+    for (u64 next = 0x400000; next < 0x7FFFFFFF0000ull;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(next), &mbi, sizeof(mbi)) == 0) {
+            break;
+        }
+        const u64 base = reinterpret_cast<u64>(mbi.BaseAddress);
+        out.push_back({base, mbi.RegionSize, mbi.State == MEM_FREE});
+        next = AlignUpTo(base + mbi.RegionSize, granularity);
+    }
+    return out;
+}
+
+} // namespace
+
+bool InstallNativeMemory(const App::Config& cfg, s32 sdk_version, u32 psf_attributes) {
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const u64 granularity = system.dwAllocationGranularity;
+    const u32 build = HostWindowsBuild();
+    Memory::Layout layout = Memory::GameLayout(HostRegions(granularity), static_cast<u32>(sdk_version), build,
+                                               granularity, cfg.extra_dmem_mib, cfg.extra_fmem_mib);
+    layout.commit = cfg.memory_commit_on_demand ? Memory::CommitMode::OnDemand : Memory::CommitMode::Upfront;
+    std::string error;
+    auto vm = Memory::VirtualMemory::Create(layout, &error);
+    if (vm == nullptr) {
+        SSPC_LOG(Memory, Critical, "--native memory: SecondSonPC's memory manager cannot take the guest address space: {}",
+                 error);
+        return false;
+    }
+    const bool title_neo = ((psf_attributes >> 23) & 1) != 0; // param.sfo ATTRIBUTE: supports PS4 Pro
+    const Memory::Budget console{
+        .neo = cfg.neo_mode && title_neo,
+        .dev_kit = cfg.dev_kit,
+        .extra_dmem_mib = cfg.extra_dmem_mib,
+        .extra_fmem_mib = cfg.extra_fmem_mib,
+    };
+    Memory::VirtualMemory* manager = vm.release();
+    auto* guest = new NativeGuestMemory(*manager, console);
+    auto* gpu = new NativeGpuMemory(*manager);
+    if (!Core::SelectGuestMemory({guest, guest, guest, gpu})) {
+        SSPC_LOG(Memory, Critical, "--native memory: too late, the guest memory is already in use (the bridge's manager "
+                                   "stays)");
+        return false;
+    }
+    g_game = {manager, guest, gpu};
+    u64 total = 0;
+    for (const auto& r : layout.ranges) {
+        total += r.size;
+    }
+    SSPC_LOG(Memory, Warning,
+             "EXPERIMENTAL: the guest memory is SecondSonPC's manager (--native memory): {} ranges, {:#x} bytes in "
+             "[{:#x}, {:#x}); section {} MiB (direct {} MiB + flexible {} MiB), commit {}; SDK {:#x}, Windows build {}",
+             layout.ranges.size(), total, layout.ranges.front().base, layout.ranges.back().End(),
+             manager->Host().BackingSize() >> 20, layout.direct_size >> 20, layout.flexible_size >> 20,
+             layout.commit == Memory::CommitMode::OnDemand ? "on demand" : "upfront (as the bridge)",
+             static_cast<u32>(sdk_version), build);
+    for (const auto& r : layout.ranges) {
+        SSPC_LOG(Memory, Info, "  guest range {:#x} - {:#x}", r.base, r.End());
+    }
+    return true;
+}
+
+NativeGame GetNativeGame() {
+    return g_game;
 }
 
 } // namespace SecondSon::Bridge
