@@ -84,9 +84,16 @@ BRIDGE: его нативная версия свелась бы к вызову
    хранит гостевая память; типы (recursive/errorcheck/adaptive); производительность горячего пути
    (29 млн вызовов за 150 с — каждая лишняя микросекунда = 29 с CPU).
 
-## P2.3 — Memory Runtime — **план (не реализовано)**
+## P2.3 — Memory Runtime — **P2.3.1 экспериментально, остальное — план**
 
 Детальный план (механизмы, что нельзя до своего GPU-рантайма, порядок, тесты, критерии готовности): `docs\PHASE2_P23_P24_PLAN.md`.
+
+**P2.3.1 (2026-10-09, экспериментально, по умолчанию выключено)** — физическая direct memory:
+`sceKernelGetDirectMemorySize`, `sceKernelAllocateDirectMemory`, `sceKernelReleaseDirectMemory`
+NATIVE с `--native kernel-dmem` (`src\runtime\memory\direct_memory.*`, `src\runtime\kernel\memory.cpp`);
+мост учитывает свои direct-отображения в той же карте (патч `0007`), виртуальная память, защита и
+GPU остаются у моста. Аудит, контракт, архитектура, тесты, замеры и блокеры P2.3.2:
+`docs\PHASE2_P23_MEMORY.md`.
 
 Состояние: всё адресное пространство гостя ведёт `Core::MemoryManager` моста. Свой загрузчик
 обращается к нему только через `Loader::Host` (`src\bridge\shadps4\loader_host.cpp`):

@@ -97,11 +97,17 @@ RULES = [
      "yes", "low", "high", "bridge function", "-", "P3", "moves last (shared by all BRIDGE code)"),
     (r"^sceKernelGetPrtAperture$", r".", 4, "partially resident texture aperture",
      "GPU memory (PRT)", "no", "high", "high", "none", "-", "P4", ""),
+    (r"^sceKernel(GetDirectMemorySize|AllocateDirectMemory|ReleaseDirectMemory)$", r".", 3,
+     "physical direct memory: budget, allocation, release",
+     "release unmaps the views through the bridge's memory manager (patch 0007); the bridge's Map "
+     "counts its views in the native map", "yes", "medium", "high", "bridge function + native tests",
+     "kernel-dmem", "P1",
+     "P2.3.1: NATIVE only with --native kernel-dmem (EXPERIMENTAL, BRIDGE by default; docs/PHASE2_P23_MEMORY.md)"),
     (r"^(sceKernel(\w*DirectMemory\w*|Mprotect|QueryMemoryProtection|\w*Mmap\w*|Munmap|\w*FlexibleMemory\w*"
      r"|Mlock)|mmap|msync)$", r".", 3, "guest address space: direct/flexible memory, protection",
      "Core::Memory address space shared with the GPU buffer/texture cache and write tracking",
-     "with adapter (patch 0007)", "very high", "very high", "partial", "kernel-memory", "P3",
-     "P2.3 (docs/PHASE2_P23_P24_PLAN.md)"),
+     "with a MemoryForGpu adapter", "very high", "very high", "partial", "kernel-memory", "P3",
+     "P2.3.2: own virtual memory manager first (docs/PHASE2_P23_MEMORY.md §9)"),
     (r"^sceKernel(\w*Equeue|\w*UserEvent)$", r".", 4, "event queues",
      "VideoOut flip and Gnm EOP events are delivered into the game's queues", "no", "high", "high",
      "bridge function", "kernel-equeue", "P4", "moves with VideoOut/GnmDriver"),
@@ -222,7 +228,7 @@ def main() -> int:
     tier_names = {1: "Tier 1 — Low Risk", 2: "Tier 2 — Medium Risk", 3: "Tier 3 — High Risk",
                   4: "Tier 4 — GPU-Coupled", 0: "Unclassified"}
     out = [
-        "# Phase 2.2.3 — матрица переноса BRIDGE-функций",
+        "# Phase 2 — матрица переноса BRIDGE-функций (аудит P2.2.3, состояние после P2.3.1)",
         "",
         f"Сгенерировано `tools\\migration_matrix.py` по прогону `{a.run}`"
         + (f", снимок конца загрузки `{a.startup}`" if a.startup else "")
@@ -239,7 +245,7 @@ def main() -> int:
         "",
         "## Сводка",
         "",
-        "| Tier | функций | вызваны в прогоне или сессии | вызовов за прогон | NATIVE после P2.2.3 | по библиотекам |",
+        "| Tier | функций | вызваны в прогоне или сессии | вызовов за прогон | NATIVE в прогоне «после» | по библиотекам |",
         "|---|---:|---:|---:|---:|---|",
     ]
     for tier in sorted(by_tier):
@@ -266,15 +272,28 @@ def main() -> int:
         "отдельная группа `kernel-rwlock`. Ни одна другая импортируемая BRIDGE-функция мьютексы/condvar "
         "игры не получает (`docs\\KERNEL_SYNC.md` §4).",
         "- **Блокеры остального**: потоки, TLS-ключи, сигналы — P2.4 (нужен свой менеджер потоков после "
-        "P2.3); память — P2.3 (адаптер GPU-видимой памяти, патч 0007); event queues, VideoOut, GnmDriver — "
+        "P2.3); виртуальная память — P2.3.2 (свой менеджер и адаптер GPU-видимой памяти `MemoryForGpu`); "
+        "event queues, VideoOut, GnmDriver — "
         "Tier 4 до собственного GPU-рантайма; аудио/видео-декодеры, сохранения, трофеи, диалоги, сеть — "
         "фазы своих подсистем (сохранения — только с проверкой целостности).",
+        "",
+        "## Решения P2.3.1 (память)",
+        "",
+        "- **Перенесено (экспериментально, по умолчанию BRIDGE)**: `sceKernelGetDirectMemorySize`, "
+        "`sceKernelAllocateDirectMemory`, `sceKernelReleaseDirectMemory` — группа `kernel-dmem`, включается "
+        "`--native kernel-dmem` вместе с учётом отображений моста в нативной карте (патч `0007`). "
+        "Колонка «После» показывает прогон с этим ключом.",
+        "- **Остаются BRIDGE**: `sceKernelMapDirectMemory`, `sceKernelMunmap`, `mmap`, "
+        "`sceKernelMapNamedFlexibleMemory`, `sceKernelMprotect`, `sceKernelQueryMemoryProtection` — "
+        "виртуальная память (vma_map, плейсхолдеры, подложка, защита страниц) общая с GPU-мостом; `msync`, "
+        "`sceKernelMlock`, `sceKernelGetPrtAperture` — семантика неизвестна, вызовов нет "
+        "(`docs\\PHASE2_P23_MEMORY.md`).",
     ]
     for tier in sorted(by_tier):
         out += ["", f"## {tier_names[tier]}", "",
                 "| Функция | NID | Библиотека | Импортёры | Назначение | Старт | Геймплей | Сессия | "
                 "Реализация моста | Зависимости от shadPS4 | Без GPU | Сложность | Риск | Оракул | Группа | "
-                "Приоритет | После P2.2.3 | Заметки |",
+                "Приоритет | После | Заметки |",
                 "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for t in by_tier[tier]:
             out.append(f"| `{t['name']}` | `{t['nid']}` | {t['library']} | {t['importers']} | {t['purpose']} | "
