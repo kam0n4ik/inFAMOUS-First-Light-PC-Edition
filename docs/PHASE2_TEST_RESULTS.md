@@ -208,8 +208,9 @@ Esc — отпустить (пауза) / захватить снова; кли�
 
 | Проверка | Результат |
 |---|---|
-| `--selftest` | 377 / 0 |
-| `--fault-test` | 20 / 0 |
+| Сборки | `RelWithDebInfo` (`build\`) — без предупреждений; `Debug` (`build\debug\`, 9 мин с нуля) — без ошибок, в нашем коде только 3 давних `_wfopen` (`log.cpp`, `import_counter.cpp`) |
+| `--selftest` | 377 / 0 (`RelWithDebInfo` и `Debug`) |
+| `--fault-test` | 20 / 0 (`RelWithDebInfo` и `Debug`) |
 | `tools\tests\game_process_tests.ps1` | 82 / 0 |
 | Патчи моста `0001`–`0006` (в т. ч. `0005` SSPC-001, `0006` ввод) | не менялись |
 | Сохранения `userdata\home` | не записывались в этой сессии (последняя запись 00:27:55, до неё) |
