@@ -36,7 +36,7 @@ fullscreen = false                 # F11 toggles while playing
 fullscreenMode = "borderless"      # "borderless" | "exclusive"
 vblankFrequency = 60               # FPS unlock is a later stage (game timing must be checked first)
 presentMode = "mailbox"            # "mailbox" | "fifo" (vsync) | "immediate"
-showFps = false                    # FPS counter overlay at start-up (F10 toggles)
+showFps = true                   # FPS counter overlay at start-up (F10 toggles)
 
 [Audio]
 volume = 100                       # 0..100, on top of the game's own volume settings
