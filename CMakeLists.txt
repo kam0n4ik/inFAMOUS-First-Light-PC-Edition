@@ -50,6 +50,9 @@ add_library(sspc_runtime STATIC
     src/runtime/language.cpp
     src/runtime/libc/libc_mem.cpp
     src/runtime/memory/direct_memory.cpp
+    src/runtime/memory/host_address_space.cpp
+    src/runtime/memory/virtual_memory.cpp
+    src/runtime/memory/vma_map.cpp
     src/runtime/net/net_util.cpp
     src/runtime/pad/pad.cpp
     src/runtime/playgo/playgo.cpp

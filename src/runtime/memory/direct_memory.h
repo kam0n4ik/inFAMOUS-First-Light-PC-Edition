@@ -86,6 +86,9 @@ public:
 
     /// Sets the size (a page multiple; 0 = unconfigured). Refused while anything is allocated.
     bool Configure(u64 size);
+    /// Changes the size of a configured map (a page multiple, not 0), keeping what is allocated: refused
+    /// when a page that would be cut off is not free. The bridge's SetupMemoryRegions shrinks its map so.
+    bool Resize(u64 size);
     u64 Size() const;
 
     /// First fit: the lowest AlignUp(max(search_start, free area start), alignment) whose range fits

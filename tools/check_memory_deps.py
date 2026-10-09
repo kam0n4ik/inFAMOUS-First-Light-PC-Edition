@@ -46,6 +46,7 @@ EXCEPTIONS = {
     "src/bridge/shadps4/memory_host.cpp": ("E3", "glue of the bridge's manager with the native direct memory"),
     B + "video_core/page_manager.cpp": ("E5", "Linux only (UffdImpl)"),
     "src/bridge/shadps4/selftest.cpp": ("E6", "self-test of the bridge's implementation"),
+    "src/bridge/shadps4/selftest_vmm.cpp": ("E6", "self-test: GameLayout against the bridge's regions"),
     B + "core/memory.h": ("E7", "the implementation"),
     B + "core/memory.cpp": ("E7", "the implementation"),
     B + "core/address_space.h": ("E7", "the implementation"),

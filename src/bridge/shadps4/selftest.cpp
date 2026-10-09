@@ -37,6 +37,8 @@
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/memory_host.h"
+#include "bridge/shadps4/selftest_vmm.h"
+#include "common/elf_info.h"
 #include "common/singleton.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
@@ -4654,6 +4656,13 @@ int RunSelfTest(const App::Config& cfg) {
     TestDirectMemoryBridge(t, cfg);
     TestGpuMemory(t, cfg);
     TestGuestMemory(t);
+    for (const auto& g : TestNativeVirtualMemory(Common::ElfInfo::Instance().CompiledSdkVer())) {
+        t.checks += g.checks;
+        t.failures += g.failures;
+        t.report.insert(t.report.end(), g.lines.begin(), g.lines.end());
+        t.report.push_back(fmt::format("{:14} {:4} checks, {} different, 0 known differences - {}", g.name, g.checks,
+                                       g.failures, g.failures == 0 ? "PASS" : "FAIL"));
+    }
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

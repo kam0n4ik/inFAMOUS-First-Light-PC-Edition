@@ -81,6 +81,30 @@ bool DirectMemory::Configure(u64 size) {
     return true;
 }
 
+bool DirectMemory::Resize(u64 size) {
+    if (size == 0 || size % kPageSize != 0) {
+        return false;
+    }
+    std::scoped_lock lock{mutex_};
+    if (size_ == 0) {
+        return false;
+    }
+    if (size < size_) {
+        for (auto it = std::prev(areas_.upper_bound(size)); it != areas_.end(); ++it) {
+            if (it->second.state != AreaState::Free) {
+                return false;
+            }
+        }
+        SplitAt(size);
+        areas_.erase(areas_.lower_bound(size), areas_.end());
+    } else if (size > size_) {
+        areas_.emplace(size_, Info{.size = size - size_});
+    }
+    size_ = size;
+    Coalesce(0, size_);
+    return true;
+}
+
 u64 DirectMemory::Size() const {
     std::scoped_lock lock{mutex_};
     return size_;
