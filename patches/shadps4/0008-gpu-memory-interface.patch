@@ -1,9 +1,9 @@
 diff --git a/src/core/gpu_memory.h b/src/core/gpu_memory.h
 new file mode 100644
-index 00000000..9480a151
+index 00000000..b0cf1c6f
 --- /dev/null
 +++ b/src/core/gpu_memory.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// SecondSonPC patch 0008 (P2.3.2, docs/PHASE2_P232_GPU_MEMORY.md): the guest memory as the GPU
 +// bridge uses it. video_core and GnmDriver reach the memory manager only through GpuMemory, and
@@ -20,7 +20,8 @@ index 00000000..9480a151
 +/// The memory manager's notifications, in this order for one map/unmap/release: OnGpuUnmap
 +/// (before the address space changes, writer lock not held) -> OnGpuRegister (host pages mapped
 +/// or unmapped, writer lock held) -> OnGpuMap (writer lock not held). The operation's unmap lock
-+/// is held throughout: a listener must not map or unmap guest memory.
++/// is held throughout, except for a PRT area (SetPrtArea: OnGpuUnmap/OnGpuMap without any lock).
++/// A listener must not map or unmap guest memory.
 +class GpuMemoryListener {
 +public:
 +    virtual ~GpuMemoryListener() = default;
