@@ -4,7 +4,7 @@
 // (third_party/shadPS4 @ 0fe263a). What is used, and why it is still BRIDGE:
 //   __Error()                    guest errno (Kernel, Phase 2)
 //   HandleTable::Create/Delete   descriptor numbers shared with event queues/sockets (Kernel, Phase 2)
-//   MemoryManager::InvalidateMemory  GPU-tracked pages (Memory/GPU, Phase 2/4)
+//   GuestWriteNotifier           GPU-tracked pages (Memory/GPU, Phase 2/4; patch 0009)
 //   MntPoints::GetHostPath       only for the mount points SaveData creates (SaveData, Phase 3)
 //   posix_* / open / close ...   descriptors SecondSonPC did not open (std handles, /dev, equeues)
 #include <memory>
@@ -15,9 +15,9 @@
 
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
+#include "core/guest_memory.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
-#include "core/memory.h"
 
 namespace Libraries::Kernel { // defined in core/libraries/kernel/{file_system,kernel}.cpp
 s32* PS4_SYSV_ABI __Error();
@@ -57,7 +57,7 @@ public:
 
     void InvalidateGuestMemory(u64 address, u64 size) override {
         if (size != 0) {
-            Core::Memory::Instance()->InvalidateMemory(address, size);
+            Core::GetGuestWriteNotifier().NotifyHostWrite(address, size);
         }
     }
 

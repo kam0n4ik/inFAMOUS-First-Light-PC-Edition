@@ -77,7 +77,7 @@
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
 #include "core/debug_state.h"
-#include "core/memory.h"
+#include "core/guest_memory.h"
 #include "core/signals.h"
 #include "core/user_settings.h"
 #include "emulator.h"
@@ -954,8 +954,7 @@ void RunGame(const App::Config& cfg) {
     Common::Singleton<Core::FileSys::HandleTable>::Instance()->CreateStdHandles();
 
     // Reserves the guest address space. Must precede Trace::Init (thunks are host allocations).
-    auto* memory = Core::Memory::Instance();
-    (void)memory;
+    Core::GetGuestVirtualMemory().Reserve();
     g_controllers = Common::Singleton<::Input::GameControllers>::Instance();
     // The Phase 0 path's loader. The sspc path never creates shadPS4's Core::Linker.
     Core::Linker* shad_linker = own_loader ? nullptr : Common::Singleton<Core::Linker>::Instance();

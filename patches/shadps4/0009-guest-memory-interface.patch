@@ -1,0 +1,550 @@
+diff --git a/src/core/guest_memory.h b/src/core/guest_memory.h
+new file mode 100644
+index 00000000..47909c10
+--- /dev/null
++++ b/src/core/guest_memory.h
+@@ -0,0 +1,151 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// SecondSonPC patch 0009 (P2.3.3a, docs/PHASE2_P233_MEMORY_DEPENDENCIES.md): the guest memory as
++// everything but the GPU bridge (core/gpu_memory.h) and libkernel's memory functions uses it: the
++// loader, the threads' stacks and heap, file reads into guest buffers. Calls are at the memory
++// manager's level (libkernel's argument checks are the caller's). The implementation is the
++// bridge's MemoryManager (memory.cpp); another memory manager has to keep the same contract.
++
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++#include "common/enum.h"
++#include "common/types.h"
++
++namespace Core {
++
++enum class MemoryProt : u32 {
++    NoAccess = 0,
++    CpuRead = 1,
++    CpuWrite = 2,
++    CpuReadWrite = 3,
++    CpuExec = 4,
++    GpuRead = 16,
++    GpuWrite = 32,
++    GpuReadWrite = 48,
++};
++DECLARE_ENUM_FLAG_OPERATORS(MemoryProt)
++
++enum class MemoryMapFlags : u32 {
++    NoFlags = 0,
++    Shared = 1,
++    Private = 2,
++    Fixed = 0x10,
++    NoOverwrite = 0x80,
++    Void = 0x100,
++    Stack = 0x400,
++    NoSync = 0x800,
++    Anon = 0x1000,
++    System = 0x2000,
++    NoCore = 0x20000,
++    NoCoalesce = 0x400000,
++};
++DECLARE_ENUM_FLAG_OPERATORS(MemoryMapFlags)
++
++enum class VMAType : u32 {
++    Free = 0,
++    Reserved = 1,
++    Direct = 2,
++    Flexible = 3,
++    Pooled = 4,
++    PoolReserved = 5,
++    Stack = 6,
++    Code = 7,
++    File = 8,
++    System = 9,
++};
++
++/// One mapping as the memory manager takes it.
++struct GuestMapping {
++    /// With MemoryMapFlags::Fixed the address itself, else where the search for a free range
++    /// starts (0: the manager's default base).
++    VAddr addr = 0;
++    u64 size = 0;
++    MemoryProt prot = MemoryProt::NoAccess;
++    MemoryMapFlags flags = MemoryMapFlags::NoFlags;
++    VMAType type = VMAType::Reserved;
++    std::string_view name = "anon";
++    PAddr phys = -1;        ///< Direct: the physical address
++    bool exclusive = false; ///< Direct: EBUSY when a page of it is already mapped
++    u64 alignment = 0;      ///< 0: one page
++};
++
++/// A virtual memory area in use (diagnostics).
++struct GuestArea {
++    VAddr base = 0;
++    u64 size = 0;
++    VMAType type = VMAType::Free;
++    MemoryProt prot = MemoryProt::NoAccess;
++    PAddr phys = -1;     ///< the first physical address, -1 without a physical backing
++    u32 phys_slices = 0; ///< physical areas behind it
++    std::string name;
++};
++
++/// The guest's virtual address space: ranges, mappings, protection, names.
++class GuestVirtualMemory {
++public:
++    virtual ~GuestVirtualMemory() = default;
++
++    /// Takes the guest address space now, before the host allocates much (start-up); later calls
++    /// do nothing.
++    virtual void Reserve() = 0;
++
++    /// 0 or a libkernel error code; *out_addr is where the range was mapped. Notifies the GPU.
++    virtual s32 Map(void** out_addr, const GuestMapping& mapping) = 0;
++
++    virtual s32 Unmap(VAddr addr, u64 size) = 0;
++
++    /// The guest's protection of [addr, addr + size), applied to the host pages.
++    virtual s32 Protect(VAddr addr, u64 size, MemoryProt prot) = 0;
++
++    virtual void NameRange(VAddr addr, u64 size, std::string_view name) = 0;
++
++    /// addr, and with a size all of [addr, addr + size), inside the managed address space (free
++    /// areas count, gaps between the host's regions do not).
++    virtual bool IsValid(VAddr addr, u64 size = 0) = 0;
++
++    /// Start of the system reserved part of the guest address space (constant).
++    virtual VAddr SystemReservedBase() = 0;
++
++    /// The areas in use (free ones left out), in address order: a snapshot.
++    virtual std::vector<GuestArea> Areas() = 0;
++};
++
++/// The guest's physical memory: budgets and direct memory.
++class GuestPhysicalMemory {
++public:
++    virtual ~GuestPhysicalMemory() = default;
++
++    /// The direct and flexible memory budgets from the executable's SceKernelMemParam (start-up,
++    /// before the guest runs).
++    virtual void SetupRegions(u64 flexible_size, bool use_extended_mem1,
++                              bool use_extended_mem2) = 0;
++
++    virtual u64 DirectSize() = 0;
++
++    /// First fit in [search_start, search_end); -1 when nothing fits.
++    virtual PAddr AllocateDirect(PAddr search_start, PAddr search_end, u64 size, u64 alignment,
++                                 s32 memory_type) = 0;
++
++    /// Unmaps the views of [start, start + size) (the GPU first) and frees it. `checked`: ENOENT
++    /// when a page is not allocated.
++    virtual s32 ReleaseDirect(PAddr start, u64 size, bool checked) = 0;
++};
++
++/// Who must hear of host writes into guest memory (the GPU's page tracking).
++class GuestWriteNotifier {
++public:
++    virtual ~GuestWriteNotifier() = default;
++
++    /// The host writes [addr, addr + size) of guest memory past the GPU's page tracking (file
++    /// reads into guest buffers): called before the write.
++    virtual void NotifyHostWrite(VAddr addr, u64 size) = 0;
++};
++
++/// The guest memory: the bridge's MemoryManager. Valid for the process lifetime.
++GuestVirtualMemory& GetGuestVirtualMemory();
++GuestPhysicalMemory& GetGuestPhysicalMemory();
++GuestWriteNotifier& GetGuestWriteNotifier();
++
++} // namespace Core
+diff --git a/src/core/libraries/kernel/file_system.cpp b/src/core/libraries/kernel/file_system.cpp
+index 5f06f7be..d92f2a0a 100644
+--- a/src/core/libraries/kernel/file_system.cpp
++++ b/src/core/libraries/kernel/file_system.cpp
+@@ -27,12 +27,12 @@
+ #include "core/file_sys/directories/normal_directory.h"
+ #include "core/file_sys/directories/pfs_directory.h"
+ #include "core/file_sys/fs.h"
++#include "core/guest_memory.h"
+ #include "core/libraries/kernel/file_system.h"
+ #include "core/libraries/kernel/orbis_error.h"
+ #include "core/libraries/kernel/posix_error.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/net/net_kernel.h"
+-#include "core/memory.h"
+ #include "kernel.h"
+ 
+ #ifdef _WIN32
+@@ -353,10 +353,10 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
+ static thread_local std::vector<u8> file_buf{};
+ 
+ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
+-    const auto* memory = Core::Memory::Instance();
+     // Invalidate up to the actual number of bytes that could be read.
+     const auto remaining = file->GetSize() - file->Tell();
+-    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
++    Core::GetGuestWriteNotifier().NotifyHostWrite(reinterpret_cast<VAddr>(buf),
++                                                  std::min<u64>(nbytes, remaining));
+     if (file_buf.capacity() < nbytes) {
+         file_buf.reserve(nbytes);
+     }
+diff --git a/src/core/libraries/kernel/threads/pthread.cpp b/src/core/libraries/kernel/threads/pthread.cpp
+index ff26d408..e86b8862 100644
+--- a/src/core/libraries/kernel/threads/pthread.cpp
++++ b/src/core/libraries/kernel/threads/pthread.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/arch.h"
+ #include "common/assert.h"
+ #include "common/thread.h"
+ #ifdef _WIN32
+@@ -10,6 +11,7 @@
+ #include <pthread.h>
+ #endif
+ #include "core/debug_state.h"
++#include "core/guest_memory.h"
+ #include "core/libraries/kernel/kernel.h"
+ #include "core/libraries/kernel/orbis_error.h"
+ #include "core/libraries/kernel/posix_error.h"
+@@ -17,7 +19,6 @@
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/kernel/threads/thread_state.h"
+ #include "core/libraries/libs.h"
+-#include "core/memory.h"
+ 
+ #if defined(ARCH_X86_64) || defined(__arm64__) || defined(__aarch64__)
+ extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func,
+@@ -332,8 +333,8 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
+     new_thread->cancel_enable = true;
+     new_thread->cancel_async = false;
+ 
+-    auto* memory = Core::Memory::Instance();
+-    if (name && memory->IsValidMapping(reinterpret_cast<VAddr>(name))) {
++    auto& memory = Core::GetGuestVirtualMemory();
++    if (name && memory.IsValid(reinterpret_cast<VAddr>(name))) {
+         new_thread->name = name;
+     } else {
+         new_thread->name = fmt::format("Thread{}", new_thread->tid.load());
+@@ -492,7 +493,7 @@ int PS4_SYSV_ABI posix_sched_get_priority_min(SchedPolicy policy) {
+ int PS4_SYSV_ABI posix_pthread_rename_np(PthreadT thread, const char* name) {
+     LOG_INFO(Kernel_Pthread, "name = {}", name ? name : "(null)");
+     auto* thread_state = ThrState::Instance();
+-    auto* memory = Core::Memory::Instance();
++    auto& memory = Core::GetGuestVirtualMemory();
+ 
+     if (thread == g_curthread) {
+         // If the requested thread is curthread, skip locking and reference logic.
+@@ -501,7 +502,7 @@ int PS4_SYSV_ABI posix_pthread_rename_np(PthreadT thread, const char* name) {
+                               thread->name.data());
+         if (name && False(thread->attr.flags & PthreadAttrFlags::StackUser)) {
+             VAddr stack_addr = std::bit_cast<VAddr>(thread->attr.stackaddr_attr);
+-            memory->NameVirtualRange(stack_addr, thread->attr.stacksize_attr, name);
++            memory.NameRange(stack_addr, thread->attr.stacksize_attr, name);
+         }
+         return ORBIS_OK;
+     }
+@@ -521,7 +522,7 @@ int PS4_SYSV_ABI posix_pthread_rename_np(PthreadT thread, const char* name) {
+                               thread->name.data());
+         if (name && False(thread->attr.flags & PthreadAttrFlags::StackUser)) {
+             VAddr stack_addr = std::bit_cast<VAddr>(thread->attr.stackaddr_attr);
+-            memory->NameVirtualRange(stack_addr, thread->attr.stacksize_attr, name);
++            memory.NameRange(stack_addr, thread->attr.stacksize_attr, name);
+         }
+     }
+ 
+diff --git a/src/core/libraries/kernel/threads/stack.cpp b/src/core/libraries/kernel/threads/stack.cpp
+index 8c031e94..5837ce24 100644
+--- a/src/core/libraries/kernel/threads/stack.cpp
++++ b/src/core/libraries/kernel/threads/stack.cpp
+@@ -2,9 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/assert.h"
++#include "core/guest_memory.h"
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/kernel/threads/thread_state.h"
+-#include "core/memory.h"
+ 
+ namespace Libraries::Kernel {
+ 
+@@ -98,14 +98,17 @@ int ThreadState::CreateStack(PthreadAttr* attr) {
+ 
+     /* Map the stack and guard page together, and split guard
+        page from allocated space: */
+-    auto* memory = Core::Memory::Instance();
+-    int ret = memory->MapMemory(reinterpret_cast<void**>(&stackaddr), stackaddr,
+-                                stacksize + guardsize, Core::MemoryProt::CpuReadWrite,
+-                                Core::MemoryMapFlags::NoFlags, Core::VMAType::Stack);
++    auto& memory = Core::GetGuestVirtualMemory();
++    int ret = memory.Map(reinterpret_cast<void**>(&stackaddr),
++                         {.addr = stackaddr,
++                          .size = stacksize + guardsize,
++                          .prot = Core::MemoryProt::CpuReadWrite,
++                          .flags = Core::MemoryMapFlags::NoFlags,
++                          .type = Core::VMAType::Stack});
+     ASSERT_MSG(ret == 0, "Unable to map stack memory");
+ 
+     if (guardsize != 0) {
+-        ret = memory->Protect(stackaddr, guardsize, Core::MemoryProt::NoAccess);
++        ret = memory.Protect(stackaddr, guardsize, Core::MemoryProt::NoAccess);
+         ASSERT_MSG(ret == 0, "Unable to protect guard page");
+     }
+ 
+diff --git a/src/core/libraries/kernel/threads/thread_state.cpp b/src/core/libraries/kernel/threads/thread_state.cpp
+index cb48a38d..1cb65e67 100644
+--- a/src/core/libraries/kernel/threads/thread_state.cpp
++++ b/src/core/libraries/kernel/threads/thread_state.cpp
+@@ -4,11 +4,11 @@
+ #include <boost/container/small_vector.hpp>
+ #include "common/alignment.h"
+ #include "common/scope_exit.h"
++#include "core/guest_memory.h"
+ #include "core/libraries/kernel/posix_error.h"
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/kernel/threads/sleepq.h"
+ #include "core/libraries/kernel/threads/thread_state.h"
+-#include "core/memory.h"
+ #include "core/tls.h"
+ 
+ namespace Libraries::Kernel {
+@@ -20,13 +20,15 @@ void TcbDtor(Core::Tcb* oldtls);
+ 
+ ThreadState::ThreadState() {
+     // Reserve memory for maximum amount of threads allowed.
+-    auto* memory = Core::Memory::Instance();
+-    auto& impl = memory->GetAddressSpace();
++    auto& memory = Core::GetGuestVirtualMemory();
+     static constexpr u32 ThrHeapSize = Common::AlignUp(sizeof(Pthread) * MaxThreads, 16_KB);
+     void* heap_addr{};
+-    const int ret = memory->MapMemory(&heap_addr, impl.SystemReservedVirtualBase(), ThrHeapSize,
+-                                      Core::MemoryProt::CpuReadWrite, Core::MemoryMapFlags::NoFlags,
+-                                      Core::VMAType::File, "ThrHeap");
++    const int ret = memory.Map(&heap_addr, {.addr = memory.SystemReservedBase(),
++                                            .size = ThrHeapSize,
++                                            .prot = Core::MemoryProt::CpuReadWrite,
++                                            .flags = Core::MemoryMapFlags::NoFlags,
++                                            .type = Core::VMAType::File,
++                                            .name = "ThrHeap"});
+     ASSERT_MSG(ret == 0, "Unable to allocate thread heap memory {}", ret);
+     thread_heap.Initialize(heap_addr, ThrHeapSize);
+ }
+diff --git a/src/core/libraries/np/np_trophy.cpp b/src/core/libraries/np/np_trophy.cpp
+index e976703a..81c9b631 100644
+--- a/src/core/libraries/np/np_trophy.cpp
++++ b/src/core/libraries/np/np_trophy.cpp
+@@ -11,13 +11,13 @@
+ #include "common/path_util.h"
+ #include "common/slot_vector.h"
+ #include "core/emulator_settings.h"
++#include "core/guest_memory.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/np/np_error.h"
+ #include "core/libraries/np/np_handler.h"
+ #include "core/libraries/np/np_trophy.h"
+ #include "core/libraries/np/trophy_ui.h"
+ #include "core/libraries/system/userservice.h"
+-#include "core/memory.h"
+ 
+ namespace Libraries::Np::NpTrophy {
+ 
+@@ -361,10 +361,10 @@ s32 PS4_SYSV_ABI sceNpTrophyDestroyHandle(OrbisNpTrophyHandle handle) {
+ }
+ 
+ u64 ReadFile(Common::FS::IOFile& file, void* buf, u64 nbytes) {
+-    const auto* memory = Core::Memory::Instance();
+     // Invalidate up to the actual number of bytes that could be read.
+     const auto remaining = file.GetSize() - file.Tell();
+-    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
++    Core::GetGuestWriteNotifier().NotifyHostWrite(reinterpret_cast<VAddr>(buf),
++                                                  std::min<u64>(nbytes, remaining));
+ 
+     return file.ReadRaw<u8>(buf, nbytes);
+ }
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 4c1e383f..f10ba907 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -1553,6 +1553,20 @@ void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
+     }
+ }
+ 
++std::vector<GuestArea> MemoryManager::GetAreas() {
++    std::shared_lock lk{mutex};
++    std::vector<GuestArea> areas;
++    for (const auto& [base, vma] : vma_map) {
++        if (vma.type == VMAType::Free) {
++            continue;
++        }
++        const PAddr phys = vma.phys_areas.empty() ? -1 : vma.phys_areas.begin()->second.base;
++        areas.push_back(GuestArea{base, vma.size, vma.type, vma.prot, phys,
++                                  static_cast<u32>(vma.phys_areas.size()), vma.name});
++    }
++    return areas;
++}
++
+ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
+     // Calculate the minimum and maximum addresses present in our address space.
+     auto min_search_address = impl.SystemManagedVirtualBase();
+@@ -1806,10 +1820,85 @@ protected:
+ 
+ BridgeGpuMemory bridge_gpu_memory;
+ 
++// SecondSonPC patch 0009: everyone else's view of this memory manager. No state of its own: each
++// call is the manager call its users made before the interface, with the same arguments.
++class BridgeGuestMemory final : public GuestVirtualMemory,
++                                public GuestPhysicalMemory,
++                                public GuestWriteNotifier {
++public:
++    void Reserve() override {
++        (void)Memory::Instance();
++    }
++
++    s32 Map(void** out_addr, const GuestMapping& m) override {
++        return Memory::Instance()->MapMemory(out_addr, m.addr, m.size, m.prot, m.flags, m.type,
++                                             m.name, m.exclusive, m.phys, m.alignment);
++    }
++
++    s32 Unmap(VAddr addr, u64 size) override {
++        return Memory::Instance()->UnmapMemory(addr, size);
++    }
++
++    s32 Protect(VAddr addr, u64 size, MemoryProt prot) override {
++        return Memory::Instance()->Protect(addr, size, prot);
++    }
++
++    void NameRange(VAddr addr, u64 size, std::string_view name) override {
++        Memory::Instance()->NameVirtualRange(addr, size, name);
++    }
++
++    bool IsValid(VAddr addr, u64 size) override {
++        return Memory::Instance()->IsValidMapping(addr, size);
++    }
++
++    VAddr SystemReservedBase() override {
++        return Memory::Instance()->GetAddressSpace().SystemReservedVirtualBase();
++    }
++
++    std::vector<GuestArea> Areas() override {
++        return Memory::Instance()->GetAreas();
++    }
++
++    void SetupRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2) override {
++        Memory::Instance()->SetupMemoryRegions(flexible_size, use_extended_mem1, use_extended_mem2);
++    }
++
++    u64 DirectSize() override {
++        return Memory::Instance()->GetTotalDirectSize();
++    }
++
++    PAddr AllocateDirect(PAddr search_start, PAddr search_end, u64 size, u64 alignment,
++                         s32 memory_type) override {
++        return Memory::Instance()->Allocate(search_start, search_end, size, alignment, memory_type);
++    }
++
++    s32 ReleaseDirect(PAddr start, u64 size, bool checked) override {
++        return Memory::Instance()->Free(start, size, checked);
++    }
++
++    void NotifyHostWrite(VAddr addr, u64 size) override {
++        Memory::Instance()->InvalidateMemory(addr, size);
++    }
++};
++
++BridgeGuestMemory bridge_guest_memory;
++
+ } // Anonymous namespace
+ 
+ GpuMemory& GetGpuMemory() {
+     return bridge_gpu_memory;
+ }
+ 
++GuestVirtualMemory& GetGuestVirtualMemory() {
++    return bridge_guest_memory;
++}
++
++GuestPhysicalMemory& GetGuestPhysicalMemory() {
++    return bridge_guest_memory;
++}
++
++GuestWriteNotifier& GetGuestWriteNotifier() {
++    return bridge_guest_memory;
++}
++
+ } // namespace Core
+diff --git a/src/core/memory.h b/src/core/memory.h
+index 7c2d6855..5096974e 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -16,6 +16,7 @@
+ #include "common/types.h"
+ #include "core/address_space.h"
+ #include "core/gpu_memory.h"
++#include "core/guest_memory.h"
+ #include "core/libraries/kernel/memory.h"
+ 
+ namespace Libraries::Kernel {
+@@ -30,33 +31,7 @@ namespace Core {
+ 
+ constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+ 
+-enum class MemoryProt : u32 {
+-    NoAccess = 0,
+-    CpuRead = 1,
+-    CpuWrite = 2,
+-    CpuReadWrite = 3,
+-    CpuExec = 4,
+-    GpuRead = 16,
+-    GpuWrite = 32,
+-    GpuReadWrite = 48,
+-};
+-DECLARE_ENUM_FLAG_OPERATORS(MemoryProt)
+-
+-enum class MemoryMapFlags : u32 {
+-    NoFlags = 0,
+-    Shared = 1,
+-    Private = 2,
+-    Fixed = 0x10,
+-    NoOverwrite = 0x80,
+-    Void = 0x100,
+-    Stack = 0x400,
+-    NoSync = 0x800,
+-    Anon = 0x1000,
+-    System = 0x2000,
+-    NoCore = 0x20000,
+-    NoCoalesce = 0x400000,
+-};
+-DECLARE_ENUM_FLAG_OPERATORS(MemoryMapFlags)
++// MemoryProt, MemoryMapFlags and VMAType: core/guest_memory.h (SecondSonPC patch 0009).
+ 
+ enum class PhysicalMemoryType : u32 {
+     Free = 0,
+@@ -91,19 +66,6 @@ struct PhysicalMemoryArea {
+     }
+ };
+ 
+-enum class VMAType : u32 {
+-    Free = 0,
+-    Reserved = 1,
+-    Direct = 2,
+-    Flexible = 3,
+-    Pooled = 4,
+-    PoolReserved = 5,
+-    Stack = 6,
+-    Code = 7,
+-    File = 8,
+-    System = 9,
+-};
+-
+ struct VirtualMemoryArea {
+     VAddr base = 0;
+     u64 size = 0;
+@@ -334,6 +296,9 @@ public:
+ 
+     void InvalidateMemory(VAddr addr, u64 size) const;
+ 
++    /// SecondSonPC patch 0009: GuestVirtualMemory::Areas.
++    std::vector<GuestArea> GetAreas();
++
+ private:
+     VMAHandle FindVMA(VAddr target) {
+         return std::prev(vma_map.upper_bound(target));

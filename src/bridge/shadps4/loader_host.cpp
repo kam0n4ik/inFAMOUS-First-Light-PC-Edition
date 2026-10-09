@@ -3,7 +3,8 @@
 // SecondSonPC — TEMPORARY Phase 1-2 bridge: Loader::Host on top of the shadPS4 core
 // (third_party/shadPS4 @ 0fe263a). The calls and arguments are the ones shadPS4's own
 // Core::Module::LoadModuleToMemory and Core::Linker make (src/core/module.cpp, linker.cpp), so the
-// guest address space ends up laid out exactly like in the Phase 0 oracle.
+// guest address space ends up laid out exactly like in the Phase 0 oracle. Guest memory only
+// through Core::GuestVirtualMemory / GuestPhysicalMemory (patch 0009, P2.3.3a).
 #include "bridge/shadps4/loader_host.h"
 
 #include <cstdlib>
@@ -11,11 +12,11 @@
 
 #include "base/log.h"
 #include "bridge/shadps4/memory_host.h"
+#include "common/elf_info.h"
 #include "common/thread.h"
 #include "core/cpu_patches.h"
-#include "core/libraries/kernel/memory.h"
+#include "core/guest_memory.h"
 #include "core/libraries/kernel/threads.h"
-#include "core/memory.h"
 #include "core/tls.h"
 
 namespace SecondSon::Bridge {
@@ -42,30 +43,42 @@ Core::MemoryProt ProtFromElf(u32 flags) {
 
 class LoaderHost final : public Loader::Host {
 public:
-    LoaderHost() : memory_{Core::Memory::Instance()} {}
+    LoaderHost() : memory_{Core::GetGuestVirtualMemory()}, physical_{Core::GetGuestPhysicalMemory()} {}
 
     u64 ReserveModule(u64 desired, u64 size, std::string_view name) override {
         void* out = nullptr;
-        const s32 r = memory_->MapMemory(&out, desired, size, MemoryProt::NoAccess,
-                                         MemoryMapFlags::NoFlags, VMAType::Reserved, name);
+        const s32 r = memory_.Map(&out, {.addr = desired,
+                                         .size = size,
+                                         .prot = MemoryProt::NoAccess,
+                                         .flags = MemoryMapFlags::NoFlags,
+                                         .type = VMAType::Reserved,
+                                         .name = name});
         return r == 0 ? reinterpret_cast<u64>(out) : 0;
     }
 
     bool MapTrampoline(u64 address, u64 size, std::string_view name) override {
         void* out = reinterpret_cast<void*>(address);
-        return memory_->MapMemory(&out, address, size, MemoryProt::CpuReadWrite | MemoryProt::CpuExec,
-                                  MemoryMapFlags::Fixed, VMAType::Code, name) == 0;
+        return memory_.Map(&out, {.addr = address,
+                                  .size = size,
+                                  .prot = MemoryProt::CpuReadWrite | MemoryProt::CpuExec,
+                                  .flags = MemoryMapFlags::Fixed,
+                                  .type = VMAType::Code,
+                                  .name = name}) == 0;
     }
 
     bool MapSegment(u64 address, u64 size, u32 elf_flags, bool system_module,
                     std::string_view name) override {
         void* out = reinterpret_cast<void*>(address);
-        return memory_->MapMemory(&out, address, size, ProtFromElf(elf_flags), MemoryMapFlags::Fixed,
-                                  system_module ? VMAType::Code : VMAType::Flexible, name) == 0;
+        return memory_.Map(&out, {.addr = address,
+                                  .size = size,
+                                  .prot = ProtFromElf(elf_flags),
+                                  .flags = MemoryMapFlags::Fixed,
+                                  .type = system_module ? VMAType::Code : VMAType::Flexible,
+                                  .name = name}) == 0;
     }
 
     void SetupMemoryRegions(u64 flexible_size, bool extended1, bool extended2) override {
-        memory_->SetupMemoryRegions(flexible_size, extended1, extended2);
+        physical_.SetupRegions(flexible_size, extended1, extended2);
         if (!ConfigureNativeDirectMemory(flexible_size, extended1, extended2)) {
             SSPC_LOG(Loader, Critical, "--native kernel-dmem: direct memory budget mismatch, stopping");
             Log::Flush();
@@ -74,24 +87,50 @@ public:
     }
 
     void* MapPrimaryTls(u64 size) override {
-        // libkernel maps the primary thread's block with addr = 0 (system-managed area, which
-        // already holds a mapping, hence this address).
-        void* addr = reinterpret_cast<void*>(0x881000000ULL);
-        const s32 ret = Libraries::Kernel::sceKernelMapNamedFlexibleMemory(&addr, size, 3, 0,
-                                                                           "SceKernelPrimaryTcbTls");
+        // libkernel maps the primary thread's block with sceKernelMapNamedFlexibleMemory (RW, no
+        // flags); its search starts at 0x881000000 (the system-managed area already holds a mapping
+        // there). The function's argument checks pass for these arguments (the size is a page
+        // multiple, the name shorter than 32), so this is the memory manager call it makes.
+        void* addr = nullptr;
+        const s32 ret = memory_.Map(&addr, {.addr = 0x881000000ULL,
+                                            .size = size,
+                                            .prot = MemoryProt::CpuReadWrite,
+                                            .flags = MemoryMapFlags::NoFlags,
+                                            .type = VMAType::Flexible,
+                                            .name = "SceKernelPrimaryTcbTls"});
+        SSPC_LOG(Loader, Info, "primary thread TLS: {:#x} bytes of flexible memory at {} ({:#x})", size,
+                 addr, static_cast<u32>(ret));
         return ret == 0 ? addr : nullptr;
     }
 
     bool InitGnmDriverMemory() override {
-        s64 phys_addr{};
-        s32 result = Libraries::Kernel::sceKernelAllocateDirectMemory(
-            0, Libraries::Kernel::sceKernelGetDirectMemorySize(), 0x10000, 0x10000, 3, &phys_addr);
-        if (result == 0) {
-            void* addr{reinterpret_cast<void*>(0xfe0000000)};
-            result = Libraries::Kernel::sceKernelMapNamedDirectMemory(&addr, 0x10000, 0x13, 0, phys_addr,
-                                                                      0x10000, "SceGnmDriver");
+        // libSceGnmDriver's start-up: sceKernelAllocateDirectMemory(0, the direct memory size,
+        // 64 KiB, 64 KiB, type 3) and sceKernelMapNamedDirectMemory(0xfe0000000, 64 KiB, 0x13,
+        // flags 0, phys, 64 KiB, "SceGnmDriver"). Their argument checks pass for these constants;
+        // the mapping is exclusive (EBUSY over a mapped page) from SDK 2.50 on unless the guest
+        // enabled direct memory aliasing, which no module of this game imports. The SDK version is
+        // the one libkernel's RegisterLib read (ElfInfo, filled by the bootstrap before the bridge's
+        // libraries start; this runs on the game's main thread, after them).
+        const PAddr phys = physical_.AllocateDirect(0, physical_.DirectSize(), 0x10000, 0x10000, 3);
+        if (phys == -1) {
+            SSPC_LOG(Loader, Error, "libSceGnmDriver start-up: no direct memory");
+            return false;
         }
-        return result == 0;
+        void* addr = nullptr;
+        const s32 ret =
+            memory_.Map(&addr, {.addr = 0xfe0000000ULL,
+                                .size = 0x10000,
+                                .prot = static_cast<MemoryProt>(0x13), // CPU read/write, GPU read
+                                .flags = MemoryMapFlags::NoFlags,
+                                .type = VMAType::Direct,
+                                .name = "SceGnmDriver",
+                                .phys = phys,
+                                .exclusive = Common::ElfInfo::Instance().CompiledSdkVer() >=
+                                             Common::ElfInfo::FW_250,
+                                .alignment = 0x10000});
+        SSPC_LOG(Loader, Info, "libSceGnmDriver start-up: direct memory {:#x} mapped at {} ({:#x})", phys, addr,
+                 static_cast<u32>(ret));
+        return ret == 0;
     }
 
     void RegisterPatchModule(u64 module, u64 module_size, u64 trampoline,
@@ -130,7 +169,8 @@ public:
     }
 
 private:
-    Core::MemoryManager* memory_;
+    Core::GuestVirtualMemory& memory_;
+    Core::GuestPhysicalMemory& physical_;
     Libraries::Kernel::Thread main_thread_;
 };
 

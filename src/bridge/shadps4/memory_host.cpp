@@ -51,27 +51,6 @@ public:
         return it->second.dma_type == PhysicalMemoryType::Free;
     }
 
-    static std::string Vmas(MemoryManager& m) {
-        static constexpr const char* kTypes[] = {"free",   "reserved", "direct", "flexible", "pooled",
-                                                 "poolres", "stack",    "code",   "file",     "system"};
-        std::shared_lock lk{m.mutex};
-        std::string out;
-        for (const auto& [base, vma] : m.vma_map) {
-            if (vma.type == VMAType::Free) {
-                continue;
-            }
-            const auto type = static_cast<u32>(vma.type);
-            out += fmt::format("{:#014x} {:#014x} {:#12x} {:<8} prot {:#04x}", base, base + vma.size, vma.size,
-                               type < std::size(kTypes) ? kTypes[type] : "?", static_cast<u32>(vma.prot));
-            if (!vma.phys_areas.empty()) {
-                out += fmt::format(" phys {:#x} ({} slice{})", vma.phys_areas.begin()->second.base,
-                                   vma.phys_areas.size(), vma.phys_areas.size() == 1 ? "" : "s");
-            }
-            out += fmt::format(" \"{}\"\n", vma.name);
-        }
-        return out;
-    }
-
     /// The bridge's dmem_map in the format of the native map (a mapped area counts one view: the
     /// bridge does not count them).
     static std::string Dmem(MemoryManager& m) {
@@ -238,11 +217,28 @@ bool BridgeDirectMemoryFreeAt(u64 phys) {
     return Core::SecondSonMemoryAccess::DmemFreeAt(*Core::Memory::Instance(), phys);
 }
 
+/// The virtual memory areas in use, one line each (the --memory-map format of P2.3.1).
+static std::string VmaText(const std::vector<Core::GuestArea>& areas) {
+    static constexpr const char* kTypes[] = {"free",   "reserved", "direct", "flexible", "pooled",
+                                             "poolres", "stack",    "code",   "file",     "system"};
+    std::string out;
+    for (const auto& a : areas) {
+        const auto type = static_cast<u32>(a.type);
+        out += fmt::format("{:#014x} {:#014x} {:#12x} {:<8} prot {:#04x}", a.base, a.base + a.size, a.size,
+                           type < std::size(kTypes) ? kTypes[type] : "?", static_cast<u32>(a.prot));
+        if (a.phys_slices != 0) {
+            out += fmt::format(" phys {:#x} ({} slice{})", a.phys, a.phys_slices, a.phys_slices == 1 ? "" : "s");
+        }
+        out += fmt::format(" \"{}\"\n", a.name);
+    }
+    return out;
+}
+
 std::string MemoryMapText() {
     auto& m = *Core::Memory::Instance();
     std::string out = "# virtual memory areas (the bridge's vma_map; free areas left out)\n";
     out += "# start          end            size         type     prot  [phys first (slices)] \"name\"\n";
-    out += Core::SecondSonMemoryAccess::Vmas(m);
+    out += VmaText(Core::GetGuestVirtualMemory().Areas());
     if (g_installed) {
         const auto& dmem = Memory::GameDirectMemory();
         out += fmt::format("# direct memory: NATIVE (--native kernel-dmem), size {:#x}\n", dmem.Size());

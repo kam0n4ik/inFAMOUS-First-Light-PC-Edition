@@ -4213,6 +4213,316 @@ void TestGpuMemory(Totals& t, const App::Config& cfg) {
     c.Summary();
 }
 
+// ---------------------------------------------------------------------------- guest memory (P2.3.3a)
+
+/// Host state (state/type/protection) of every 16 KiB page of [w, w + size).
+std::string HostPagesText(u64 w, u64 size) {
+    std::string out;
+    for (u64 o = 0; o < size; o += 0x4000) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery(reinterpret_cast<void*>(w + o), &mbi, sizeof(mbi));
+        out += fmt::format("{:x}:{:x}/{:x}/{:x} ", o, mbi.State, mbi.Type, mbi.Protect);
+    }
+    return out;
+}
+
+/// The guest's areas overlapping [w, w + size), addresses relative to w.
+std::string AreasText(const std::vector<Core::GuestArea>& areas, u64 w, u64 size) {
+    std::string out;
+    for (const auto& a : areas) {
+        if (a.base + a.size <= w || a.base >= w + size) {
+            continue;
+        }
+        out += fmt::format("[{:#x}+{:#x} t{} p{:#x} {:#x}/{} \"{}\"] ", a.base - w, a.size, static_cast<u32>(a.type),
+                           static_cast<u32>(a.prot), a.phys, a.phys_slices, a.name);
+    }
+    return out;
+}
+
+/// GPU notifications with the addresses inside [w, w + size) relative to w.
+std::string RelEventsText(const std::vector<RecordingGpuListener::Event>& events, u64 w, u64 size) {
+    static constexpr const char* kNames[] = {"unmap", "register", "map", "write"};
+    std::string out;
+    for (const auto& e : events) {
+        const bool inside = e.addr >= w && e.addr - w < size;
+        out += fmt::format("[{} {}{:#x}+{:#x} c{} w{}] ", kNames[static_cast<int>(e.kind)], inside ? "w+" : "",
+                           inside ? e.addr - w : e.addr, e.size, e.committed ? 1 : 0, e.writer_locked ? 1 : 0);
+    }
+    return out;
+}
+
+/// P2.3.3a: everything but the GPU and libkernel's memory API reaches the memory manager through
+/// Core::GuestVirtualMemory / GuestPhysicalMemory / GuestWriteNotifier (patch 0009). The calls the
+/// moved users make (loader, thread stacks and heap, pthread names, file reads), once through the
+/// interfaces and once on the manager the way they called it before, in two free windows: the
+/// same results, areas, host pages and GPU notifications (relative to the window). Then the
+/// loader's two start-up mappings that used to go through libkernel's functions (libSceGnmDriver's
+/// direct memory, the primary thread's TLS) against those functions.
+void TestGuestMemory(Totals& t) {
+    using Core::MemoryMapFlags;
+    using Core::MemoryProt;
+    using Core::VMAType;
+    InputChecks c(t, "GuestMemory");
+    auto* mm = Core::Memory::Instance();
+    auto& vm = Core::GetGuestVirtualMemory();
+    auto& pm = Core::GetGuestPhysicalMemory();
+    auto& writes = Core::GetGuestWriteNotifier();
+    auto& gm = Core::GetGpuMemory();
+    if (presenter == nullptr) {
+        c.Check("the bridge's GPU is running", false, "");
+        c.Summary();
+        return;
+    }
+    const size_t vmas_before = BridgeVmaCount();
+    const auto loader = CreateLoaderHost(); // the moved loader call sites themselves
+    constexpr u64 kWindow = 0x200000;
+    const auto FreeWindow = [&] {
+        // 64 KiB aligned, so that aligned searches inside it fall on the same offsets in any window.
+        void* out = nullptr;
+        if (mm->MapMemory(&out, 0, kWindow, MemoryProt::NoAccess, MemoryMapFlags::NoFlags, VMAType::Reserved,
+                          "selftest window", false, -1, 0x10000) != 0) {
+            return ~0ull;
+        }
+        mm->UnmapMemory(reinterpret_cast<u64>(out), kWindow);
+        return reinterpret_cast<u64>(out);
+    };
+
+    c.Check("the simple queries: DirectSize = GetTotalDirectSize, SystemReservedBase = the address space's, "
+            "IsValid = IsValidMapping (inside, outside, a range)",
+            pm.DirectSize() == mm->GetTotalDirectSize() &&
+                vm.SystemReservedBase() == mm->GetAddressSpace().SystemReservedVirtualBase() &&
+                vm.IsValid(0x200000000) == mm->IsValidMapping(0x200000000) &&
+                vm.IsValid(0x1000) == mm->IsValidMapping(0x1000) &&
+                vm.IsValid(0x200000000, 0x100000) == mm->IsValidMapping(0x200000000, 0x100000) &&
+                vm.IsValid(1ull << 40, 0x4000) == mm->IsValidMapping(1ull << 40, 0x4000),
+            fmt::format("{:#x} {:#x}", pm.DirectSize(), vm.SystemReservedBase()));
+
+    // One run of the moved users' calls in window w. `via`: through the interfaces, else straight
+    // to the manager with the arguments the call sites used before patch 0009.
+    struct Run {
+        std::string text;
+        bool ok = true;
+    };
+    const auto Script = [&](bool via, u64 w) {
+        Run r;
+        RecordingGpuListener rec(false);
+        rec.next = gm.SetListener(&rec);
+        const auto Map = [&](const Core::GuestMapping& m, void** out) -> s32 {
+            if (via) {
+                return vm.Map(out, m);
+            }
+            if (m.type == VMAType::Direct) {
+                return mm->MapMemory(out, m.addr, m.size, m.prot, m.flags, m.type, m.name, m.exclusive, m.phys,
+                                     m.alignment);
+            }
+            return m.name == "anon" ? mm->MapMemory(out, m.addr, m.size, m.prot, m.flags, m.type)
+                                    : mm->MapMemory(out, m.addr, m.size, m.prot, m.flags, m.type, m.name);
+        };
+        const auto Step = [&](std::string_view what, s32 result, u64 out) {
+            const bool inside = out >= w && out - w < kWindow;
+            r.text += fmt::format("{}: {} at {}{:#x} | {}\n", what, Code(result), inside ? "w+" : "",
+                                  inside ? out - w : out, RelEventsText(rec.Take(), w, kWindow));
+            r.ok = r.ok && result == 0;
+        };
+        void* out = nullptr;
+        s32 res = 0;
+        // Loader: a module's reservation, its trampoline, a game segment (flexible, PF_R|PF_W) and a system
+        // one (code, PF_R|PF_X): through Loader::Host itself, or on the manager as before patch 0009.
+        if (via) {
+            const u64 base = loader->ReserveModule(w, 0x40000, "sspc module");
+            Step("ReserveModule", base != 0 ? 0 : -1, base);
+            Step("MapTrampoline", loader->MapTrampoline(w + 0x30000, 0x10000, "sspc module") ? 0 : -1, w + 0x30000);
+            Step("MapSegment (game)", loader->MapSegment(w, 0x20000, 0x6, false, "sspc module") ? 0 : -1, w);
+            Step("MapSegment (system)", loader->MapSegment(w + 0x20000, 0x10000, 0x5, true, "sspc module") ? 0 : -1,
+                 w + 0x20000);
+        } else {
+            res = Map({.addr = w, .size = 0x40000, .type = VMAType::Reserved, .name = "sspc module"}, &out);
+            Step("ReserveModule", res, reinterpret_cast<u64>(out));
+            out = reinterpret_cast<void*>(w + 0x30000);
+            res = Map({.addr = w + 0x30000, .size = 0x10000, .prot = MemoryProt::CpuReadWrite | MemoryProt::CpuExec,
+                       .flags = MemoryMapFlags::Fixed, .type = VMAType::Code, .name = "sspc module"},
+                      &out);
+            Step("MapTrampoline", res, reinterpret_cast<u64>(out));
+            out = reinterpret_cast<void*>(w);
+            res = Map({.addr = w, .size = 0x20000, .prot = MemoryProt::CpuReadWrite, .flags = MemoryMapFlags::Fixed,
+                       .type = VMAType::Flexible, .name = "sspc module"},
+                      &out);
+            Step("MapSegment (game)", res, reinterpret_cast<u64>(out));
+            out = reinterpret_cast<void*>(w + 0x20000);
+            res = Map({.addr = w + 0x20000, .size = 0x10000, .prot = MemoryProt::CpuRead | MemoryProt::CpuExec,
+                       .flags = MemoryMapFlags::Fixed, .type = VMAType::Code, .name = "sspc module"},
+                      &out);
+            Step("MapSegment (system)", res, reinterpret_cast<u64>(out));
+        }
+        // Threads: a stack with its guard page, the thread heap, a stack name.
+        u64 stack = w + 0x80000;
+        res = Map({.addr = stack, .size = 0x24000, .prot = MemoryProt::CpuReadWrite, .type = VMAType::Stack},
+                  reinterpret_cast<void**>(&stack));
+        Step("CreateStack", res, stack);
+        res = via ? vm.Protect(stack, 0x4000, MemoryProt::NoAccess) : mm->Protect(stack, 0x4000, MemoryProt::NoAccess);
+        Step("guard page", res, stack);
+        out = nullptr;
+        res = Map({.addr = w + 0x100000, .size = 0x10000, .prot = MemoryProt::CpuReadWrite, .type = VMAType::File,
+                   .name = "ThrHeap"},
+                  &out);
+        Step("ThreadState heap", res, reinterpret_cast<u64>(out));
+        if (via) {
+            vm.NameRange(stack + 0x4000, 0x20000, "selftest stack");
+        } else {
+            mm->NameVirtualRange(stack + 0x4000, 0x20000, "selftest stack");
+        }
+        Step("rename (stack)", 0, stack);
+        const bool valid = via ? vm.IsValid(stack + 0x4000) : mm->IsValidMapping(stack + 0x4000);
+        r.text += fmt::format("IsValid(name in the stack) {}\n", valid);
+        // libSceGnmDriver's start-up mapping, in the window.
+        const PAddr phys = via ? pm.AllocateDirect(0, pm.DirectSize(), 0x10000, 0x10000, 3)
+                               : mm->Allocate(0, mm->GetTotalDirectSize(), 0x10000, 0x10000, 3);
+        r.text += fmt::format("AllocateDirect {:#x}\n", phys);
+        const Core::GuestMapping gnm{.addr = w + 0x140000,
+                                     .size = 0x10000,
+                                     .prot = static_cast<MemoryProt>(0x13),
+                                     .type = VMAType::Direct,
+                                     .name = "SceGnmDriver",
+                                     .phys = phys,
+                                     .exclusive = true,
+                                     .alignment = 0x10000};
+        out = nullptr;
+        res = Map(gnm, &out);
+        Step("MapDirect", res, reinterpret_cast<u64>(out));
+        const u64 view = reinterpret_cast<u64>(out);
+        void* again = nullptr;
+        const s32 busy = Map(gnm, &again);
+        if (busy == 0) {
+            mm->UnmapMemory(reinterpret_cast<u64>(again), 0x10000); // must not happen: not left behind
+        }
+        Step("MapDirect again (exclusive: EBUSY)", busy == static_cast<s32>(0x80020010) ? 0 : (busy == 0 ? -1 : busy),
+             reinterpret_cast<u64>(again));
+        // A file read into a guest buffer.
+        if (via) {
+            writes.NotifyHostWrite(w + 0x1000, 0x2345);
+        } else {
+            mm->InvalidateMemory(w + 0x1000, 0x2345);
+        }
+        Step("file read", 0, w + 0x1000);
+        r.text += "areas " + AreasText(via ? vm.Areas() : mm->GetAreas(), w, kWindow) + "\n";
+        r.text += "host " + HostPagesText(w, kWindow) + "\n";
+        // Everything back.
+        const auto Unmap = [&](u64 a, u64 s) { return via ? vm.Unmap(a, s) : mm->UnmapMemory(a, s); };
+        Step("unmap view", Unmap(view, 0x10000), view);
+        Step("release", via ? pm.ReleaseDirect(phys, 0x10000, false) : mm->Free(phys, 0x10000, false), phys);
+        Step("unmap module", Unmap(w, 0x40000), w);
+        // The guard page and the name split the stack's anonymous memory into three areas; the
+        // bridge unmaps area by area and cannot split a host private allocation (an assertion,
+        // D17), so the stack becomes one area again first (its protection and name restored).
+        Step("guard page off", via ? vm.Protect(stack, 0x4000, MemoryProt::CpuReadWrite)
+                                   : mm->Protect(stack, 0x4000, MemoryProt::CpuReadWrite),
+             stack);
+        if (via) {
+            vm.NameRange(stack, 0x24000, "anon");
+        } else {
+            mm->NameVirtualRange(stack, 0x24000, "anon");
+        }
+        r.text += "stack as one area " + AreasText(mm->GetAreas(), stack, 0x24000) + "\n";
+        Step("unmap stack", Unmap(stack, 0x24000), stack);
+        Step("unmap heap", Unmap(w + 0x100000, 0x10000), w + 0x100000);
+        r.text += "after " + AreasText(mm->GetAreas(), w, kWindow) + HostPagesText(w, kWindow) + "\n";
+        gm.SetListener(rec.next);
+        return r;
+    };
+    const u64 w1 = FreeWindow();
+    const Run direct = Script(false, w1);
+    const u64 w2 = FreeWindow();
+    const Run via = Script(true, w2);
+    c.Check("the moved users' calls through the interfaces = the same calls on the manager: results, addresses, "
+            "areas, host pages, GPU notifications (relative to two free windows)",
+            w1 != ~0ull && w2 != ~0ull && direct.ok && via.ok && direct.text == via.text,
+            fmt::format("w {:#x} {:#x}\n--- manager\n{}--- interfaces\n{}", w1, w2, direct.text, via.text));
+
+    // The loader's start-up mappings: Loader::Host (interfaces) against the libkernel functions it
+    // used to call, at the same fixed addresses (free in the self-test: no game is loaded).
+    const auto Taken = [&](u64 addr, u64 size) {
+        for (const auto& a : vm.Areas()) {
+            if (a.base < addr + size && addr < a.base + a.size) {
+                return true;
+            }
+        }
+        return false;
+    };
+    constexpr u64 kGnm = 0xfe0000000;
+    constexpr u64 kTls = 0x881000000;
+    constexpr u64 kTlsSize = 0x8000;
+    if (Taken(kGnm, 0x10000) || Taken(kTls, kTlsSize)) {
+        c.Check("the loader's start-up addresses are free in the self-test", false, AreasText(vm.Areas(), 0, ~0ull));
+    } else {
+        auto& host = loader;
+        const auto State = [&](u64 addr, u64 size) {
+            return AreasText(vm.Areas(), addr, size) + HostPagesText(addr, size);
+        };
+        const auto Busy = [&](s64 phys) {
+            void* a = nullptr;
+            const s32 r =
+                Libraries::Kernel::sceKernelMapNamedDirectMemory(&a, 0x10000, 0x13, 0, phys, 0x10000, "again");
+            if (r == 0) {
+                mm->UnmapMemory(reinterpret_cast<u64>(a), 0x10000); // must not happen: not left behind
+            }
+            return r;
+        };
+        const auto PhysOf = [&](u64 addr) {
+            for (const auto& a : vm.Areas()) {
+                if (a.base == addr) {
+                    return a.phys;
+                }
+            }
+            return static_cast<PAddr>(-1);
+        };
+        const bool gnm_ok = host->InitGnmDriverMemory();
+        const std::string gnm_host = State(kGnm, 0x10000);
+        const PAddr gnm_phys = PhysOf(kGnm);
+        const s32 gnm_busy = Busy(gnm_phys);
+        mm->UnmapMemory(kGnm, 0x10000);
+        mm->Free(gnm_phys, 0x10000, false);
+        s64 phys = -1;
+        s32 api = Libraries::Kernel::sceKernelAllocateDirectMemory(
+            0, static_cast<s64>(Libraries::Kernel::sceKernelGetDirectMemorySize()), 0x10000, 0x10000, 3, &phys);
+        void* addr = reinterpret_cast<void*>(kGnm);
+        api = api == 0 ? Libraries::Kernel::sceKernelMapNamedDirectMemory(&addr, 0x10000, 0x13, 0, phys, 0x10000,
+                                                                          "SceGnmDriver")
+                       : api;
+        const std::string gnm_api = State(kGnm, 0x10000);
+        const s32 api_busy = Busy(phys);
+        mm->UnmapMemory(kGnm, 0x10000);
+        mm->Free(phys, 0x10000, false);
+        c.Check("libSceGnmDriver's start-up through the interfaces = sceKernelAllocateDirectMemory + "
+                "sceKernelMapNamedDirectMemory: the same area, physical address, host pages, exclusive (EBUSY)",
+                gnm_ok && api == 0 && gnm_host == gnm_api && gnm_phys == phys && gnm_busy == api_busy &&
+                    gnm_busy == static_cast<s32>(0x80020010),
+                fmt::format("{} {:#x}/{:#x} busy {:#x}/{:#x}\n  host {}\n  api  {}", gnm_ok, gnm_phys, phys,
+                            static_cast<u32>(gnm_busy), static_cast<u32>(api_busy), gnm_host, gnm_api));
+
+        void* tls = host->MapPrimaryTls(kTlsSize);
+        const std::string tls_host = State(kTls, kTlsSize);
+        if (tls != nullptr) {
+            mm->UnmapMemory(reinterpret_cast<u64>(tls), kTlsSize);
+        }
+        void* tls_api = reinterpret_cast<void*>(kTls);
+        const s32 tls_res =
+            Libraries::Kernel::sceKernelMapNamedFlexibleMemory(&tls_api, kTlsSize, 3, 0, "SceKernelPrimaryTcbTls");
+        const std::string tls_api_state = State(kTls, kTlsSize);
+        if (tls_res == 0) {
+            mm->UnmapMemory(reinterpret_cast<u64>(tls_api), kTlsSize);
+        }
+        c.Check("the primary thread's TLS through the interfaces = sceKernelMapNamedFlexibleMemory: the same "
+                "address, flexible area (physical address), host pages",
+                tls == reinterpret_cast<void*>(kTls) && tls_res == 0 && tls_api == tls && tls_host == tls_api_state,
+                fmt::format("{} {} {:#x}\n  host {}\n  api  {}", tls, tls_api, static_cast<u32>(tls_res), tls_host,
+                            tls_api_state));
+    }
+    c.Check("everything unmapped and released: the VMAs as before, the bridge's direct memory untouched",
+            BridgeVmaCount() == vmas_before && BridgeDirectMemoryUntouched(),
+            fmt::format("VMAs {} -> {}", vmas_before, BridgeVmaCount()));
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -4340,6 +4650,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestDirectMemoryNative(t);
     TestDirectMemoryBridge(t, cfg);
     TestGpuMemory(t, cfg);
+    TestGuestMemory(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {
