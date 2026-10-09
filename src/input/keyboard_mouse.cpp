@@ -108,6 +108,12 @@ void KeyboardMouse::AttachWindow(SDL_Window* window, bool test_mode) {
                          "takes it again, a click takes it too");
 }
 
+void KeyboardMouse::AcceptOnlyScriptedInput() {
+    scripted_only_ = true; // before the first event, on the main thread
+    SSPC_LOG(Input, Info, "automated run: only the scripted (--press) keyboard/mouse input reaches the game; "
+                          "the real keyboard and mouse are ignored");
+}
+
 bool KeyboardMouse::Pressed(Action a) const {
     for (const auto& in : settings_.bindings[static_cast<size_t>(a)]) {
         if (in.kind == InputCode::Kind::Key) {
@@ -158,6 +164,35 @@ u8 KeyboardMouse::NextTouchId() {
 
 KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
     EventResult result;
+    if (scripted_only_) {
+        u32 which = kScriptedInputId; // not a keyboard/mouse event: handled as always
+        switch (e.type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:
+            which = e.key.which;
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            which = e.button.which;
+            break;
+        case SDL_EVENT_MOUSE_MOTION:
+            which = e.motion.which;
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            which = e.wheel.which;
+            break;
+        default:
+            break;
+        }
+        if (which != kScriptedInputId) {
+            if (ignored_real_events_++ == 0) {
+                SSPC_LOG(Input, Warning, "automated run: real keyboard/mouse input ignored (event 0x{:x})",
+                         static_cast<u32>(e.type));
+            }
+            result.consumed = true; // the bridge window does not see it either
+            return result;
+        }
+    }
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {

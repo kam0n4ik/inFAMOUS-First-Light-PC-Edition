@@ -77,6 +77,10 @@ public:
     /// `test_mode` (automated runs): mouse events count as captured, the system cursor is never
     /// grabbed and focus changes are ignored, so injected input is not disturbed.
     void AttachWindow(SDL_Window* window, bool test_mode);
+    /// Automated runs (--press): keyboard and mouse events reach the game only when they carry
+    /// kScriptedInputId; the real keyboard and mouse are ignored (counted, logged once), so
+    /// someone touching the mouse during a measured run does not change what the game is sent.
+    void AcceptOnlyScriptedInput();
     /// Main thread: every SDL event of the game window.
     EventResult OnEvent(const SDL_Event& event);
     /// Game thread: the controller now; mouse movement since the previous read is used up.
@@ -93,6 +97,8 @@ public:
     static constexpr double kMotionRadiansPerCount = 0.0015;
     /// Touch drag: touch pad units per mouse count.
     static constexpr double kTouchUnitsPerCount = 2.0;
+    /// `which` of the keyboard/mouse events --press pushes (no real device has this id).
+    static constexpr u32 kScriptedInputId = 0x53535043; // "SSPC"
 
 private:
     bool Pressed(Action a) const;
@@ -111,6 +117,8 @@ private:
 
     SDL_Window* window_ = nullptr;
     bool test_mode_ = false;
+    bool scripted_only_ = false;    // main thread: real keyboard/mouse events are dropped
+    u64 ignored_real_events_ = 0;   // main thread: how many (the first one is logged)
     bool captured_ = false;
     bool want_capture_ = true; // playing: captured whenever the window has focus; Esc toggles it
     u64 focus_gained_ns_ = 0;  // a click right after the window got focus only focuses it

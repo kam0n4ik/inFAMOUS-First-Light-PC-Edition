@@ -83,6 +83,7 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "input/controller.h"
+#include "input/keyboard_mouse.h"
 #include "sdl_window.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
@@ -712,6 +713,7 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
             case Kind::KeyUp:
                 e.type = ev.kind == Kind::KeyDown ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
                 e.key.timestamp = SDL_GetTicksNS();
+                e.key.which = Input::KeyboardMouse::kScriptedInputId;
                 e.key.scancode = ev.scancode;
                 e.key.key = SDL_GetKeyFromScancode(ev.scancode, SDL_KMOD_NONE, false);
                 e.key.down = ev.kind == Kind::KeyDown;
@@ -722,6 +724,7 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.type = ev.kind == Kind::ButtonDown ? SDL_EVENT_MOUSE_BUTTON_DOWN
                                                      : SDL_EVENT_MOUSE_BUTTON_UP;
                 e.button.timestamp = SDL_GetTicksNS();
+                e.button.which = Input::KeyboardMouse::kScriptedInputId;
                 e.button.button = ev.button;
                 e.button.down = ev.kind == Kind::ButtonDown;
                 e.button.clicks = 1;
@@ -730,6 +733,7 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
             case Kind::Move:
                 e.type = SDL_EVENT_MOUSE_MOTION;
                 e.motion.timestamp = SDL_GetTicksNS();
+                e.motion.which = Input::KeyboardMouse::kScriptedInputId;
                 e.motion.xrel = ev.dx;
                 e.motion.yrel = ev.dy;
                 SDL_PushEvent(&e);

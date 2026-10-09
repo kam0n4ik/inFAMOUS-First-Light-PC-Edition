@@ -119,6 +119,9 @@ void InstallNativeInput(const App::Config& cfg, SDL_Window* window, bool test_mo
     Pad::SetInputLog(cfg.input_log);
     Input::Player1().Configure(cfg.input);
     Input::Player1().AttachWindow(window, test_mode);
+    if (test_mode) {
+        Input::Player1().AcceptOnlyScriptedInput(); // --press pushes everything the run needs
+    }
     Frontend::SetEventInterceptor(&InterceptWindowEvent);
     SSPC_LOG(Input, Info,
              "native libScePad: keyboard/mouse (SecondSonPC) + real controllers (bridge SDL layer); "

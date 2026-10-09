@@ -1090,6 +1090,49 @@ void TestInput(Totals& t) {
     c.Check("Esc again: captured, the mouse turns the camera", s2.info.captured && s2.rx == 255, sticks(s2));
     s2 = real.Read(t2 += 10'000);
     c.Check("mouse stops: right stick back to centre (no sticking)", s2.rx == 128 && s2.ry == 128, sticks(s2));
+
+    // Automated run (--press): only the scripted events reach the game, the real ones are dropped.
+    Input::KeyboardMouse run;
+    run.Configure(Input::DefaultSettings());
+    run.AttachWindow(nullptr, true);
+    run.AcceptOnlyScriptedInput();
+    const auto scripted = [](SDL_Event e) {
+        switch (e.type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:
+            e.key.which = Input::KeyboardMouse::kScriptedInputId;
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            e.button.which = Input::KeyboardMouse::kScriptedInputId;
+            break;
+        default:
+            e.motion.which = Input::KeyboardMouse::kScriptedInputId;
+            break;
+        }
+        return e;
+    };
+    u64 t3 = 9'000'000;
+    SDL_Event real_w = KeyEvent(SDL_SCANCODE_W, true);
+    real_w.key.which = 1; // a real keyboard
+    const auto r_real = run.OnEvent(real_w);
+    run.OnEvent(MotionEvent(500.0f, 0.0f)); // which 0: the real mouse
+    run.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, true));
+    auto s3 = run.Read(t3 += 10'000);
+    c.Check("automated run: real key/mouse/click ignored (and not passed to the bridge window)",
+            r_real.consumed && s3.ly == 128 && s3.rx == 128 && (s3.buttons & Button::R2) == 0, sticks(s3));
+    run.OnEvent(ButtonEvent(SDL_BUTTON_LEFT, false));
+    run.OnEvent(scripted(KeyEvent(SDL_SCANCODE_W, true)));
+    run.OnEvent(scripted(MotionEvent(15.0f, 0.0f)));
+    run.OnEvent(scripted(ButtonEvent(SDL_BUTTON_LEFT, true)));
+    s3 = run.Read(t3 += 10'000);
+    c.Check("automated run: scripted key/mouse/click reach the game",
+            s3.ly == 0 && s3.rx == 255 && (s3.buttons & Button::R2) != 0, sticks(s3));
+    SDL_Event real_up = KeyEvent(SDL_SCANCODE_W, false);
+    real_up.key.which = 1;
+    run.OnEvent(real_up); // a real release does not end a scripted hold
+    s3 = run.Read(t3 += 10'000);
+    c.Check("automated run: a real key release does not end a scripted hold", s3.ly == 0, sticks(s3));
     c.Summary();
 }
 
