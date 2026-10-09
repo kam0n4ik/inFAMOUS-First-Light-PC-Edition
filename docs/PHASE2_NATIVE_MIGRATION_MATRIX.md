@@ -1,4 +1,4 @@
-# Phase 2 — матрица переноса BRIDGE-функций (аудит P2.2.3, состояние после P2.3.2)
+# Phase 2 — матрица переноса BRIDGE-функций (аудит P2.2.3, состояние после P2.3.3)
 
 Сгенерировано `tools\migration_matrix.py` по прогону `logs\performance\p223\N0`, снимок конца загрузки `logs\performance\p223\N0\calls_33s.json`, сессия `logs\manual\2026-10-08_20-24-09_sspc\calls.json`.
 Таблица привязок прогона: BRIDGE 316, COMMON_STUB 18, NATIVE 79, OBSERVED 2, UNRESOLVED 2 (без LLE). BRIDGE-строк в матрице: **316**.
@@ -19,12 +19,16 @@
 - **Tier 1 — 9 функций, все подходящие; переносятся в P2.2.3**: `scePthreadEqual`, `scePthreadYield`, `sched_yield`, `getpagesize`, `sigfillset` (группа `kernel-util`), `sceNetHtons`, `sceNetNtohs` (`net-util`), `memset`, `memcpy` libSceLibcInternal (`libc-mem`). Других чистых функций без общего с мостом состояния среди импортов нет.
 - **Не Tier 1, хотя логика простая**: `sceNetInetNtop/Pton` пишут errno libSceNet (его читает `sceNetErrnoLoc`) и через хук моста — errno ядра; `__error` — errno всех BRIDGE-функций; `sceKernelGetProcessTime` — часы моста, общие с метками VideoOut/AudioOut (NATIVE-обёртка звала бы мост); `sceKernelConvert*time` — у эталона ошибка единиц (минуты как секунды), эталона PS4 нет.
 - **Синхронизация**: мьютексы (19) и condvar (6) — одна группа `kernel-mutex`: condvar эталона работает с объектом мьютекса эталона и откладывает пробуждения через его флаг; `libc.prx` пишет флаг в объект мьютекса по `+0x20` — раскладка сохранена. RW-блокировки (7, только Fios2) — отдельная группа `kernel-rwlock`. Ни одна другая импортируемая BRIDGE-функция мьютексы/condvar игры не получает (`docs\KERNEL_SYNC.md` §4).
-- **Блокеры остального**: потоки, TLS-ключи, сигналы — P2.4 (нужен свой менеджер потоков после P2.3); виртуальная память — P2.3.3 (интерфейс для остальных пользователей менеджера памяти, затем свой менеджер; интерфейс GPU-памяти `Core::GpuMemory` сделан в P2.3.2, патч `0008`); event queues, VideoOut, GnmDriver — Tier 4 до собственного GPU-рантайма; аудио/видео-декодеры, сохранения, трофеи, диалоги, сеть — фазы своих подсистем (сохранения — только с проверкой целостности).
+- **Блокеры остального**: потоки, TLS-ключи, сигналы — P2.4 (нужен свой менеджер потоков после P2.3); виртуальная память — переключение игры на свой менеджер в P2.3.4 (интерфейсы `Core::GpuMemory` P2.3.2 и `Core::Guest*` P2.3.3a, свой менеджер и адаптеры P2.3.3b/c — пока только в самотесте); event queues, VideoOut, GnmDriver — Tier 4 до собственного GPU-рантайма; аудио/видео-декодеры, сохранения, трофеи, диалоги, сеть — фазы своих подсистем (сохранения — только с проверкой целостности).
 
 ## Решения P2.3.1 (память)
 
 - **Перенесено (экспериментально, по умолчанию BRIDGE)**: `sceKernelGetDirectMemorySize`, `sceKernelAllocateDirectMemory`, `sceKernelReleaseDirectMemory` — группа `kernel-dmem`, включается `--native kernel-dmem` вместе с учётом отображений моста в нативной карте (патч `0007`). Колонка «После» показывает прогон с этим ключом.
 - **Остаются BRIDGE**: `sceKernelMapDirectMemory`, `sceKernelMunmap`, `mmap`, `sceKernelMapNamedFlexibleMemory`, `sceKernelMprotect`, `sceKernelQueryMemoryProtection` — виртуальная память (vma_map, плейсхолдеры, подложка, защита страниц) общая с GPU-мостом; `msync`, `sceKernelMlock`, `sceKernelGetPrtAperture` — семантика неизвестна, вызовов нет (`docs\PHASE2_P23_MEMORY.md`).
+
+## Решения P2.3.3 (память)
+
+- **Привязки не менялись** (NATIVE 120 / BRIDGE 275): функции памяти libkernel остаются BRIDGE. Свой менеджер виртуальной памяти (`src\runtime\memory`) и адаптеры Core-интерфейсов (`src\bridge\shadps4\native_memory`) проверены дифференциальными тестами против моста, игрой не используются (`docs\PHASE2_P233_NATIVE_VMM.md`). Исправлены дефекты моста D10, D11 (SSPC-005), D12 (патчи `0010`, `0011`); найдены и документированы SSPC-006 (D17) и SSPC-007 (D20).
 
 ## Tier 1 — Low Risk
 
