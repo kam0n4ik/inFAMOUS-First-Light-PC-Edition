@@ -1,0 +1,595 @@
+diff --git a/src/core/gpu_memory.h b/src/core/gpu_memory.h
+new file mode 100644
+index 00000000..9480a151
+--- /dev/null
++++ b/src/core/gpu_memory.h
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// SecondSonPC patch 0008 (P2.3.2, docs/PHASE2_P232_GPU_MEMORY.md): the guest memory as the GPU
++// bridge uses it. video_core and GnmDriver reach the memory manager only through GpuMemory, and
++// the memory manager reaches the GPU only through GpuMemoryListener. The implementation is the
++// bridge's MemoryManager (memory.cpp); another memory manager has to keep the same contract.
++
++#pragma once
++
++#include "common/types.h"
++#include "core/address_space.h"
++
++namespace Core {
++
++/// The memory manager's notifications, in this order for one map/unmap/release: OnGpuUnmap
++/// (before the address space changes, writer lock not held) -> OnGpuRegister (host pages mapped
++/// or unmapped, writer lock held) -> OnGpuMap (writer lock not held). The operation's unmap lock
++/// is held throughout: a listener must not map or unmap guest memory.
++class GpuMemoryListener {
++public:
++    virtual ~GpuMemoryListener() = default;
++    /// [addr, addr + size) is about to be unmapped or replaced: write back and drop GPU caches.
++    virtual void OnGpuUnmap(VAddr addr, u64 size) = 0;
++    /// The host pages of [addr, addr + size) were mapped or unmapped (page tracking tables).
++    virtual void OnGpuRegister(VAddr addr, u64 size) = 0;
++    /// [addr, addr + size) is mapped and visible to the GPU.
++    virtual void OnGpuMap(VAddr addr, u64 size) = 0;
++    /// Host code writes [addr, addr + size) past the page tracking (file reads, mprotect).
++    virtual void OnGuestWrite(VAddr addr, u64 size) = 0;
++};
++
++class GpuMemory {
++public:
++    /// Smaller ranges are not clamped and cost no lookup (every buffer bind asks).
++    static constexpr u64 MinSizeToClamp = 1_GB;
++
++    virtual ~GpuMemory() = default;
++
++    /// The PS4's GPU can only handle 40 bit addresses. addr + size is not checked for overflow.
++    static constexpr bool IsValidGpuMapping(VAddr addr, u64 size) {
++        constexpr VAddr max_gpu_address{0x10000000000};
++        return addr + size < max_gpu_address;
++    }
++
++    /// Who gets the notifications (the rasterizer, once, before the guest runs); returns the
++    /// previous listener. Not synchronized with memory operations.
++    virtual GpuMemoryListener* SetListener(GpuMemoryListener* listener) = 0;
++
++    /// size, or less: the rest of addr's area plus the mapped areas that follow it. A snapshot,
++    /// stale after the next map or unmap. addr must be inside the guest address space.
++    u64 ClampRangeSize(VAddr addr, u64 size) {
++        return size < MinSizeToClamp ? size : ClampLargeRange(addr, size);
++    }
++
++    /// Reads guest memory through the physical backing; pages without one read as zeros. No lock,
++    /// never faults: a range unmapped meanwhile reads stale data. addr + size <= 2^40.
++    virtual void CopySparseMemory(VAddr addr, u8* dest, u64 size) = 0;
++
++    /// Writes guest memory through the physical backing, past any page protection. false when
++    /// the area at address has no physical backing. Runs in the access violation handler too.
++    virtual bool TryWriteBacking(void* address, const void* data, u64 size) = 0;
++
++    /// Host protection of the mapped pages in the range for GPU access tracking (None, Read or
++    /// ReadWrite); the guest's protection stays. Runs in the access violation handler: no
++    /// allocation, no logging, only the address space's own lock.
++    virtual void ProtectTracking(VAddr addr, u64 size, MemoryPermission perms) = 0;
++
++    /// End of the system reserved part of the guest address space (constant).
++    virtual VAddr SystemReservedEnd() = 0;
++
++protected:
++    virtual u64 ClampLargeRange(VAddr addr, u64 size) = 0;
++};
++
++/// The GPU bridge's guest memory: the bridge's MemoryManager. Valid for the process lifetime.
++GpuMemory& GetGpuMemory();
++
++} // namespace Core
+diff --git a/src/core/libraries/gnmdriver/gnmdriver.cpp b/src/core/libraries/gnmdriver/gnmdriver.cpp
+index a6744f2e..3d6bfea3 100644
+--- a/src/core/libraries/gnmdriver/gnmdriver.cpp
++++ b/src/core/libraries/gnmdriver/gnmdriver.cpp
+@@ -9,16 +9,15 @@
+ #include "common/elf_info.h"
+ #include "common/logging/log.h"
+ #include "common/slot_vector.h"
+-#include "core/address_space.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
++#include "core/gpu_memory.h"
+ #include "core/libraries/gnmdriver/gnm_error.h"
+ #include "core/libraries/gnmdriver/gnmdriver_init.h"
+ #include "core/libraries/kernel/orbis_error.h"
+ #include "core/libraries/kernel/process.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/videoout/video_out.h"
+-#include "core/memory.h"
+ #include "core/platform.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/amdgpu/pm4_cmds.h"
+@@ -1032,10 +1031,7 @@ int PS4_SYSV_ABI sceGnmGetShaderStatus() {
+ VAddr PS4_SYSV_ABI sceGnmGetTheTessellationFactorRingBufferBaseAddress() {
+     LOG_TRACE(Lib_GnmDriver, "called");
+     if (tessellation_factors_ring_addr == -1) {
+-        auto* memory = Core::Memory::Instance();
+-        auto& address_space = memory->GetAddressSpace();
+-        tessellation_factors_ring_addr = address_space.SystemReservedVirtualBase() +
+-                                         address_space.SystemReservedVirtualSize() - 0x10000000;
++        tessellation_factors_ring_addr = Core::GetGpuMemory().SystemReservedEnd() - 0x10000000;
+     }
+ 
+     return tessellation_factors_ring_addr;
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index bb6ff58a..4c1e383f 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -11,7 +11,6 @@
+ #include "core/libraries/kernel/orbis_error.h"
+ #include "core/libraries/kernel/process.h"
+ #include "core/memory.h"
+-#include "video_core/renderer_vulkan/vk_rasterizer.h"
+ 
+ namespace Core {
+ 
+@@ -132,7 +131,7 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
+ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
+     PrtArea& area = prt_areas[id];
+     if (area.mapped) {
+-        rasterizer->UnmapMemory(area.start, area.end - area.start);
++        gpu->OnGpuUnmap(area.start, area.end - area.start);
+     }
+ 
+     area.start = address;
+@@ -141,7 +140,7 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
+ 
+     // Pretend the entire PRT area is mapped to avoid GPU tracking errors.
+     // The caches will use CopySparseMemory to fetch data which avoids unmapped areas.
+-    rasterizer->MapMemory(address, size);
++    gpu->OnGpuMap(address, size);
+ }
+ 
+ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+@@ -360,7 +359,7 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
+     // Early unmap from GPU to avoid deadlocking.
+     for (auto& [addr, unmap_size] : remove_list) {
+         if (IsValidGpuMapping(addr, unmap_size)) {
+-            rasterizer->UnmapMemory(addr, unmap_size);
++            gpu->OnGpuUnmap(addr, unmap_size);
+         }
+     }
+ 
+@@ -465,7 +464,7 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
+ 
+         // Perform an address space mapping for each physical area
+         void* out_addr = impl.Map(current_addr, size_to_map, new_dmem_area.base);
+-        rasterizer->RegisterMemory(current_addr, size_to_map);
++        gpu->OnGpuRegister(current_addr, size_to_map);
+ 
+         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
+         // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
+@@ -482,7 +481,7 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
+ 
+     lk2.unlock();
+     if (IsValidGpuMapping(mapped_addr, size)) {
+-        rasterizer->MapMemory(mapped_addr, size);
++        gpu->OnGpuMap(mapped_addr, size);
+     }
+ 
+     return ORBIS_OK;
+@@ -620,7 +619,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
+ 
+     // Perform early GPU unmap to avoid potential deadlocks
+     if (IsValidGpuMapping(virtual_addr, size)) {
+-        rasterizer->UnmapMemory(virtual_addr, size);
++        gpu->OnGpuUnmap(virtual_addr, size);
+     }
+ 
+     // Acquire writer lock.
+@@ -660,7 +659,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
+ 
+             // Perform an address space mapping for each physical area
+             void* out_addr = impl.Map(current_addr, size_to_map, new_fmem_area.base, is_exec);
+-            rasterizer->RegisterMemory(current_addr, size_to_map);
++            gpu->OnGpuRegister(current_addr, size_to_map);
+ 
+             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
+             // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
+@@ -726,7 +725,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
+         // Flexible address space mappings were performed while finding direct memory areas.
+         if (type != VMAType::Flexible) {
+             impl.Map(mapped_addr, size, phys_addr, is_exec);
+-            rasterizer->RegisterMemory(mapped_addr, size);
++            gpu->OnGpuRegister(mapped_addr, size);
+             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
+             // TRACK_ALLOC(mapped_addr, size, "VMEM");
+         }
+@@ -735,7 +734,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
+ 
+         // If this is not a reservation, then map to GPU and address space
+         if (IsValidGpuMapping(mapped_addr, size)) {
+-            rasterizer->MapMemory(mapped_addr, size);
++            gpu->OnGpuMap(mapped_addr, size);
+         }
+     }
+ 
+@@ -817,7 +816,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
+ 
+     // Perform early GPU unmap to avoid potential deadlocks
+     if (IsValidGpuMapping(virtual_addr, size)) {
+-        rasterizer->UnmapMemory(virtual_addr, size);
++        gpu->OnGpuUnmap(virtual_addr, size);
+     }
+ 
+     // Aquire writer lock
+@@ -861,7 +860,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
+                       map_ctx);
+     if (prot != Core::MemoryProt::CpuRead) {
+         // read-only mappings cannot be registered with userfaultfd in writeprotect mode
+-        rasterizer->RegisterMemory(mapped_addr, size);
++        gpu->OnGpuRegister(mapped_addr, size);
+     }
+ 
+     *out_addr = std::bit_cast<void*>(mapped_addr);
+@@ -885,7 +884,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
+ 
+     // Perform early GPU unmap to avoid potential deadlocks
+     if (IsValidGpuMapping(virtual_addr, size)) {
+-        rasterizer->UnmapMemory(virtual_addr, size);
++        gpu->OnGpuUnmap(virtual_addr, size);
+     }
+ 
+     // Aquire writer mutex
+@@ -946,7 +945,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
+     // Unmap from address space
+     u64 size_to_unmap = size;
+     VAddr unmapped_addr = impl.Unmap(virtual_addr, &size_to_unmap);
+-    rasterizer->RegisterMemory(unmapped_addr, size_to_unmap);
++    gpu->OnGpuRegister(unmapped_addr, size_to_unmap);
+ 
+     // Tracy memory tracking breaks from merging memory areas. Disabled for now.
+     // TRACK_FREE(virtual_addr, "VMEM");
+@@ -989,7 +988,7 @@ s32 MemoryManager::UnmapDirectPhysical(std::span<const std::pair<PAddr, u64>> ra
+     // GPU first, as in Free.
+     for (const auto& [addr, size] : remove_list) {
+         if (IsValidGpuMapping(addr, size)) {
+-            rasterizer->UnmapMemory(addr, size);
++            gpu->OnGpuUnmap(addr, size);
+         }
+     }
+ 
+@@ -1018,7 +1017,7 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
+ 
+     // If the requested range has GPU access, unmap from GPU.
+     if (IsValidGpuMapping(virtual_addr, size)) {
+-        rasterizer->UnmapMemory(virtual_addr, size);
++        gpu->OnGpuUnmap(virtual_addr, size);
+     }
+ 
+     // Acquire writer lock.
+@@ -1092,7 +1091,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
+         // Unmap the memory region.
+         u64 size_to_unmap = size_in_vma;
+         VAddr unmapped_addr = impl.Unmap(virtual_addr, &size_to_unmap);
+-        rasterizer->RegisterMemory(unmapped_addr, size_to_unmap);
++        gpu->OnGpuRegister(unmapped_addr, size_to_unmap);
+ 
+         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
+         // TRACK_FREE(virtual_addr, "VMEM");
+@@ -1549,8 +1548,8 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
+ }
+ 
+ void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
+-    if (rasterizer) {
+-        rasterizer->InvalidateMemory(addr, size);
++    if (gpu) {
++        gpu->OnGuestWrite(addr, size);
+     }
+ }
+ 
+@@ -1773,4 +1772,44 @@ MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_han
+     return map.emplace_hint(std::next(phys_handle), new_area.base, new_area);
+ }
+ 
++namespace {
++
++// SecondSonPC patch 0008: the GPU bridge's view of this memory manager. No state of its own.
++class BridgeGpuMemory final : public GpuMemory {
++public:
++    GpuMemoryListener* SetListener(GpuMemoryListener* listener) override {
++        return Memory::Instance()->SetGpuListener(listener);
++    }
++
++    void CopySparseMemory(VAddr addr, u8* dest, u64 size) override {
++        Memory::Instance()->CopySparseMemory(addr, dest, size);
++    }
++
++    bool TryWriteBacking(void* address, const void* data, u64 size) override {
++        return Memory::Instance()->TryWriteBacking(address, data, size);
++    }
++
++    void ProtectTracking(VAddr addr, u64 size, MemoryPermission perms) override {
++        Memory::Instance()->GetAddressSpace().Protect(addr, size, perms);
++    }
++
++    VAddr SystemReservedEnd() override {
++        auto& address_space = Memory::Instance()->GetAddressSpace();
++        return address_space.SystemReservedVirtualBase() + address_space.SystemReservedVirtualSize();
++    }
++
++protected:
++    u64 ClampLargeRange(VAddr addr, u64 size) override {
++        return Memory::Instance()->ClampRangeSize(addr, size);
++    }
++};
++
++BridgeGpuMemory bridge_gpu_memory;
++
++} // Anonymous namespace
++
++GpuMemory& GetGpuMemory() {
++    return bridge_gpu_memory;
++}
++
+ } // namespace Core
+diff --git a/src/core/memory.h b/src/core/memory.h
+index a24d37e9..7c2d6855 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -15,12 +15,9 @@
+ #include "common/singleton.h"
+ #include "common/types.h"
+ #include "core/address_space.h"
++#include "core/gpu_memory.h"
+ #include "core/libraries/kernel/memory.h"
+ 
+-namespace Vulkan {
+-class Rasterizer;
+-}
+-
+ namespace Libraries::Kernel {
+ struct OrbisQueryInfo;
+ }
+@@ -207,8 +204,9 @@ public:
+     explicit MemoryManager();
+     ~MemoryManager();
+ 
+-    void SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
+-        rasterizer = rasterizer_;
++    /// SecondSonPC patch 0008: GpuMemory::SetListener.
++    GpuMemoryListener* SetGpuListener(GpuMemoryListener* listener) {
++        return std::exchange(gpu, listener);
+     }
+ 
+     AddressSpace& GetAddressSpace() {
+@@ -240,9 +238,7 @@ public:
+     }
+ 
+     bool IsValidGpuMapping(VAddr virtual_addr, u64 size) {
+-        // The PS4's GPU can only handle 40 bit addresses.
+-        const VAddr max_gpu_address{0x10000000000};
+-        return virtual_addr + size < max_gpu_address;
++        return GpuMemory::IsValidGpuMapping(virtual_addr, size);
+     }
+ 
+     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
+@@ -389,7 +385,7 @@ private:
+     u64 flexible_usage{};
+     u64 pool_budget{};
+     s32 sdk_version{};
+-    Vulkan::Rasterizer* rasterizer{};
++    GpuMemoryListener* gpu{};            // SecondSonPC patch 0008
+     DirectMemoryBackend* dmem_backend{}; // SecondSonPC patch 0007
+ 
+     struct PrtArea {
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index 27b99a71..21fdf037 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -9,9 +9,9 @@
+ #include "common/thread.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
++#include "core/gpu_memory.h"
+ #include "core/libraries/kernel/process.h"
+ #include "core/libraries/videoout/driver.h"
+-#include "core/memory.h"
+ #include "core/platform.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/amdgpu/pm4_cmds.h"
+@@ -663,7 +663,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                     rasterizer->OnFence();
+                 }
+                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+-                    auto* memory = Core::Memory::Instance();
++                    auto* memory = &Core::GetGpuMemory();
+                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                 });
+                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+@@ -683,7 +683,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                 }
+                 event_eop->SignalFence(
+                     [](void* address, u64 data, u32 num_bytes) {
+-                        auto* memory = Core::Memory::Instance();
++                        auto* memory = &Core::GetGpuMemory();
+                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                     },
+                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index 4df8f19f..81494bf5 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -6,7 +6,7 @@
+ 
+ #include "common/alignment.h"
+ #include "core/debug_state.h"
+-#include "core/memory.h"
++#include "core/gpu_memory.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+@@ -52,7 +52,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
+                          TextureCache& texture_cache_, PageManager& tracker)
+     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
+       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
+-      memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
++      memory{&Core::GetGpuMemory()}, texture_cache{texture_cache_},
+       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
+       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 7fe82e04..9fc04559 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -18,7 +18,7 @@ struct Liverpool;
+ }
+ 
+ namespace Core {
+-class MemoryManager;
++class GpuMemory;
+ }
+ 
+ namespace Vulkan {
+@@ -131,7 +131,7 @@ private:
+     Vulkan::Runtime& runtime;
+     Vulkan::StagingBufferPool& staging_pool;
+     AmdGpu::Liverpool* liverpool;
+-    Core::MemoryManager* memory;
++    Core::GpuMemory* memory;
+     TextureCache& texture_cache;
+     std::unique_ptr<MemoryTracker> memory_tracker;
+ 
+diff --git a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+index c8e463cf..75233cf8 100644
+--- a/src/video_core/page_manager.cpp
++++ b/src/video_core/page_manager.cpp
+@@ -424,11 +424,9 @@ struct SignalImpl : public PageManager::Impl {
+ 
+     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+         RENDERER_TRACE;
+-        auto* memory = Core::Memory::Instance();
+-        auto& impl = memory->GetAddressSpace();
+         ASSERT_MSG(perms != Core::MemoryPermission::Write,
+                    "Attempted to protect region as write-only which is not a valid permission");
+-        impl.Protect(address, size, perms);
++        Core::GetGpuMemory().ProtectTracking(address, size, perms);
+     }
+ 
+     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index bd430118..cb55d350 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -4,7 +4,7 @@
+ #include "common/debug.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
+-#include "core/memory.h"
++#include "core/gpu_memory.h"
+ #include "shader_recompiler/resource.h"
+ #include "shader_recompiler/runtime_info.h"
+ #include "video_core/amdgpu/liverpool.h"
+@@ -38,14 +38,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
+       buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache, page_manager},
+       texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache, page_manager},
+-      liverpool{liverpool_}, memory{Core::Memory::Instance()},
++      liverpool{liverpool_}, memory{&Core::GetGpuMemory()},
+       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
+       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
+       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+     if (!EmulatorSettings.IsNullGPU()) {
+         liverpool->BindRasterizer(this);
+     }
+-    memory->SetRasterizer(this);
++    memory->SetListener(this);
+ 
+     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+         runtime.FlushBarriers();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index e01715c5..c86bfce5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -5,6 +5,7 @@
+ 
+ #include "common/recursive_lock.h"
+ #include "common/shared_first_mutex.h"
++#include "core/gpu_memory.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/page_manager.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+@@ -15,16 +16,12 @@ namespace AmdGpu {
+ struct Liverpool;
+ }
+ 
+-namespace Core {
+-class MemoryManager;
+-}
+-
+ namespace Vulkan {
+ 
+ class GraphicsPipeline;
+ class Runtime;
+ 
+-class Rasterizer {
++class Rasterizer : private Core::GpuMemoryListener {
+ public:
+     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
+                         AmdGpu::Liverpool* liverpool);
+@@ -132,6 +129,20 @@ private:
+     bool IsComputeImageCopy(const Pipeline* pipeline);
+     bool IsComputeImageClear(const Pipeline* pipeline);
+ 
++    // SecondSonPC patch 0008: the memory manager's notifications (Core::GpuMemoryListener).
++    void OnGpuUnmap(VAddr addr, u64 size) override {
++        UnmapMemory(addr, size);
++    }
++    void OnGpuRegister(VAddr addr, u64 size) override {
++        RegisterMemory(addr, size);
++    }
++    void OnGpuMap(VAddr addr, u64 size) override {
++        MapMemory(addr, size);
++    }
++    void OnGuestWrite(VAddr addr, u64 size) override {
++        InvalidateMemory(addr, size);
++    }
++
+ private:
+     friend class VideoCore::BufferCache;
+ 
+@@ -142,7 +153,7 @@ private:
+     VideoCore::BufferCache buffer_cache;
+     VideoCore::TextureCache texture_cache;
+     AmdGpu::Liverpool* liverpool;
+-    Core::MemoryManager* memory;
++    Core::GpuMemory* memory;
+     boost::icl::interval_set<VAddr> mapped_ranges;
+     Common::SharedFirstMutex mapped_ranges_mutex;
+     PipelineCache pipeline_cache;
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index b4846209..2374f834 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -9,7 +9,7 @@
+ #include "common/div_ceil.h"
+ #include "common/hash.h"
+ #include "core/emulator_settings.h"
+-#include "core/memory.h"
++#include "core/gpu_memory.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/page_manager.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+@@ -107,14 +107,14 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+     if (sync) {
+         scheduler.Finish();
+         download.Invalidate();
+-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+-                                                  download.mapped, download_size);
++        Core::GetGpuMemory().TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
++                                             download.mapped, download_size);
+     } else {
+         scheduler.DeferPriorityOperation(
+             [this, device_addr = image.info.guest_address, download, download_size] {
+                 download.Invalidate();
+-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+-                                                          download.mapped, download_size);
++                Core::GetGpuMemory().TryWriteBacking(std::bit_cast<u8*>(device_addr),
++                                                     download.mapped, download_size);
+                 runtime.GetStagingPool().FreeDeferred(download);
+             });
+     }
