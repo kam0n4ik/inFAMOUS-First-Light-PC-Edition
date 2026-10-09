@@ -3,6 +3,8 @@
 #       [-Press "space@12,space@22,shot@60,shot@95"] [-ExtraArgs "..."] [-Session name] [-DryRun]
 # Modes (sema / event flags):  A native/native   B native/bridge (--bridge kernel-eventflag)
 #                              C bridge/native (--bridge kernel-sema)   D bridge/bridge (both)
+# Phase 2.2.3 groups:          N0 none of them (as before the phase)  N1 + Tier 1 (kernel-util,
+#                              net-util, libc-mem)  N2 + kernel-mutex (mutexes, condvars)  N3 + kernel-rwlock
 # Every run: same exe, same SecondSonPC.toml, a fresh copy of the same save snapshot (--user-data),
 # the same key presses ("Continue" twice -> forest gameplay from ~30 s). tools\perf_sampler.ps1
 # samples the process once a second while it runs.
@@ -30,6 +32,11 @@ $saves = "$root\userdata\home"
 $modeArgs = @{
     A = ""; B = "--bridge kernel-eventflag"; C = "--bridge kernel-sema"
     D = "--bridge kernel-sema --bridge kernel-eventflag"
+    # Phase 2.2.3 groups, added one at a time: N0 = state before the phase (NATIVE 79) ... N3 = all.
+    N0 = "--bridge kernel-util --bridge net-util --bridge libc-mem --bridge kernel-mutex --bridge kernel-rwlock"
+    N1 = "--bridge kernel-mutex --bridge kernel-rwlock"
+    N2 = "--bridge kernel-rwlock"
+    N3 = ""
 }
 $modeList = @($Modes.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim().ToUpper() })
 
@@ -43,7 +50,7 @@ function Get-SaveHashes {
 }
 
 if (-not $modeList.Count -or @($modeList | Where-Object { -not $modeArgs.ContainsKey($_) }).Count) {
-    Fail "-Modes must list A, B, C and/or D"
+    Fail "-Modes must list A, B, C, D (sema/event flags) and/or N0..N3 (Phase 2.2.3 groups)"
 }
 if ($Seconds -lt 30 -or $Seconds -gt 300) { Fail "-Seconds must be 30..300 (short runs only)" }
 if ($Press -match '\s') { Fail "-Press must not contain spaces" }

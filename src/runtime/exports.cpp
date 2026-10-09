@@ -74,6 +74,7 @@ std::vector<Export> Collect() {
                              AppContent::AppContentExports(), Pad::PadExports(),
                              Kernel::KernelExports(), Kernel::SemaphoreExports(),
                              Kernel::EventFlagExports(), Kernel::KernelUtilExports(),
+                             Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
                              Net::NetUtilExports(), Libc::LibcMemExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());

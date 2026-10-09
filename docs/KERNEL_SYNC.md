@@ -12,12 +12,12 @@
 
 | Группа | Импорты | Вызовов | Места в eboot | Риск | Решение |
 |---|---|---:|---|---|---|
-| 1. Мьютексы | `scePthreadMutex{Init,Destroy,Lock,Unlock,Trylock}`, `scePthreadMutexattr{Init,Destroy,Settype,Setprotocol}`, POSIX `pthread_mutex_*`, `pthread_mutexattr_*` (19) | ≈ 28,8 млн | Lock 553, Unlock 621, Init 335 | высокий | одним шагом с condvar и rwlock |
+| 1. Мьютексы | `scePthreadMutex{Init,Destroy,Lock,Unlock,Trylock}`, `scePthreadMutexattr{Init,Destroy,Settype,Setprotocol}`, POSIX `pthread_mutex_*`, `pthread_mutexattr_*` (19) | ≈ 28,8 млн | Lock 553, Unlock 621, Init 335 | высокий | **NATIVE** (P2.2.3, группа `kernel-mutex` вместе с condvar) |
 | 2. Семафоры | `sceKernel{Create,Wait,Signal,Delete}Sema` (4) | ≈ 122 тыс. | 1 / 2 / 2 / 1 (одна обёртка `0x66a0c0…0x66a123`) | средний | **NATIVE** (этот шаг) |
 | 3. Event flags | `sceKernel{Create,Delete,Set,Wait}EventFlag` (4) | ≈ 8,8 тыс. | 22 / 32 / 6 / 17 | средний | следующий шаг |
 | 4. Event queues | `sceKernel{Create,Delete,Wait}Equeue`, `sceKernel{Add,Trigger,Delete}UserEvent` (6) | 6 | Create 1, Wait 2 | высокий | с Phase 4: в очереди игры пишут VideoOut/GnmDriver моста (flip, EOP) |
-| 5. Condvar | `scePthreadCond{Init,Destroy,Wait,Broadcast,Signal,Timedwait}` (6) | ≈ 1,3 млн | Wait 15, Broadcast 45 | высокий | с мьютексами (ждут на них) |
-| 6. Прочее | RW-блокировки `scePthreadRwlock*` (7, ≈ 2,7 тыс.); `__error` (errno) | — | rwlock в eboot нет | высокий / средний | rwlock — с мьютексами; errno — последним (общий со всеми BRIDGE-функциями) |
+| 5. Condvar | `scePthreadCond{Init,Destroy,Wait,Broadcast,Signal,Timedwait}` (6) | ≈ 1,3 млн | Wait 15, Broadcast 45 | высокий | **NATIVE** (P2.2.3, группа `kernel-mutex`: ждут на мьютексах) |
+| 6. Прочее | RW-блокировки `scePthreadRwlock*` (7, ≈ 2,7 тыс.; импортирует только Fios2); `__error` (errno) | — | rwlock в eboot нет | высокий / средний | rwlock — **NATIVE** (P2.2.3, отдельная группа `kernel-rwlock`); errno — последним (общий со всеми BRIDGE-функциями) |
 
 ### Подробно по группам
 
@@ -76,13 +76,19 @@ errorcheck, adaptive; ошибки `EINVAL`, `EBUSY`, `EDEADLK`, `EPERM`. Нуж
 |---|---|---|---|
 | 1. Семафоры (`src\runtime\kernel\semaphore.cpp`, группа `kernel-sema`) | **NATIVE** (2026-10-09) | `KernelSema` 29 (NATIVE↔BRIDGE, 1 известное отличие) + `KernelSema(n)` 17; 3 запуска подряд — 0 расхождений | **НЕ ПРОВЕРЕНО** |
 | 2. Event flags (`src\runtime\kernel\event_flag.cpp`, группа `kernel-eventflag`) | **NATIVE** (2026-10-09) | `KernelEventFlag` 19 (NATIVE↔BRIDGE, безопасные для оракула пути) + `KernelEventFlag(n)` 30; 3 запуска подряд — 0 расхождений | **НЕ ПРОВЕРЕНО** |
-| 3. Мьютексы + condvar + rwlock | план: сначала аудит функций моста, получающих мьютексы игры, и замер горячего пути | — | — |
+| 3. Мьютексы + condvar (`mutex.cpp`, `condvar.cpp`, группа `kernel-mutex`) | **NATIVE** (2026-10-09, P2.2.3) | `KernelMutex` 12 + `KernelCond` 7 (1 известное отличие) + многопоточные `PthreadSync(n)`; 3 запуска подряд — 0 расхождений | см. `docs\PHASE2_TEST_RESULTS.md` |
+| 3a. RW-блокировки (`rwlock.cpp`, группа `kernel-rwlock`) | **NATIVE** (2026-10-09, P2.2.3) | `KernelRwlock` 6 + многопоточные проверки в `PthreadSync(n)` | см. `docs\PHASE2_TEST_RESULTS.md` |
 | 4. Event queues | с Phase 4 | — | — |
 
 Счётчики привязок после шага 2 (сводка таблицы при `--selftest`): **NATIVE 79 / OBSERVED 2 /
 BRIDGE 316 / COMMON_STUB 18 / UNRESOLVED 2**, LLE 147 (после шага 1 было 75 / 2 / 320 / 18 / 2).
 Переключатели независимы: `--bridge kernel-eventflag` → 75 / 320, `--bridge kernel-sema` → 75 / 320,
 оба вместе → 71 / 324.
+
+После Phase 2.2.3: **NATIVE 120 / OBSERVED 2 / BRIDGE 275 / COMMON_STUB 18 / UNRESOLVED 2**
+(+9 Tier 1 — `kernel-util` 5, `net-util` 2, `libc-mem` 2; +25 `kernel-mutex` — 19 мьютексов и 6 condvar;
++7 `kernel-rwlock`). `--bridge kernel-mutex` возвращает эталону все 25 сразу (`kernel-condvar` — то же
+имя), `--bridge kernel-rwlock` — 7; группы sema/eventflag не затронуты.
 
 ### Семафоры: отличия от эталона
 
@@ -156,3 +162,80 @@ BRIDGE 316 / COMMON_STUB 18 / UNRESOLVED 2**, LLE 147 (после шага 1 б�
 
 **НЕ ПРОВЕРЕНО:** event flags в игре (оба загрузчика; путь `shadps4` их не использует); атрибуты
 реальных флагов игры (22 создания / 32 удаления за прогон аудита) и AND/OR/CLEAR/таймауты в бою.
+
+## 4. Мьютексы, condvar, RW-блокировки (Phase 2.2.3)
+
+### Аудит зависимостей (до переноса)
+
+- **Кто в мосте получает мьютексы/condvar игры.** Поиск по `third_party\shadPS4\src`: кроме самих
+  `threads\{mutex,condvar}.cpp` — `libc_internal` (`_Mtxinit/_Mtxlock/...`, `fflush` → `_Lockfilelock`),
+  `np_common` (`sceNpMutex*`, `sceNpCond*`). Игра импортирует из них только `fflush`
+  (libSceLibcInternal, из `libSceFios2.prx`, 1 вызов за прогон): Fios2 передаёт ей `_Stdout` своего
+  импорта libSceLibcInternal, а этот объект в таблице привязок **не разрешён** (UNRESOLVED) — FILE
+  libc.prx с нативным мьютексом до `fflush` моста не доходит. `scePthreadOnce` (BRIDGE) мьютексов не
+  использует (атомарное состояние).
+- **Мьютекс и condvar неразделимы.** `CondWait` эталона сам отпускает и берёт мьютекс
+  (`IsOwned/CvUnlock/CvLock` по объекту эталона), а `Signal/Broadcast` откладывают пробуждение через
+  флаг `Deferred` мьютекса и очередь потока (`curthread->WakeAll()` в `Unlock`). Нативный мьютекс с
+  condvar эталона (или наоборот) сломал бы оба — одна группа `kernel-mutex`. `--bridge kernel-condvar`
+  принимается как имя той же группы (с предупреждением в логе).
+- **Гостевой код пишет внутрь объекта мьютекса.** Дизассемблирование `libc.prx`
+  (`tools\find_calls.py --module ...\sce_module\libc.prx`): сразу после `scePthreadMutexInit`
+  — `mov rax,[mtx]; or dword ptr [rax+0x20], 0x100` (адреса 0x5b96a, 0x5bbf1, 0x5d81c), то есть libc
+  ставит `PMUTEX_FLAG_PRIVATE` в слово флагов объекта. Эталон держит там `m_flags`
+  (`static_assert(offsetof(PthreadMutex, m_flags) == 0x20)`). Остальные обращения к `+0x20` рядом с
+  вызовами мьютексов в libc.prx — поля собственной обёртки libc (мьютекс в ней по `+8`, condvar по `+0x10`).
+- **RW-блокировки** — отдельные объекты, их функции получает только Fios2; ни одна другая функция
+  их не принимает → отдельная группа `kernel-rwlock`.
+- **Что осталось от моста:** ничего. Владелец — идентификатор потока хоста (гостевые потоки —
+  потоки Windows 1:1); `g_curthread` эталона не нужен. Отмена потоков (`pthread_cancel`) игра не
+  импортирует — точки отмены в ожиданиях не нужны.
+
+### Устройство
+
+- `src\runtime\kernel\pthread_sync.h` — объект мьютекса с раскладкой libthr/эталона до `+0x24`:
+  `0x00` владелец (id потока, 0 — свободен), `0x08` счётчик рекурсии, `0x0C` спины, `0x14` протокол,
+  **`0x20` флаги** (тип в младшем байте, `0x100` от libc), `0x24` слово блокировки
+  (0 свободен / 1 занят / 2 занят и, возможно, есть спящие). Тип читается из `+0x20` при каждом
+  захвате; после инициализации SecondSonPC это слово **не пишет** (`or` у libc неатомарный — эталон
+  пишет туда `Deferred` в горячем пути).
+- `mutex.cpp` — захват: CAS 0→1; иначе спин (adaptive, 2000 итераций, только протокол NONE — как
+  эталон), затем `exchange(2)` и сон на слове (`std::atomic::wait` = WaitOnAddress); отпускание:
+  `exchange(0)`, при «2» — `notify_one`. Статические инициализаторы `NULL` (error-check) и `1`
+  (adaptive) создаются под одним замком при первом использовании; `2` — уничтожен.
+- `condvar.cpp` — очередь `Sync::WaitList` (FIFO, как TAILQ libkernel) под замком condvar; ждущий
+  встаёт в очередь **до** освобождения мьютекса (сигнал после освобождения его найдёт); мьютекс
+  освобождается целиком (все уровни рекурсии) и восстанавливается после пробуждения;
+  `scePthreadCondTimedwait` — относительный таймаут в мкс (`reltimedwait_np` libthr).
+- `rwlock.cpp` — `std::mutex` + две `std::condition_variable` как механизм; правила — libthr:
+  писатели в приоритете, но поток, уже держащий чтение (счётчик `rdlock_count` на поток, по всем
+  rwlock), проходит мимо ждущего писателя (иначе рекурсивное чтение зависло бы).
+- Уничтоженные объекты всех трёх видов не освобождаются (списки «retired»; десятки объектов за час
+  игры): поток, ещё выходящий из ожидания, читает валидную память.
+
+### Отличия от эталона (сознательно)
+
+1. `CondDestroy` при ждущих → `EBUSY` (libthr); эталон удаляет объект под ними.
+2. `CondWait` с уничтоженным мьютексом (значение 2) → `EINVAL` (libthr `_mutex_owned`); эталон вызывает
+   `IsOwned()` на «объекте» по адресу 2 (UB, проверка `this <= 2` выкидывается компилятором) и
+   отвечает `EPERM` — единственная строка «KNOWN» в `KernelCond`.
+3. Повторный захват normal-мьютекса владельцем: libkernel — взаимоблокировка, эталон — assert (падение
+   процесса); SecondSonPC пишет Critical в лог и блокирует поток (семантика PS4, видна в логе).
+4. Нет «отложенного пробуждения» (Deferred): разбуженный сигналом поток сразу пытается взять
+   мьютекс. Корректность не меняется; цена — возможный лишний цикл сна, измеряется по FPS.
+5. RW-блокировки: приоритет писателей (libthr) вместо «читатели первыми» эталона
+   (`Common::SharedFirstMutex` — писатель может голодать); `unlock` без удержания → `EPERM` (у эталона
+   `unlock_shared()` — UB); тип атрибута проверяется эталоном только для SDK ≥ 4.50 — игра SDK 4.00.
+6. Владелец и `PTHREAD_PRIO_INHERIT/PROTECT`: протокол хранится, приоритеты не повышаются (эталон
+   тоже не повышает).
+
+### Что проверено (`--selftest`)
+
+| Группа | NATIVE↔BRIDGE (эталону на потоке самотеста подставлен объект гостевого потока) | Только нативно (многопоточные, против ожидаемых значений) |
+|---|---|---|
+| Мьютексы (`KernelMutex` 12) | все 4 типа: lock, trylock и lock владельцем, лишние unlock, захват после записи libc в `+0x20`, destroy/повторный destroy, операции над уничтоженным; статические `NULL`/`1`; destroy занятого → EBUSY; `*attr == NULL`; POSIX-коды (рекурсивный и error-check); ошибки атрибутов | 8 потоков × 100 000 для каждого типа — ни одного потерянного инкремента; trylock/unlock чужим потоком → EBUSY/EPERM, destroy занятого → EBUSY; статический инициализатор, впервые взятый 16 потоками сразу — один объект; спящий захватчик будится; неконтентный lock+unlock: нативно ≈ 34 нс, эталон ≈ 530 нс |
+| Condvar (`KernelCond` 7) | signal/broadcast без ждущих, wait без владения → EPERM, таймауты 20 мс и 0 с повторным захватом, рекурсивный мьютекс (2 уровня восстановлены), уничтоженный и статический condvar | 4 производителя × 4 потребителя × 20 000 — каждый элемент ровно один раз (нет потерянных пробуждений); broadcast будит всех 8; signal будит ровно одного, в порядке прихода; таймаут 30 мс ≥ 29 мс с мьютексом; 300 сигналов в гонке с таймаутами 1 мс — OK/ETIMEDOUT, мьютекс всегда снова захвачен, очередь пуста; destroy при ждущем → EBUSY, после ухода → OK; wait на чужом мьютексе → EPERM |
+| RW-блокировки (`KernelRwlock` 6) | чтение ×2, trywrlock при чтении, запись с tryrd/trywr, try-пути, уничтоженный и статический | 4 читателя одновременно внутри; 4 писателя × 5000 + 4 читателя × 20 000 — писатели исключительны, без потерь; ждущий писатель: новый читатель EBUSY, рекурсивный проходит, писатель затем получает замок; unlock без удержания / чужой записи → EPERM; писатель среди 4 «крутящихся» читателей — 50 захватов, ни один не ждал > 200 мс |
+
+**НЕ ПРОВЕРЕНО на момент записи:** игра с нативными мьютексами/condvar/rwlock (загрузка, геймплей,
+FPS, зависания) — см. `docs\PHASE2_TEST_RESULTS.md`.

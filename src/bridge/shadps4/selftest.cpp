@@ -25,6 +25,7 @@
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_mouse.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "app/config.h"
 #include "input/keyboard_mouse.h"
@@ -35,11 +36,14 @@
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/libraries/kernel/threads/pthread.h"
+#include "core/libraries/kernel/threads/sleepq.h"
 #include "core/user_settings.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/vfs.h"
 #include "runtime/kernel/kernel.h"
+#include "runtime/kernel/pthread_sync.h"
 #include "runtime/psf/param_sfo.h"
 #include "runtime/user/user_service.h"
 
@@ -1832,6 +1836,868 @@ void TestTier1(Totals& t) {
     Compare(t, "Tier1", native, bridge);
 }
 
+// ---------------------------------------------------------------------------- pthread sync (P2.2.3)
+
+/// The oracle's pthread functions read g_curthread, the calling guest thread's object (owner of a
+/// mutex, its sleep queue in a condvar wait): the self-test thread gets one while the BRIDGE side
+/// runs. The objects are not freed (the oracle swaps sleep queues between threads).
+class GuestThreadForOracle {
+public:
+    GuestThreadForOracle() : saved_{Libraries::Kernel::g_curthread} {
+        auto* td = new Libraries::Kernel::Pthread{};
+        td->sleepqueue = new Libraries::Kernel::SleepQueue{};
+        Libraries::Kernel::g_curthread = td;
+    }
+    ~GuestThreadForOracle() {
+        Libraries::Kernel::g_curthread = saved_;
+    }
+
+private:
+    Libraries::Kernel::Pthread* saved_;
+};
+
+using GuestObj = void*; // pthread_mutex_t / _cond_t / _rwlock_t / _mutexattr_t: a pointer the implementation owns
+
+void* Addr(GuestObj& o) {
+    return static_cast<void*>(&o);
+}
+
+std::string ObjValue(GuestObj o) {
+    const auto v = reinterpret_cast<u64>(o);
+    return v <= 2 ? std::to_string(v) : std::string("object");
+}
+
+/// libc.prx right after scePthreadMutexInit: `or dword [m+0x20], 0x100` (PMUTEX_FLAG_PRIVATE).
+void LibcMarksPrivate(GuestObj m) {
+    *reinterpret_cast<u32*>(static_cast<u8*>(m) + 0x20) |= 0x100;
+}
+
+namespace Nid {
+constexpr const char* kMutexInit = "cmo1RIYva9o";
+constexpr const char* kMutexDestroy = "2Of0f+3mhhE";
+constexpr const char* kMutexLock = "9UK1vLZQft4";
+constexpr const char* kMutexTrylock = "upoVrzMHFeE";
+constexpr const char* kMutexUnlock = "tn3VlD0hG60";
+constexpr const char* kAttrInit = "F8bUHwAG284";
+constexpr const char* kAttrDestroy = "smWEktiyyG0";
+constexpr const char* kAttrSettype = "iMp8QpE+XO4";
+constexpr const char* kAttrSetprotocol = "1FGvU0i9saQ";
+constexpr const char* kCondInit = "2Tb92quprl0";
+constexpr const char* kCondDestroy = "g+PZd2hiacg";
+constexpr const char* kCondWait = "WKAXJ4XBPQ4";
+constexpr const char* kCondTimedwait = "BmMjYxmew1w";
+constexpr const char* kCondSignal = "kDh-NfxgMtE";
+constexpr const char* kCondBroadcast = "JGgj7Uvrl+A";
+constexpr const char* kRwInit = "6ULAa0fq4jA";
+constexpr const char* kRwDestroy = "BB+kb08Tl9A";
+constexpr const char* kRwRdlock = "Ox9i0c7L5w0";
+constexpr const char* kRwWrlock = "mqdNorrB+gI";
+constexpr const char* kRwUnlock = "+L98PIbGttk";
+constexpr const char* kRwTryrdlock = "XD3mDeybCnk";
+constexpr const char* kRwTrywrlock = "bIHoZCTomsI";
+} // namespace Nid
+
+/// Single-threaded mutex paths both implementations can run: every type, the owner's relock and
+/// trylock, extra unlocks, libc's flag write, destroyed and static-initializer values, POSIX codes.
+void MutexScript(Side& s) {
+    const void* init = s.F(Nid::kMutexInit);
+    const void* destroy = s.F(Nid::kMutexDestroy);
+    const void* lock = s.F(Nid::kMutexLock);
+    const void* trylock = s.F(Nid::kMutexTrylock);
+    const void* unlock = s.F(Nid::kMutexUnlock);
+    const void* attr_init = s.F(Nid::kAttrInit);
+    const void* attr_destroy = s.F(Nid::kAttrDestroy);
+    const void* settype = s.F(Nid::kAttrSettype);
+    const void* setproto = s.F(Nid::kAttrSetprotocol);
+    const void* p_init = s.F("ttHNfU+qDBU");
+    const void* p_destroy = s.F("ltCfaGr2JGE");
+    const void* p_lock = s.F("7H0iTOciTLo");
+    const void* p_trylock = s.F("K-jXhbt2gn4");
+    const void* p_unlock = s.F("2Z+PpY6CaJg");
+    const void* p_attr_init = s.F("dQHWEsJtoE4");
+    const void* p_attr_destroy = s.F("HF7lK46xzjY");
+    const void* p_settype = s.F("mDmgMOGVUqg");
+    // Steps run one per statement (the order of evaluation of function arguments is unspecified).
+    std::string line;
+    const auto step = [&line](const char* what, s32 code) { line += fmt::format(" {} {};", what, Code(code)); };
+    const auto L = [](const void* f, GuestObj& o) { return Call<s32>(f, Addr(o)); };
+    const auto flush = [&s, &line](const std::string& head) {
+        s.Line("{}:{}", head, line);
+        line.clear();
+    };
+
+    GuestObj attr = nullptr;
+    step("attr init", L(attr_init, attr));
+    step("settype 0", Call<s32>(settype, Addr(attr), 0u));
+    step("settype 5", Call<s32>(settype, Addr(attr), 5u));
+    step("setprotocol 3", Call<s32>(setproto, Addr(attr), 3u));
+    flush("attr");
+    for (const u32 type : {1u, 2u, 3u, 4u}) {
+        GuestObj m = nullptr;
+        step("settype", Call<s32>(settype, Addr(attr), type));
+        step("setprotocol", Call<s32>(setproto, Addr(attr), type == 4 ? 1u : 0u));
+        step("init", Call<s32>(init, Addr(m), Addr(attr), "selftest"));
+        line += " -> " + ObjValue(m) + ";";
+        step("lock", L(lock, m));
+        step("trylock by owner", L(trylock, m));
+        if (type != 3) { // a normal mutex locked again by its owner deadlocks (libkernel) / asserts (oracle)
+            step("lock by owner", L(lock, m));
+        }
+        LibcMarksPrivate(m);
+        for (int i = 0; i < 4; ++i) {
+            step("unlock", L(unlock, m));
+        }
+        step("lock after libc's private flag", L(lock, m));
+        if (type == 2) {
+            step("lock by owner", L(lock, m));
+            step("unlock", L(unlock, m));
+        }
+        step("unlock", L(unlock, m));
+        step("destroy", L(destroy, m));
+        line += " -> " + ObjValue(m) + ";";
+        step("destroy again", L(destroy, m));
+        step("lock", L(lock, m));
+        step("trylock", L(trylock, m));
+        step("unlock", L(unlock, m));
+        flush(fmt::format("type {}", type));
+    }
+    step("attr destroy", L(attr_destroy, attr));
+    line += " -> " + ObjValue(attr) + ";";
+    step("again", L(attr_destroy, attr));
+    flush("attr destroy");
+
+    GuestObj st = nullptr;
+    step("unlock", L(unlock, st));
+    step("destroy", L(destroy, st));
+    line += " -> " + ObjValue(st) + ";";
+    step("lock", L(lock, st));
+    line += " -> " + ObjValue(st) + ";";
+    step("lock by owner", L(lock, st));
+    step("unlock", L(unlock, st));
+    step("destroy", L(destroy, st));
+    flush("static initializer");
+    GuestObj ad = reinterpret_cast<GuestObj>(1);
+    step("lock", L(lock, ad));
+    line += " -> " + ObjValue(ad) + ";";
+    step("lock by owner", L(lock, ad));
+    step("unlock", L(unlock, ad));
+    step("destroy", L(destroy, ad));
+    flush("adaptive initializer");
+    GuestObj busy = nullptr;
+    step("init", Call<s32>(init, Addr(busy), static_cast<void*>(nullptr), "busy"));
+    step("lock", L(lock, busy));
+    step("destroy", L(destroy, busy));
+    step("unlock", L(unlock, busy));
+    step("destroy", L(destroy, busy));
+    flush("destroy while locked");
+    GuestObj null_attr = nullptr;
+    GuestObj dm = nullptr;
+    step("init", Call<s32>(init, Addr(dm), Addr(null_attr), static_cast<const char*>(nullptr)));
+    step("lock", L(lock, dm));
+    step("lock by owner", L(lock, dm));
+    step("unlock", L(unlock, dm));
+    step("destroy", L(destroy, dm));
+    flush("init with *attr = NULL (defaults)");
+
+    GuestObj pa = nullptr;
+    GuestObj pm = nullptr;
+    step("attr init", L(p_attr_init, pa));
+    step("settype 2", Call<s32>(p_settype, Addr(pa), 2u));
+    step("init", Call<s32>(p_init, Addr(pm), Addr(pa)));
+    step("lock", L(p_lock, pm));
+    step("lock", L(p_lock, pm));
+    step("trylock", L(p_trylock, pm));
+    for (int i = 0; i < 4; ++i) {
+        step("unlock", L(p_unlock, pm));
+    }
+    step("destroy", L(p_destroy, pm));
+    step("destroy again", L(p_destroy, pm));
+    step("attr destroy", L(p_attr_destroy, pa));
+    step("again", L(p_attr_destroy, pa));
+    flush("posix recursive");
+    GuestObj pe = nullptr;
+    step("init", Call<s32>(p_init, Addr(pe), static_cast<void*>(nullptr)));
+    step("lock", L(p_lock, pe));
+    step("lock by owner", L(p_lock, pe));
+    step("trylock", L(p_trylock, pe));
+    step("unlock", L(p_unlock, pe));
+    step("unlock again", L(p_unlock, pe));
+    step("destroy", L(p_destroy, pe));
+    flush("posix error-check");
+}
+
+/// Condition-variable paths both implementations can run on one thread: no waiters, ownership
+/// errors, timed waits (the mutex is held again afterwards, recursion restored), destroyed and
+/// static values.
+void CondScript(Side& s) {
+    const void* init = s.F(Nid::kCondInit);
+    const void* destroy = s.F(Nid::kCondDestroy);
+    const void* wait = s.F(Nid::kCondWait);
+    const void* timedwait = s.F(Nid::kCondTimedwait);
+    const void* signal = s.F(Nid::kCondSignal);
+    const void* broadcast = s.F(Nid::kCondBroadcast);
+    const void* m_init = s.F(Nid::kMutexInit);
+    const void* m_lock = s.F(Nid::kMutexLock);
+    const void* m_unlock = s.F(Nid::kMutexUnlock);
+    const void* attr_init = s.F(Nid::kAttrInit);
+    const void* settype = s.F(Nid::kAttrSettype);
+    std::string line;
+    const auto step = [&line](const char* what, s32 code) { line += fmt::format(" {} {};", what, Code(code)); };
+    const auto L = [](const void* f, GuestObj& o) { return Call<s32>(f, Addr(o)); };
+    const auto flush = [&s, &line](const char* head) {
+        s.Line("{}:{}", head, line);
+        line.clear();
+    };
+
+    GuestObj c = nullptr;
+    step("init", Call<s32>(init, Addr(c), static_cast<void*>(nullptr), "selftest"));
+    line += " -> " + ObjValue(c) + ";";
+    step("signal", L(signal, c));
+    step("broadcast", L(broadcast, c));
+    flush("no waiters");
+    GuestObj m = nullptr;
+    Call<s32>(m_init, Addr(m), static_cast<void*>(nullptr), "cv");
+    step("wait, mutex not owned", Call<s32>(wait, Addr(c), Addr(m)));
+    flush("ownership");
+    GuestObj dead = reinterpret_cast<GuestObj>(2);
+    step("wait", Call<s32>(wait, Addr(c), Addr(dead)));
+    flush("wait on a destroyed mutex");
+    step("lock", L(m_lock, m));
+    step("timed wait 20 ms", Call<s32>(timedwait, Addr(c), Addr(m), 20000u));
+    step("unlock (held again)", L(m_unlock, m));
+    step("unlock again", L(m_unlock, m));
+    step("lock", L(m_lock, m));
+    step("timed wait 0 us", Call<s32>(timedwait, Addr(c), Addr(m), 0u));
+    step("unlock", L(m_unlock, m));
+    flush("timed waits");
+    GuestObj attr = nullptr;
+    Call<s32>(attr_init, Addr(attr));
+    Call<s32>(settype, Addr(attr), 2u);
+    GuestObj mr = nullptr;
+    Call<s32>(m_init, Addr(mr), Addr(attr), "cv-recursive");
+    step("lock", L(m_lock, mr));
+    step("lock", L(m_lock, mr));
+    step("timed wait 10 ms", Call<s32>(timedwait, Addr(c), Addr(mr), 10000u));
+    for (int i = 0; i < 3; ++i) {
+        step("unlock", L(m_unlock, mr));
+    }
+    flush("recursive mutex locked twice");
+    step("destroy", L(destroy, c));
+    line += " -> " + ObjValue(c) + ";";
+    step("again", L(destroy, c));
+    step("signal", L(signal, c));
+    step("broadcast", L(broadcast, c));
+    step("wait", Call<s32>(wait, Addr(c), Addr(m)));
+    flush("destroyed");
+    GuestObj sc = nullptr;
+    step("signal", L(signal, sc));
+    line += " -> " + ObjValue(sc) + ";";
+    step("destroy", L(destroy, sc));
+    flush("static initializer");
+}
+
+/// Reader/writer lock paths both implementations can run on one thread.
+void RwlockScript(Side& s) {
+    const void* init = s.F(Nid::kRwInit);
+    const void* destroy = s.F(Nid::kRwDestroy);
+    const void* rd = s.F(Nid::kRwRdlock);
+    const void* wr = s.F(Nid::kRwWrlock);
+    const void* unlock = s.F(Nid::kRwUnlock);
+    const void* tryrd = s.F(Nid::kRwTryrdlock);
+    const void* trywr = s.F(Nid::kRwTrywrlock);
+    std::string line;
+    const auto step = [&line](const char* what, s32 code) { line += fmt::format(" {} {};", what, Code(code)); };
+    const auto L = [](const void* f, GuestObj& o) { return Call<s32>(f, Addr(o)); };
+    const auto flush = [&s, &line](const char* head) {
+        s.Line("{}:{}", head, line);
+        line.clear();
+    };
+
+    GuestObj r = nullptr;
+    step("init", Call<s32>(init, Addr(r), static_cast<void*>(nullptr), "selftest"));
+    line += " -> " + ObjValue(r) + ";";
+    flush("init");
+    step("rdlock", L(rd, r));
+    step("rdlock", L(rd, r));
+    step("trywrlock", L(trywr, r));
+    step("unlock", L(unlock, r));
+    step("unlock", L(unlock, r));
+    flush("readers");
+    step("wrlock", L(wr, r));
+    step("tryrdlock", L(tryrd, r));
+    step("trywrlock", L(trywr, r));
+    step("unlock", L(unlock, r));
+    flush("writer");
+    step("tryrdlock", L(tryrd, r));
+    step("unlock", L(unlock, r));
+    step("trywrlock", L(trywr, r));
+    step("unlock", L(unlock, r));
+    flush("try");
+    step("destroy", L(destroy, r));
+    line += " -> " + ObjValue(r) + ";";
+    step("again", L(destroy, r));
+    step("rdlock", L(rd, r));
+    step("wrlock", L(wr, r));
+    step("tryrdlock", L(tryrd, r));
+    step("trywrlock", L(trywr, r));
+    step("unlock", L(unlock, r));
+    flush("destroyed");
+    GuestObj sr = nullptr;
+    step("rdlock", L(rd, sr));
+    line += " -> " + ObjValue(sr) + ";";
+    step("unlock", L(unlock, sr));
+    step("destroy", L(destroy, sr));
+    flush("static initializer");
+}
+
+constexpr s32 kSceOk = 0;
+constexpr s32 kSceEperm = static_cast<s32>(0x80020001);
+constexpr s32 kSceEdeadlk = static_cast<s32>(0x8002000B);
+constexpr s32 kSceEbusy = static_cast<s32>(0x80020010);
+constexpr s32 kSceEinval = static_cast<s32>(0x80020016);
+constexpr s32 kSceEtimedout = static_cast<s32>(0x8002003C);
+
+/// Mutex, condvar and rwlock: NATIVE vs BRIDGE on the paths above, then the concurrent semantics
+/// (and object lifetime) on the native side against expected values.
+void TestPthreadSync(Totals& t) {
+    {
+        Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+        MutexScript(native);
+        {
+            GuestThreadForOracle guest;
+            MutexScript(bridge);
+        }
+        Compare(t, "KernelMutex", native, bridge);
+    }
+    {
+        Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+        CondScript(native);
+        {
+            GuestThreadForOracle guest;
+            CondScript(bridge);
+        }
+        // libthr's _mutex_owned: a destroyed mutex -> EINVAL. The oracle calls IsOwned() on the
+        // value 2 as an object (undefined behaviour; its `this <= 2` test is optimised away) and
+        // returns EPERM.
+        Compare(t, "KernelCond", native, bridge, {"wait on a destroyed mutex"});
+    }
+    {
+        Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+        RwlockScript(native);
+        {
+            GuestThreadForOracle guest;
+            RwlockScript(bridge);
+        }
+        Compare(t, "KernelRwlock", native, bridge);
+    }
+
+    InputChecks c(t, "PthreadSync(n)");
+    const void* init = NativeOf(Nid::kMutexInit);
+    const void* destroy = NativeOf(Nid::kMutexDestroy);
+    const void* lock = NativeOf(Nid::kMutexLock);
+    const void* trylock = NativeOf(Nid::kMutexTrylock);
+    const void* unlock = NativeOf(Nid::kMutexUnlock);
+    const void* attr_init = NativeOf(Nid::kAttrInit);
+    const void* attr_destroy = NativeOf(Nid::kAttrDestroy);
+    const void* settype = NativeOf(Nid::kAttrSettype);
+    const void* c_init = NativeOf(Nid::kCondInit);
+    const void* c_destroy = NativeOf(Nid::kCondDestroy);
+    const void* c_wait = NativeOf(Nid::kCondWait);
+    const void* c_timedwait = NativeOf(Nid::kCondTimedwait);
+    const void* c_signal = NativeOf(Nid::kCondSignal);
+    const void* c_broadcast = NativeOf(Nid::kCondBroadcast);
+    const void* rw_init = NativeOf(Nid::kRwInit);
+    const void* rw_destroy = NativeOf(Nid::kRwDestroy);
+    const void* rw_rd = NativeOf(Nid::kRwRdlock);
+    const void* rw_wr = NativeOf(Nid::kRwWrlock);
+    const void* rw_unlock = NativeOf(Nid::kRwUnlock);
+    const void* rw_tryrd = NativeOf(Nid::kRwTryrdlock);
+    const auto C = [](const void* f, GuestObj& o) { return Call<s32>(f, Addr(o)); };
+    const auto make_mutex = [&](u32 type, const char* name) {
+        GuestObj attr = nullptr;
+        Call<s32>(attr_init, Addr(attr));
+        Call<s32>(settype, Addr(attr), type);
+        GuestObj m = nullptr;
+        Call<s32>(init, Addr(m), Addr(attr), name);
+        Call<s32>(attr_destroy, Addr(attr));
+        return m;
+    };
+    const auto make_cond = [&](const char* name) {
+        GuestObj cv = nullptr;
+        Call<s32>(c_init, Addr(cv), static_cast<void*>(nullptr), name);
+        return cv;
+    };
+
+    // --- mutexes: mutual exclusion under contention, every type (8 threads x 100000) ---
+    for (const u32 type : {1u, 2u, 3u, 4u}) {
+        GuestObj m = make_mutex(type, "contention");
+        u64 counter = 0;
+        std::atomic<int> errors{0};
+        std::vector<std::thread> threads;
+        constexpr int kThreads = 8, kIters = 100000;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kThreads; ++i) {
+            threads.emplace_back([&] {
+                for (int k = 0; k < kIters; ++k) {
+                    errors += C(lock, m) != kSceOk;
+                    if (type == 2) {
+                        errors += C(lock, m) != kSceOk;
+                    }
+                    ++counter;
+                    if (type == 2) {
+                        errors += C(unlock, m) != kSceOk;
+                    }
+                    errors += C(unlock, m) != kSceOk;
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        c.Check(fmt::format("type {}: 8 threads x 100000 lock/unlock, no lost update", type),
+                counter == u64{kThreads} * kIters && errors == 0 && C(destroy, m) == kSceOk,
+                fmt::format("counter {} errors {} ({:.0f} ms)", counter, errors.load(), ms));
+    }
+    {
+        GuestObj m = make_mutex(1, "ownership");
+        C(lock, m);
+        s32 other_try = 0, other_unlock = 0;
+        std::thread([&] {
+            other_try = C(trylock, m);
+            other_unlock = C(unlock, m);
+        }).join();
+        const s32 busy = C(destroy, m);
+        const s32 u = C(unlock, m);
+        c.Check("owned by another thread: trylock EBUSY, unlock EPERM, destroy EBUSY",
+                other_try == kSceEbusy && other_unlock == kSceEperm && busy == kSceEbusy && u == kSceOk &&
+                    C(destroy, m) == kSceOk,
+                fmt::format("{} {} {} {}", Code(other_try), Code(other_unlock), Code(busy), Code(u)));
+    }
+    {
+        GuestObj m = nullptr; // PTHREAD_MUTEX_INITIALIZER, first used by 16 threads at once
+        u64 counter = 0;
+        std::vector<std::thread> threads;
+        std::atomic<bool> go{false};
+        for (int i = 0; i < 16; ++i) {
+            threads.emplace_back([&] {
+                while (!go) {
+                    std::this_thread::yield();
+                }
+                for (int k = 0; k < 10000; ++k) {
+                    C(lock, m);
+                    ++counter;
+                    C(unlock, m);
+                }
+            });
+        }
+        go = true;
+        for (auto& th : threads) {
+            th.join();
+        }
+        const u64 retired = Kernel::PthreadSync::Test::RetiredMutexes();
+        c.Check("static initializer raced by 16 threads: one object, no lost update; destroy retires it",
+                m != nullptr && counter == 160000 && C(destroy, m) == kSceOk &&
+                    Kernel::PthreadSync::Test::RetiredMutexes() == retired + 1 && m == reinterpret_cast<GuestObj>(2),
+                fmt::format("counter {}", counter));
+    }
+    {
+        GuestObj m = make_mutex(1, "handoff");
+        C(lock, m);
+        std::atomic<s32> result{-1};
+        std::atomic<bool> got{false};
+        std::thread waiter([&] {
+            result = C(lock, m);
+            got = true;
+            C(unlock, m);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const bool blocked = !got;
+        C(unlock, m);
+        const bool woke = WaitUntil([&] { return got.load(); }, 2000);
+        waiter.join();
+        c.Check("a sleeping locker is woken by the unlock", blocked && woke && result == kSceOk && C(destroy, m) == kSceOk,
+                fmt::format("blocked {} woke {}", blocked, woke));
+    }
+    {
+        // Uncontended cost on this thread (the import thunk adds the same to both in the game).
+        GuestObj nm = make_mutex(1, "cost");
+        constexpr int kOps = 1000000;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kOps; ++i) {
+            C(lock, nm);
+            C(unlock, nm);
+        }
+        const double native_ns =
+            std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / kOps;
+        C(destroy, nm);
+        double bridge_ns = 0;
+        {
+            GuestThreadForOracle guest;
+            const void* b_init = BridgeOf(Nid::kMutexInit);
+            const void* b_lock = BridgeOf(Nid::kMutexLock);
+            const void* b_unlock = BridgeOf(Nid::kMutexUnlock);
+            GuestObj bm = nullptr;
+            Call<s32>(b_init, Addr(bm), static_cast<void*>(nullptr), "cost");
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kOps; ++i) {
+                C(b_lock, bm);
+                C(b_unlock, bm);
+            }
+            bridge_ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / kOps;
+        }
+        c.Check("uncontended lock+unlock no slower than the oracle", native_ns <= bridge_ns * 1.2 + 5.0,
+                fmt::format("native {:.1f} ns, bridge {:.1f} ns", native_ns, bridge_ns));
+        t.report.push_back(fmt::format("  INFO  uncontended lock+unlock: native {:.1f} ns, bridge {:.1f} ns",
+                                       native_ns, bridge_ns));
+    }
+
+    // --- condition variables ---
+    {
+        GuestObj m = make_mutex(1, "queue");
+        GuestObj not_empty = make_cond("not-empty");
+        std::vector<int> queue;
+        bool done = false;
+        u64 consumed = 0, sum = 0;
+        std::atomic<int> errors{0};
+        constexpr int kProducers = 4, kConsumers = 4, kItems = 20000;
+        std::vector<std::thread> threads;
+        for (int p = 0; p < kProducers; ++p) {
+            threads.emplace_back([&, p] {
+                for (int i = 0; i < kItems; ++i) {
+                    errors += C(lock, m) != kSceOk;
+                    queue.push_back(p * kItems + i);
+                    errors += C(c_signal, not_empty) != kSceOk;
+                    errors += C(unlock, m) != kSceOk;
+                }
+            });
+        }
+        std::atomic<int> consumers_done{0};
+        for (int q = 0; q < kConsumers; ++q) {
+            threads.emplace_back([&] {
+                C(lock, m);
+                for (;;) {
+                    while (queue.empty() && !done) {
+                        errors += Call<s32>(c_wait, Addr(not_empty), Addr(m)) != kSceOk;
+                    }
+                    if (queue.empty()) {
+                        break;
+                    }
+                    sum += static_cast<u64>(queue.back());
+                    queue.pop_back();
+                    ++consumed;
+                }
+                C(unlock, m);
+                ++consumers_done;
+            });
+        }
+        for (int p = 0; p < kProducers; ++p) {
+            threads[p].join();
+        }
+        C(lock, m);
+        done = true;
+        C(c_broadcast, not_empty);
+        C(unlock, m);
+        const bool finished = WaitUntil([&] { return consumers_done == kConsumers; }, 20000);
+        for (size_t i = kProducers; i < threads.size(); ++i) {
+            if (finished) {
+                threads[i].join();
+            } else {
+                threads[i].detach();
+            }
+        }
+        const u64 n = u64{kProducers} * kItems;
+        c.Check("4 producers x 4 consumers x 20000: every item consumed once, no lost wake-up",
+                finished && consumed == n && sum == n * (n - 1) / 2 && errors == 0,
+                fmt::format("finished {} consumed {} errors {}", finished, consumed, errors.load()));
+        if (finished) {
+            C(c_destroy, not_empty);
+            C(destroy, m);
+        }
+    }
+    {
+        GuestObj m = make_mutex(1, "broadcast");
+        GuestObj cv = make_cond("broadcast");
+        int ready = 0;
+        bool go = false;
+        std::atomic<int> woken{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i) {
+            threads.emplace_back([&] {
+                C(lock, m);
+                ++ready;
+                while (!go) {
+                    Call<s32>(c_wait, Addr(cv), Addr(m));
+                }
+                ++woken;
+                C(unlock, m);
+            });
+        }
+        WaitUntil([&] {
+            C(lock, m);
+            const bool all = ready == 8; // every waiter holds m until it sleeps in the wait
+            C(unlock, m);
+            return all;
+        });
+        C(lock, m);
+        go = true;
+        C(c_broadcast, cv);
+        C(unlock, m);
+        const bool all = WaitUntil([&] { return woken == 8; });
+        for (auto& th : threads) {
+            all ? th.join() : th.detach();
+        }
+        c.Check("broadcast wakes all 8 waiters", all, fmt::format("woken {}", woken.load()));
+    }
+    {
+        GuestObj m = make_mutex(1, "fifo");
+        GuestObj cv = make_cond("fifo");
+        int ready = 0, tokens = 0;
+        std::vector<int> order;
+        std::vector<std::thread> threads;
+        for (int id = 1; id <= 3; ++id) {
+            threads.emplace_back([&, id] {
+                C(lock, m);
+                ++ready;
+                while (tokens == 0) {
+                    Call<s32>(c_wait, Addr(cv), Addr(m));
+                }
+                --tokens;
+                order.push_back(id);
+                C(unlock, m);
+            });
+            WaitUntil([&, id] {
+                C(lock, m);
+                const bool in = ready == id;
+                C(unlock, m);
+                return in;
+            });
+        }
+        bool one_each = true;
+        for (size_t k = 1; k <= 3; ++k) {
+            C(lock, m);
+            ++tokens;
+            C(c_signal, cv);
+            C(unlock, m);
+            one_each &= WaitUntil([&] {
+                C(lock, m);
+                const bool got = order.size() == k;
+                C(unlock, m);
+                return got;
+            });
+        }
+        for (auto& th : threads) {
+            one_each ? th.join() : th.detach();
+        }
+        c.Check("signal wakes exactly one waiter, longest waiting first", one_each && order == std::vector<int>{1, 2, 3},
+                fmt::format("order {}", fmt::join(order, " ")));
+    }
+    {
+        GuestObj m = make_mutex(1, "timed");
+        GuestObj cv = make_cond("timed");
+        C(lock, m);
+        const auto t0 = std::chrono::steady_clock::now();
+        const s32 r = Call<s32>(c_timedwait, Addr(cv), Addr(m), 30000u);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const s32 u = C(unlock, m);
+        c.Check("timed wait 30 ms: ETIMEDOUT after >= 29 ms with the mutex held again",
+                r == kSceEtimedout && ms >= 29.0 && ms < 1000.0 && u == kSceOk, fmt::format("{} after {:.1f} ms", Code(r), ms));
+    }
+    {
+        // A signal racing the timeout: the waiter returns OK or ETIMEDOUT, always holding the mutex,
+        // and never stays queued.
+        GuestObj m = make_mutex(1, "race");
+        GuestObj cv = make_cond("race");
+        int bad = 0;
+        for (int i = 0; i < 300; ++i) {
+            s32 r = 0, u = 0;
+            std::thread waiter([&] {
+                C(lock, m);
+                r = Call<s32>(c_timedwait, Addr(cv), Addr(m), 1000u);
+                u = C(unlock, m);
+            });
+            std::this_thread::sleep_for(std::chrono::microseconds(i % 3 == 0 ? 0 : 900 + i % 200));
+            C(lock, m);
+            C(c_signal, cv);
+            C(unlock, m);
+            waiter.join();
+            bad += (r != kSceOk && r != kSceEtimedout) || u != kSceOk;
+        }
+        c.Check("300 signals racing 1 ms timeouts: OK or ETIMEDOUT, mutex always re-held, queue empty",
+                bad == 0 && C(c_destroy, cv) == kSceOk, fmt::format("bad {}", bad));
+    }
+    {
+        GuestObj m = make_mutex(1, "destroy-wait");
+        GuestObj cv = make_cond("destroy-wait");
+        int tokens = 0;
+        std::atomic<bool> in{false}, out{false};
+        std::thread waiter([&] {
+            C(lock, m);
+            in = true;
+            while (tokens == 0) {
+                Call<s32>(c_wait, Addr(cv), Addr(m));
+            }
+            C(unlock, m);
+            out = true;
+        });
+        WaitUntil([&] { return in.load(); });
+        C(lock, m); // the waiter is asleep in the wait once m is free again
+        const s32 busy = C(c_destroy, cv);
+        ++tokens;
+        C(c_signal, cv);
+        C(unlock, m);
+        const bool left = WaitUntil([&] { return out.load(); });
+        left ? waiter.join() : waiter.detach();
+        const u64 retired = Kernel::PthreadSync::Test::RetiredConds();
+        const s32 d = C(c_destroy, cv);
+        c.Check("destroy with a waiter -> EBUSY; after it left -> OK, object retired",
+                busy == kSceEbusy && left && d == kSceOk && Kernel::PthreadSync::Test::RetiredConds() == retired + 1,
+                fmt::format("{} {}", Code(busy), Code(d)));
+    }
+    {
+        GuestObj m = make_mutex(1, "foreign");
+        GuestObj cv = make_cond("foreign");
+        C(lock, m);
+        s32 r = 0;
+        std::thread([&] { r = Call<s32>(c_wait, Addr(cv), Addr(m)); }).join();
+        C(unlock, m);
+        c.Check("wait on a mutex another thread owns -> EPERM", r == kSceEperm, Code(r));
+    }
+
+    // --- reader/writer locks ---
+    const auto make_rw = [&](const char* name) {
+        GuestObj r = nullptr;
+        Call<s32>(rw_init, Addr(r), static_cast<void*>(nullptr), name);
+        return r;
+    };
+    {
+        GuestObj rw = make_rw("readers");
+        std::atomic<int> inside{0};
+        std::atomic<bool> all_in{false};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&] {
+                C(rw_rd, rw);
+                if (++inside == 4) {
+                    all_in = true;
+                }
+                WaitUntil([&] { return all_in.load(); }, 2000);
+                C(rw_unlock, rw);
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        c.Check("4 readers hold the lock at the same time", all_in.load(), "");
+    }
+    {
+        GuestObj rw = make_rw("exclusion");
+        std::atomic<int> readers_in{0}, writers_in{0}, violations{0};
+        u64 value = 0;
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&] {
+                for (int k = 0; k < 5000; ++k) {
+                    C(rw_wr, rw);
+                    violations += ++writers_in != 1 || readers_in != 0;
+                    ++value;
+                    --writers_in;
+                    C(rw_unlock, rw);
+                }
+            });
+            threads.emplace_back([&] {
+                for (int k = 0; k < 20000; ++k) {
+                    C(rw_rd, rw);
+                    ++readers_in;
+                    violations += writers_in != 0;
+                    --readers_in;
+                    C(rw_unlock, rw);
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        c.Check("4 writers x 5000 + 4 readers x 20000: writers exclusive, no lost update",
+                violations == 0 && value == 20000, fmt::format("violations {} value {}", violations.load(), value));
+    }
+    {
+        // Writer preference with the recursive-read escape: R holds a read lock, W waits to write.
+        GuestObj rw = make_rw("preference");
+        std::atomic<int> step{0};
+        s32 recursive_try = -1;
+        std::thread reader([&] {
+            C(rw_rd, rw);
+            step = 1;
+            WaitUntil([&] { return step.load() == 2; });
+            recursive_try = C(rw_tryrd, rw); // holds a read lock: may pass the waiting writer
+            if (recursive_try == kSceOk) {
+                C(rw_unlock, rw);
+            }
+            C(rw_unlock, rw);
+        });
+        WaitUntil([&] { return step.load() == 1; });
+        std::atomic<bool> wrote{false};
+        std::thread writer([&] {
+            C(rw_wr, rw);
+            wrote = true;
+            C(rw_unlock, rw);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // the writer is waiting now
+        const s32 new_reader = C(rw_tryrd, rw);                    // this thread holds no read lock
+        step = 2;
+        reader.join();
+        const bool writer_got_it = WaitUntil([&] { return wrote.load(); });
+        writer.join();
+        c.Check("waiting writer: new reader EBUSY, recursive reader passes, writer then gets the lock",
+                new_reader == kSceEbusy && recursive_try == kSceOk && writer_got_it,
+                fmt::format("{} {} {}", Code(new_reader), Code(recursive_try), writer_got_it));
+    }
+    {
+        GuestObj rw = make_rw("eperm");
+        const s32 nothing = C(rw_unlock, rw);
+        C(rw_wr, rw);
+        s32 foreign = 0;
+        std::thread([&] { foreign = C(rw_unlock, rw); }).join();
+        const s32 own = C(rw_unlock, rw);
+        c.Check("unlock holding nothing / another thread's write lock -> EPERM",
+                nothing == kSceEperm && foreign == kSceEperm && own == kSceOk,
+                fmt::format("{} {} {}", Code(nothing), Code(foreign), Code(own)));
+    }
+    {
+        // Reader churn must not starve a writer.
+        GuestObj rw = make_rw("starvation");
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> readers;
+        for (int i = 0; i < 4; ++i) {
+            readers.emplace_back([&] {
+                while (!stop) {
+                    C(rw_rd, rw);
+                    std::this_thread::yield();
+                    C(rw_unlock, rw);
+                }
+            });
+        }
+        double worst_ms = 0;
+        for (int i = 0; i < 50; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            C(rw_wr, rw);
+            worst_ms = std::max(worst_ms,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            C(rw_unlock, rw);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        stop = true;
+        for (auto& th : readers) {
+            th.join();
+        }
+        c.Check("writer under 4 churning readers: 50 write locks, none waits > 200 ms", worst_ms < 200.0,
+                fmt::format("worst {:.2f} ms", worst_ms));
+        C(rw_destroy, rw);
+    }
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -1954,6 +2820,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestKernelSema(t);
     TestKernelEventFlag(t);
     TestTier1(t);
+    TestPthreadSync(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

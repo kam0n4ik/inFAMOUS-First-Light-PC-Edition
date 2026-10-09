@@ -146,9 +146,25 @@ bool Bindings::Build(std::span<const Runtime::Export> natives, std::span<const P
     for (const auto& b : bridge) {
         bridge_by_key.emplace(Key(b.nid, b.library, b.module), &b);
     }
+    // Condition variables release and re-take mutexes: one group, so a NATIVE mutex never reaches the
+    // oracle's condvar (or the other way round). "kernel-condvar" is accepted as a name for it.
+    std::vector<std::string> bridged = options.bridged_groups;
+    if (Contains(bridged, "kernel-condvar") && !Contains(bridged, "kernel-mutex")) {
+        SSPC_LOG(Loader, Warning, "--bridge kernel-condvar: condition variables move with the mutexes -> "
+                                  "--bridge kernel-mutex");
+        bridged.emplace_back("kernel-mutex");
+    }
+    // Checked against every export: `natives` no longer holds the groups the loader left out.
+    const auto all = Runtime::Exports();
+    for (const auto& g : bridged) {
+        if (g != "kernel-condvar" &&
+            std::none_of(all.begin(), all.end(), [&g](const Runtime::Export& n) { return g == n.group; })) {
+            SSPC_LOG(Loader, Error, "--bridge {}: SecondSonPC has no group of that name (ignored)", g);
+        }
+    }
     std::unordered_map<std::string, const Runtime::Export*> native_by_key;
     for (const auto& n : natives) {
-        if (Contains(options.bridged_groups, n.group) || Contains(options.no_bind, n.name)) {
+        if (Contains(bridged, n.group) || Contains(options.no_bind, n.name)) {
             SSPC_LOG(Loader, Warning, "DIAGNOSTIC: {} ({}) not bound, group '{}' -> BRIDGE", n.name,
                      n.library, n.group);
             continue;

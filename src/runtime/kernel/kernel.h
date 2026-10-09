@@ -40,6 +40,9 @@ std::span<const Runtime::Export> KernelExports();
 std::span<const Runtime::Export> SemaphoreExports();
 std::span<const Runtime::Export> EventFlagExports();
 std::span<const Runtime::Export> KernelUtilExports(); // kernel_util.cpp, group "kernel-util"
+std::span<const Runtime::Export> MutexExports();      // mutex.cpp, group "kernel-mutex"
+std::span<const Runtime::Export> CondvarExports();    // condvar.cpp, group "kernel-mutex" (waits on mutexes)
+std::span<const Runtime::Export> RwlockExports();     // rwlock.cpp, group "kernel-rwlock"
 
 /// Self-test access to the native semaphores (functions the game does not import, and state).
 namespace SemaphoreTest {
