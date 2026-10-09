@@ -1,0 +1,245 @@
+diff --git a/src/core/signals.cpp b/src/core/signals.cpp
+index b750484c..67472b2d 100644
+--- a/src/core/signals.cpp
++++ b/src/core/signals.cpp
+@@ -12,6 +12,8 @@
+ #include "core/signals.h"
+ #include "emulator.h"
+ 
++#include "bridge/shadps4/track_diag.h" // SecondSonPC P2.5 diagnostics
++
+ #ifdef _WIN32
+ #include <windows.h>
+ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
+@@ -56,8 +58,16 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+         guest_info._si_signo = POSIX_SIGSEGV;
+         guest_info._si_code = POSIX_SEGV_MAPERR;
+         static_protection_exception = true; // Windows static guest red-zone protection
+-        handled = signals->DispatchAccessViolation(
+-            pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
++        {
++            // SecondSonPC P2.5 (--track-stats): time of the bridge's access violation handlers.
++            const u64 sspc_start =
++                SecondSon::TrackDiag::Enabled() ? SecondSon::TrackDiag::Ticks() : 0;
++            handled = signals->DispatchAccessViolation(
++                pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
++            if (sspc_start != 0) {
++                SecondSon::TrackDiag::OnDispatch(sspc_start, handled);
++            }
++        }
+         break;
+     case EXCEPTION_ILLEGAL_INSTRUCTION:
+         guest_info._si_signo = POSIX_SIGILL;
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index 81494bf5..c6ae66b2 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -21,6 +21,7 @@
+ #include <vk_mem_alloc.h>
+ 
+ #include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++#include "bridge/shadps4/track_diag.h"     // SecondSonPC P2.5 diagnostics
+ 
+ namespace VideoCore {
+ 
+@@ -99,6 +100,9 @@ void BufferCache::TickFrame() {
+ 
+ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
++        if (SecondSon::TrackDiag::Enabled()) {
++            SecondSon::TrackDiag::OnFlushRequest(); // SecondSonPC P2.5
++        }
+         ReadMemory(device_addr, size, true, assume_locks);
+     });
+ }
+@@ -130,6 +134,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
+ }
+ 
+ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
++    const u64 sspc_start = SecondSon::TrackDiag::Enabled() ? SecondSon::TrackDiag::Ticks() : 0;
+     boost::container::small_vector<vk::BufferCopy, 1> copies;
+     u64 total_size_bytes = 0;
+     const VAddr arena_base = arena->cpu_addr;
+@@ -167,6 +172,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+                                 copy.size);
+     }
+     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
++    if (sspc_start != 0) {
++        SecondSon::TrackDiag::OnReadback(total_size_bytes, sspc_start); // SecondSonPC P2.5
++    }
+ }
+ 
+ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
+@@ -177,6 +185,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+         memory->CopySparseMemory(device_addr, data, size);
+         stream_buffer.Commit();
++        if (SecondSon::TrackDiag::Enabled()) {
++            SecondSon::TrackDiag::OnStreamCopy(size); // SecondSonPC P2.5
++        }
+         return {&stream_buffer, offset};
+     }
+     const u64 first_block = device_addr >> block_shift;
+@@ -335,12 +346,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+ 
+ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
+                                     bool is_written, bool is_texel_buffer) {
++    const u64 sspc_start = SecondSon::TrackDiag::Enabled() ? SecondSon::TrackDiag::Ticks() : 0;
+     boost::container::small_vector<vk::BufferCopy, 4> copies;
+     size_t total_size_bytes{};
+     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+         copies.emplace_back(total_size_bytes, addr, size);
+         total_size_bytes += size;
+     });
++    // SecondSonPC P2.5 (--track-stats): CPU-modified data uploaded (the time ends after staging).
++    const auto sspc_upload_done = [&] {
++        if (sspc_start != 0 && total_size_bytes != 0) {
++            SecondSon::TrackDiag::OnUpload(total_size_bytes, static_cast<u32>(copies.size()),
++                                           sspc_start);
++        }
++    };
+     // SecondSonPC (SSPC-001): an upload larger than this goes through one bounded staging buffer
+     // in pieces, each copied by the GPU before the next piece reuses the memory. Uploading the whole
+     // range at once needs a host-visible staging buffer as large as the range (2.5 GiB for a
+@@ -393,6 +412,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32
+         staging.Flush();
+         runtime.CopyBuffer(staging.buffer, arena, copies);
+     }
++    sspc_upload_done();
+     if (is_texel_buffer && !is_written) {
+         return SynchronizeMemoryFromImage(arena, device_addr, size);
+     }
+diff --git a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+index 75233cf8..0dd5e953 100644
+--- a/src/video_core/page_manager.cpp
++++ b/src/video_core/page_manager.cpp
+@@ -17,6 +17,8 @@
+ #include "video_core/page_manager.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ 
++#include "bridge/shadps4/track_diag.h" // SecondSonPC P2.5 diagnostics
++
+ #ifndef _WIN64
+ #include <sys/mman.h>
+ #include "common/adaptive_mutex.h"
+@@ -426,7 +428,13 @@ struct SignalImpl : public PageManager::Impl {
+         RENDERER_TRACE;
+         ASSERT_MSG(perms != Core::MemoryPermission::Write,
+                    "Attempted to protect region as write-only which is not a valid permission");
++        // SecondSonPC P2.5 (--track-stats): count and time every tracking protection change.
++        const u64 sspc_start = SecondSon::TrackDiag::Enabled() ? SecondSon::TrackDiag::Ticks() : 0;
+         Core::GetGpuMemory().ProtectTracking(address, size, perms);
++        if (sspc_start != 0) {
++            SecondSon::TrackDiag::OnProtect(size, True(perms & Core::MemoryPermission::Write),
++                                            sspc_start);
++        }
+     }
+ 
+     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+@@ -434,12 +442,12 @@ struct SignalImpl : public PageManager::Impl {
+         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
+         const auto is_gpu_thread =
+             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+-        if (Common::IsWriteError(context)) {
+-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+-        } else {
+-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+-        }
+-        return false;
++        const bool is_write = Common::IsWriteError(context);
++        SecondSon::TrackDiag::FaultScope sspc_scope{addr, is_write, is_gpu_thread}; // P2.5
++        const bool handled = is_write ? rasterizer->InvalidateMemory(addr, size, is_gpu_thread)
++                                      : rasterizer->ReadMemory(addr, size, is_gpu_thread);
++        sspc_scope.SetHandled(handled);
++        return handled;
+     }
+ };
+ 
+diff --git a/src/video_core/texture_cache/image.cpp b/src/video_core/texture_cache/image.cpp
+index 836d2c60..bcb19d7a 100644
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -13,6 +13,7 @@
+ #include <vk_mem_alloc.h>
+ 
+ #include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++#include "bridge/shadps4/track_diag.h"     // SecondSonPC P2.5 diagnostics
+ 
+ namespace VideoCore {
+ 
+@@ -241,6 +242,18 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+     const bool partially_transited = !subresource_states.empty();
+ 
++    // SecondSonPC P2.5 (--track-stats): how much work each transition request is.
++    const size_t sspc_before = barriers.size();
++    u32 sspc_iterations = 1;
++    const auto sspc_record = [&] {
++        if (SecondSon::TrackDiag::Enabled()) {
++            SecondSon::TrackDiag::OnBarriers(sspc_iterations,
++                                             static_cast<u32>(barriers.size() - sspc_before),
++                                             info.resources.levels * info.resources.layers,
++                                             needs_partial_transition, partially_transited);
++        }
++    };
++
+     if (needs_partial_transition || partially_transited) {
+         if (!partially_transited) {
+             subresource_states.resize(info.resources.levels * info.resources.layers);
+@@ -258,6 +271,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+         const u32 end_layer = needs_partial_transition
+                                   ? subres_range->base.layer + subres_range->extent.layers
+                                   : info.resources.layers;
++        sspc_iterations = (end_mip - start_mip) * (end_layer - start_layer);
+         for (u32 mip = start_mip; mip < end_mip; ++mip) {
+             for (u32 layer = start_layer; layer < end_layer; ++layer) {
+                 // NOTE: these loops may produce a lot of small barriers.
+@@ -305,6 +319,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+                                      vk::AccessFlagBits2::eMemoryWrite;
+         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
+         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
++            sspc_record();
+             return;
+         }
+         barriers.emplace_back(vk::ImageMemoryBarrier2{
+@@ -330,6 +345,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+     last_state.layout = dst_layout;
+     last_state.access_mask = dst_mask;
+     last_state.pl_stage = dst_stage;
++    sspc_record();
+ }
+ 
+ } // namespace VideoCore
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index 2374f834..b867de41 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -20,6 +20,8 @@
+ #include "video_core/texture_cache/texture_cache.h"
+ #include "video_core/texture_cache/tile_manager.h"
+ 
++#include "bridge/shadps4/track_diag.h" // SecondSonPC P2.5 diagnostics
++
+ namespace VideoCore {
+ 
+ static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
+@@ -137,6 +139,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+     SmallVector<ImageId, 8> image_ids;
+     ForEachImageInRegion(pages_start, pages_end - pages_start,
+                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
++    if (SecondSon::TrackDiag::Enabled()) {
++        SecondSon::TrackDiag::OnTextureInvalidate(static_cast<u32>(image_ids.size())); // P2.5
++    }
+ 
+     for (const auto image_id : image_ids) {
+         Image& image = slot_images[image_id];
+@@ -517,6 +522,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+     const auto& info = desc.info;
+     ASSERT(info.guest_address != 0);
++    if (SecondSon::TrackDiag::Enabled()) {
++        SecondSon::TrackDiag::OnFindImage(); // SecondSonPC P2.5
++    }
+ 
+     SmallVector<ImageId, 8> image_ids;
+     ForEachImageInRegion(info.guest_address, info.guest_size,

@@ -22,6 +22,7 @@
 #include <iterator>
 #include <string>
 #include <vector>
+#include <intrin.h>
 #include <windows.h>
 #include <dbghelp.h>
 
@@ -141,6 +142,8 @@ std::atomic<u64> g_av_host{0};        // ... of them from SecondSonPC.exe (no sy
 std::atomic<u64> g_av_queried{0};     // ... that cost a VirtualQuery of the address
 std::atomic<u64> g_query_ticks{0};    // QueryPerformanceCounter ticks spent in those queries
 std::atomic<u64> g_query_max_ticks{0};
+bool g_stamp_first_chance = false;    // --track-stats (P2.5): time stamp of each access violation
+thread_local u64 t_first_chance_tsc = 0;
 
 constexpr const char* kRegNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
@@ -360,6 +363,9 @@ LONG WINAPI FirstChanceFilter(EXCEPTION_POINTERS* info) {
     if (!IsAccessViolation(info)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    if (g_stamp_first_chance) {
+        t_first_chance_tsc = __rdtsc();
+    }
     g_av_count.fetch_add(1, std::memory_order_relaxed);
     const FaultFacts f = Facts(info);
     if (ClassifyFault(f) == FaultKind::Execute) {
@@ -507,6 +513,14 @@ void LogFirstChanceStats(const char* reason) {
              reason, count, d_count, dt, dt > 0 ? d_count / dt : 0.0, late, d_late,
              g_late_handler != nullptr ? "" : ", data-fault recorder not installed yet", host, queried, d_queried,
              double(ticks) * 1e3 / freq.QuadPart, d_query_ms, max_us, g_serial.load());
+}
+
+void EnableFirstChanceStamp() {
+    g_stamp_first_chance = true;
+}
+
+u64 FirstChanceStamp() {
+    return t_first_chance_tsc;
 }
 
 void InstallLateFaultRecorder() {

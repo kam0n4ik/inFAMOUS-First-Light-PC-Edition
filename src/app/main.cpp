@@ -13,6 +13,8 @@
 //     --fault-test             first-chance crash recorder test -> logs\faulttest.txt, no game
 //     --no-fault-recorder      no first-chance crash recorder (A/B performance diagnostics)
 //     --frame-log              presented frame times -> logs\frametimes.csv (tools\perf_runs.ps1)
+//     --track-stats            GPU write tracking statistics (access violations, protection changes,
+//                              uploads) every 10 s in SecondSonPC.log; per frame with --frame-log
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
 //     --press <key@sec,...>    automated runs: key presses (SDL key names, e.g. n = cross in the
 //                              bridge's default keyboard layout) pushed into the window's event
@@ -130,6 +132,8 @@ int main(int argc, char* argv[]) {
             config->fault_recorder = false; // diagnostics only
         } else if (arg == "--frame-log") {
             config->frame_log = true; // diagnostics only
+        } else if (arg == "--track-stats") {
+            config->track_stats = true; // diagnostics only (P2.5)
         } else if (arg == "--selftest") {
             config->selftest = true;
             config->import_counter = false;

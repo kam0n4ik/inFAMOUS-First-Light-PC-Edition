@@ -48,6 +48,7 @@
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/memory_host.h"
 #include "bridge/shadps4/native_memory.h"
+#include "bridge/shadps4/track_diag.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
 #include "loader/linker.h"
@@ -617,7 +618,15 @@ void StartFrameLog(const std::filesystem::path& file) {
             SSPC_LOG(App, Error, "--frame-log: cannot write {}", file.string());
             return;
         }
-        out << "t_s,frame_ms\n";
+        // --track-stats (P2.5): the GPU write tracking of each frame (deltas; frames between two
+        // polls share them evenly).
+        const bool track = TrackDiag::Enabled();
+        const double tpus = TrackDiag::TicksPerMicrosecond();
+        TrackDiag::Totals tlast = TrackDiag::Take();
+        out << (track ? "t_s,frame_ms,faults,fault_us,chain_us,protect_track,protect_untrack,pages_track,"
+                        "pages_untrack,protect_us,uploads,upload_kib,upload_us,readbacks,readback_kib,"
+                        "readback_us,flushes,tex_images\n"
+                      : "t_s,frame_ms\n");
         const HANDLE timer =
             CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         SSPC_LOG(App, Info, "--frame-log: presented frames -> {} ({})", file.string(),
@@ -645,12 +654,33 @@ void StartFrameLog(const std::filesystem::path& file) {
             if (last.QuadPart != 0) {
                 const double t = double(now.QuadPart - start.QuadPart) / freq.QuadPart;
                 const double ms = double(now.QuadPart - last.QuadPart) * 1000.0 / freq.QuadPart / (now_frames - frames);
+                std::string extra;
+                if (track) {
+                    const TrackDiag::Totals tn = TrackDiag::Take();
+                    const double n = now_frames - frames;
+                    const auto per = [n](u64 a, u64 b) { return double(a - b) / n; };
+                    const auto us = [n, tpus](u64 a, u64 b) { return double(a - b) / tpus / n; };
+                    extra = fmt::format(
+                        ",{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}",
+                        per(tn.faults, tlast.faults), us(tn.fault_ticks, tlast.fault_ticks),
+                        us(tn.chain_ticks, tlast.chain_ticks), per(tn.protect_track, tlast.protect_track),
+                        per(tn.protect_untrack, tlast.protect_untrack), per(tn.pages_track, tlast.pages_track),
+                        per(tn.pages_untrack, tlast.pages_untrack), us(tn.protect_ticks, tlast.protect_ticks),
+                        per(tn.uploads, tlast.uploads), per(tn.upload_bytes, tlast.upload_bytes) / 1024.0,
+                        us(tn.upload_ticks, tlast.upload_ticks), per(tn.readbacks, tlast.readbacks),
+                        per(tn.readback_bytes, tlast.readback_bytes) / 1024.0,
+                        us(tn.readback_ticks, tlast.readback_ticks), per(tn.flushes, tlast.flushes),
+                        per(tn.tex_images, tlast.tex_images));
+                    tlast = tn;
+                }
                 for (u32 i = frames; i != now_frames; ++i) {
-                    out << fmt::format("{:.3f},{:.3f}\n", t, ms);
+                    out << fmt::format("{:.3f},{:.3f}{}\n", t, ms, extra);
                 }
                 if ((rows += now_frames - frames) % 32 < now_frames - frames) {
                     out.flush();
                 }
+            } else if (track) {
+                tlast = TrackDiag::Take(); // the first frame has no row: start the deltas here
             }
             last = now;
             frames = now_frames;
@@ -1010,6 +1040,9 @@ void RunGame(const App::Config& cfg) {
     window->SetIcon(meta.icon);
     if (!cfg.test_presses.empty()) {
         StartTestInput(cfg.test_presses, cfg.logs_dir);
+    }
+    if (cfg.track_stats) {
+        TrackDiag::Enable(); // before the GPU (its page manager) and before the frame log
     }
     if (cfg.frame_log) {
         StartFrameLog(cfg.logs_dir / "frametimes.csv");

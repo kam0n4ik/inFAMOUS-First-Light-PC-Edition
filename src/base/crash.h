@@ -31,6 +31,12 @@ void InstallLateFaultRecorder();
 /// VRAM/commit sample.
 void LogFirstChanceStats(const char* reason);
 
+/// P2.5 diagnostics (--track-stats): from now on the first-chance recorder stores the time stamp
+/// counter of every access violation it sees on this thread; FirstChanceStamp() reads the current
+/// thread's last one (0 before the first). Lets the bridge measure the whole vectored handler chain.
+void EnableFirstChanceStamp();
+u64 FirstChanceStamp();
+
 /// What the first-chance recorder does with an exception.
 enum class FaultKind : u8 {
     Ignore,              // not an access violation, or one the bridge handles (protected pages)
