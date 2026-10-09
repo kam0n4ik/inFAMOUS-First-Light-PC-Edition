@@ -1390,6 +1390,373 @@ void TestKernelSema(Totals& t) {
     c.Summary();
 }
 
+// ---------------------------------------------------------------------------- libkernel event flags
+
+constexpr const char* kEvfCreate = "BpFoboUJoZU";
+constexpr const char* kEvfDelete = "8mql9OcQnd4";
+constexpr const char* kEvfSet = "IOnSvHzqu6A";
+constexpr const char* kEvfWait = "JTvBflhYazQ";
+
+/// NATIVE and BRIDGE only on the paths that are memory-safe in the oracle: the oracle Waits by
+/// dereferencing g_curthread (absent in a self-test thread) before it checks anything, Deletes by a
+/// bare `delete` (double delete / stale handle crash), and Sets through a raw pointer. So the shared
+/// script stays on return codes of Create's validation, a live Set, a null-handle Delete/Wait and a
+/// zero-pattern Wait; blocking, clearing, bad handles and reuse are checked on the native side only.
+void EvfScript(Side& s) {
+    const auto create = s.F(kEvfCreate), del = s.F(kEvfDelete), set = s.F(kEvfSet), wait = s.F(kEvfWait);
+    const void* none = nullptr;
+    const auto Create = [&](u64* ef, const char* name, u32 attr, u64 init, const void* opt) {
+        return Call<s32>(create, ef, name, attr, init, opt);
+    };
+    u64 h = 0xDEAD;
+    int opt_dummy = 0;
+    s.Line("create null ef -> {}", Code(Create(static_cast<u64*>(nullptr), "n", 0u, 0ull, none)));
+    s.Line("create null name -> {}", Code(Create(&h, nullptr, 0u, 0ull, none)));
+    s.Line("create opt param -> {}", Code(Create(&h, "n", 0u, 0ull, static_cast<const void*>(&opt_dummy))));
+    s.Line("create attr 0x23 -> {}", Code(Create(&h, "n", 0x23u, 0ull, none)));
+    s.Line("create attr 0x33 -> {}", Code(Create(&h, "n", 0x33u, 0ull, none)));
+    s.Line("create name 32 chars -> {}", Code(Create(&h, std::string(32, 'x').c_str(), 1u, 0ull, none)));
+    u64 a = 0, b = 0, c = 0;
+    s.Line("create multi|fifo -> {}", Code(Create(&a, "evf-a", 0x21u, 0x0ull, none)));
+    s.Line("create single|fifo init -> {}", Code(Create(&b, "evf-b", 0x11u, 0xF0ull, none)));
+    s.Line("create default attr -> {}", Code(Create(&c, "evf-c", 0x00u, 0x1ull, none)));
+    s.Line("name 31 chars ok -> {}", Create(&h, std::string(31, 'x').c_str(), 1u, 0ull, none) == 0);
+    s.Line("set live -> {}", Code(Call<s32>(set, a, 0x5ull)));
+    s.Line("set null handle -> {}", Code(Call<s32>(set, 0ull, 0x1ull)));
+    s.Line("wait null handle -> {}", Code(Call<s32>(wait, 0ull, 0x1ull, 0x01u, static_cast<u64*>(nullptr),
+                                                    static_cast<u32*>(nullptr))));
+    s.Line("wait pattern 0 -> {}", Code(Call<s32>(wait, a, 0x0ull, 0x01u, static_cast<u64*>(nullptr),
+                                                  static_cast<u32*>(nullptr))));
+    s.Line("delete null handle -> {}", Code(Call<s32>(del, 0ull)));
+    s.Line("delete a -> {}", Code(Call<s32>(del, a)));
+    s.Line("delete b -> {}", Code(Call<s32>(del, b)));
+    s.Line("delete c -> {}", Code(Call<s32>(del, c)));
+    s.Line("delete h -> {}", Code(Call<s32>(del, h)));
+}
+
+/// A thread blocked in the native sceKernelWaitEventFlag.
+struct EvfThread {
+    std::thread thread;
+    std::atomic<bool> done{false};
+    s32 result = 0;
+    u64 pattern = 0;
+    u32 left = 0;
+    int order = 0;
+};
+
+/// NATIVE vs BRIDGE on the safe return-code paths, then the blocking / clearing / ordering semantics
+/// on the native side only, against expected values.
+void TestKernelEventFlag(Totals& t) {
+    Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+    EvfScript(native);
+    EvfScript(bridge);
+    Compare(t, "KernelEventFlag", native, bridge);
+
+    InputChecks c(t, "KernelEventFlag(n)");
+    Kernel::Host* real_host = Kernel::GetHost();
+    SemaTestHost test_host{real_host};
+    Kernel::SetHost(&test_host);
+    const void* create = NativeOf(kEvfCreate);
+    const void* set = NativeOf(kEvfSet);
+    const void* del = NativeOf(kEvfDelete);
+    const void* wait = NativeOf(kEvfWait);
+    const void* none = nullptr;
+    constexpr s32 kOk = 0;
+    constexpr s32 kEperm = static_cast<s32>(0x80020001);
+    constexpr s32 kEsrch = static_cast<s32>(0x80020003);
+    constexpr s32 kEacces = static_cast<s32>(0x8002000D);
+    constexpr s32 kEbusy = static_cast<s32>(0x80020010);
+    constexpr s32 kEinval = static_cast<s32>(0x80020016);
+    constexpr s32 kEtimedout = static_cast<s32>(0x8002003C);
+    constexpr s32 kEcanceled = static_cast<s32>(0x80020055);
+    constexpr u32 kAnd = 0x01, kOr = 0x02, kClearAll = 0x10, kClearPat = 0x20;
+    constexpr u32 kMulti = 0x20, kSingle = 0x10, kFifo = 0x01, kPrio = 0x02;
+    std::atomic<int> sequence{0};
+
+    const auto make = [&](const char* name, u32 attr, u64 init) {
+        u64 h = 0;
+        Call<s32>(create, &h, name, attr, init, none);
+        return h;
+    };
+    const auto Wait = [&](u64 h, u64 bits, u32 mode, u64* res, u32* timeout) {
+        return Call<s32>(wait, h, bits, mode, res, timeout);
+    };
+    const auto start = [&](EvfThread& w, u64 h, u64 bits, u32 mode, s32 priority,
+                           std::optional<u32> timeout) {
+        w.thread = std::thread([&w, &sequence, wait, h, bits, mode, priority, timeout] {
+            t_sema_priority = priority;
+            u32 left = timeout.value_or(0);
+            u64 res = 0;
+            w.result = Call<s32>(wait, h, bits, mode, &res, timeout ? &left : static_cast<u32*>(nullptr));
+            w.pattern = res;
+            w.left = left;
+            w.order = ++sequence;
+            w.done = true;
+        });
+    };
+    const auto waiters = [](u64 h) { return Kernel::EventFlagTest::Waiters(h); };
+    const auto bits_of = [](u64 h) { return Kernel::EventFlagTest::Bits(h); };
+    const auto finish = [&](u64 h, std::initializer_list<EvfThread*> list) {
+        Call<s32>(del, h);
+        for (auto* w : list) {
+            if (w->thread.joinable()) {
+                w->thread.join();
+            }
+        }
+    };
+
+    {   // immediate satisfy, AND and OR, no clear
+        const u64 h = make("evf-now", kMulti, 0xAull);
+        u64 res = 0;
+        const s32 ra = Wait(h, 0x2ull, kAnd, &res, nullptr);
+        c.Check("AND met now: OK, result is the whole pattern, bits untouched",
+                ra == kOk && res == 0xAull && bits_of(h) == 0xAll, fmt::format("ret {:#x} res {:#x}",
+                                                                               static_cast<u32>(ra), res));
+        res = 0;
+        const s32 ro = Wait(h, 0x6ull, kOr, &res, nullptr); // 0x6 & 0xA = 0x2, one bit overlaps
+        c.Check("OR met now (one bit): OK, result 0xA", ro == kOk && res == 0xAull,
+                fmt::format("ret {:#x} res {:#x}", static_cast<u32>(ro), res));
+        c.Check("AND unmet now: poll path EBUSY", Kernel::EventFlagTest::Poll(h, 0x1ull, kAnd, &res) == kEbusy, "");
+        Call<s32>(del, h);
+    }
+    {   // block until Set completes the AND pattern
+        const u64 h = make("evf-and-block", kMulti, 0x0ull);
+        EvfThread w;
+        start(w, h, 0x3ull, kAnd, 0, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        Call<s32>(set, h, 0x1ull); // half the pattern
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        c.Check("partial Set does not wake an AND waiter", !w.done && waiters(h) == 1,
+                fmt::format("done {} waiting {}", w.done.load(), waiters(h)));
+        Call<s32>(set, h, 0x2ull); // completes 0x3
+        const bool woke = WaitUntil([&] { return w.done.load(); });
+        c.Check("completing Set wakes the AND waiter with the full pattern",
+                woke && w.result == kOk && w.pattern == 0x3ull, fmt::format("ret {:#x} pat {:#x}",
+                                                                            static_cast<u32>(w.result), w.pattern));
+        finish(h, {&w});
+    }
+    {   // CLEAR_ALL and CLEAR_PAT on wake
+        const u64 h = make("evf-clr-all", kMulti, 0x0ull);
+        EvfThread w;
+        start(w, h, 0x4ull, kAnd | kClearAll, 0, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        Call<s32>(set, h, 0xCull); // 0x4|0x8
+        WaitUntil([&] { return w.done.load(); });
+        c.Check("CLEAR_ALL: waiter sees 0xC, flag cleared to 0",
+                w.result == kOk && w.pattern == 0xCull && bits_of(h) == 0x0ll,
+                fmt::format("pat {:#x} bits {:#x}", w.pattern, bits_of(h)));
+        finish(h, {&w});
+
+        const u64 k = make("evf-clr-pat", kMulti, 0x0ull);
+        EvfThread w2;
+        start(w2, k, 0x4ull, kAnd | kClearPat, 0, std::nullopt);
+        WaitUntil([&] { return waiters(k) == 1; });
+        Call<s32>(set, k, 0xCull);
+        WaitUntil([&] { return w2.done.load(); });
+        c.Check("CLEAR_PAT: waiter sees 0xC, only the waited bits cleared (0x8 left)",
+                w2.result == kOk && w2.pattern == 0xCull && bits_of(k) == 0x8ll,
+                fmt::format("pat {:#x} bits {:#x}", w2.pattern, bits_of(k)));
+        finish(k, {&w2});
+    }
+    {   // one Set wakes every satisfied OR waiter (no clear)
+        const u64 h = make("evf-broadcast", kMulti, 0x0ull);
+        EvfThread w1, w2;
+        start(w1, h, 0x1ull, kOr, 0, std::nullopt);
+        start(w2, h, 0x2ull, kOr, 0, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 2; });
+        Call<s32>(set, h, 0x3ull);
+        const bool both = WaitUntil([&] { return w1.done && w2.done; });
+        c.Check("one Set wakes both OR waiters, each sees 0x3",
+                both && w1.result == kOk && w2.result == kOk && w1.pattern == 0x3ull && w2.pattern == 0x3ull, "");
+        finish(h, {&w1, &w2});
+    }
+    {   // timeouts
+        const u64 h = make("evf-timeout", kMulti, 0x0ull);
+        u32 left = 30'000;
+        u64 res = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        const s32 r = Wait(h, 0x1ull, kAnd, &res, &left);
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        c.Check("30 ms timeout: ETIMEDOUT, 0 left, result is current bits, nobody waiting",
+                r == kEtimedout && left == 0 && res == 0x0ull && ms >= 25 && waiters(h) == 0,
+                fmt::format("{:#x} left {} after {} ms", static_cast<u32>(r), left, ms));
+        EvfThread w;
+        start(w, h, 0x1ull, kAnd, 0, 2'000'000u);
+        WaitUntil([&] { return waiters(h) == 1; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        Call<s32>(set, h, 0x1ull);
+        WaitUntil([&] { return w.done.load(); });
+        c.Check("Set within a 2 s timeout: OK, remaining time written back (oracle leaves it)",
+                w.result == kOk && w.left > 1'000'000u && w.left < 1'990'000u && w.pattern == 0x1ull,
+                fmt::format("left {} pat {:#x}", w.left, w.pattern));
+        finish(h, {&w});
+    }
+    {   // FIFO: first to wait wakes first (CLEAR_ALL so each Set wakes one)
+        const u64 h = make("evf-fifo", kMulti | kFifo, 0x0ull);
+        EvfThread w1, w2;
+        start(w1, h, 0x1ull, kAnd | kClearAll, 700, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        start(w2, h, 0x1ull, kAnd | kClearAll, 256, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 2; });
+        Call<s32>(set, h, 0x1ull);
+        WaitUntil([&] { return w1.done.load(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        c.Check("FIFO: the first to wait wakes first regardless of priority", w1.done && !w2.done, "");
+        Call<s32>(set, h, 0x1ull);
+        WaitUntil([&] { return w2.done.load(); });
+        c.Check("FIFO: the second Set wakes the other", w2.done && w2.result == kOk, "");
+        finish(h, {&w1, &w2});
+    }
+    {   // priority: lowest value first, FIFO among equals (CLEAR_ALL)
+        const u64 h = make("evf-prio", kMulti | kPrio, 0x0ull);
+        EvfThread a, b, d;
+        start(a, h, 0x1ull, kAnd | kClearAll, 700, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        start(b, h, 0x1ull, kAnd | kClearAll, 500, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 2; });
+        start(d, h, 0x1ull, kAnd | kClearAll, 600, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 3; });
+        for (int i = 0; i < 3; ++i) {
+            const int before = sequence;
+            Call<s32>(set, h, 0x1ull);
+            WaitUntil([&] { return sequence == before + 1; });
+        }
+        c.Check("priority event flag: 500, 600, 700",
+                b.order < d.order && d.order < a.order && a.done,
+                fmt::format("orders 700:{} 500:{} 600:{}", a.order, b.order, d.order));
+        finish(h, {&a, &b, &d});
+    }
+    {   // delete while waiting: both woken with EACCES, the timed one with 0 left; handle invalid
+        const u64 h = make("evf-delete", kMulti, 0x0ull);
+        EvfThread w1, w2;
+        start(w1, h, 0x1ull, kAnd, 500, std::nullopt);
+        start(w2, h, 0x2ull, kAnd, 600, 5'000'000u);
+        WaitUntil([&] { return waiters(h) == 2; });
+        const s32 r = Call<s32>(del, h);
+        const bool woke = WaitUntil([&] { return w1.done && w2.done; });
+        c.Check("delete while 2 wait: Delete OK, both EACCES, timed one 0 left",
+                r == kOk && woke && w1.result == kEacces && w2.result == kEacces && w2.left == 0,
+                fmt::format("{:#x} {:#x} left {}", static_cast<u32>(w1.result), static_cast<u32>(w2.result), w2.left));
+        c.Check("the deleted handle is invalid",
+                Wait(h, 0x1ull, kAnd, nullptr, nullptr) == kEsrch && Call<s32>(set, h, 0x1ull) == kEsrch, "");
+        if (w1.thread.joinable()) {
+            w1.thread.join();
+        }
+        if (w2.thread.joinable()) {
+            w2.thread.join();
+        }
+    }
+    {   // cancel while waiting: ECANCELED, result is the cancel pattern, bits set to it
+        const u64 h = make("evf-cancel", kMulti, 0x0ull);
+        EvfThread w;
+        start(w, h, 0x1ull, kAnd, 0, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        s32 count = -1;
+        const s32 rc = Kernel::EventFlagTest::Cancel(h, 0xFFull, &count);
+        WaitUntil([&] { return w.done.load(); });
+        c.Check("cancel: waiter ECANCELED with the cancel pattern, count 1, bits set to pattern",
+                rc == kOk && w.result == kEcanceled && w.pattern == 0xFFull && count == 1 && bits_of(h) == 0xFFll,
+                fmt::format("rc {:#x} res {:#x} pat {:#x} count {}", static_cast<u32>(rc),
+                            static_cast<u32>(w.result), w.pattern, count));
+        finish(h, {&w});
+    }
+    {   // single-waiter flag: a second waiter is refused with EPERM
+        const u64 h = make("evf-single", kSingle, 0x0ull);
+        EvfThread w1;
+        start(w1, h, 0x1ull, kAnd, 0, std::nullopt);
+        WaitUntil([&] { return waiters(h) == 1; });
+        u64 res = 0;
+        const s32 r = Wait(h, 0x1ull, kAnd, &res, nullptr); // returns at once, does not block
+        c.Check("SINGLE flag: a second waiter gets EPERM", r == kEperm,
+                fmt::format("{:#x}", static_cast<u32>(r)));
+        finish(h, {&w1});
+    }
+    {   // handle reuse after delete
+        const u64 h1 = make("evf-reuse-1", kMulti, 0x0ull);
+        Call<s32>(del, h1);
+        const u64 h2 = make("evf-reuse-2", kMulti, 0x0ull);
+        c.Check("a create after a delete reuses the freed handle", h2 == h1,
+                fmt::format("{} vs {}", h1, h2));
+        Call<s32>(del, h2);
+    }
+    {   // poll: OK with the pattern ready (and clears), EBUSY without
+        const u64 h = make("evf-poll", kMulti, 0x5ull);
+        u64 res = 0;
+        c.Check("poll AND met -> OK, result 0x5", Kernel::EventFlagTest::Poll(h, 0x4ull, kAnd, &res) == kOk && res == 0x5ull, "");
+        c.Check("poll AND unmet -> EBUSY", Kernel::EventFlagTest::Poll(h, 0x8ull, kAnd, &res) == kEbusy, "");
+        c.Check("poll OR unmet -> EBUSY", Kernel::EventFlagTest::Poll(h, 0x8ull, kOr, &res) == kEbusy, "");
+        c.Check("poll with CLEAR_ALL clears on success",
+                Kernel::EventFlagTest::Poll(h, 0x1ull, kAnd | kClearAll, &res) == kOk && res == 0x5ull && bits_of(h) == 0x0ll, "");
+        Call<s32>(del, h);
+    }
+    {   // Clear keeps only the bits in the pattern (libkernel's &=)
+        const u64 h = make("evf-clearfn", kMulti, 0xFFull);
+        Kernel::EventFlagTest::Clear(h, 0x0Full);
+        c.Check("Clear(0x0F) on 0xFF leaves 0x0F", bits_of(h) == 0x0Fll, fmt::format("{:#x}", bits_of(h)));
+        Call<s32>(del, h);
+    }
+    {   // invalid arguments on the native side (the oracle would UNREACHABLE / EINVAL)
+        u64 h = 0;
+        c.Check("create FIFO|PRIO -> EINVAL", Call<s32>(create, &h, "x", 0x03u, 0x0ull, none) == kEinval, "");
+        c.Check("create SINGLE|MULTI -> EINVAL", Call<s32>(create, &h, "x", 0x30u, 0x0ull, none) == kEinval, "");
+        const u64 v = make("evf-badmode", kMulti, 0x1ull);
+        u64 res = 0;
+        c.Check("wait mode AND|OR -> EINVAL", Wait(v, 0x1ull, 0x03u, &res, nullptr) == kEinval, "");
+        c.Check("wait mode CLEAR_ALL|CLEAR_PAT -> EINVAL", Wait(v, 0x1ull, kAnd | 0x30u, &res, nullptr) == kEinval, "");
+        c.Check("wait pattern 0 -> EINVAL", Wait(v, 0x0ull, kAnd, &res, nullptr) == kEinval, "");
+        Call<s32>(del, v);
+    }
+    {   // concurrency: a broadcast wakes every waiter, then a one-at-a-time handoff loses none
+        constexpr int kThreads = 32;
+        const u64 h = make("evf-broadcast-n", kMulti, 0x0ull);
+        std::vector<EvfThread> ws(kThreads);
+        for (auto& w : ws) {
+            start(w, h, 0x1ull, kAnd, 0, 5'000'000u); // level-triggered, no clear
+        }
+        WaitUntil([&] { return waiters(h) == kThreads; });
+        Call<s32>(set, h, 0x1ull);
+        const bool all = WaitUntil(
+            [&] { return std::all_of(ws.begin(), ws.end(), [](const EvfThread& w) { return w.done.load(); }); },
+            8000);
+        int ok = 0;
+        for (auto& w : ws) {
+            if (w.thread.joinable()) {
+                w.thread.join();
+            }
+            ok += w.result == kOk;
+        }
+        c.Check("one Set wakes all 32 level-triggered waiters", all && ok == kThreads,
+                fmt::format("ok {}/{}", ok, kThreads));
+        Call<s32>(del, h);
+
+        const u64 k = make("evf-handoff-n", kMulti, 0x0ull);
+        std::vector<EvfThread> hs(kThreads);
+        for (auto& w : hs) {
+            start(w, k, 0x1ull, kAnd | kClearAll, 0, 5'000'000u); // each consumes the bit
+        }
+        WaitUntil([&] { return waiters(k) == kThreads; });
+        for (int i = 0; i < kThreads; ++i) {
+            const int before = sequence;
+            Call<s32>(set, k, 0x1ull);
+            WaitUntil([&] { return sequence >= before + 1; });
+        }
+        int done = 0, okh = 0;
+        for (auto& w : hs) {
+            if (w.thread.joinable()) {
+                w.thread.join();
+            }
+            done += w.done.load();
+            okh += w.result == kOk;
+        }
+        c.Check("one-at-a-time handoff wakes all 32, none lost", done == kThreads && okh == kThreads,
+                fmt::format("done {} ok {}", done, okh));
+        Call<s32>(del, k);
+    }
+    Kernel::SetHost(real_host);
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -1510,6 +1877,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestInput(t);
     TestKernelTime(t);
     TestKernelSema(t);
+    TestKernelEventFlag(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

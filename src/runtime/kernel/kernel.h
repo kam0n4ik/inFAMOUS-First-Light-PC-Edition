@@ -38,6 +38,7 @@ void Start();
 
 std::span<const Runtime::Export> KernelExports();
 std::span<const Runtime::Export> SemaphoreExports();
+std::span<const Runtime::Export> EventFlagExports();
 
 /// Self-test access to the native semaphores (functions the game does not import, and state).
 namespace SemaphoreTest {
@@ -46,5 +47,14 @@ s32 Cancel(u32 sem, s32 set_count, s32* waiter_count);
 s32 Tokens(u32 sem);  // -1: no such semaphore
 s32 Waiters(u32 sem); // -1: no such semaphore
 } // namespace SemaphoreTest
+
+/// Self-test access to the native event flags (functions the game does not import, and state).
+namespace EventFlagTest {
+s32 Poll(u64 ef, u64 bits, u32 wait_mode, u64* result);
+s32 Clear(u64 ef, u64 pattern);
+s32 Cancel(u64 ef, u64 pattern, s32* num_waiters);
+s64 Bits(u64 ef);    // -1: no such event flag
+s32 Waiters(u64 ef); // -1: no such event flag
+} // namespace EventFlagTest
 
 } // namespace SecondSon::Kernel
