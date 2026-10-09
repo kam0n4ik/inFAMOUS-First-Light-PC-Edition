@@ -37,6 +37,20 @@ public:
         return m.dmem_map.size() == 1 && m.dmem_map.begin()->second.dma_type == PhysicalMemoryType::Free;
     }
 
+    static bool WriterLocked(MemoryManager& m) {
+        if (!m.mutex.try_lock_shared()) {
+            return true;
+        }
+        m.mutex.unlock_shared();
+        return false;
+    }
+
+    static bool DmemFreeAt(MemoryManager& m, PAddr phys) {
+        std::shared_lock lk{m.mutex};
+        const auto it = std::prev(m.dmem_map.upper_bound(phys));
+        return it->second.dma_type == PhysicalMemoryType::Free;
+    }
+
     static std::string Vmas(MemoryManager& m) {
         static constexpr const char* kTypes[] = {"free",   "reserved", "direct", "flexible", "pooled",
                                                  "poolres", "stack",    "code",   "file",     "system"};
@@ -214,6 +228,14 @@ u64 BridgeDirectMemorySize() {
 
 bool BridgeDirectMemoryUntouched() {
     return Core::SecondSonMemoryAccess::DmemUntouched(*Core::Memory::Instance());
+}
+
+bool BridgeMemoryWriterLocked() {
+    return Core::SecondSonMemoryAccess::WriterLocked(*Core::Memory::Instance());
+}
+
+bool BridgeDirectMemoryFreeAt(u64 phys) {
+    return Core::SecondSonMemoryAccess::DmemFreeAt(*Core::Memory::Instance(), phys);
 }
 
 std::string MemoryMapText() {

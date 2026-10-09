@@ -40,6 +40,7 @@
 #include "common/singleton.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/memory.h"
@@ -3579,6 +3580,639 @@ void TestDirectMemoryBridge(Totals& t, const App::Config& cfg) {
     c.Summary();
 }
 
+// ---------------------------------------------------------------------------- GPU memory (P2.3.2)
+
+constexpr const char* kMprotectNid = "vSMAm3cxYTY"; // sceKernelMprotect: BRIDGE
+constexpr u64 kGiB = 1ull << 30;
+
+/// Sits between the memory manager and the rasterizer: records every notification with what the
+/// host and the memory managers show at that moment, then forwards it unchanged.
+class RecordingGpuListener final : public Core::GpuMemoryListener {
+public:
+    enum class Kind { Unmap, Register, Map, Write };
+    struct Event {
+        Kind kind;
+        VAddr addr;
+        u64 size;
+        bool committed = false;     // the host shows the first page as committed memory
+        bool writer_locked = false; // the memory manager's writer lock is held
+        int phys = -1;              // the `probe` page: 0 free, 1 allocated, 2 releasing (-1 not read)
+        bool queried = false;       // a GpuMemory query (reader lock) from the callback returned
+    };
+
+    explicit RecordingGpuListener(bool native) : native_{native} {}
+
+    void OnGpuUnmap(VAddr addr, u64 size) override {
+        Record(Kind::Unmap, addr, size);
+        next->OnGpuUnmap(addr, size);
+    }
+    void OnGpuRegister(VAddr addr, u64 size) override {
+        Record(Kind::Register, addr, size);
+        next->OnGpuRegister(addr, size);
+    }
+    void OnGpuMap(VAddr addr, u64 size) override {
+        Record(Kind::Map, addr, size);
+        next->OnGpuMap(addr, size);
+    }
+    void OnGuestWrite(VAddr addr, u64 size) override {
+        Record(Kind::Write, addr, size);
+        next->OnGuestWrite(addr, size);
+    }
+
+    std::vector<Event> Take() {
+        std::scoped_lock lk{mutex_};
+        return std::exchange(events_, {});
+    }
+
+    Core::GpuMemoryListener* next = nullptr;
+    std::atomic<u64> probe{~0ull};
+
+private:
+    void Record(Kind kind, VAddr addr, u64 size) {
+        Event e{kind, addr, size};
+        MEMORY_BASIC_INFORMATION mbi{};
+        e.committed = VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT;
+        e.writer_locked = BridgeMemoryWriterLocked();
+        if (const u64 p = probe; p != ~0ull) {
+            if (native_) {
+                const auto s = DmemAreaAt(Memory::GameDirectMemory(), p).state;
+                e.phys = s == Memory::AreaState::Free ? 0 : s == Memory::AreaState::Allocated ? 1 : 2;
+            } else if (!e.writer_locked) {
+                e.phys = BridgeDirectMemoryFreeAt(p) ? 0 : 1;
+            }
+        }
+        if ((kind == Kind::Unmap || kind == Kind::Map) && !e.writer_locked) {
+            // What the rasterizer may do from these callbacks (buffer downloads, clamps): reader lock.
+            (void)Core::GetGpuMemory().ClampRangeSize(addr, Core::GpuMemory::MinSizeToClamp);
+            e.queried = true;
+        }
+        std::scoped_lock lk{mutex_};
+        events_.push_back(e);
+    }
+
+    bool native_;
+    std::mutex mutex_;
+    std::vector<Event> events_;
+};
+
+std::string EventsText(const std::vector<RecordingGpuListener::Event>& events) {
+    static constexpr const char* kNames[] = {"unmap", "register", "map", "write"};
+    std::string out;
+    for (const auto& e : events) {
+        out += fmt::format("[{} {:#x}+{:#x} c{} w{} p{} q{}] ", kNames[static_cast<int>(e.kind)], e.addr, e.size,
+                           e.committed ? 1 : 0, e.writer_locked ? 1 : 0, e.phys, e.queried ? 1 : 0);
+    }
+    return out;
+}
+
+/// P2.3.2: the GPU bridge reaches guest memory through Core::GpuMemory (patch 0008). Its answers
+/// against the memory manager's own functions and against a model built from this test's own
+/// layout and data; the notifications in their order, with their locks and the state of the
+/// physical page at that moment; queries racing with map, unmap and protect. `native` =
+/// --native kernel-dmem (the physical side in the native map). The game is not running.
+void GpuMemoryScenario(Totals& t, InputChecks& c, bool native) {
+    using Core::MemoryMapFlags;
+    using Core::MemoryPermission;
+    using Core::MemoryProt;
+    using Core::VMAType;
+    using Kind = RecordingGpuListener::Kind;
+    using Event = RecordingGpuListener::Event;
+    auto* mm = Core::Memory::Instance();
+    auto& gm = Core::GetGpuMemory();
+    auto& dmem = Memory::GameDirectMemory();
+    auto& rasterizer = presenter->GetRasterizer();
+    const u64 total = mm->GetTotalDirectSize();
+    const void* alloc = native ? NativeOf(DmemNid::kAllocate) : BridgeOf(DmemNid::kAllocate);
+    const void* release = native ? NativeOf(DmemNid::kRelease) : BridgeOf(DmemNid::kRelease);
+    const void* map = BridgeOf(DmemNid::kMap);
+    const void* munmap = BridgeOf(DmemNid::kMunmap);
+    const void* mprotect = BridgeOf(kMprotectNid);
+    if (alloc == nullptr || release == nullptr || map == nullptr || munmap == nullptr || mprotect == nullptr) {
+        c.Check("the memory functions are available", false, "");
+        return;
+    }
+    constexpr s32 kFixed = 0x10;
+    constexpr s32 kRw = 0x33; // CPU and GPU read/write
+    const size_t vmas_before = BridgeVmaCount();
+    const auto Alloc = [&](u64 len, s32 type) {
+        s64 phys = -1;
+        const s32 r = Call<s32>(alloc, s64{0}, static_cast<s64>(total), len, u64{0}, type, &phys);
+        return r == 0 ? static_cast<u64>(phys) : ~0ull;
+    };
+    const auto Map = [&](u64 phys, u64 len, s32 prot, s32 flags, u64 at) {
+        void* addr = reinterpret_cast<void*>(at);
+        const s32 r = Call<s32>(map, &addr, len, prot, flags, static_cast<s64>(phys), u64{0});
+        return r == 0 ? reinterpret_cast<u64>(addr) : ~0ull;
+    };
+    const auto Unmap = [&](u64 va, u64 len) { return Call<s32>(munmap, reinterpret_cast<void*>(va), len); };
+    const auto Rel = [&](u64 phys, u64 len) { return Call<s32>(release, phys, len); };
+    const auto Protect = [&](u64 va, u64 len, s32 prot) {
+        return Call<s32>(mprotect, reinterpret_cast<const void*>(va), len, prot);
+    };
+    const auto Host = [](u64 va) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery(reinterpret_cast<void*>(va), &mbi, sizeof(mbi));
+        return mbi;
+    };
+    const auto FreeWindow = [&](u64 len) {
+        // A free stretch of the guest address space: reserved, then given back.
+        void* out = nullptr;
+        if (mm->MapMemory(&out, 0, len, MemoryProt::NoAccess, MemoryMapFlags::NoFlags, VMAType::Reserved,
+                          "selftest window") != 0) {
+            return ~0ull;
+        }
+        mm->UnmapMemory(reinterpret_cast<u64>(out), len);
+        return reinterpret_cast<u64>(out);
+    };
+    const auto Is = [](const Event& e, Kind k, u64 addr, u64 size) {
+        return e.kind == k && e.addr == addr && e.size == size;
+    };
+    const auto Covers = [](const Event& e, Kind k, u64 addr, u64 size) {
+        return e.kind == k && e.addr <= addr && e.addr + e.size >= addr + size;
+    };
+
+    // The window w, by offset: A [0, 0x40000) direct; [0x40000, 0x50000) free; B [0x50000, 0x70000)
+    // direct; C [0x70000, 0x80000) direct, another memory type (not merged with B); R [0x80000,
+    // 0x90000) reserved; N [0xA0000, 0xB0000) anonymous memory (no physical backing).
+    const u64 w = FreeWindow(0x100000);
+    const u64 pa = Alloc(0x40000, 0);
+    const u64 pb = Alloc(0x20000, 0);
+    const u64 pc = Alloc(0x10000, 3);
+    const u64 va = Map(pa, 0x40000, kRw, kFixed, w);
+    const u64 vb = Map(pb, 0x20000, kRw, kFixed, w + 0x50000);
+    const u64 vc = Map(pc, 0x10000, kRw, kFixed, w + 0x70000);
+    void* out = nullptr;
+    const s32 rr = mm->MapMemory(&out, w + 0x80000, 0x10000, MemoryProt::NoAccess, MemoryMapFlags::Fixed,
+                                 VMAType::Reserved, "selftest reserved");
+    const s32 rn = mm->MapMemory(&out, w + 0xA0000, 0x10000, MemoryProt::CpuReadWrite, MemoryMapFlags::Fixed,
+                                 VMAType::Code, "selftest anonymous");
+    const auto cleanup = [&] {
+        Unmap(w, 0x40000);
+        Unmap(w + 0x50000, 0x30000);
+        mm->UnmapMemory(w + 0x80000, 0x10000);
+        mm->UnmapMemory(w + 0xA0000, 0x10000);
+        Rel(pa, 0x40000);
+        Rel(pb, 0x20000);
+        Rel(pc, 0x10000);
+    };
+    const bool layout = w != ~0ull && va == w && vb == w + 0x50000 && vc == w + 0x70000 && rr == 0 && rn == 0;
+    c.Check("layout: three direct views, a hole, a reserved and an anonymous area",
+            layout, fmt::format("w {:#x} views {:#x} {:#x} {:#x} reserved {} anonymous {}", w, va, vb, vc, rr, rn));
+    if (!layout) {
+        cleanup();
+        return;
+    }
+    // The model: what every byte of the window reads as through the physical backing.
+    const auto Pattern = [w](u64 addr) -> u8 {
+        const u64 o = addr - w;
+        if (o < 0x40000) {
+            return static_cast<u8>(o * 7 + 1);
+        }
+        if (o >= 0x50000 && o < 0x70000) {
+            return static_cast<u8>(o * 13 + 5);
+        }
+        if (o >= 0x70000 && o < 0x80000) {
+            return static_cast<u8>(0xC0 | (o & 0x3F));
+        }
+        return 0;
+    };
+    const auto Fill = [&](u64 from, u64 to) {
+        for (u64 o = from; o < to; ++o) {
+            *reinterpret_cast<u8*>(w + o) = Pattern(w + o);
+        }
+    };
+    Fill(0, 0x40000);
+    Fill(0x50000, 0x80000);
+    std::memset(reinterpret_cast<void*>(w + 0xA0000), 0x77, 0x10000);
+
+    // Equivalence with the memory manager's own functions and with the model.
+    struct Range {
+        u64 off;
+        u64 len;
+    };
+    constexpr Range kCopies[] = {{0, 0xB0000},   {0x3FFF0, 0x20},  {0x3C001, 0x18000}, {0x4FFFF, 2},
+                                 {0x7FFFF, 1},   {0x81234, 0x100}, {0xA0000, 0x10000}, {0x12345, 0}};
+    bool copy_ok = true;
+    std::string copy_detail;
+    for (const auto& r : kCopies) {
+        std::vector<u8> a(r.len + 1, 0xEE), b(r.len + 1, 0xEE), model(r.len + 1, 0xEE);
+        gm.CopySparseMemory(w + r.off, a.data(), r.len);
+        mm->CopySparseMemory(w + r.off, b.data(), r.len);
+        for (u64 i = 0; i < r.len; ++i) {
+            model[i] = Pattern(w + r.off + i);
+        }
+        if (a != b || a != model) {
+            copy_ok = false;
+            copy_detail += fmt::format("{:#x}+{:#x} ", r.off, r.len);
+        }
+    }
+    c.Check("CopySparseMemory = the memory manager's = the model: views copied, the hole, the reserved and the "
+            "anonymous area read as zeros, nothing past the end written, size 0 writes nothing",
+            copy_ok, copy_detail);
+
+    struct Clamp {
+        u64 off;
+        u64 size;
+        u64 expect;
+    };
+    constexpr Clamp kClamps[] = {
+        {0, 0x1000, 0x1000},                         // below 1 GiB: no lookup
+        {0x7F000, 0x3FFFFFFF, 0x3FFFFFFF},           // below 1 GiB, past the mapped end: still not clamped
+        {0x1000, kGiB, 0x3F000},                     // the rest of A; the hole stops it
+        {0x54000, kGiB, 0x1C000 + 0x10000},          // the rest of B, then C; R (reserved) stops it
+        {0x44000, kGiB, 0xC000 + 0x20000 + 0x10000}, // from the hole: its rest counts, then B and C
+    };
+    bool clamp_ok = true;
+    std::string clamp_detail;
+    for (const auto& k : kClamps) {
+        const u64 a = gm.ClampRangeSize(w + k.off, k.size);
+        const u64 b = mm->ClampRangeSize(w + k.off, k.size);
+        if (a != k.expect || b != k.expect) {
+            clamp_ok = false;
+            clamp_detail += fmt::format("{:#x}+{:#x}: {:#x}/{:#x} want {:#x} ", k.off, k.size, a, b, k.expect);
+        }
+    }
+    c.Check("ClampRangeSize = the memory manager's = the layout (below 1 GiB unclamped; the first area counts even "
+            "when free; mapped areas that follow; free and reserved areas stop it)",
+            clamp_ok, clamp_detail);
+    {
+        const u64 wb = FreeWindow(kGiB + 0x100000);
+        const u64 pbig = Alloc(kGiB, 0);
+        const u64 vbig = wb != ~0ull && pbig != ~0ull ? Map(pbig, kGiB, kRw, kFixed, wb) : ~0ull;
+        const bool ok = vbig == wb && gm.ClampRangeSize(vbig, kGiB) == kGiB &&
+                        gm.ClampRangeSize(vbig + 0x10000, kGiB) == kGiB - 0x10000 &&
+                        gm.ClampRangeSize(vbig, 2 * kGiB) == kGiB && mm->ClampRangeSize(vbig, 2 * kGiB) == kGiB &&
+                        mm->ClampRangeSize(vbig + 0x10000, kGiB) == kGiB - 0x10000;
+        if (vbig != ~0ull) {
+            Unmap(vbig, kGiB);
+        }
+        if (pbig != ~0ull) {
+            Rel(pbig, kGiB);
+        }
+        c.Check("ClampRangeSize on a 1 GiB view: 1 GiB, the rest from an offset, 1 GiB when asked for 2", ok,
+                fmt::format("{:#x} {:#x}", wb, vbig));
+    }
+
+    struct Gpu {
+        u64 addr;
+        u64 size;
+        bool valid;
+    };
+    constexpr u64 kTop = 1ull << 40;
+    constexpr Gpu kGpu[] = {{0, 0, true},          {kTop - 1, 0, true},      {kTop - 1, 1, false},
+                            {kTop, 0, false},      {kTop - 16, 16, false},   {kTop - 16, 15, true},
+                            {~0ull, 2, true},      {1ull << 63, 1ull << 63, true}}; // the last two wrap (D10)
+    bool gpu_ok = true;
+    for (const auto& g : kGpu) {
+        gpu_ok = gpu_ok && Core::GpuMemory::IsValidGpuMapping(g.addr, g.size) == g.valid &&
+                 mm->IsValidGpuMapping(g.addr, g.size) == g.valid;
+    }
+    auto& space = mm->GetAddressSpace();
+    const VAddr reserved_end = space.SystemReservedVirtualBase() + space.SystemReservedVirtualSize();
+    const VAddr ring = Libraries::GnmDriver::sceGnmGetTheTessellationFactorRingBufferBaseAddress();
+    c.Check("IsValidGpuMapping: 40-bit limit at the edges, the sum wraps as before (D10); SystemReservedEnd = the "
+            "address space's 0x1000000000, GnmDriver's tessellation factor ring 0xff0000000 as before",
+            gpu_ok && gm.SystemReservedEnd() == reserved_end && reserved_end == 0x1000000000 && ring == 0xff0000000,
+            fmt::format("gpu {} end {:#x} ring {:#x}", gpu_ok, reserved_end, ring));
+
+    std::array<u8, 16> data{};
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<u8>(0xA0 + i);
+    }
+    {
+        gm.ProtectTracking(w, 0x4000, MemoryPermission::Read);
+        const bool wrote = gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x10), data.data(), 16);
+        const bool seen = std::memcmp(reinterpret_cast<void*>(w + 0x10), data.data(), 16) == 0;
+        const DWORD prot = Host(w).Protect;
+        gm.ProtectTracking(w, 0x4000, MemoryPermission::ReadWrite);
+        Fill(0x10, 0x20);
+        c.Check("TryWriteBacking writes past a read-only tracking protection and leaves it in place",
+                wrote && seen && prot == PAGE_READONLY, fmt::format("{} {} prot {:#x}", wrote, seen, prot));
+    }
+    {
+        const bool wrote = gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x3FFF8), data.data(), 16);
+        const bool part = std::memcmp(reinterpret_cast<void*>(w + 0x3FFF8), data.data(), 8) == 0 &&
+                          Host(w + 0x40000).State == MEM_RESERVE;
+        Fill(0x3FFF8, 0x40000);
+        const bool in_hole = gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x44000), data.data(), 16);
+        const bool in_reserved = gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x80000), data.data(), 16);
+        const bool in_anonymous = gm.TryWriteBacking(reinterpret_cast<void*>(w + 0xA0000), data.data(), 16);
+        const bool same = mm->TryWriteBacking(reinterpret_cast<void*>(w + 0x44000), data.data(), 16) == in_hole &&
+                          mm->TryWriteBacking(reinterpret_cast<void*>(w + 0x80000), data.data(), 16) == in_reserved &&
+                          mm->TryWriteBacking(reinterpret_cast<void*>(w + 0xA0000), data.data(), 16) == in_anonymous;
+        c.Check("TryWriteBacking partly over a view writes the view's part only (the hole stays a placeholder); "
+                "starting in the hole, the reserved or the anonymous area: false, nothing written; as the manager",
+                wrote && part && !in_hole && !in_reserved && !in_anonymous && same &&
+                    *reinterpret_cast<const u8*>(w + 0xA0000) == 0x77,
+                fmt::format("{} {} {} {} {} {}", wrote, part, in_hole, in_reserved, in_anonymous, same));
+    }
+    {
+        // A write across two physical areas (B -> C), through GpuMemory and through the manager.
+        const auto Across = [&](auto&& write) {
+            write();
+            std::array<u8, 16> got{};
+            std::memcpy(got.data(), reinterpret_cast<const void*>(w + 0x6FFF8), 16);
+            Fill(0x6FFF8, 0x70008);
+            return got;
+        };
+        const auto via_gm =
+            Across([&] { gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x6FFF8), data.data(), 16); });
+        const auto via_mm =
+            Across([&] { mm->TryWriteBacking(reinterpret_cast<void*>(w + 0x6FFF8), data.data(), 16); });
+        std::array<u8, 16> d11{};
+        std::memcpy(d11.data(), data.data(), 8);
+        std::memcpy(d11.data() + 8, data.data(), 8);
+        c.Check("TryWriteBacking across two physical areas writes what the manager writes: D11 reproduced (the "
+                "second area gets the start of the data again), not fixed in P2.3.2",
+                via_gm == via_mm && via_gm == d11,
+                fmt::format("{} / {}", Hex(via_gm.data(), 16), Hex(via_mm.data(), 16)));
+    }
+    {
+        gm.ProtectTracking(w, 0x80000, MemoryPermission::None);
+        const bool none = Host(w).Protect == PAGE_NOACCESS && Host(w + 0x3C000).Protect == PAGE_NOACCESS &&
+                          Host(w + 0x50000).Protect == PAGE_NOACCESS && Host(w + 0x7C000).Protect == PAGE_NOACCESS &&
+                          Host(w + 0x40000).State == MEM_RESERVE;
+        Libraries::Kernel::OrbisVirtualQueryInfo info{};
+        const s32 q = Libraries::Kernel::sceKernelVirtualQuery(reinterpret_cast<const void*>(w), 0, &info, sizeof(info));
+        gm.ProtectTracking(w, 0x80000, MemoryPermission::Read);
+        const DWORD via_gm = Host(w + 0x50000).Protect;
+        space.Protect(w, 0x80000, MemoryPermission::None);
+        space.Protect(w, 0x80000, MemoryPermission::Read);
+        const DWORD via_space = Host(w + 0x50000).Protect;
+        gm.ProtectTracking(w, 0x80000, MemoryPermission::ReadWrite);
+        const bool rw = Host(w).Protect == PAGE_READWRITE && Host(w + 0x70000).Protect == PAGE_READWRITE;
+        c.Check("ProtectTracking: host protection of the views only (the hole stays a placeholder), the guest's "
+                "protection unchanged, the same as AddressSpace::Protect",
+                none && q == 0 && info.protection == kRw && via_gm == PAGE_READONLY && via_space == via_gm && rw,
+                fmt::format("{} {} {:#x} {:#x} {:#x} {}", none, q, info.protection, via_gm, via_space, rw));
+    }
+
+    // Results are snapshots: nothing about a mapping is cached between calls.
+    {
+        const u64 before = gm.ClampRangeSize(w + 0x54000, kGiB);
+        Unmap(w + 0x70000, 0x10000);
+        const u64 after = gm.ClampRangeSize(w + 0x54000, kGiB);
+        std::array<u8, 16> stale{};
+        stale.fill(0xEE);
+        gm.CopySparseMemory(w + 0x70000, stale.data(), stale.size());
+        const bool zeros = std::ranges::all_of(stale, [](u8 b) { return b == 0; });
+        const bool unwritable = !gm.TryWriteBacking(reinterpret_cast<void*>(w + 0x70000), data.data(), 16);
+        const u64 again = Map(pc, 0x10000, kRw, kFixed, w + 0x70000);
+        std::array<u8, 16> back{};
+        gm.CopySparseMemory(w + 0x70000, back.data(), back.size());
+        bool kept = true;
+        for (size_t i = 0; i < back.size(); ++i) {
+            kept = kept && back[i] == Pattern(w + 0x70000 + i);
+        }
+        c.Check("results are snapshots: once C is unmapped the clamp is shorter, C reads as zeros and cannot be "
+                "written; mapped again, C shows its physical data",
+                before == 0x2C000 && after == 0x1C000 && zeros && unwritable && again == w + 0x70000 && kept,
+                fmt::format("{:#x} {:#x} {} {} {:#x} {}", before, after, zeros, unwritable, again, kept));
+    }
+
+    if (!native) {
+        // The cost of the indirection on the GPU's frequent calls (informational).
+        volatile u8 sink = 0;
+        std::array<u8, 64> small{};
+        const auto NsPer = [](int n, auto&& f) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; ++i) {
+                f(i);
+            }
+            return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / n;
+        };
+        double copy_mm = 1e9, copy_gm = 1e9, clamp_mm = 1e9, clamp_gm = 1e9, prot_mm = 1e9, prot_gm = 1e9;
+        for (int round = 0; round < 3; ++round) {
+            copy_mm = std::min(copy_mm, NsPer(1'000'000, [&](int i) {
+                mm->CopySparseMemory(w + ((i & 0xFFF) << 6), small.data(), small.size());
+                sink = sink + small[0];
+            }));
+            copy_gm = std::min(copy_gm, NsPer(1'000'000, [&](int i) {
+                gm.CopySparseMemory(w + ((i & 0xFFF) << 6), small.data(), small.size());
+                sink = sink + small[0];
+            }));
+            clamp_mm = std::min(clamp_mm, NsPer(1'000'000, [&](int i) {
+                sink = sink + static_cast<u8>(mm->ClampRangeSize(w + (i & 0xFFF), 0x1000));
+            }));
+            clamp_gm = std::min(clamp_gm, NsPer(1'000'000, [&](int i) {
+                sink = sink + static_cast<u8>(gm.ClampRangeSize(w + (i & 0xFFF), 0x1000));
+            }));
+            prot_mm = std::min(prot_mm, NsPer(5'000, [&](int i) {
+                space.Protect(w, 0x4000, i % 2 == 0 ? MemoryPermission::Read : MemoryPermission::ReadWrite);
+            }));
+            prot_gm = std::min(prot_gm, NsPer(5'000, [&](int i) {
+                gm.ProtectTracking(w, 0x4000, i % 2 == 0 ? MemoryPermission::Read : MemoryPermission::ReadWrite);
+            }));
+        }
+        space.Protect(w, 0x4000, MemoryPermission::ReadWrite);
+        t.report.push_back(fmt::format(
+            "  INFO  GpuMemory(perf): ns per call, manager directly / through GpuMemory (best of 3): "
+            "CopySparseMemory 64 B {:.1f} / {:.1f}; ClampRangeSize < 1 GiB {:.2f} / {:.2f}; "
+            "ProtectTracking 16 KiB {:.0f} / {:.0f}",
+            copy_mm, copy_gm, clamp_mm, clamp_gm, prot_mm, prot_gm));
+    }
+
+    // The notifications, recorded between the memory manager and the rasterizer.
+    {
+        RecordingGpuListener rec(native);
+        rec.next = gm.SetListener(&rec);
+        c.Check("SetListener: the rasterizer was the listener", rec.next != nullptr, "");
+        if (rec.next == nullptr) {
+            gm.SetListener(nullptr);
+            cleanup();
+            return;
+        }
+        const u64 pd = Alloc(0x40000, 0);
+        rec.probe = pd;
+        const u64 vd = Map(pd, 0x40000, kRw, 0, 0);
+        auto ev = rec.Take();
+        c.Check("map: unmap (before: placeholder, no writer lock, a query returns) -> register (committed, writer "
+                "lock) -> map (no writer lock); the GPU has the range",
+                pd != ~0ull && vd != ~0ull && ev.size() == 3 && Is(ev[0], Kind::Unmap, vd, 0x40000) &&
+                    !ev[0].committed && !ev[0].writer_locked && ev[0].queried &&
+                    Is(ev[1], Kind::Register, vd, 0x40000) && ev[1].committed && ev[1].writer_locked &&
+                    Is(ev[2], Kind::Map, vd, 0x40000) && ev[2].committed && !ev[2].writer_locked && ev[2].queried &&
+                    rasterizer.IsMapped(vd, 0x40000),
+                EventsText(ev));
+
+        Protect(vd + 0x5000, 0x100, 0x13);
+        ev = rec.Take();
+        Protect(vd + 0x4000, 0x4000, kRw);
+        rec.Take();
+        c.Check("mprotect: one guest-write notification for the whole 16 KiB page, no writer lock",
+                ev.size() == 1 && Is(ev[0], Kind::Write, vd + 0x4000, 0x4000) && !ev[0].writer_locked, EventsText(ev));
+
+        Unmap(vd + 0x20000, 0x20000);
+        ev = rec.Take();
+        c.Check("munmap of half: unmap (still committed, no writer lock) -> register of the placeholder (writer "
+                "lock); the GPU keeps only the other half",
+                ev.size() == 2 && Is(ev[0], Kind::Unmap, vd + 0x20000, 0x20000) && ev[0].committed &&
+                    !ev[0].writer_locked && ev[0].queried && Covers(ev[1], Kind::Register, vd + 0x20000, 0x20000) &&
+                    !ev[1].committed && ev[1].writer_locked && !rasterizer.IsMapped(vd + 0x20000, 0x20000) &&
+                    rasterizer.IsMapped(vd, 0x20000),
+                EventsText(ev));
+
+        const u64 pe = Alloc(0x10000, 0);
+        const u64 ve = Map(pe, 0x10000, kRw, kFixed, vd);
+        ev = rec.Take();
+        c.Check("Fixed map over a view: unmap (the old view still there) -> register of the freed placeholder -> "
+                "register of the new view -> map",
+                ve == vd && ev.size() == 4 && Is(ev[0], Kind::Unmap, vd, 0x10000) && ev[0].committed &&
+                    !ev[0].writer_locked && Covers(ev[1], Kind::Register, vd, 0x10000) && !ev[1].committed &&
+                    ev[1].writer_locked && Is(ev[2], Kind::Register, vd, 0x10000) && ev[2].committed &&
+                    ev[2].writer_locked && Is(ev[3], Kind::Map, vd, 0x10000) && !ev[3].writer_locked,
+                EventsText(ev));
+
+        rec.probe = pd + 0x10000;
+        const s32 rd = Rel(pd, 0x40000);
+        ev = rec.Take();
+        const bool freed = native ? DmemAreaAt(dmem, pd + 0x10000).state == Memory::AreaState::Free
+                                  : BridgeDirectMemoryFreeAt(pd + 0x10000);
+        c.Check(native ? "NATIVE release of a mapped allocation: the GPU hears of the view while it is still mapped and "
+                         "the pages are 'releasing', then the host unmaps; free only afterwards"
+                       : "BRIDGE release of a mapped allocation: the GPU hears of the view while it is still mapped and "
+                         "the pages are allocated, then the host unmaps; free only afterwards",
+                rd == 0 && ev.size() == 2 && Is(ev[0], Kind::Unmap, vd + 0x10000, 0x10000) && ev[0].committed &&
+                    !ev[0].writer_locked && ev[0].phys == (native ? 2 : 1) &&
+                    Covers(ev[1], Kind::Register, vd + 0x10000, 0x10000) && !ev[1].committed &&
+                    ev[1].writer_locked && freed && !rasterizer.IsMapped(vd + 0x10000, 0x10000),
+                fmt::format("{} {}", Code(rd), EventsText(ev)));
+
+        rec.probe = pe;
+        const s32 re = Rel(pe, 0x10000);
+        ev = rec.Take();
+        c.Check("release of the Fixed view's allocation: unmap (mapped, pages not free) -> register; nothing left "
+                "on the GPU",
+                re == 0 && ev.size() == 2 && Is(ev[0], Kind::Unmap, vd, 0x10000) && ev[0].committed &&
+                    ev[0].phys == (native ? 2 : 1) && Covers(ev[1], Kind::Register, vd, 0x10000) &&
+                    !rasterizer.IsMapped(vd, 0x40000),
+                fmt::format("{} {}", Code(re), EventsText(ev)));
+        rec.probe = ~0ull;
+        Core::GpuMemoryListener* const mine = gm.SetListener(rec.next);
+        c.Check("the rasterizer is the listener again", mine == &rec, "");
+    }
+
+    // Queries racing with map/unmap next to them and with the guest's mprotect of the same view.
+    {
+        const u64 ps = Alloc(0x40000, 0);
+        const u64 pch = Alloc(0x20000, 0);
+        const u64 vs = Map(ps, 0x40000, kRw, 0, 0);
+        const auto Sp = [](u64 o) { return static_cast<u8>(o * 31 + 7); };
+        for (u64 o = 0; o < 0x40000; ++o) {
+            reinterpret_cast<u8*>(vs)[o] = Sp(o);
+        }
+        std::atomic<int> done{0}, bad_reads{0}, bad_clamps{0}, bad_writes{0}, map_failures{0}, protect_failures{0};
+        std::vector<std::thread> threads;
+        threads.emplace_back([&] {
+            for (int i = 0; i < 300; ++i) {
+                const u64 v = Map(pch, 0x20000, kRw, 0, 0);
+                if (v == ~0ull) {
+                    ++map_failures;
+                    continue;
+                }
+                std::memset(reinterpret_cast<void*>(v), 0xC5, 0x20000);
+                map_failures += Unmap(v, 0x20000) != 0 ? 1 : 0;
+            }
+            ++done;
+        });
+        threads.emplace_back([&] {
+            for (int i = 0; i < 300; ++i) {
+                protect_failures += Protect(vs, 0x40000, i % 2 == 0 ? 0x13 : kRw) != 0 ? 1 : 0;
+            }
+            ++done;
+        });
+        for (int k = 0; k < 3; ++k) {
+            threads.emplace_back([&, k] {
+                std::mt19937_64 rng(0x9E3779B97F4A7C15ull + k);
+                std::vector<u8> buf(0x1000);
+                std::array<u8, 32> same{};
+                for (int i = 0; i < 5000; ++i) {
+                    const u64 off = rng() % 0x3F000;
+                    const u64 len = 1 + rng() % 0x1000;
+                    gm.CopySparseMemory(vs + off, buf.data(), len);
+                    for (u64 j = 0; j < len; ++j) {
+                        if (buf[j] != Sp(off + j)) {
+                            ++bad_reads;
+                            break;
+                        }
+                    }
+                    if (i % 8 == 0) {
+                        const u64 cl = gm.ClampRangeSize(vs + off, kGiB);
+                        bad_clamps += cl < 0x40000 - off || cl > kGiB ? 1 : 0;
+                    }
+                    if (i % 16 == 0) {
+                        for (u64 j = 0; j < same.size(); ++j) {
+                            same[j] = Sp(off + j);
+                        }
+                        bad_writes += gm.TryWriteBacking(reinterpret_cast<void*>(vs + off), same.data(), same.size()) ? 0 : 1;
+                    }
+                    if (i % 64 == 0) {
+                        gm.ProtectTracking(vs, 0x40000, MemoryPermission::ReadWrite);
+                    }
+                }
+                ++done;
+            });
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        while (done < static_cast<int>(threads.size()) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (done < static_cast<int>(threads.size())) {
+            SSPC_LOG(App, Critical, "selftest: GpuMemory concurrency test did not finish in 90 s (deadlock)");
+            Log::Flush();
+            std::quick_exit(5);
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        bool intact = true;
+        for (u64 o = 0; o < 0x40000; ++o) {
+            intact = intact && reinterpret_cast<const u8*>(vs)[o] == Sp(o);
+        }
+        c.Check("5 threads: map/unmap next to a view, mprotect of it, 3 x (copy, clamp, write, protect) on it: no "
+                "deadlock (90 s watchdog), every read and write right, the view intact and still on the GPU",
+                bad_reads == 0 && bad_clamps == 0 && bad_writes == 0 && map_failures == 0 && protect_failures == 0 &&
+                    intact && rasterizer.IsMapped(vs, 0x40000),
+                fmt::format("reads {} clamps {} writes {} maps {} protects {} intact {}", bad_reads.load(),
+                            bad_clamps.load(), bad_writes.load(), map_failures.load(), protect_failures.load(), intact));
+        Unmap(vs, 0x40000);
+        Rel(ps, 0x40000);
+        Rel(pch, 0x20000);
+    }
+
+    cleanup();
+    c.Check("everything unmapped and released: the VMAs as before, the physical map empty again",
+            BridgeVmaCount() == vmas_before && (native ? dmem.Pristine() : BridgeDirectMemoryUntouched()),
+            fmt::format("VMAs {} -> {}; {}", vmas_before, BridgeVmaCount(), native ? DmemText(dmem) : ""));
+}
+
+void TestGpuMemory(Totals& t, const App::Config& cfg) {
+    {
+        InputChecks c(t, "GpuMemory(int)");
+        if (presenter == nullptr) {
+            c.Check("the bridge's GPU is running", false, "");
+        } else {
+            GpuMemoryScenario(t, c, false);
+        }
+        c.Summary();
+    }
+    InputChecks c(t, "GpuMemory(dmem)");
+    auto& dmem = Memory::GameDirectMemory();
+    const u64 total = Core::Memory::Instance()->GetTotalDirectSize();
+    const bool configured = presenter != nullptr && BridgeDirectMemoryUntouched() && dmem.Configure(total);
+    const bool installed = configured && InstallNativeDirectMemory(cfg);
+    c.Check("the same with --native kernel-dmem (installed on the untouched memory manager)", installed,
+            fmt::format("configured {}", configured));
+    if (installed) {
+        GpuMemoryScenario(t, c, true);
+        c.Check("switched back to the bridge's direct memory",
+                UninstallNativeDirectMemory() && dmem.Configure(0) && BridgeDirectMemoryUntouched(), "");
+    } else {
+        dmem.Configure(0);
+    }
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -3705,6 +4339,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestDirectMemoryOracle(t);
     TestDirectMemoryNative(t);
     TestDirectMemoryBridge(t, cfg);
+    TestGpuMemory(t, cfg);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

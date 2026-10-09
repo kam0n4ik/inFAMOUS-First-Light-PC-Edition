@@ -31,6 +31,12 @@ bool ConfigureNativeDirectMemory(u64 flexible_size, bool extended1, bool extende
 u64 BridgeDirectMemorySize();
 bool BridgeDirectMemoryUntouched();
 
+/// Self-test (P2.3.2, GPU notifications): whether the bridge memory manager's writer lock is held
+/// right now (by anyone), and whether `phys` is free in its own map (dmem_map; takes the reader
+/// lock, so only call it while the caller does not hold the writer lock).
+bool BridgeMemoryWriterLocked();
+bool BridgeDirectMemoryFreeAt(u64 phys);
+
 /// The guest's memory maps as text: the bridge's virtual memory areas, then the direct memory map
 /// (the native one when installed, else the bridge's dmem_map) in the same format for both.
 std::string MemoryMapText();
