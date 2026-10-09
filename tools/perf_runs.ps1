@@ -5,6 +5,8 @@
 #                              C bridge/native (--bridge kernel-sema)   D bridge/bridge (both)
 # Phase 2.2.3 groups:          N0 none of them (as before the phase)  N1 + Tier 1 (kernel-util,
 #                              net-util, libc-mem)  N2 + kernel-mutex (mutexes, condvars)  N3 + kernel-rwlock
+# Phase 2.3.1 memory:          M0 default (bridge direct memory)  M1 --native kernel-dmem (experimental)
+# A mode may be listed more than once (M0,M1,M1,M0): its runs go to <mode>_1, <mode>_2, ...
 # Every run: same exe, same SecondSonPC.toml, a fresh copy of the same save snapshot (--user-data),
 # the same key presses ("Continue" twice -> forest gameplay from ~30 s). tools\perf_sampler.ps1
 # samples the process once a second while it runs.
@@ -37,8 +39,17 @@ $modeArgs = @{
     N1 = "--bridge kernel-mutex --bridge kernel-rwlock"
     N2 = "--bridge kernel-rwlock"
     N3 = ""
+    # Phase 2.3.1: M0 = default (direct memory accounted by the bridge), M1 = experimental native
+    # direct memory. Alternate them (-Modes M0,M1,M1,M0): a mode listed twice gets M0_1, M0_2, ...
+    M0 = ""; M1 = "--native kernel-dmem"
 }
 $modeList = @($Modes.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim().ToUpper() })
+$repeated = @($modeList | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+$seen = @{}
+$runList = foreach ($m in $modeList) {
+    $seen[$m] = 1 + [int]$seen[$m]
+    [pscustomobject]@{ Mode = $m; Label = $(if ($repeated -contains $m) { "${m}_$($seen[$m])" } else { $m }) }
+}
 
 function Fail([string]$Message) { "perf_runs: $Message"; exit 1 }
 function Get-SaveHashes {
@@ -50,7 +61,7 @@ function Get-SaveHashes {
 }
 
 if (-not $modeList.Count -or @($modeList | Where-Object { -not $modeArgs.ContainsKey($_) }).Count) {
-    Fail "-Modes must list A, B, C, D (sema/event flags) and/or N0..N3 (Phase 2.2.3 groups)"
+    Fail "-Modes must list A, B, C, D (sema/event flags), N0..N3 (Phase 2.2.3 groups) and/or M0, M1 (P2.3.1 memory)"
 }
 if ($Seconds -lt 30 -or $Seconds -gt 300) { Fail "-Seconds must be 30..300 (short runs only)" }
 if ($Press -match '\s') { Fail "-Press must not contain spaces" }
@@ -67,7 +78,7 @@ $exe = Get-Item "$root\build\bin\SecondSonPC.exe"
 "perf_runs: modes $($modeList -join ','), $Seconds s each, presses '$Press', free commit $freeCommitGiB / $limitGiB GiB (need $MinFreeCommitGiB), exe $($exe.LastWriteTime.ToString('s')) -> $out"
 if ($freeCommitGiB -lt $MinFreeCommitGiB) { Fail "free system commit $freeCommitGiB GiB < $MinFreeCommitGiB GiB" }
 if ($DryRun) {
-    foreach ($m in $modeList) { "  mode ${m}: --loader sspc --user-data $out\profile --vram-log 5$(if (-not $NoFrameLog) { ' --frame-log' }) --press $Press $($modeArgs[$m]) $ExtraArgs" }
+    foreach ($r in $runList) { $m = $r.Mode; "  run $($r.Label): --loader sspc --user-data $out\profile --vram-log 5$(if (-not $NoFrameLog) { ' --frame-log' }) --press $Press $($modeArgs[$m]) $ExtraArgs" }
     exit 0
 }
 
@@ -82,12 +93,13 @@ $meta = [ordered]@{
 }
 $meta | ConvertTo-Json | Set-Content -Encoding UTF8 "$out\session.json"
 
-foreach ($m in $modeList) {
-    $tag = "perf_${Session}_$m"
+foreach ($r in $runList) {
+    $m = $r.Mode
+    $tag = "perf_${Session}_$($r.Label)"
     $profileDir = "$out\profile"
     if (Test-Path $profileDir) { Remove-Item $profileDir -Recurse -Force }
     Copy-Item "$out\snapshot" $profileDir -Recurse
-    $modeDir = "$out\$m"
+    $modeDir = "$out\$($r.Label)"
     New-Item -ItemType Directory -Force $modeDir | Out-Null
 
     $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
@@ -117,7 +129,7 @@ foreach ($m in $modeList) {
     Set-Content -Encoding UTF8 "$modeDir\summary.json" $line
     $s = $line | ConvertFrom-Json
     $run = Get-Content -Raw -Encoding UTF8 "$runDir\run.json" | ConvertFrom-Json
-    "mode ${m} ($($modeArgs[$m])): $($run.how) exit $($run.exit_hex), frames $($s.frames), series $(($s.frames_series | ForEach-Object { $_[1] }) -join ' '), first-chance $($s.first_chance_faults), crash: $(if ($s.crash) { $s.crash } else { 'none' })"
+    "run $($r.Label) ($($modeArgs[$m])): $($run.how) exit $($run.exit_hex), frames $($s.frames), series $(($s.frames_series | ForEach-Object { $_[1] }) -join ' '), first-chance $($s.first_chance_faults), crash: $(if ($s.crash) { $s.crash } else { 'none' })"
 }
 if (Test-Path "$out\profile") { Remove-Item "$out\profile" -Recurse -Force }
 

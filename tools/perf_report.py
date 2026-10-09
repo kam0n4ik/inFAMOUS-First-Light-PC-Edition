@@ -200,6 +200,49 @@ def fmt(v) -> str:
     return "n/a" if v is None or v == {} else str(v)
 
 
+RUN_SUFFIX_RE = re.compile(r"_\d+$")
+
+
+def by_mode(modes: list[dict]) -> list[dict]:
+    """Runs of the same mode (M0_1, M0_2 -> M0): mean and spread between the runs."""
+    groups: dict[str, list[dict]] = {}
+    for m in modes:
+        groups.setdefault(RUN_SUFFIX_RE.sub("", m["mode"]), []).append(m)
+    out = []
+    for name, runs in groups.items():
+        fps = [r["fps_gameplay_avg"] for r in runs if r["fps_gameplay_avg"] is not None]
+        ft = [r["frametimes"] for r in runs if r["frametimes"]]
+        pr = [r["process"] for r in runs if r["process"]]
+
+        def mean(values: list[float]) -> float | None:
+            return round(statistics.mean(values), 2) if values else None
+
+        def peak(values: list[float]) -> float | None:
+            return max(values) if values else None
+
+        out.append({
+            "mode": name,
+            "runs": [r["mode"] for r in runs],
+            "how": [r["how"] for r in runs],
+            "fps_gameplay_mean": mean(fps),
+            "fps_gameplay_min": min(fps) if fps else None,
+            "fps_gameplay_max": max(fps) if fps else None,
+            "fps_gameplay_spread": round(max(fps) - min(fps), 2) if fps else None,
+            "fps_gameplay_stdev": round(statistics.stdev(fps), 2) if len(fps) > 1 else None,
+            "frametime_p50_ms_mean": mean([f["frametime_p50_ms"] for f in ft]),
+            "frametime_p95_ms_mean": mean([f["frametime_p95_ms"] for f in ft]),
+            "frametime_p99_ms_mean": mean([f["frametime_p99_ms"] for f in ft]),
+            "fps_1pct_low_mean": mean([f["fps_1pct_low"] for f in ft]),
+            "cpu_pct_mean": mean([p["cpu_pct_avg"] for p in pr]),
+            "private_mib_max": peak([p["private_mib_max"] for p in pr]),
+            "ws_private_mib_max": peak([p["ws_private_mib_max"] for p in pr]),
+            "sys_commit_mib_max": peak([p["sys_commit_mib_max"] for p in pr]),
+            "gpu_dedicated_mib_max": peak([p["gpu_dedicated_mib_max"] for p in pr]),
+            "first_chance_faults": sum(r["first_chance_faults"] or 0 for r in runs),
+        })
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("session_dir", type=Path)
@@ -211,7 +254,8 @@ def main() -> int:
     if (d / "session.json").exists():
         session = json.loads((d / "session.json").read_text(encoding="utf-8-sig"))
     modes = [mode_report(p, a.gameplay_from) for p in sorted(d.iterdir()) if (p / "summary.json").exists()]
-    report = {"session": session, "gameplay_from_s": a.gameplay_from, "modes": modes}
+    grouped = by_mode(modes)
+    report = {"session": session, "gameplay_from_s": a.gameplay_from, "modes": modes, "by_mode": grouped}
     (d / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
     cols = ["mode", "how", "fps_loading_avg", "fps_gameplay_avg", "fps_gameplay_window_median",
@@ -258,6 +302,20 @@ def main() -> int:
             lines.append(f"  VEH: {json.dumps(m['veh'])}")
         if m.get("crash"):
             lines.append(f"  crash/first-chance: {m['crash']}")
+    if any(len(g["runs"]) > 1 for g in grouped):
+        lines += ["", "## By mode (runs of the same mode together)", "",
+                  "| mode | runs | FPS gameplay mean | min..max (spread) | stdev | P50/P95/P99 ms (mean) | "
+                  "1% low | CPU % | private max MiB | WS private max MiB | sys commit max MiB | VRAM proc MiB | "
+                  "first-chance | how |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for g in grouped:
+            lines.append(
+                f"| {g['mode']} | {len(g['runs'])} | {fmt(g['fps_gameplay_mean'])} | {fmt(g['fps_gameplay_min'])}.."
+                f"{fmt(g['fps_gameplay_max'])} ({fmt(g['fps_gameplay_spread'])}) | {fmt(g['fps_gameplay_stdev'])} | "
+                f"{fmt(g['frametime_p50_ms_mean'])}/{fmt(g['frametime_p95_ms_mean'])}/{fmt(g['frametime_p99_ms_mean'])} | "
+                f"{fmt(g['fps_1pct_low_mean'])} | {fmt(g['cpu_pct_mean'])} | {fmt(g['private_mib_max'])} | "
+                f"{fmt(g['ws_private_mib_max'])} | {fmt(g['sys_commit_mib_max'])} | {fmt(g['gpu_dedicated_mib_max'])} | "
+                f"{g['first_chance_faults']} | {', '.join(str(h) for h in g['how'])} |")
     (d / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
     return 0
