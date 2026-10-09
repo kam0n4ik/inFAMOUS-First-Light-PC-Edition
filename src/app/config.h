@@ -92,6 +92,11 @@ struct Config {
     bool frame_log = false;                  // --frame-log: presented frame times -> logs\frametimes.csv
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input
+    // [ShaderCache]: translated shaders and pipelines kept between runs (bridge, patch 0013) in
+    // <dir>\<game>\<generation>-<device>; --shader-cache <dir> / --no-shader-cache for test runs.
+    bool shader_cache = true;
+    std::filesystem::path shader_cache_dir;
+    bool clear_shader_cache = false;         // --clear-shader-cache: delete <dir>\<game> and exit
 };
 
 /// Parses <root>\SecondSonPC.toml. On failure returns nullopt and fills `errors`.

@@ -50,6 +50,19 @@ else()
                         "or a patch out of date: regenerate it, see docs/PATCHES.md)")
 endif()
 
+# Generation of the persistent shader cache (patch 0013, video_core/cache_storage.cpp): the git trees of
+# the shader recompiler, the video core and common/ (serdes, types, hashes) of "HEAD + every patch", and
+# the compiler (the cache stores structures as raw bytes, so their layout must not change under it). A
+# patch that changes how shaders are translated or cached changes it, and the cache of another
+# generation is never read. A changed patch re-runs this configure step, so the generation follows it.
+_sspc_git(_sspc_gen_recompiler rev-parse ${_sspc_expected}:shader_recompiler)
+_sspc_git(_sspc_gen_video rev-parse ${_sspc_expected}:video_core)
+_sspc_git(_sspc_gen_common rev-parse ${_sspc_expected}:common)
+string(SHA256 _sspc_gen_full "${_sspc_gen_recompiler}${_sspc_gen_video}${_sspc_gen_common}${CMAKE_CXX_COMPILER_ID}${CMAKE_CXX_COMPILER_VERSION}")
+string(SUBSTRING ${_sspc_gen_full} 0 16 SSPC_SHADER_CACHE_GENERATION)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_sspc_shadps4_patches})
+message(STATUS "SecondSonPC: shader cache generation ${SSPC_SHADER_CACHE_GENERATION}")
+
 set(ENABLE_DISCORD_RPC OFF CACHE BOOL "" FORCE)
 set(ENABLE_UPDATER OFF CACHE BOOL "" FORCE)
 set(ENABLE_TESTS OFF CACHE BOOL "" FORCE)
@@ -84,6 +97,9 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp
     )
     target_link_libraries(shadps4 PRIVATE ${runtime_target})
+    # Only this file needs the generation: a new one recompiles one file, not the bridge.
+    set_source_files_properties(${_sspc_shad_dir}/src/video_core/cache_storage.cpp TARGET_DIRECTORY shadps4
+        PROPERTIES COMPILE_DEFINITIONS "SSPC_SHADER_CACHE_GENERATION=\"${SSPC_SHADER_CACHE_GENERATION}\"")
     set_target_properties(shadps4 PROPERTIES
         OUTPUT_NAME SecondSonPC
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin

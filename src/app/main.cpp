@@ -24,6 +24,9 @@
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
+//     --shader-cache <dir>     the persistent shader cache in <dir> for this run ([ShaderCache] dir)
+//     --no-shader-cache        no persistent shader cache for this run
+//     --clear-shader-cache     deletes the cache generations under [ShaderCache] dir and exits
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
 #include <algorithm>
@@ -133,6 +136,13 @@ int main(int argc, char* argv[]) {
             vram_log_seconds = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--press" && has_value) {
             config->test_presses = argv[++i];
+        } else if (arg == "--shader-cache" && has_value) {
+            config->shader_cache = true; // test runs: a cache of their own (cold/warm series)
+            config->shader_cache_dir = std::filesystem::absolute(argv[++i]);
+        } else if (arg == "--no-shader-cache") {
+            config->shader_cache = false;
+        } else if (arg == "--clear-shader-cache") {
+            config->clear_shader_cache = true;
         } else {
             return Fail(std::string("unknown argument: ") + std::string(arg));
         }
@@ -167,6 +177,33 @@ int main(int argc, char* argv[]) {
                              config->fault_recorder || config->fault_test);
     if (config->fault_test) {
         return Base::RunFaultSelfTest(config->logs_dir); // before any bridge code: no other handlers
+    }
+    if (config->clear_shader_cache) {
+        // <dir>\<game>\<generation>: only directories with the cache's own marker are removed.
+        u64 removed = 0;
+        const auto dirs_in = [](const std::filesystem::path& dir) {
+            std::vector<std::filesystem::path> out; // no exceptions: an unreadable entry ends the list
+            std::error_code ec;
+            for (auto it = std::filesystem::directory_iterator(dir, ec);
+                 !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+                out.push_back(it->path());
+            }
+            return out;
+        };
+        for (const auto& game : dirs_in(config->shader_cache_dir)) {
+            for (const auto& gen : dirs_in(game)) {
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(gen / "generation", ec) &&
+                    std::filesystem::remove_all(gen, ec) > 0 && !ec) {
+                    ++removed;
+                }
+            }
+        }
+        SSPC_LOG(App, Info, "--clear-shader-cache: {} cache generation(s) removed from {}", removed,
+                 config->shader_cache_dir.string());
+        std::printf("SecondSonPC: %llu shader cache generation(s) removed from %s\n",
+                    static_cast<unsigned long long>(removed), config->shader_cache_dir.string().c_str());
+        return 0;
     }
     Base::StartVramLog(vram_log_seconds);
     const bool own_loader = config->loader == App::Config::LoaderBackend::Sspc;

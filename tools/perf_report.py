@@ -59,7 +59,45 @@ def frame_stats(path: Path, start_s: float) -> dict:
         "frametime_p95_ms": round(percentile(ms, 95), 2),
         "frametime_p99_ms": round(percentile(ms, 99), 2),
         "frametime_max_ms": round(max(ms), 2),
+        "frames_over_33ms": sum(1 for m in ms if m > 1000.0 / 30.0),
+        "frames_over_50ms": sum(1 for m in ms if m > 50.0),
+        "frames_over_100ms": sum(1 for m in ms if m > 100.0),
     }
+
+
+# The bridge's compile statistics (patch 0013, vk_pipeline_serialization.cpp LogStats): the last line.
+SC_STATS_RE = re.compile(
+    r"Shader cache stats \(([^)]*)\): compiled modules (\d+) \+ permutations (\d+), graphics (\d+), "
+    r"compute (\d+); preloaded modules (\d+), graphics (\d+), compute (\d+), stale (\d+), used (\d+); "
+    r"ms translate ([\d.]+) spirv ([\d.]+) module ([\d.]+) graphics ([\d.]+) compute ([\d.]+); "
+    r"stalls (\d+) \(([\d.]+) ms, >5ms (\d+), >20ms (\d+), >100ms (\d+), max ([\d.]+) ms\); "
+    r"warm-up ([\d.]+) ms; driver cache (\d+) bytes; persistent cache (\w+)")
+SC_SIZE_RE = re.compile(r"Shader cache: (.+) \(generation ([^)]+)\): (\d+) files, ([\d.]+) MiB")
+SC_DUMPED_RE = re.compile(r"Cache dumped: written (\d+) blobs \(([\d.]+) MiB")
+
+
+def shader_cache_stats(log: Path) -> dict:
+    if not log.exists():
+        return {}
+    keys = ["when", "modules", "permutations", "graphics", "compute", "preloaded_modules",
+            "preloaded_graphics", "preloaded_compute", "stale", "preloaded_used", "translate_ms",
+            "spirv_ms", "module_ms", "graphics_ms", "compute_ms", "stalls", "stall_ms", "stalls_5ms",
+            "stalls_20ms", "stalls_100ms", "stall_max_ms", "warmup_ms", "driver_cache_bytes",
+            "persistent"]
+    out: dict = {}
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = SC_STATS_RE.search(line)
+        if m:
+            vals = list(m.groups())
+            out.update({k: (v if k in ("when", "persistent") else float(v)) for k, v in zip(keys, vals)})
+        s = SC_SIZE_RE.search(line)
+        if s:
+            out.update({"dir": s.group(1), "generation": s.group(2), "files_at_start": int(s.group(3)),
+                        "mib_at_start": float(s.group(4))})
+        d = SC_DUMPED_RE.search(line)
+        if d:
+            out.update({"blobs_written": int(d.group(1)), "mib_written": float(d.group(2))})
+    return out
 
 
 def sample_stats(path: Path, start_s: float) -> dict:
@@ -191,6 +229,8 @@ def mode_report(mode_dir: Path, gameplay_from: float) -> dict:
         "errors_bridge": summary.get("errors_bridge"),
     }
     r["frametimes"] = frame_stats(mode_dir / "frametimes.csv", gameplay_from)
+    r["frametimes_all"] = frame_stats(mode_dir / "frametimes.csv", 0.0)  # loading included
+    r["shader_cache"] = shader_cache_stats(mode_dir / "bridge_shadps4.log")
     r["process"] = sample_stats(mode_dir / "samples.csv", gameplay_from)
     r["veh"] = veh_stats(mode_dir / "SecondSonPC.log", gameplay_from)
     return r
@@ -297,7 +337,26 @@ def main() -> int:
         if ft:
             lines.append(f"  frametimes (gameplay): avg {ft['fps_avg']} FPS, median {ft['fps_median']}, 1% low "
                          f"{ft['fps_1pct_low']}, P50/P95/P99 {ft['frametime_p50_ms']}/{ft['frametime_p95_ms']}/"
-                         f"{ft['frametime_p99_ms']} ms, max {ft['frametime_max_ms']} ms")
+                         f"{ft['frametime_p99_ms']} ms, max {ft['frametime_max_ms']} ms, frames >33.3/50/100 ms "
+                         f"{ft['frames_over_33ms']}/{ft['frames_over_50ms']}/{ft['frames_over_100ms']}")
+        fa = m.get("frametimes_all") or {}
+        if fa:
+            lines.append(f"  frametimes (whole run, loading included): {fa['frames']} frames, P99 "
+                         f"{fa['frametime_p99_ms']} ms, max {fa['frametime_max_ms']} ms, frames >33.3/50/100 ms "
+                         f"{fa['frames_over_33ms']}/{fa['frames_over_50ms']}/{fa['frames_over_100ms']}")
+        sc = m.get("shader_cache") or {}
+        if sc.get("when"):
+            lines.append(
+                f"  shader cache ({sc['persistent']}, {sc.get('files_at_start', 'n/a')} files / "
+                f"{sc.get('mib_at_start', 'n/a')} MiB at start, written {sc.get('blobs_written', 0)} blobs / "
+                f"{sc.get('mib_written', 0)} MiB): compiled modules {int(sc['modules'])}+{int(sc['permutations'])} perm, "
+                f"pipelines {int(sc['graphics'])} gfx + {int(sc['compute'])} cs (misses); preloaded "
+                f"{int(sc['preloaded_graphics'])} gfx + {int(sc['preloaded_compute'])} cs, used {int(sc['preloaded_used'])} "
+                f"(hits), stale {int(sc['stale'])}; GPU thread stalled {sc['stall_ms']:.0f} ms in {int(sc['stalls'])} "
+                f"compiles (>5/20/100 ms {int(sc['stalls_5ms'])}/{int(sc['stalls_20ms'])}/{int(sc['stalls_100ms'])}, "
+                f"max {sc['stall_max_ms']} ms); translate {sc['translate_ms']:.0f} + spirv {sc['spirv_ms']:.0f} + module "
+                f"{sc['module_ms']:.0f} + pipelines {sc['graphics_ms'] + sc['compute_ms']:.0f} ms; warm-up "
+                f"{sc['warmup_ms']:.0f} ms; driver cache {int(sc['driver_cache_bytes']) // 1024} KiB loaded")
         if m.get("veh"):
             lines.append(f"  VEH: {json.dumps(m['veh'])}")
         if m.get("crash"):

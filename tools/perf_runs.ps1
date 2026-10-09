@@ -51,6 +51,9 @@ $modeArgs = @{
     M0 = ""; M1 = "--native kernel-dmem"
     # Phase 2.3.4: the guest memory on SecondSonPC's manager (M2), with commit on demand (M3).
     M2 = "--native memory"; M3 = "--native memory --memory-commit on-demand"
+    # P2.4 shader cache (patch 0013): C0 no persistent cache (every run compiles everything), C1 the
+    # test cache logs\p24\sc_test (cold on its first run, warm after it). The user's cache is not used.
+    C0 = "--no-shader-cache"; C1 = "--shader-cache E:\SecondSonPC\logs\p24\sc_test"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}

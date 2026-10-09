@@ -23,6 +23,12 @@ extraFlexibleMemoryMiB = 0         # added to the retail flexible memory budget
 userData = "userdata"              # /savedata0 -> userdata\home\<user>\savedata\CUSA00004\<dir>
 logs = "logs"                      # SecondSonPC.log, calls.json, bridge_shadps4.log
 
+[ShaderCache]                      # translated shaders and pipelines kept between runs: a level seen
+                                   # before does not compile them again (docs\SHADER_CACHE.md)
+enabled = true
+dir = 'cache\shaders'              # <dir>\CUSA00004\<translator>-<GPU and driver>; SecondSonPC.exe
+                                   # --clear-shader-cache empties it (rebuilt while playing)
+
 [Display]
 width = 1280
 height = 720

@@ -177,6 +177,7 @@ void OnQuickExit() {
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();
+    Common::Log::Flush(); // the cache's last lines (its statistics, tools\perf_report.py reads them)
     if (g_controllers != nullptr) {
         g_controllers->ResetLightbarColors();
         Sleep(10);
@@ -238,6 +239,22 @@ void ApplyBridgeSettings(const App::Config& cfg) {
     // Offline console: no network, no shadNet (NP offline is Phase 3).
     s.SetConnectedToNetwork(false);
     s.SetShadNetEnabled(false);
+    // [ShaderCache] (patch 0013): <dir>\<game>\<generation>-<device> keeps the translated SPIR-V,
+    // the pipeline keys and the driver's VkPipelineCache between runs (one file per blob).
+    bool shader_cache = cfg.shader_cache;
+    if (shader_cache) {
+        std::error_code ec; // SetUserPath ignores a directory that does not exist
+        std::filesystem::create_directories(cfg.shader_cache_dir, ec);
+        if (!std::filesystem::is_directory(cfg.shader_cache_dir, ec)) {
+            SSPC_LOG(Bridge, Error, "[ShaderCache] dir {} cannot be created: the cache is off",
+                     cfg.shader_cache_dir.string());
+            shader_cache = false;
+        } else {
+            Common::FS::SetUserPath(Common::FS::PathType::CacheDir, cfg.shader_cache_dir);
+        }
+    }
+    s.SetPipelineCacheEnabled(shader_cache);
+    s.SetPipelineCacheArchived(false);
     // [Debug]
     s.SetVkValidationEnabled(cfg.vulkan_validation);
     s.SetVkCrashDiagnosticEnabled(cfg.vulkan_crash_diagnostic);
@@ -246,12 +263,13 @@ void ApplyBridgeSettings(const App::Config& cfg) {
     SSPC_LOG(Bridge, Info,
              "bridge settings from SecondSonPC.toml: neo {}, devkit {}, extra dmem/fmem {}/{} MiB, "
              "window {}x{}{}, vblank {} Hz, present {}, volume {}, audio device \"{}\", "
-             "vk validation {}, crash diagnostic {}",
+             "vk validation {}, crash diagnostic {}, shader cache {}",
              cfg.neo_mode, cfg.dev_kit, cfg.extra_dmem_mib, cfg.extra_fmem_mib, cfg.window_width,
              cfg.window_height,
              cfg.fullscreen ? (cfg.exclusive_fullscreen ? " fullscreen" : " borderless") : "",
              cfg.vblank_hz, cfg.present_mode, cfg.volume, cfg.audio_device, cfg.vulkan_validation,
-             cfg.vulkan_crash_diagnostic);
+             cfg.vulkan_crash_diagnostic,
+             cfg.shader_cache ? cfg.shader_cache_dir.string() : std::string("off"));
 }
 
 /// Host file of a guest path in /app0 (the module loader's view; the game's files go through the

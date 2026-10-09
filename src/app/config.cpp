@@ -208,6 +208,11 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     c.user_data_dir = resolve(user_data);
     c.logs_dir = resolve(logs);
 
+    std::string shader_cache = "cache\\shaders";
+    r.Bool("ShaderCache", "enabled", c.shader_cache);
+    r.String("ShaderCache", "dir", shader_cache);
+    c.shader_cache_dir = resolve(shader_cache);
+
     r.UInt("Display", "width", c.window_width, 640, 7680);
     r.UInt("Display", "height", c.window_height, 360, 4320);
     r.Bool("Display", "fullscreen", c.fullscreen);
