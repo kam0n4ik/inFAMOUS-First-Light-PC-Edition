@@ -3861,9 +3861,11 @@ void GpuMemoryScenario(Totals& t, InputChecks& c, bool native) {
         bool valid;
     };
     constexpr u64 kTop = 1ull << 40;
-    constexpr Gpu kGpu[] = {{0, 0, true},          {kTop - 1, 0, true},      {kTop - 1, 1, false},
-                            {kTop, 0, false},      {kTop - 16, 16, false},   {kTop - 16, 15, true},
-                            {~0ull, 2, true},      {1ull << 63, 1ull << 63, true}}; // the last two wrap (D10)
+    // Patch 0011 (D10): a range ending exactly at 2^40 is valid, a sum that wraps is not (both were the other
+    // way before).
+    constexpr Gpu kGpu[] = {{0, 0, true},          {kTop - 1, 0, true},      {kTop - 1, 1, true},
+                            {kTop, 0, false},      {kTop - 16, 16, true},    {kTop - 16, 17, false},
+                            {~0ull, 2, false},     {1ull << 63, 1ull << 63, false}};
     bool gpu_ok = true;
     for (const auto& g : kGpu) {
         gpu_ok = gpu_ok && Core::GpuMemory::IsValidGpuMapping(g.addr, g.size) == g.valid &&
@@ -3872,10 +3874,25 @@ void GpuMemoryScenario(Totals& t, InputChecks& c, bool native) {
     auto& space = mm->GetAddressSpace();
     const VAddr reserved_end = space.SystemReservedVirtualBase() + space.SystemReservedVirtualSize();
     const VAddr ring = Libraries::GnmDriver::sceGnmGetTheTessellationFactorRingBufferBaseAddress();
-    c.Check("IsValidGpuMapping: 40-bit limit at the edges, the sum wraps as before (D10); SystemReservedEnd = the "
+    c.Check("IsValidGpuMapping: 40-bit limit at the edges, no wrapping (D10, patch 0011); SystemReservedEnd = the "
             "address space's 0x1000000000, GnmDriver's tessellation factor ring 0xff0000000 as before",
             gpu_ok && gm.SystemReservedEnd() == reserved_end && reserved_end == 0x1000000000 && ring == 0xff0000000,
             fmt::format("gpu {} end {:#x} ring {:#x}", gpu_ok, reserved_end, ring));
+    {
+        // D12 (patch 0011): reads beyond the 40-bit table (before: past the end of its top level) are zeros,
+        // through GpuMemory and the manager; a read wrapping past 2^64 too.
+        std::array<u8, 32> beyond{};
+        beyond.fill(0xEE);
+        gm.CopySparseMemory(kTop - 8, beyond.data(), 16);
+        mm->CopySparseMemory((1ull << 48) + 0x100, beyond.data() + 16, 16);
+        const bool zeros = std::ranges::all_of(beyond, [](u8 b) { return b == 0; });
+        beyond.fill(0xEE);
+        gm.CopySparseMemory(~0ull - 15, beyond.data(), 32);
+        const bool wrapped = std::ranges::all_of(beyond, [](u8 b) { return b == 0; });
+        c.Check("CopySparseMemory beyond 2^40 (and wrapping past 2^64) reads zeros, nothing read out of bounds (D12, "
+                "patch 0011)",
+                zeros && wrapped, fmt::format("{} {}", zeros, wrapped));
+    }
 
     std::array<u8, 16> data{};
     for (size_t i = 0; i < data.size(); ++i) {

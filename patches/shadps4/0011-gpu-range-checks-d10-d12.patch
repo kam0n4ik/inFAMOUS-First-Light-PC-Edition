@@ -1,0 +1,34 @@
+diff --git a/src/core/gpu_memory.h b/src/core/gpu_memory.h
+index b0cf1c6f..90ec2f42 100644
+--- a/src/core/gpu_memory.h
++++ b/src/core/gpu_memory.h
+@@ -36,10 +36,11 @@ public:
+ 
+     virtual ~GpuMemory() = default;
+ 
+-    /// The PS4's GPU can only handle 40 bit addresses. addr + size is not checked for overflow.
++    /// The PS4's GPU can only handle 40 bit addresses: [addr, addr + size) inside [0, 2^40). SecondSonPC
++    /// patch 0011 (D10): without wrapping, and a range ending exactly at 2^40 is valid.
+     static constexpr bool IsValidGpuMapping(VAddr addr, u64 size) {
+         constexpr VAddr max_gpu_address{0x10000000000};
+-        return addr + size < max_gpu_address;
++        return addr < max_gpu_address && size <= max_gpu_address - addr;
+     }
+ 
+     /// Who gets the notifications (the rasterizer, once, before the guest runs); returns the
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 384a1455..73b21a4e 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -149,7 +149,10 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+         const u64 page = virtual_addr >> 14;
+         const u64 offset_in_page = virtual_addr % 16_KB;
+         const u64 copy_size = std::min<u64>(16_KB - offset_in_page, size);
+-        if (auto* entry = backing_pages.find(page); entry && *entry) {
++        // SecondSonPC patch 0011 (D12): the table covers 2^40 bytes; beyond it there is nothing to read.
++        const bool covered = page < (1ULL << (AddressSpace::Traits::ADDRESS_SPACE_BITS -
++                                               AddressSpace::Traits::PAGE_BITS));
++        if (auto* entry = covered ? backing_pages.find(page) : nullptr; entry && *entry) {
+             std::memcpy(dest, *entry + offset_in_page, copy_size);
+         } else {
+             std::memset(dest, 0, copy_size);
