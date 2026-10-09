@@ -25,4 +25,12 @@ struct TestGroup {
 /// fixed, a page model, threads, the commit experiment).
 std::vector<TestGroup> TestNativeVirtualMemory(u32 sdk_version);
 
+/// P2.3.3c: the bridge's interfaces over the manager (selftest_native.cpp): the same calls on the bridge and
+/// on the manager compared step by step, the adapters under threads. *diff_transcript: the scripted
+/// scenario's steps on both sides (logs/selftest_native_diff.txt).
+std::vector<TestGroup> TestNativeMemoryAdapters(u32 sdk_version, std::string* diff_transcript);
+
+/// A free stretch of the host's address space at or above 2 TiB (0: none); the self-test's managers live there.
+u64 FindFreeNativeWindow(u64 size);
+
 } // namespace SecondSon::Bridge

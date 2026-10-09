@@ -4673,7 +4673,13 @@ int RunSelfTest(const App::Config& cfg) {
     TestDirectMemoryBridge(t, cfg);
     TestGpuMemory(t, cfg);
     TestGuestMemory(t);
-    for (const auto& g : TestNativeVirtualMemory(Common::ElfInfo::Instance().CompiledSdkVer())) {
+    auto native_groups = TestNativeVirtualMemory(Common::ElfInfo::Instance().CompiledSdkVer());
+    std::string diff_transcript;
+    for (auto& g : TestNativeMemoryAdapters(Common::ElfInfo::Instance().CompiledSdkVer(), &diff_transcript)) {
+        native_groups.push_back(std::move(g));
+    }
+    std::ofstream(cfg.logs_dir / "selftest_native_diff.txt", std::ios::binary) << diff_transcript;
+    for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;
         t.report.insert(t.report.end(), g.lines.begin(), g.lines.end());

@@ -1392,6 +1392,10 @@ void MeasureLatencies(TestGroup& g, u32 sdk) {
 
 } // namespace
 
+u64 FindFreeNativeWindow(u64 size) {
+    return FindFreeWindow(size);
+}
+
 std::vector<TestGroup> TestNativeVirtualMemory(u32 sdk_version) {
     std::vector<TestGroup> groups;
     const auto Run = [&](const char* name, auto&& test) {
