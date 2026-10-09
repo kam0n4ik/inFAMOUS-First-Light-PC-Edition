@@ -14,8 +14,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <thread>
@@ -32,10 +36,15 @@
 #include "base/log.h"
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
+#include "bridge/shadps4/memory_host.h"
 #include "common/singleton.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/libraries/kernel/memory.h"
+#include "core/memory.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/sleepq.h"
 #include "core/user_settings.h"
@@ -44,8 +53,11 @@
 #include "runtime/filesystem/vfs.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/pthread_sync.h"
+#include "runtime/memory/direct_memory.h"
 #include "runtime/psf/param_sfo.h"
 #include "runtime/user/user_service.h"
+
+extern std::unique_ptr<Vulkan::Presenter> presenter; // shadPS4 gnmdriver.cpp (started for BRIDGE imports)
 
 namespace SecondSon::Bridge {
 
@@ -2698,6 +2710,875 @@ void TestPthreadSync(Totals& t) {
     c.Summary();
 }
 
+// ---------------------------------------------------------------------------- direct memory (P2.3.1)
+
+namespace DmemNid {
+constexpr const char* kGetSize = "pO96TwzOm5E";
+constexpr const char* kAllocate = "rTXw65xmLIA";
+constexpr const char* kRelease = "MBuItvba6z8";
+constexpr const char* kMap = "L-Q3LEjIbgA";    // sceKernelMapDirectMemory: BRIDGE in both modes
+constexpr const char* kMunmap = "cQke9UuBQOk"; // sceKernelMunmap: BRIDGE
+} // namespace DmemNid
+
+constexpr u64 kDmemPage = Memory::kPageSize;
+
+std::string DmemText(const Memory::DirectMemory& m) {
+    std::string out;
+    for (const auto& a : m.Snapshot()) {
+        if (a.state == Memory::AreaState::Free) {
+            out += fmt::format("[{:#x},{:#x}) free ", a.base, a.base + a.size);
+        } else {
+            out += fmt::format("[{:#x},{:#x}) {} t{} v{} ", a.base, a.base + a.size,
+                               a.state == Memory::AreaState::Allocated ? "alloc" : "releasing", a.memory_type,
+                               a.mappings);
+        }
+    }
+    return out;
+}
+
+Memory::Area DmemAreaAt(const Memory::DirectMemory& m, u64 addr) {
+    for (const auto& a : m.Snapshot()) {
+        if (addr >= a.base && addr - a.base < a.size) {
+            return a;
+        }
+    }
+    return {};
+}
+
+/// The same allocations and releases on both sides, each on its own map of the bridge's current
+/// size: the game's start-up (scaled to that size), every parameter check, first fit with holes,
+/// search windows and alignments, the release rules. Everything is released at the end.
+void DmemScript(Side& s) {
+    const void* get_size = s.F(DmemNid::kGetSize);
+    const void* alloc = s.F(DmemNid::kAllocate);
+    const void* release = s.F(DmemNid::kRelease);
+    const u64 size = Call<u64>(get_size);
+    const s64 end = static_cast<s64>(size);
+    s.Line("sceKernelGetDirectMemorySize -> {:#x}", size);
+    const auto A = [&](s64 start, s64 stop, u64 len, u64 align, s32 type) -> u64 {
+        s64 phys = -1;
+        const s32 r = Call<s32>(alloc, start, stop, len, align, type, &phys);
+        s.Line("Allocate({:#x}, {:#x}, len {:#x}, align {:#x}, type {}) -> {} {:#x}", start, stop, len, align,
+               type, Code(r), r == 0 ? phys : -1);
+        return r == 0 ? static_cast<u64>(phys) : ~0ull;
+    };
+    const auto R = [&](u64 start, u64 len) {
+        s.Line("Release({:#x}, {:#x}) -> {}", start, len, Code(Call<s32>(release, start, len)));
+    };
+
+    // The game's start-up (docs/PHASE2_P23_MEMORY.md §2): four blocks take the whole budget.
+    A(0, end, 0x48000000, 0x10000, 0);
+    const u64 gnm = A(0, end, 0x10000, 0x10000, 3);
+    const u64 third = A(0, end, 0x20000000, 0x10000, 0);
+    A(0, end, size - (third + 0x20000000), 0x10000, 3);
+    A(0, end, 0x4000, 0, 0); // nothing left
+    R(gnm, 0x10000);
+    A(0, end, 0x8000, 0, 1); // the hole
+    R(0, size);              // everything, allocated or not
+
+    // Parameter checks, in the oracle's order.
+    A(-0x4000, end, 0x4000, 0, 0);
+    A(0, -1, 0x4000, 0, 0);
+    A(0, end, 0, 0, 0);
+    A(0, end, 0x2000, 0, 0);
+    A(0, end, 0x4000, 0x2000, 0);
+    A(0, end, 0x4000, 0, 11);
+    s.Line("Allocate(out = NULL) -> {}",
+           Code(Call<s32>(alloc, s64{0}, end, u64{0x4000}, u64{0}, s32{0}, static_cast<s64*>(nullptr))));
+    A(0x8000, 0x8000, 0x4000, 0, 0);
+    A(0x8000, 0x4000, 0x4000, 0, 0);
+    A(0, 0x4000, 0x8000, 0, 0);
+    A(0x4000, 0x8000, 0x8000, 0, 0);
+    A(end, end + 0x10000, 0x4000, 0, 0);
+    R(A(0, end + 0x100000, 0x4000, 0, 0), 0x4000); // a search end beyond the budget
+    R(A(0, end, 0x4000, 0, 10), 0x4000);
+    R(A(0, end, 0x4000, 0, -1), 0x4000);           // a negative type passes, as with the oracle
+    R(A(0x6000, end, 0x4000, 0, 2), 0x4000);       // an unaligned search start
+
+    // First fit with holes, windows and alignments.
+    const u64 x = A(0, end, 0x10000, 0, 0);
+    const u64 y = A(0, end, 0x10000, 0, 0);
+    const u64 z = A(0, end, 0x10000, 0, 0);
+    R(y, 0x10000);
+    A(0, end, 0x8000, 0, 0);
+    A(0, end, 0x10000, 0, 0);
+    A(static_cast<s64>(y + 0x8000), end, 0x4000, 0x4000, 0);
+    A(0, end, 0x4000, 0x20000, 2);
+    A(0, end, 0x4000, 0xC000, 2); // a page multiple that is not a power of two
+    A(0, static_cast<s64>(z + 0x14000), 0x10000, 0, 0);
+    A(0, end, 0x10000, 0x40000000, 0);
+
+    // Release rules.
+    R(0x2000, 0x4000);
+    R(0x4000, 0x2000);
+    R(0x2000, 0);
+    R(0x4000, 0);
+    R(size + 0x4000, 0x4000);
+    R(size, 0x4000);
+    R(z + 0x4000, 0x4000); // the middle of an allocation
+    A(0, end, 0x4000, 0, 4);
+    A(0, end, 0x8000, 0, 4);
+    R(x, 0x10000);
+    R(x, 0x10000); // again
+    R(0, size);
+    s.Line("after releasing everything: GetDirectMemorySize -> {:#x}", Call<u64>(get_size));
+}
+
+void TestDirectMemoryOracle(Totals& t) {
+    InputChecks c(t, "KernelDmem(pre)");
+    auto& dmem = Memory::GameDirectMemory();
+    const u64 size = Core::Memory::Instance()->GetTotalDirectSize();
+    const bool ready = BridgeDirectMemoryUntouched() && dmem.Configure(size);
+    c.Check("both maps start untouched, the native one sized like the bridge's", ready, fmt::format("{:#x}", size));
+    c.Summary();
+    if (!ready) {
+        return;
+    }
+    Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+    DmemScript(native);
+    native.Line("map back to one free area: {}", dmem.Pristine() && dmem.Snapshot().size() == 1);
+    DmemScript(bridge);
+    bridge.Line("map back to one free area: {}", BridgeDirectMemoryUntouched());
+    Compare(t, "KernelDmem", native, bridge);
+    dmem.Configure(0);
+}
+
+/// A fake virtual memory side for DirectMemory: a "view" is a mapped physical range (BeginMap);
+/// UnmapPhysical removes the overlap of every view with the released ranges, as the bridge does.
+class FakeViews final : public Memory::Unmapper {
+public:
+    explicit FakeViews(Memory::DirectMemory& m) : m_{m} {}
+
+    /// Counted and recorded under one lock, which UnmapPhysical takes too (the bridge's unmap_mutex).
+    s32 Map(u64 phys, u64 len, bool exclusive) {
+        std::scoped_lock lock{mutex_};
+        const s32 r = m_.BeginMap(phys, len, exclusive, nullptr);
+        if (r == Memory::kOk) {
+            views_.push_back({phys, len});
+        }
+        return r;
+    }
+
+    s32 UnmapPhysical(std::span<const Memory::PhysRange> ranges) override {
+        ++calls;
+        {
+            std::scoped_lock lock{mutex_};
+            last.assign(ranges.begin(), ranges.end());
+        }
+        if (during) {
+            during();
+        }
+        if (fail != 0) {
+            return fail;
+        }
+        if (!keep_views) {
+            std::scoped_lock lock{mutex_};
+            for (const auto& r : ranges) {
+                RemoveLocked(r.base, r.size);
+            }
+        }
+        return Memory::kOk;
+    }
+
+    size_t Views() {
+        std::scoped_lock lock{mutex_};
+        return views_.size();
+    }
+
+    std::atomic<int> calls{0};
+    s32 fail = 0;
+    bool keep_views = false;
+    std::vector<Memory::PhysRange> last;
+    std::function<void()> during;
+
+private:
+    void RemoveLocked(u64 base, u64 len) {
+        std::vector<Memory::PhysRange> next;
+        for (const auto& v : views_) {
+            const u64 lo = std::max(v.base, base);
+            const u64 hi = std::min(v.base + v.size, base + len);
+            if (lo >= hi) {
+                next.push_back(v);
+                continue;
+            }
+            m_.EndMap(lo, hi - lo);
+            if (v.base < lo) {
+                next.push_back({v.base, lo - v.base});
+            }
+            if (hi < v.base + v.size) {
+                next.push_back({hi, v.base + v.size - hi});
+            }
+        }
+        views_ = std::move(next);
+    }
+
+    Memory::DirectMemory& m_;
+    std::mutex mutex_;
+    std::vector<Memory::PhysRange> views_;
+};
+
+/// SecondSonPC's direct memory on its own: limits and overflows, the oracle's defects it does not
+/// copy, view counting, release with failing or incomplete unmapping, a page-by-page reference
+/// model, threads, cycles.
+void TestDirectMemoryNative(Totals& t) {
+    InputChecks c(t, "KernelDmem(n)");
+    constexpr u64 P = kDmemPage;
+    constexpr u64 kMax = ~0ull;
+    constexpr s32 kOk = Memory::kOk;
+    constexpr s32 kEinval = Memory::kErrEinval;
+    constexpr s32 kEagain = Memory::kErrEagain;
+    constexpr s32 kEnomem = Memory::kErrEnomem;
+    constexpr s32 kEbusy = Memory::kErrEbusy;
+    constexpr s32 kEnoent = Memory::kErrEnoent;
+    using Memory::AreaState;
+
+    {
+        Memory::DirectMemory m;
+        u64 out = 1;
+        c.Check("unconfigured: size 0, every allocation EAGAIN",
+                m.Size() == 0 && m.Allocate(0, kMax, P, 0, 0, &out) == kEagain && m.Pristine(), "");
+        c.Check("Configure: a size that is not a page multiple is refused", !m.Configure(P + 1) && m.Size() == 0, "");
+    }
+    {
+        Memory::DirectMemory m(64 * P);
+        u64 out = 0;
+        c.Check("Allocate: empty or unaligned length, unaligned alignment, NULL out -> EINVAL",
+                m.Allocate(0, kMax, 0, 0, 0, &out) == kEinval && m.Allocate(0, kMax, P / 2, 0, 0, &out) == kEinval &&
+                    m.Allocate(0, kMax, P, P / 2, 0, &out) == kEinval &&
+                    m.Allocate(0, kMax, P, 0, 0, nullptr) == kEinval && m.Pristine(),
+                DmemText(m));
+        c.Check("Allocate: a length near 2^64 -> EAGAIN, nothing allocated",
+                m.Allocate(0, kMax, kMax - P + 1, 0, 0, &out) == kEagain && m.Pristine(), DmemText(m));
+        c.Check("Allocate: alignment 2^63 past 0 -> EAGAIN (the aligned start lies past the map)",
+                m.Allocate(P, kMax, P, 1ull << 63, 0, &out) == kEagain && m.Pristine(), DmemText(m));
+        const s32 at0 = m.Allocate(0, kMax, P, 1ull << 63, 0, &out);
+        c.Check("Allocate: alignment 2^63 from 0 -> 0", at0 == kOk && out == 0, fmt::format("{:#x}", out));
+        m.Release(0, P, false, nullptr);
+        c.Check("Allocate: a search start near 2^64 -> EAGAIN", m.Allocate(kMax - P + 1, kMax, P, 0, 0, &out) == kEagain,
+                "");
+        const s32 all = m.Allocate(0, kMax, 64 * P, 0, 7, &out);
+        c.Check("Allocate: the whole map, then nothing is left",
+                all == kOk && out == 0 && m.Allocate(0, kMax, P, 0, 0, &out) == kEagain, DmemText(m));
+        c.Check("Release: start + len wraps -> EINVAL and nothing is freed (oracle defect D1)",
+                m.Release(P, kMax - P + 1, false, nullptr) == kEinval && DmemAreaAt(m, 0).size == 64 * P,
+                DmemText(m));
+        c.Check("Release: unaligned start or length -> EINVAL, length 0 -> OK",
+                m.Release(P / 2, P, false, nullptr) == kEinval && m.Release(P, P / 2, false, nullptr) == kEinval &&
+                    m.Release(P / 2, 0, false, nullptr) == kEinval && m.Release(P, 0, false, nullptr) == kOk,
+                "");
+        c.Check("Release at or beyond the end of the map -> OK, nothing changes",
+                m.Release(64 * P, P, false, nullptr) == kOk && m.Release(1000 * P, P, false, nullptr) == kOk &&
+                    DmemAreaAt(m, 0).size == 64 * P,
+                DmemText(m));
+        c.Check("Release running past the end frees exactly up to the end (oracle defect D4)",
+                m.Release(60 * P, 100 * P, false, nullptr) == kOk && DmemAreaAt(m, 0).size == 60 * P &&
+                    DmemAreaAt(m, 60 * P).state == AreaState::Free && m.CheckInvariants().empty(),
+                DmemText(m));
+        c.Check("BeginMap: a wrapping range -> ENOMEM (oracle defect D9), beyond the map -> ENOMEM, "
+                "unaligned or empty -> EINVAL",
+                m.BeginMap(P, kMax - P + 1, false, nullptr) == kEnomem && m.BeginMap(56 * P, 16 * P, false, nullptr) == kEnomem &&
+                    m.BeginMap(P / 2, P, false, nullptr) == kEinval && m.BeginMap(0, 0, false, nullptr) == kEinval &&
+                    DmemAreaAt(m, 0).mappings == 0,
+                DmemText(m));
+        m.Release(0, 64 * P, false, nullptr);
+        c.Check("everything released: one free area, invariants hold",
+                m.Pristine() && m.Snapshot().size() == 1 && m.CheckInvariants().empty(), m.CheckInvariants());
+    }
+    {
+        // Bookkeeping only (no memory behind it): a map almost 2^64 bytes large, so that aligned
+        // starts and range ends really reach the top of the 64-bit space.
+        Memory::DirectMemory m(kMax - P + 1);
+        u64 out = 0;
+        const s32 wrap_align = m.Allocate((1ull << 63) + P, kMax, P, 1ull << 63, 0, &out);
+        const s32 at_top = m.Allocate(kMax - 2 * P + 1, kMax, P, 0, 5, &out);
+        const u64 top = out;
+        const s32 past_top = m.Allocate(kMax - 2 * P + 1, kMax, 2 * P, 0, 5, &out);
+        c.Check("near 2^64: an aligned start that would wrap -> EAGAIN; the last page can be allocated, two "
+                "pages from there cannot",
+                wrap_align == kEagain && at_top == kOk && top == kMax - 2 * P + 1 && past_top == kEagain,
+                fmt::format("{:#x} {:#x} {:#x} top {:#x}", static_cast<u32>(wrap_align), static_cast<u32>(at_top),
+                            static_cast<u32>(past_top), top));
+        const s32 map_top = m.BeginMap(top, P, true, nullptr);
+        m.EndMap(top, P);
+        c.Check("near 2^64: the last page maps and is released; a release wrapping past 2^64 -> EINVAL",
+                map_top == kOk && m.Release(top, 2 * P, false, nullptr) == kEinval &&
+                    m.Release(top, P, false, nullptr) == kOk && m.Pristine() && m.CheckInvariants().empty(),
+                DmemText(m));
+    }
+    {
+        Memory::DirectMemory m(0x120000000);
+        u64 p1 = 0, p2 = 0, p3 = 0, p4 = 0, more = 0;
+        const bool ok = m.Allocate(0, 0x120000000, 0x48000000, 0x10000, 0, &p1) == kOk &&
+                        m.Allocate(0, 0x120000000, 0x10000, 0x10000, 3, &p2) == kOk &&
+                        m.Allocate(0, 0x120000000, 0x20000000, 0x10000, 0, &p3) == kOk &&
+                        m.Allocate(0, 0x120000000, 0xb7ff0000, 0x10000, 3, &p4) == kOk;
+        c.Check("the game's start-up on its budget: 0x0, 0x48000000, 0x48010000, 0x68010000 (as logged with the bridge)",
+                ok && p1 == 0 && p2 == 0x48000000 && p3 == 0x48010000 && p4 == 0x68010000,
+                fmt::format("{:#x} {:#x} {:#x} {:#x}", p1, p2, p3, p4));
+        c.Check("... and then the budget is used up", m.Allocate(0, 0x120000000, P, 0, 0, &more) == kEagain, "");
+    }
+    {
+        Memory::Budget b{.flexible_size = 0x20000000, .extended2 = false};
+        const u64 game = Memory::DirectMemorySize(b);
+        b.extended2 = true;
+        const u64 extended = Memory::DirectMemorySize(b);
+        const u64 neo = Memory::DirectMemorySize({.neo = true, .flexible_size = 0x20000000, .extended1 = false});
+        const u64 devkit = Memory::DirectMemorySize({.dev_kit = true, .flexible_size = 0x20000000, .extended2 = false});
+        const u64 extra = Memory::DirectMemorySize(
+            {.extra_dmem_mib = 256, .extra_fmem_mib = 128, .flexible_size = 0x20000000, .extended2 = false});
+        const u64 too_big = Memory::DirectMemorySize({.flexible_size = 6000ull << 20});
+        c.Check("budget: the game's SceKernelMemParam (flexible 512 MiB, no extended memory 2) = 0x120000000; "
+                "with it 0x128000000; Pro without extended 1 0x140000000; devkit 0x178000000; "
+                "+256 MiB direct +128 MiB flexible 0x130000000; flexible larger than everything 0",
+                game == 0x120000000 && extended == 0x128000000 && neo == 0x140000000 && devkit == 0x178000000 &&
+                    extra == 0x130000000 && too_big == 0,
+                fmt::format("{:#x} {:#x} {:#x} {:#x} {:#x} {:#x}", game, extended, neo, devkit, extra, too_big));
+    }
+    {
+        Memory::DirectMemory m(64 * P);
+        u64 a = 0, b = 0;
+        m.Allocate(0, kMax, 8 * P, 0, 3, &a);
+        m.Allocate(0, kMax, 8 * P, 0, 5, &b);
+        std::vector<Memory::PhysSlice> slices;
+        const s32 both = m.BeginMap(0, 16 * P, true, &slices);
+        c.Check("BeginMap over two allocations of types 3 and 5: two slices",
+                both == kOk && slices.size() == 2 && slices[0].base == 0 && slices[0].size == 8 * P &&
+                    slices[0].memory_type == 3 && slices[1].base == 8 * P && slices[1].memory_type == 5,
+                DmemText(m));
+        m.EndMap(0, 16 * P);
+        c.Check("BeginMap of free pages -> ENOMEM", m.BeginMap(16 * P, P, false, nullptr) == kEnomem, "");
+        const s32 first = m.BeginMap(0, 8 * P, true, nullptr);
+        const s32 second = m.BeginMap(0, 8 * P, true, nullptr);
+        const s32 alias = m.BeginMap(0, 8 * P, false, nullptr);
+        c.Check("exclusive view, a second exclusive one -> EBUSY, a non-exclusive alias -> OK (2 views)",
+                first == kOk && second == kEbusy && alias == kOk && DmemAreaAt(m, 0).mappings == 2, DmemText(m));
+        m.EndMap(0, 8 * P);
+        c.Check("one of two views unmapped: the pages stay mapped, an exclusive view is still EBUSY (oracle defect D3)",
+                DmemAreaAt(m, 0).mappings == 1 && m.BeginMap(0, 8 * P, true, nullptr) == kEbusy, DmemText(m));
+        m.EndMap(0, 8 * P);
+        c.Check("both unmapped: an exclusive view is possible again",
+                m.BeginMap(0, 8 * P, true, nullptr) == kOk && DmemAreaAt(m, 0).mappings == 1, DmemText(m));
+        c.Check("the first failing page decides: mapped pages first -> EBUSY; then free pages -> ENOMEM",
+                m.BeginMap(0, 20 * P, true, nullptr) == kEbusy && m.BeginMap(8 * P, 12 * P, true, nullptr) == kEnomem, "");
+        const s32 half_free = m.BeginMap(4 * P, 16 * P, false, nullptr);
+        c.Check("BeginMap partly over free pages -> ENOMEM and no count changes (all or nothing)",
+                half_free == kEnomem && DmemAreaAt(m, 4 * P).mappings == 1 && DmemAreaAt(m, 8 * P).mappings == 0,
+                DmemText(m));
+        m.EndMap(2 * P, 2 * P);
+        c.Check("a view unmapped in the middle: counts 1 / 0 / 1",
+                DmemAreaAt(m, 0).mappings == 1 && DmemAreaAt(m, 2 * P).mappings == 0 &&
+                    DmemAreaAt(m, 4 * P).mappings == 1 && m.CheckInvariants().empty(),
+                DmemText(m));
+        m.EndMap(2 * P, 2 * P); // was not mapped: logged, no underflow
+        c.Check("EndMap of pages that are not mapped: the count stays 0 (accounting error logged)",
+                DmemAreaAt(m, 2 * P).mappings == 0 && m.CheckInvariants().empty(), DmemText(m));
+        m.EndMap(0, 2 * P);
+        m.EndMap(4 * P, 4 * P);
+        m.Release(0, 64 * P, false, nullptr);
+        c.Check("views gone and released: one free area", m.Pristine() && m.Snapshot().size() == 1, DmemText(m));
+    }
+    {
+        Memory::DirectMemory m(64 * P);
+        FakeViews v{m};
+        u64 a = 0;
+        m.Allocate(0, kMax, 16 * P, 0, 3, &a);
+        v.Map(0, 16 * P, false);
+        v.Map(4 * P, 4 * P, false);
+        bool releasing_seen = false;
+        bool unavailable = false;
+        v.during = [&] {
+            u64 o = 0;
+            releasing_seen = DmemAreaAt(m, 0).state == AreaState::Releasing &&
+                             DmemAreaAt(m, 15 * P).state == AreaState::Releasing;
+            unavailable = m.Allocate(0, 16 * P, P, 0, 0, &o) == kEagain && m.BeginMap(0, P, false, nullptr) == kEnomem;
+        };
+        const s32 r = m.Release(0, 16 * P, false, &v);
+        c.Check("release of mapped memory: the views go first (one call with exactly the range), then the pages are free",
+                r == kOk && v.calls == 1 && v.last.size() == 1 && v.last[0].base == 0 && v.last[0].size == 16 * P &&
+                    v.Views() == 0 && m.Pristine(),
+                DmemText(m));
+        c.Check("... while the views are removed the pages are 'releasing': neither allocated nor mapped again",
+                releasing_seen && unavailable, "");
+    }
+    {
+        Memory::DirectMemory m(64 * P);
+        FakeViews v{m};
+        u64 a = 0;
+        m.Allocate(0, kMax, 8 * P, 0, 4, &a);
+        v.Map(0, 8 * P, false);
+        v.fail = static_cast<s32>(0x8002000E);
+        const s32 r = m.Release(0, 8 * P, false, &v);
+        c.Check("the unmapping fails: its error is returned, the range is allocated again with its type and view",
+                r == static_cast<s32>(0x8002000E) && DmemAreaAt(m, 0).state == AreaState::Allocated &&
+                    DmemAreaAt(m, 0).memory_type == 4 && DmemAreaAt(m, 0).mappings == 1 && m.CheckInvariants().empty(),
+                DmemText(m));
+        v.fail = 0;
+        v.keep_views = true;
+        const s32 busy = m.Release(0, 8 * P, false, &v);
+        c.Check("a view survives the unmapping: EBUSY, the pages are not freed",
+                busy == kEbusy && DmemAreaAt(m, 0).state == AreaState::Allocated && DmemAreaAt(m, 0).mappings == 1,
+                DmemText(m));
+        const s32 none = m.Release(0, 8 * P, false, nullptr);
+        c.Check("mapped pages and no unmapper: EBUSY, the pages are not freed",
+                none == kEbusy && DmemAreaAt(m, 0).state == AreaState::Allocated, DmemText(m));
+        v.keep_views = false;
+        const int calls = v.calls;
+        c.Check("then a working unmapper releases them", m.Release(0, 8 * P, false, &v) == kOk && m.Pristine() &&
+                                                           v.calls == calls + 1,
+                DmemText(m));
+        m.Allocate(0, kMax, 8 * P, 0, 4, &a);
+        const int before = v.calls;
+        c.Check("release of unmapped memory does not call the unmapper",
+                m.Release(0, 8 * P, false, &v) == kOk && v.calls == before && m.Pristine(), "");
+    }
+    {
+        Memory::DirectMemory m(64 * P);
+        FakeViews v{m};
+        u64 a = 0;
+        m.Allocate(0, kMax, 16 * P, 0, 2, &a);
+        v.Map(0, 16 * P, false);
+        const s32 r = m.Release(4 * P, 4 * P, false, &v);
+        c.Check("release of the middle of a view: exactly the middle is unmapped and freed",
+                r == kOk && v.last.size() == 1 && v.last[0].base == 4 * P && v.last[0].size == 4 * P && v.Views() == 2 &&
+                    DmemAreaAt(m, 0).mappings == 1 && DmemAreaAt(m, 4 * P).state == AreaState::Free &&
+                    DmemAreaAt(m, 8 * P).mappings == 1,
+                DmemText(m));
+        const s32 again = m.Release(4 * P, 4 * P, false, &v);
+        c.Check("the same release again: OK, nothing changes", again == kOk && DmemAreaAt(m, 8 * P).mappings == 1, "");
+        const s32 checked_hole = m.Release(0, 16 * P, true, &v);
+        const s32 checked_end = m.Release(60 * P, 8 * P, true, &v);
+        c.Check("checked release over a hole or past the end: ENOENT, nothing changes",
+                checked_hole == kEnoent && checked_end == kEnoent && DmemAreaAt(m, 0).mappings == 1, DmemText(m));
+        c.Check("Configure while allocated is refused", !m.Configure(32 * P) && m.Size() == 64 * P, "");
+        m.Release(0, 64 * P, false, &v);
+        c.Check("the rest released (views removed): Configure is possible again",
+                m.Pristine() && v.Views() == 0 && m.Configure(32 * P) && m.Size() == 32 * P, DmemText(m));
+    }
+    {
+        // Reference model: one entry per page (-1 free, else the type); first fit = the lowest aligned
+        // start at or after the search start whose pages are all free and that ends inside the window.
+        constexpr u64 kPages = 256;
+        Memory::DirectMemory m(kPages * P);
+        std::vector<s32> ref(kPages, -1);
+        std::mt19937_64 rng(20261009);
+        int mismatches = 0;
+        std::string first;
+        const auto pages = [&] {
+            std::vector<s32> v(kPages, -1);
+            for (const auto& a : m.Snapshot()) {
+                for (u64 p = a.base / P; p < (a.base + a.size) / P; ++p) {
+                    v[p] = a.state == AreaState::Free ? -1 : a.memory_type;
+                }
+            }
+            return v;
+        };
+        constexpr std::array<u64, 6> kAligns{0, P, 2 * P, 3 * P, 4 * P, 16 * P};
+        for (int i = 0; i < 4000; ++i) {
+            if (rng() % 3 != 0) {
+                const u64 start = (rng() % (kPages * P)) & ~u64{0x3FF};
+                const u64 stop = rng() % 4 == 0 ? kMax : start + (rng() % (kPages * P));
+                const u64 len = (1 + rng() % 16) * P;
+                const u64 align = kAligns[rng() % kAligns.size()];
+                const s32 type = static_cast<s32>(rng() % 11);
+                std::optional<u64> expect;
+                const u64 step = align == 0 ? P : align;
+                const u64 limit = std::min(stop, kPages * P);
+                for (u64 base = (start + step - 1) / step * step; base + len <= limit; base += step) {
+                    bool free = true;
+                    for (u64 p = base / P; p < (base + len) / P && free; ++p) {
+                        free = ref[p] == -1;
+                    }
+                    if (free) {
+                        expect = base;
+                        break;
+                    }
+                }
+                u64 got = 0;
+                const s32 r = m.Allocate(start, stop, len, align, type, &got);
+                if ((r == kOk) != expect.has_value() || (r == kOk && got != *expect)) {
+                    if (mismatches++ == 0) {
+                        first = fmt::format("Allocate({:#x}, {:#x}, {:#x}, {:#x}): {:#x} {:#x}, model {}", start, stop,
+                                            len, align, static_cast<u32>(r), got,
+                                            expect ? fmt::format("{:#x}", *expect) : "none");
+                    }
+                }
+                if (r == kOk) {
+                    for (u64 p = got / P; p < (got + len) / P; ++p) {
+                        ref[p] = type;
+                    }
+                }
+            } else {
+                const u64 start = (rng() % kPages) * P;
+                const u64 len = (rng() % 40) * P;
+                m.Release(start, len, false, nullptr);
+                for (u64 p = start / P; p < std::min(kPages, (start + len) / P); ++p) {
+                    ref[p] = -1;
+                }
+            }
+            if (pages() != ref && mismatches++ == 0) {
+                first = fmt::format("step {}: page map differs from the model", i);
+            }
+        }
+        c.Check("4000 random allocations/releases (search windows, alignments 0..16 pages, types) match a page-by-page "
+                "first-fit model",
+                mismatches == 0 && m.CheckInvariants().empty(), fmt::format("{} mismatches, first: {}", mismatches, first));
+    }
+    {
+        Memory::DirectMemory m(1024 * P);
+        FakeViews v{m};
+        std::mutex owned_mutex;
+        std::map<u64, u64> owned;
+        std::atomic<int> overlaps{0}, errors{0}, invariant_failures{0};
+        std::atomic<bool> stop{false};
+        std::thread checker([&] {
+            while (!stop) {
+                if (!m.CheckInvariants().empty()) {
+                    ++invariant_failures;
+                }
+                std::this_thread::yield();
+            }
+        });
+        std::vector<std::thread> workers;
+        for (int w = 0; w < 8; ++w) {
+            workers.emplace_back([&, w] {
+                std::mt19937_64 rng(1000 + w);
+                std::vector<std::pair<u64, u64>> mine;
+                const auto drop = [&](size_t k) {
+                    const u64 base = mine[k].first;
+                    const u64 len = mine[k].second;
+                    {
+                        std::scoped_lock lock{owned_mutex};
+                        owned.erase(base);
+                    }
+                    if (m.Release(base, len, false, &v) != kOk) {
+                        ++errors;
+                    }
+                    mine.erase(mine.begin() + static_cast<std::ptrdiff_t>(k));
+                };
+                for (int i = 0; i < 3000; ++i) {
+                    if (rng() % 2 == 0 || mine.empty()) {
+                        const u64 len = (1 + rng() % 8) * P;
+                        const u64 align = std::array<u64, 3>{0, P, 4 * P}[rng() % 3];
+                        u64 base = 0;
+                        if (m.Allocate(0, kMax, len, align, static_cast<s32>(rng() % 4), &base) != kOk) {
+                            continue;
+                        }
+                        {
+                            std::scoped_lock lock{owned_mutex};
+                            const auto next = owned.lower_bound(base);
+                            if ((next != owned.end() && next->first < base + len) ||
+                                (next != owned.begin() && std::prev(next)->first + std::prev(next)->second > base)) {
+                                ++overlaps;
+                            }
+                            owned[base] = len;
+                        }
+                        mine.emplace_back(base, len);
+                        if (rng() % 2 == 0 && v.Map(base, len, false) != kOk) {
+                            ++errors;
+                        }
+                    } else {
+                        drop(rng() % mine.size());
+                    }
+                }
+                while (!mine.empty()) {
+                    drop(mine.size() - 1);
+                }
+            });
+        }
+        for (auto& th : workers) {
+            th.join();
+        }
+        stop = true;
+        checker.join();
+        c.Check("8 threads x 3000 allocate / map / release: never two owners of a page, the map always consistent, "
+                "all free at the end",
+                overlaps == 0 && errors == 0 && invariant_failures == 0 && m.Pristine() && v.Views() == 0,
+                fmt::format("overlaps {} errors {} invariant failures {} {}", overlaps.load(), errors.load(),
+                            invariant_failures.load(), DmemText(m)));
+    }
+    {
+        // Mapping the very pages being released: a view either exists before the release marks them
+        // (then the release removes it) or its BeginMap fails; never a view of freed memory.
+        Memory::DirectMemory m(64 * P);
+        FakeViews v{m};
+        int not_ok = 0, late = 0, mapped_before = 0, concurrent_releases_ok = 0;
+        std::atomic<bool> in_unmap{false};
+        v.during = [&] {
+            in_unmap = true; // the second release starts now, while these pages are 'releasing'
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        for (int round = 0; round < 200; ++round) {
+            u64 base = 0;
+            m.Allocate(0, kMax, 4 * P, 0, 1, &base);
+            v.Map(base, 4 * P, false); // the first release goes through the unmapper
+            in_unmap = false;
+            std::atomic<bool> released{false};
+            std::atomic<int> late_maps{0}, maps{0};
+            std::thread mapper([&] {
+                for (int i = 0; i < 40; ++i) {
+                    const bool after = released.load();
+                    if (v.Map(base, 4 * P, false) == kOk) {
+                        ++maps;
+                        late_maps += after ? 1 : 0;
+                    }
+                }
+            });
+            std::thread second([&] {
+                for (int i = 0; i < 2000 && !in_unmap; ++i) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                if (m.Release(base, 4 * P, false, &v) == kOk && DmemAreaAt(m, base).state == AreaState::Free) {
+                    ++concurrent_releases_ok;
+                }
+            });
+            for (int i = 0; i < 2000 && maps.load() == 0; ++i) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50)); // the mapper is under way
+            }
+            const s32 r = m.Release(base, 4 * P, false, &v);
+            released = true;
+            mapper.join();
+            second.join();
+            not_ok += r == kOk ? 0 : 1;
+            late += late_maps;
+            mapped_before += maps > 0 ? 1 : 0;
+        }
+        v.during = nullptr;
+        c.Check("200 rounds: a second release of a range that is being released (and mapped by another thread) "
+                "returns only when the range is free; no view survives or appears after the release",
+                not_ok == 0 && late == 0 && concurrent_releases_ok == 200 && mapped_before > 100 && v.Views() == 0 &&
+                    m.Pristine() &&
+                    m.CheckInvariants().empty(),
+                fmt::format("failed {} late views {} second ok {} rounds with views {} {}", not_ok, late,
+                            concurrent_releases_ok, mapped_before, DmemText(m)));
+    }
+    {
+        Memory::DirectMemory m(512 * P);
+        FakeViews v{m};
+        std::mt19937_64 rng(7);
+        bool ok = true;
+        for (int i = 0; i < 1000 && ok; ++i) {
+            u64 base = 0;
+            const u64 len = (1 + rng() % 32) * P;
+            ok = m.Allocate(0, kMax, len, rng() % 2 == 0 ? 0 : 8 * P, 3, &base) == kOk;
+            const int views = static_cast<int>(rng() % 3);
+            for (int k = 0; k < views && ok; ++k) {
+                ok = v.Map(base, len, false) == kOk;
+            }
+            ok = ok && m.Release(base, len, false, &v) == kOk;
+        }
+        c.Check("1000 allocate / map / release cycles: one free area, no view left",
+                ok && m.Pristine() && m.Snapshot().size() == 1 && v.Views() == 0, DmemText(m));
+    }
+    c.Summary();
+}
+
+size_t BridgeVmaCount() {
+    const std::string text = MemoryMapText();
+    size_t count = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t eol = text.find('\n', pos);
+        const std::string_view line(text.data() + pos, (eol == std::string::npos ? text.size() : eol) - pos);
+        if (line.starts_with("# direct memory")) {
+            break;
+        }
+        count += line.starts_with("0x") ? 1 : 0;
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    return count;
+}
+
+/// --native kernel-dmem on the bridge's real memory manager (the game is not running): NATIVE
+/// allocations mapped and unmapped by the BRIDGE's functions, the host's view of the address space
+/// (VirtualQuery) and the GPU's (Rasterizer::IsMapped) after every step, the switch refused once the
+/// bridge's own map is in use. Only mapped memory is touched.
+void TestDirectMemoryBridge(Totals& t, const App::Config& cfg) {
+    InputChecks c(t, "KernelDmem(int)");
+    constexpr s32 kEbusy = Memory::kErrEbusy;
+    constexpr s32 kEnomem = Memory::kErrEnomem;
+    auto* mm = Core::Memory::Instance();
+    auto& dmem = Memory::GameDirectMemory();
+    const u64 total = mm->GetTotalDirectSize();
+    const void* alloc = NativeOf(DmemNid::kAllocate);
+    const void* release = NativeOf(DmemNid::kRelease);
+    const void* bridge_alloc = BridgeOf(DmemNid::kAllocate);
+    const void* bridge_release = BridgeOf(DmemNid::kRelease);
+    const void* map = BridgeOf(DmemNid::kMap);
+    const void* munmap = BridgeOf(DmemNid::kMunmap);
+    if (presenter == nullptr || map == nullptr || munmap == nullptr) {
+        c.Check("the bridge's GPU and memory functions are available", false, "");
+        c.Summary();
+        return;
+    }
+    auto& rasterizer = presenter->GetRasterizer();
+
+    s64 early = -1;
+    Call<s32>(bridge_alloc, s64{0}, static_cast<s64>(total), u64{0x10000}, u64{0}, s32{0}, &early);
+    const bool refused = !InstallNativeDirectMemory(cfg);
+    Call<s32>(bridge_release, static_cast<u64>(early), u64{0x10000});
+    c.Check("the switch is refused once the bridge's own map has an allocation (decided before resources exist)",
+            refused && !NativeDirectMemoryInstalled() && BridgeDirectMemoryUntouched(), "");
+
+    const size_t vmas_before = BridgeVmaCount();
+    const bool configured = BridgeDirectMemoryUntouched() && dmem.Configure(total);
+    const bool installed = configured && InstallNativeDirectMemory(cfg);
+    c.Check("installed on the untouched memory manager; the bridge's budget now comes from the native map",
+            installed && NativeDirectMemoryInstalled() && mm->GetTotalDirectSize() == total,
+            fmt::format("configured {} installed {}", configured, installed));
+    if (!installed) {
+        dmem.Configure(0);
+        c.Summary();
+        return;
+    }
+
+    const auto Alloc = [&](u64 len, s32 type) {
+        s64 phys = -1;
+        const s32 r = Call<s32>(alloc, s64{0}, static_cast<s64>(total), len, u64{0}, type, &phys);
+        return r == 0 ? static_cast<u64>(phys) : ~0ull;
+    };
+    const auto Map = [&](u64 phys, u64 len, s32 prot, s32 flags, u64 at) {
+        void* addr = reinterpret_cast<void*>(at);
+        const s32 r = Call<s32>(map, &addr, len, prot, flags, static_cast<s64>(phys), u64{0});
+        return std::pair<s32, u64>{r, reinterpret_cast<u64>(addr)};
+    };
+    const auto Rel = [&](u64 phys, u64 len) { return Call<s32>(release, phys, len); };
+    const auto committed = [](u64 va) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        return VirtualQuery(reinterpret_cast<void*>(va), &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT &&
+               mbi.Type == MEM_MAPPED;
+    };
+    const auto placeholder = [](u64 va) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        return VirtualQuery(reinterpret_cast<void*>(va), &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_RESERVE;
+    };
+    const auto bridge_view = [](u64 va, Libraries::Kernel::OrbisVirtualQueryInfo& info) {
+        return Libraries::Kernel::sceKernelVirtualQuery(reinterpret_cast<const void*>(va), 0, &info, sizeof(info));
+    };
+    Libraries::Kernel::OrbisVirtualQueryInfo info{};
+
+    const u64 p = Alloc(0x40000, 3);
+    const auto [r1, va] = Map(p, 0x40000, 0x33, 0, 0);
+    const s32 q1 = bridge_view(va, info);
+    c.Check("a NATIVE allocation mapped by the BRIDGE: a direct view, offset = the physical address, type 3",
+            p != ~0ull && r1 == 0 && q1 == 0 && info.is_direct && info.offset == p && info.memory_type == 3 &&
+                info.end - info.start == 0x40000,
+            fmt::format("phys {:#x} map {} at {:#x} query {} offset {:#x}", p, Code(r1), va, Code(q1), info.offset));
+    c.Check("the view is real memory (MEM_COMMIT, MEM_MAPPED) and the GPU knows the range; the native map counts it",
+            committed(va) && committed(va + 0x3C000) && rasterizer.IsMapped(va, 0x40000) &&
+                DmemAreaAt(dmem, p).mappings == 1,
+            DmemText(dmem));
+    std::memset(reinterpret_cast<void*>(va), 0x5A, 0x40000);
+
+    const auto [r2, va2] = Map(p, 0x40000, 0x33, 0, 0);
+    c.Check("a second view of the same pages: EBUSY (SDK 4.00, no aliasing), not counted",
+            r2 == kEbusy && DmemAreaAt(dmem, p).mappings == 1, fmt::format("{} {}", Code(r2), DmemText(dmem)));
+
+    const u64 other = Alloc(0x10000, 0);
+    const auto [r3, va3] = Map(other, 0x10000, 0x3, 0x90, va); // Fixed | NoOverwrite over the view
+    c.Check("a mapping over an occupied range (Fixed | NoOverwrite): ENOMEM, the native count is rolled back",
+            r3 == kEnomem && DmemAreaAt(dmem, other).mappings == 0 && DmemAreaAt(dmem, p).mappings == 1,
+            fmt::format("{} {}", Code(r3), DmemText(dmem)));
+    const auto [r4, va4] = Map(total - 0x10000, 0x10000, 0x3, 0, 0);
+    const auto [r5, va5] = Map(total, 0x10000, 0x3, 0, 0);
+    c.Check("mapping free pages or pages past the budget: ENOMEM", r4 == kEnomem && r5 == kEnomem,
+            fmt::format("{} {}", Code(r4), Code(r5)));
+    Rel(other, 0x10000);
+    (void)va2;
+    (void)va3;
+    (void)va4;
+    (void)va5;
+
+    const s32 u = Call<s32>(munmap, reinterpret_cast<void*>(va + 0x20000), u64{0x20000});
+    c.Check("sceKernelMunmap (BRIDGE) of half the view: 1 view on the first half, 0 on the second, still allocated",
+            u == 0 && DmemAreaAt(dmem, p).mappings == 1 && DmemAreaAt(dmem, p + 0x20000).mappings == 0 &&
+                DmemAreaAt(dmem, p + 0x20000).state == Memory::AreaState::Allocated,
+            DmemText(dmem));
+    c.Check("... that half is a placeholder again and the GPU no longer has it; the other half is untouched",
+            placeholder(va + 0x20000) && !rasterizer.IsMapped(va + 0x20000, 0x20000) && committed(va) &&
+                rasterizer.IsMapped(va, 0x20000),
+            "");
+    const auto [r6, vb] = Map(p + 0x20000, 0x20000, 0x33, 0, 0);
+    c.Check("the unmapped half maps again (exclusive) and shows the data written through the first view",
+            r6 == 0 && DmemAreaAt(dmem, p + 0x20000).mappings == 1 && *reinterpret_cast<const u8*>(vb) == 0x5A &&
+                *reinterpret_cast<const u8*>(vb + 0x1FFFF) == 0x5A,
+            fmt::format("{} {}", Code(r6), DmemText(dmem)));
+
+    const s32 rr = Rel(p, 0x40000);
+    c.Check("NATIVE release of the mapped allocation: both views gone (host and GPU), the pages free, the bridge's "
+            "own map untouched",
+            rr == 0 && placeholder(va) && placeholder(vb) && !rasterizer.IsMapped(va, 0x20000) &&
+                !rasterizer.IsMapped(vb, 0x20000) && bridge_view(va, info) != 0 &&
+                DmemAreaAt(dmem, p).state == Memory::AreaState::Free && BridgeDirectMemoryUntouched(),
+            fmt::format("{} {}", Code(rr), DmemText(dmem)));
+
+    const u64 p9 = Alloc(0x30000, 0);
+    const auto [r9, v9] = Map(p9, 0x30000, 0x3, 0, 0);
+    std::memset(reinterpret_cast<void*>(v9), 0x11, 0x10000);
+    std::memset(reinterpret_cast<void*>(v9 + 0x20000), 0x33, 0x10000);
+    const s32 mid = Rel(p9 + 0x10000, 0x10000);
+    c.Check("releasing the middle of a mapped allocation unmaps exactly the middle of its view; the rest keeps its data",
+            r9 == 0 && mid == 0 && committed(v9) && placeholder(v9 + 0x10000) && committed(v9 + 0x20000) &&
+                *reinterpret_cast<const u8*>(v9 + 0xFFFF) == 0x11 && *reinterpret_cast<const u8*>(v9 + 0x20000) == 0x33 &&
+                DmemAreaAt(dmem, p9).mappings == 1 && DmemAreaAt(dmem, p9 + 0x10000).state == Memory::AreaState::Free &&
+                DmemAreaAt(dmem, p9 + 0x20000).mappings == 1,
+            DmemText(dmem));
+    Rel(p9, 0x30000);
+    c.Check("... and releasing the whole range removes the rest", placeholder(v9) && placeholder(v9 + 0x20000) && dmem.Pristine(),
+            DmemText(dmem));
+
+    {
+        // Fixed (overwrite) over an existing view: the bridge unmaps the old view first.
+        const u64 pa = Alloc(0x10000, 0);
+        const u64 pb = Alloc(0x10000, 3);
+        const auto [ra, vfa] = Map(pa, 0x10000, 0x3, 0, 0);
+        std::memset(reinterpret_cast<void*>(vfa), 0xA1, 0x10000);
+        const auto [rb, vfb] = Map(pb, 0x10000, 0x3, 0, 0);
+        std::memset(reinterpret_cast<void*>(vfb), 0xB2, 0x10000);
+        Call<s32>(munmap, reinterpret_cast<void*>(vfb), u64{0x10000});
+        const auto [rf, vf] = Map(pb, 0x10000, 0x3, 0x10, vfa); // Fixed at the first view's address
+        c.Check("a Fixed mapping over an existing view replaces it: the old pages lose their view, the new pages "
+                "have one, the address shows the new pages",
+                ra == 0 && rb == 0 && rf == 0 && vf == vfa && DmemAreaAt(dmem, pa).mappings == 0 &&
+                    DmemAreaAt(dmem, pb).mappings == 1 && *reinterpret_cast<const u8*>(vf) == 0xB2 &&
+                    rasterizer.IsMapped(vf, 0x10000),
+                fmt::format("{} {} {} {}", Code(ra), Code(rb), Code(rf), DmemText(dmem)));
+        Rel(pa, 0x10000);
+        Rel(pb, 0x10000);
+        c.Check("... both released: no view, nothing allocated", placeholder(vf) && dmem.Pristine(), DmemText(dmem));
+    }
+
+    s64 bp = -1;
+    const s32 ba = Call<s32>(bridge_alloc, s64{0}, static_cast<s64>(total), u64{0x10000}, u64{0}, s32{1}, &bp);
+    const auto in_native = DmemAreaAt(dmem, static_cast<u64>(bp));
+    const bool bridge_map_untouched = BridgeDirectMemoryUntouched();
+    const s32 br = Call<s32>(bridge_release, static_cast<u64>(bp), u64{0x10000});
+    c.Check("the BRIDGE's own sceKernelAllocate/ReleaseDirectMemory use the native map too (one source of truth)",
+            ba == 0 && in_native.state == Memory::AreaState::Allocated && in_native.memory_type == 1 &&
+                bridge_map_untouched && br == 0 && dmem.Pristine(),
+            fmt::format("{} {:#x} {}", Code(ba), bp, Code(br)));
+
+    bool cycles_ok = true;
+    for (int i = 0; i < 100 && cycles_ok; ++i) {
+        const u64 len = 0x10000ull * (1 + i % 4);
+        const u64 phys = Alloc(len, i % 2 == 0 ? 0 : 3);
+        const auto [r, view] = Map(phys, len, i % 2 == 0 ? 0x3 : 0x33, 0, 0);
+        if (i % 3 == 0) {
+            Call<s32>(munmap, reinterpret_cast<void*>(view), len);
+        }
+        cycles_ok = phys != ~0ull && r == 0 && Rel(phys, len) == 0 && placeholder(view);
+    }
+    c.Check("100 allocate / map / (unmap) / release cycles: no allocation, view or VMA left",
+            cycles_ok && dmem.Pristine() && BridgeVmaCount() == vmas_before,
+            fmt::format("VMAs {} -> {}", vmas_before, BridgeVmaCount()));
+
+    const bool uninstalled = UninstallNativeDirectMemory();
+    c.Check("switched back: the bridge's own map was never used, its budget is its own again",
+            uninstalled && !NativeDirectMemoryInstalled() && BridgeDirectMemoryUntouched() &&
+                mm->GetTotalDirectSize() == total && dmem.Configure(0),
+            "");
+    c.Summary();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -2821,6 +3702,9 @@ int RunSelfTest(const App::Config& cfg) {
     TestKernelEventFlag(t);
     TestTier1(t);
     TestPthreadSync(t);
+    TestDirectMemoryOracle(t);
+    TestDirectMemoryNative(t);
+    TestDirectMemoryBridge(t, cfg);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {

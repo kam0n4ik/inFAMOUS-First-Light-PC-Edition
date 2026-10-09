@@ -1,7 +1,8 @@
 // SecondSonPC — libkernel (Phase 2, P2.2). NATIVE groups: time — clocks, sleeps, TSC frequency —
 // and sceKernelIsNeoMode ("kernel"); semaphores ("kernel-sema", docs/KERNEL_SYNC.md). The other
 // synchronisation objects, threads and memory stay BRIDGE (docs/PHASE2_PLAN.md,
-// docs/generated/KERNEL_AUDIT.md).
+// docs/generated/KERNEL_AUDIT.md). P2.3.1: direct memory ("kernel-dmem", experimental, off unless
+// --native kernel-dmem; docs/PHASE2_P23_MEMORY.md).
 #pragma once
 
 #include <span>
@@ -32,6 +33,8 @@ Host* GetHost();
 
 /// neo: [Console] neoMode; title_supports_neo: param.sfo ATTRIBUTE bit 23.
 void Configure(bool neo, bool title_supports_neo);
+/// What sceKernelIsNeoMode tells the game (also decides the direct memory budget).
+bool NeoMode();
 
 /// Start-up: the TSC frequency is measured in the background (100 ms) from here on.
 void Start();
@@ -43,6 +46,7 @@ std::span<const Runtime::Export> KernelUtilExports(); // kernel_util.cpp, group 
 std::span<const Runtime::Export> MutexExports();      // mutex.cpp, group "kernel-mutex"
 std::span<const Runtime::Export> CondvarExports();    // condvar.cpp, group "kernel-mutex" (waits on mutexes)
 std::span<const Runtime::Export> RwlockExports();     // rwlock.cpp, group "kernel-rwlock"
+std::span<const Runtime::Export> DirectMemoryExports(); // memory.cpp, group "kernel-dmem" (experimental)
 
 /// Self-test access to the native semaphores (functions the game does not import, and state).
 namespace SemaphoreTest {

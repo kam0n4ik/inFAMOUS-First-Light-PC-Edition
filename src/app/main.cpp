@@ -18,8 +18,12 @@
 //                              bridge's default keyboard layout) pushed into the window's event
 //                              queue <sec> seconds after the window opens; no window focus needed
 //     --bridge <group>         sends a NATIVE group back to BRIDGE (fs, system, ...)
+//     --native <group>         enables an EXPERIMENTAL group, BRIDGE by default (kernel-dmem: direct
+//                              memory, P2.3.1; --loader sspc only)
+//     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -95,6 +99,10 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--bridge" && has_value) {
             config->bridged_groups.emplace_back(argv[++i]);
+        } else if (arg == "--native" && has_value) {
+            config->native_groups.emplace_back(argv[++i]); // experimental groups only
+        } else if (arg == "--memory-map" && has_value) {
+            config->memory_map_s = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--call-order" && has_value) {
             config->call_order = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--reloc-snapshot" && has_value) {
@@ -123,6 +131,15 @@ int main(int argc, char* argv[]) {
 
     if (config->selftest && config->loader != App::Config::LoaderBackend::Sspc) {
         return Fail("--selftest compares SecondSonPC's subsystems with shadPS4's; it needs --loader sspc");
+    }
+    if (!config->native_groups.empty() && config->loader != App::Config::LoaderBackend::Sspc) {
+        return Fail("--native enables SecondSonPC code on its own loader; it needs --loader sspc");
+    }
+    for (const auto& g : config->native_groups) {
+        if (std::find(config->bridged_groups.begin(), config->bridged_groups.end(), g) !=
+            config->bridged_groups.end()) {
+            return Fail("--native " + g + " and --bridge " + g + " contradict each other");
+        }
     }
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
@@ -159,6 +176,9 @@ int main(int argc, char* argv[]) {
              config->bind_observers);
     for (const auto& g : config->bridged_groups) {
         SSPC_LOG(App, Warning, "DIAGNOSTIC: --bridge {}", g);
+    }
+    for (const auto& g : config->native_groups) {
+        SSPC_LOG(App, Warning, "EXPERIMENTAL: --native {}", g);
     }
 
     if (stock_bootstrap) {

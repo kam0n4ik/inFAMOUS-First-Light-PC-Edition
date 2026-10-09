@@ -15,6 +15,7 @@ struct Export {
     const char* group = ""; // SecondSonPC subsystem ("loader", "sysmodule", "system", "fs", ...);
                             // --bridge <group> sends the whole group back to BRIDGE (diagnostics)
     bool phase0 = false;    // also bound by the Phase 0 loader path (shadPS4 Core::Linker)
+    bool experimental = false; // not bound unless enabled with --native <group> (BRIDGE by default)
 };
 
 /// All exports, subsystem by subsystem. The first entry for an import key wins.

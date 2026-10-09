@@ -13,7 +13,7 @@ namespace {
 
 constexpr std::array<std::string_view, static_cast<size_t>(Category::Count)> kCategoryNames{
     "App",   "Loader",   "Kernel",   "SystemService", "User", "Filesystem", "Input", "Audio",
-    "GPU",   "Shader",   "SaveData", "Language",      "Bridge",     "Trace",
+    "GPU",   "Shader",   "SaveData", "Language",      "Bridge",     "Trace", "Memory",
 };
 constexpr std::array<std::string_view, 7> kLevelNames{"Trace", "Debug",    "Info", "Warning",
                                                        "Error", "Critical", "Off"};

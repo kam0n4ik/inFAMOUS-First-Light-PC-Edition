@@ -42,12 +42,14 @@ add_library(sspc_runtime STATIC
     src/runtime/kernel/condvar.cpp
     src/runtime/kernel/event_flag.cpp
     src/runtime/kernel/kernel_util.cpp
+    src/runtime/kernel/memory.cpp
     src/runtime/kernel/mutex.cpp
     src/runtime/kernel/rwlock.cpp
     src/runtime/kernel/semaphore.cpp
     src/runtime/kernel/time.cpp
     src/runtime/language.cpp
     src/runtime/libc/libc_mem.cpp
+    src/runtime/memory/direct_memory.cpp
     src/runtime/net/net_util.cpp
     src/runtime/pad/pad.cpp
     src/runtime/playgo/playgo.cpp

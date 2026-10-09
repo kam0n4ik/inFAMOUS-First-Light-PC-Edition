@@ -335,6 +335,10 @@ void Configure(bool neo, bool title_supports_neo) {
     g_title_neo = title_supports_neo;
 }
 
+bool NeoMode() {
+    return IsNeoMode() != 0;
+}
+
 void Start() {
     g_network_boottime = std::chrono::system_clock::now();
     g_initial_uptime = std::chrono::steady_clock::now();

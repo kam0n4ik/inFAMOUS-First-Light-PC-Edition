@@ -48,6 +48,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/kernel_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/loader_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/memory_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/rtld_tcb.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/gpu_alloc_diag.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp

@@ -80,6 +80,8 @@ struct Config {
     enum class LoaderBackend { Sspc, Shadps4 };
     LoaderBackend loader = LoaderBackend::Sspc; // default since Phase 1 milestone 1 (docs/MIGRATION.md)
     std::vector<std::string> bridged_groups; // --bridge <group>: NATIVE group back to BRIDGE
+    std::vector<std::string> native_groups;  // --native <group>: EXPERIMENTAL group enabled (BRIDGE by default)
+    u32 memory_map_s = 0;                    // --memory-map <s>: guest memory maps -> logs\memory_map.txt
     u32 call_order = 0;                      // --call-order N: record the first N import calls
     bool selftest = false;                   // --selftest: NATIVE vs BRIDGE subsystem test, no game
     bool fault_test = false;                 // --fault-test: crash recorder test, no game, no bridge

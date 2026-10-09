@@ -6,8 +6,11 @@
 // guest address space ends up laid out exactly like in the Phase 0 oracle.
 #include "bridge/shadps4/loader_host.h"
 
+#include <cstdlib>
 #include <string>
 
+#include "base/log.h"
+#include "bridge/shadps4/memory_host.h"
 #include "common/thread.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/kernel/memory.h"
@@ -63,6 +66,11 @@ public:
 
     void SetupMemoryRegions(u64 flexible_size, bool extended1, bool extended2) override {
         memory_->SetupMemoryRegions(flexible_size, extended1, extended2);
+        if (!ConfigureNativeDirectMemory(flexible_size, extended1, extended2)) {
+            SSPC_LOG(Loader, Critical, "--native kernel-dmem: direct memory budget mismatch, stopping");
+            Log::Flush();
+            std::quick_exit(1);
+        }
     }
 
     void* MapPrimaryTls(u64 size) override {

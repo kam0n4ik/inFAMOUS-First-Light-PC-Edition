@@ -46,6 +46,7 @@
 #include "bridge/shadps4/bootstrap.h"
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
+#include "bridge/shadps4/memory_host.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
 #include "loader/linker.h"
@@ -272,6 +273,9 @@ std::vector<Runtime::Export> SelectExports(const App::Config& cfg, bool phase0_p
         const bool loader_core = group == "loader" || group == "sysmodule";
         if (phase0_path && !e.phase0) {
             continue; // Phase 1 code: the Phase 0 path keeps shadPS4's implementation
+        }
+        if (e.experimental && !Listed(cfg.native_groups, group)) {
+            continue; // BRIDGE unless enabled with --native <group>
         }
         if (!loader_core && ((observer && !cfg.bind_observers) || (!observer && !cfg.bind_natives) ||
                              Listed(cfg.bridged_groups, group) || Listed(cfg.no_bind, e.name))) {
@@ -518,6 +522,12 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                               g));
         }
     }
+    for (const auto& g : cfg.native_groups) {
+        if (std::ranges::none_of(Runtime::Exports(),
+                                 [&g](const Runtime::Export& e) { return e.experimental && g == e.group; })) {
+            Fatal(fmt::format("--native {}: SecondSonPC has no experimental group of that name", g));
+        }
+    }
     // The table decides which shadPS4 libraries are still needed, so it is built first (BRIDGE
     // entries are addresses of shadPS4 functions; nothing has to be started to take them).
     static Loader::Bindings bindings;
@@ -526,6 +536,11 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     options.bridged_groups = cfg.bridged_groups;
     if (!bindings.Build(SelectExports(cfg, false), BridgeExports(), options)) {
         Fatal("binding table is inconsistent, see SecondSonPC.log");
+    }
+    // The direct memory functions and the bridge's accounting of mapped direct memory switch
+    // together, before anything is allocated (the self-test switches them itself).
+    if (Listed(cfg.native_groups, "kernel-dmem") && !cfg.selftest && !InstallNativeDirectMemory(cfg)) {
+        Fatal("--native kernel-dmem: the bridge's direct memory is already in use, see SecondSonPC.log");
     }
     StartBridgeLibraries(bindings, cfg.selftest);
     InstallKernelHost(cfg, psf_attributes);
@@ -966,6 +981,7 @@ void RunGame(const App::Config& cfg) {
     if (cfg.frame_log) {
         StartFrameLog(cfg.logs_dir / "frametimes.csv");
     }
+    StartMemoryMapDump(cfg.logs_dir / "memory_map.txt", cfg.memory_map_s);
 
     using Common::FS::GetUserPath;
     using Common::FS::PathType;
