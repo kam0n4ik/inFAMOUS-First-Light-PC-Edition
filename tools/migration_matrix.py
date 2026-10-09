@@ -106,8 +106,9 @@ RULES = [
     (r"^(sceKernel(\w*DirectMemory\w*|Mprotect|QueryMemoryProtection|\w*Mmap\w*|Munmap|\w*FlexibleMemory\w*"
      r"|Mlock)|mmap|msync)$", r".", 3, "guest address space: direct/flexible memory, protection",
      "Core::Memory address space shared with the GPU buffer/texture cache and write tracking",
-     "with a MemoryForGpu adapter", "very high", "very high", "partial", "kernel-memory", "P3",
-     "P2.3.2: own virtual memory manager first (docs/PHASE2_P23_MEMORY.md §9)"),
+     "with the Core::GpuMemory interface (patch 0008)", "very high", "very high", "partial", "kernel-memory", "P3",
+     "P2.3.3: interface for the other memory manager users, then own virtual memory manager "
+     "(docs/PHASE2_P232_GPU_MEMORY.md §10)"),
     (r"^sceKernel(\w*Equeue|\w*UserEvent)$", r".", 4, "event queues",
      "VideoOut flip and Gnm EOP events are delivered into the game's queues", "no", "high", "high",
      "bridge function", "kernel-equeue", "P4", "moves with VideoOut/GnmDriver"),
@@ -228,7 +229,7 @@ def main() -> int:
     tier_names = {1: "Tier 1 — Low Risk", 2: "Tier 2 — Medium Risk", 3: "Tier 3 — High Risk",
                   4: "Tier 4 — GPU-Coupled", 0: "Unclassified"}
     out = [
-        "# Phase 2 — матрица переноса BRIDGE-функций (аудит P2.2.3, состояние после P2.3.1)",
+        "# Phase 2 — матрица переноса BRIDGE-функций (аудит P2.2.3, состояние после P2.3.2)",
         "",
         f"Сгенерировано `tools\\migration_matrix.py` по прогону `{a.run}`"
         + (f", снимок конца загрузки `{a.startup}`" if a.startup else "")
@@ -272,7 +273,8 @@ def main() -> int:
         "отдельная группа `kernel-rwlock`. Ни одна другая импортируемая BRIDGE-функция мьютексы/condvar "
         "игры не получает (`docs\\KERNEL_SYNC.md` §4).",
         "- **Блокеры остального**: потоки, TLS-ключи, сигналы — P2.4 (нужен свой менеджер потоков после "
-        "P2.3); виртуальная память — P2.3.2 (свой менеджер и адаптер GPU-видимой памяти `MemoryForGpu`); "
+        "P2.3); виртуальная память — P2.3.3 (интерфейс для остальных пользователей менеджера памяти, затем "
+        "свой менеджер; интерфейс GPU-памяти `Core::GpuMemory` сделан в P2.3.2, патч `0008`); "
         "event queues, VideoOut, GnmDriver — "
         "Tier 4 до собственного GPU-рантайма; аудио/видео-декодеры, сохранения, трофеи, диалоги, сеть — "
         "фазы своих подсистем (сохранения — только с проверкой целостности).",
