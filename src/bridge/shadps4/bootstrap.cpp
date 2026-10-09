@@ -48,6 +48,7 @@
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/memory_host.h"
 #include "bridge/shadps4/native_memory.h"
+#include "bridge/shadps4/perf_opts.h"
 #include "bridge/shadps4/track_diag.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
@@ -1041,6 +1042,8 @@ void RunGame(const App::Config& cfg) {
     if (!cfg.test_presses.empty()) {
         StartTestInput(cfg.test_presses, cfg.logs_dir);
     }
+    SSPC_LOG(App, Info, "P2.5 bridge performance changes: barrier-memo {}",
+             PerfOpts::barrier_memo ? "on" : "off");
     if (cfg.track_stats) {
         TrackDiag::Enable(); // before the GPU (its page manager) and before the frame log
     }

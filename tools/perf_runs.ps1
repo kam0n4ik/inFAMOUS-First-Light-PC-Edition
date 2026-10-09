@@ -58,6 +58,9 @@ $modeArgs = @{
     # manager too (commit on demand). With M0 (bridge/bridge) and M3 (native memory, bridge threads)
     # these are the four combinations A-D of docs/PHASE2_P24_NATIVE_THREADS.md.
     T = "--native threads"; TM = "--native threads --native memory --memory-commit on-demand"
+    # P2.5 bridge performance changes, one build: PO0 every change off, PO1 the defaults (all on that
+    # passed their A/B: barrier-memo). PO0 = PO1 of the build before P2.5.
+    PO0 = "--no-perf-opt barrier-memo"; PO1 = ""
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}

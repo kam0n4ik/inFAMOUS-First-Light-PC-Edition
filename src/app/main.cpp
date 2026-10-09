@@ -15,6 +15,8 @@
 //     --frame-log              presented frame times -> logs\frametimes.csv (tools\perf_runs.ps1)
 //     --track-stats            GPU write tracking statistics (access violations, protection changes,
 //                              uploads) every 10 s in SecondSonPC.log; per frame with --frame-log
+//     --perf-opt <name>        P2.5 bridge performance change on / --no-perf-opt <name> off
+//                              (barrier-memo: on by default; docs\PHASE2_P25_PERFORMANCE.md)
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
 //     --press <key@sec,...>    automated runs: key presses (SDL key names, e.g. n = cross in the
 //                              bridge's default keyboard layout) pushed into the window's event
@@ -46,6 +48,7 @@
 #include "base/log.h"
 #include "base/vram_monitor.h"
 #include "bridge/shadps4/bootstrap.h"
+#include "bridge/shadps4/perf_opts.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
 
@@ -134,6 +137,15 @@ int main(int argc, char* argv[]) {
             config->frame_log = true; // diagnostics only
         } else if (arg == "--track-stats") {
             config->track_stats = true; // diagnostics only (P2.5)
+        } else if ((arg == "--perf-opt" || arg == "--no-perf-opt") && has_value) {
+            // P2.5: one bridge performance change on or off (bridge/shadps4/perf_opts.h).
+            const std::string_view name = argv[++i];
+            const bool on = arg == "--perf-opt";
+            if (name == "barrier-memo") {
+                SecondSon::PerfOpts::barrier_memo = on;
+            } else {
+                return Fail(std::string(arg) + ": unknown change " + std::string(name) + " (barrier-memo)");
+            }
         } else if (arg == "--selftest") {
             config->selftest = true;
             config->import_counter = false;

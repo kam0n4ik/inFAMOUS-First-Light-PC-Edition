@@ -1,0 +1,118 @@
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 7e1c025a..4f6fd2bb 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -673,6 +673,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
+         new_backing->state.layout = dst_layout;
+         new_backing->state.access_mask = dst_access;
+         new_backing->state.pl_stage = dst_stage;
++        ++new_backing->state_gen; // SecondSonPC P2.5 (--perf-opt barrier-memo)
+     }
+ 
+     backing = new_backing;
+diff --git a/src/video_core/texture_cache/image.cpp b/src/video_core/texture_cache/image.cpp
+index bcb19d7a..efb8d366 100644
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -13,6 +13,7 @@
+ #include <vk_mem_alloc.h>
+ 
+ #include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++#include "bridge/shadps4/perf_opts.h"      // SecondSonPC P2.5 optimizations
+ #include "bridge/shadps4/track_diag.h"     // SecondSonPC P2.5 diagnostics
+ 
+ namespace VideoCore {
+@@ -255,9 +256,31 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+     };
+ 
+     if (needs_partial_transition || partially_transited) {
++        // SecondSonPC P2.5 (--perf-opt barrier-memo): a partial read-only request that already found
++        // its whole range in this state, with no subresource state changed since (state_gen), would
++        // walk the range again only to emit no barrier and change no state.
++        constexpr auto sspc_write_flags = vk::AccessFlagBits2::eTransferWrite |
++                                          vk::AccessFlagBits2::eShaderWrite |
++                                          vk::AccessFlagBits2::eMemoryWrite;
++        const bool sspc_memo = SecondSon::PerfOpts::barrier_memo && needs_partial_transition &&
++                               !(dst_mask & sspc_write_flags);
++        if (sspc_memo && partially_transited) {
++            for (const auto& clean : backing->clean) {
++                if (clean.gen == backing->state_gen && clean.range == *subres_range &&
++                    clean.layout == dst_layout && clean.access == dst_mask) {
++                    sspc_iterations = 0;
++                    last_state.layout = dst_layout; // as the end of this function
++                    last_state.access_mask = dst_mask;
++                    last_state.pl_stage = dst_stage;
++                    sspc_record();
++                    return;
++                }
++            }
++        }
+         if (!partially_transited) {
+             subresource_states.resize(info.resources.levels * info.resources.layers);
+             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
++            ++backing->state_gen;
+         }
+ 
+         // In case of partial transition, we need to change the specified subresources only.
+@@ -272,6 +295,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+                                   ? subres_range->base.layer + subres_range->extent.layers
+                                   : info.resources.layers;
+         sspc_iterations = (end_mip - start_mip) * (end_layer - start_layer);
++        bool sspc_changed = false;
+         for (u32 mip = start_mip; mip < end_mip; ++mip) {
+             for (u32 layer = start_layer; layer < end_layer; ++layer) {
+                 // NOTE: these loops may produce a lot of small barriers.
+@@ -306,12 +330,22 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+                     state.layout = dst_layout;
+                     state.access_mask = dst_mask;
+                     state.pl_stage = dst_stage;
++                    sspc_changed = true;
+                 }
+             }
+         }
++        if (sspc_changed) {
++            ++backing->state_gen;
++        }
++        if (sspc_memo) {
++            // The whole range is now in the requested read-only state.
++            backing->clean[backing->next_clean++ % backing->clean.size()] = {
++                backing->state_gen, *subres_range, dst_layout, dst_mask};
++        }
+ 
+         if (!needs_partial_transition) {
+             subresource_states.clear();
++            ++backing->state_gen;
+         }
+     } else { // Full resource transition
+         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+diff --git a/src/video_core/texture_cache/image.h b/src/video_core/texture_cache/image.h
+index e200eff0..ab7cc4c6 100644
+--- a/src/video_core/texture_cache/image.h
++++ b/src/video_core/texture_cache/image.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <mutex>
+ #include <optional>
+ 
+@@ -149,6 +150,18 @@ public:
+         SmallVector<ImageViewInfo, 2> image_view_infos;
+         SmallVector<ImageViewId, 2> image_view_ids;
+         u32 num_samples;
++        // SecondSonPC P2.5 (--perf-opt barrier-memo): bumped whenever `subresource_states` (or
++        // `state`, outside GetBarriers) change; `clean` remembers partial read-only requests that
++        // left every subresource of their range in the requested state at generation `gen`.
++        u64 state_gen = 0;
++        struct CleanRequest {
++            u64 gen = ~u64{0};
++            SubresourceRange range;
++            vk::ImageLayout layout{};
++            vk::AccessFlags2 access{};
++        };
++        std::array<CleanRequest, 4> clean{};
++        u32 next_clean = 0;
+     };
+     SmallVector<BackingImage, 2> backing_images;
+     BackingImage* backing{};
