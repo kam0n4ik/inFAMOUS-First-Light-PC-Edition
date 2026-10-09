@@ -19,6 +19,8 @@ param(
     [string]$Session = "",
     [int]$MinFreeCommitGiB = 15,
     [switch]$NoFrameLog,                          # without --frame-log (per-frame times)
+    [int]$SnapshotAt = 0,                         # copy logs\calls.json this many s after start
+                                                  # (the last periodic dump) -> <mode>\calls_<N>s.json
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
@@ -84,10 +86,19 @@ foreach ($m in $modeList) {
     $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\perf_sampler.ps1", "-Out", "$modeDir\samples.csv")
     Remove-Item "$logs\frametimes.csv" -ErrorAction SilentlyContinue
+    $snap = $null
+    if ($SnapshotAt -gt 0) {
+        # Waits for the game (run_phase0 removes the previous calls.json before starting it).
+        $snapCmd = "`$p = `$null; for (`$i = 0; `$i -lt 150 -and -not `$p; `$i++) { `$p = Get-Process SecondSonPC -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not `$p) { Start-Sleep -Milliseconds 200 } }; " +
+                   "if (`$p) { `$t = `$p.StartTime.AddSeconds($SnapshotAt); while ((Get-Date) -lt `$t -and -not `$p.HasExited) { Start-Sleep -Milliseconds 200 }; " +
+                   "Copy-Item '$logs\calls.json' '$modeDir\calls_${SnapshotAt}s.json' -ErrorAction SilentlyContinue }"
+        $snap = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @("-NoProfile", "-Command", $snapCmd)
+    }
     $frameArg = if ($NoFrameLog) { "" } else { "--frame-log" }
     $gameArgs = "--loader sspc --user-data $profileDir --vram-log 5 $frameArg --press $Press $($modeArgs[$m]) $ExtraArgs".Trim()
     $text = & "$PSScriptRoot\run_phase0.ps1" -Seconds $Seconds -Tag $tag -NoReport -ExtraArgs $gameArgs 2>&1 | Out-String
     [void]$sampler.WaitForExit(30000)
+    if ($snap) { [void]$snap.WaitForExit(30000) }
     Set-Content -Encoding UTF8 "$modeDir\run_phase0.txt" $text
     if (Test-Path "$logs\frametimes.csv") { Move-Item "$logs\frametimes.csv" "$modeDir\frametimes.csv" -Force }
 
