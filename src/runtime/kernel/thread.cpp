@@ -23,7 +23,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -105,6 +104,8 @@ constexpr u64 kExtraStack = 128 * 1024;
 // No-access memory below every stack this manager maps (SecondSonPC; the oracle has none): an
 // overflow faults instead of writing into the neighbouring stack.
 constexpr u64 kStackGuard = 16 * 1024;
+// Larger requests are refused (EAGAIN) before the size arithmetic could wrap.
+constexpr u64 kMaxStackSize = 1ull << 30;
 
 constexpr u32 kAttrMagic = 0x41545452;   // "RTTA"
 constexpr u32 kThreadMagic = 0x44524854; // "THRD"
@@ -167,8 +168,13 @@ struct alignas(64) Thread {
 
 Thread g_threads[kMaxThreads];
 
-std::mutex g_table_lock; // g_free, g_pending, g_stacks, g_table_ready, the counters below
-std::deque<u32> g_free;
+std::mutex g_table_lock; // g_free*, g_pending, g_stacks, g_table_ready, the counters below
+// Free slots, FIFO. Fixed storage (and g_pending/g_stacks reserved once): an exiting or detaching
+// guest thread never allocates, so it cannot throw (the bridge's VEH ends the process on any C++
+// exception) when the system commit limit is reached.
+std::array<u32, kMaxThreads> g_free{};
+u32 g_free_head = 0;
+u32 g_free_count = 0;
 std::vector<u32> g_pending; // detached threads that exited: reaped once their host thread is gone
 // Stacks of gone threads, kept for the next thread of the same size: never unmapped (the bridge's
 // memory manager asserts when a stack whose guard split its area is unmapped, D17; the bridge itself
@@ -211,6 +217,19 @@ thread_local std::unique_ptr<Specific> t_specific;
 
 u32 IndexOf(const Thread* t) {
     return static_cast<u32>(t - g_threads);
+}
+
+// g_free as a ring (g_table_lock held). A slot is never pushed twice: at most kMaxThreads entries.
+void PushFree(u32 index) {
+    g_free[(g_free_head + g_free_count) % kMaxThreads] = index;
+    ++g_free_count;
+}
+
+u32 PopFree() {
+    const u32 index = g_free[g_free_head];
+    g_free_head = (g_free_head + 1) % kMaxThreads;
+    --g_free_count;
+    return index;
 }
 
 /// The slot an ScePthread names, or nullptr (not a slot address). The slot may be free: callers
@@ -297,9 +316,10 @@ void Release(Thread* t) {
     }
     std::scoped_lock lk{g_table_lock};
     if (own) {
+        // Reserved for kMaxThreads; grows (allocates) only past that many distinct stacks kept.
         g_stacks.push_back({stack, size, guard});
     }
-    g_free.push_back(IndexOf(t));
+    PushFree(IndexOf(t));
     ++g_reaped;
 }
 
@@ -316,12 +336,13 @@ void* TakeCachedStack(u64 size, u64 guard) {
 }
 
 void ReapPending() {
-    std::vector<u32> gone;
+    std::array<u32, kMaxThreads> gone; // no allocation on the guest thread
+    u32 count = 0;
     {
         std::scoped_lock lk{g_table_lock};
         for (size_t i = 0; i < g_pending.size();) {
             if (WaitForSingleObject(g_threads[g_pending[i]].host, 0) == WAIT_OBJECT_0) {
-                gone.push_back(g_pending[i]);
+                gone[count++] = g_pending[i];
                 g_pending[i] = g_pending.back();
                 g_pending.pop_back();
             } else {
@@ -329,8 +350,8 @@ void ReapPending() {
             }
         }
     }
-    for (const u32 index : gone) {
-        Release(&g_threads[index]);
+    for (u32 i = 0; i < count; ++i) {
+        Release(&g_threads[gone[i]]);
     }
 }
 
@@ -338,21 +359,22 @@ Thread* AllocSlot() {
     std::scoped_lock lk{g_table_lock};
     if (!g_table_ready) {
         for (u32 i = 0; i < kMaxThreads; ++i) {
-            g_free.push_back(i);
+            PushFree(i);
         }
+        // Every later push_back stays within this (see g_free): one entry per slot at most.
+        g_pending.reserve(kMaxThreads);
+        g_stacks.reserve(kMaxThreads);
         g_table_ready = true;
     }
-    if (g_free.empty()) {
+    if (g_free_count == 0) {
         return nullptr;
     }
-    const u32 index = g_free.front();
-    g_free.pop_front();
-    return &g_threads[index];
+    return &g_threads[PopFree()];
 }
 
 void FreeSlot(Thread* t) {
     std::scoped_lock lk{g_table_lock};
-    g_free.push_back(IndexOf(t));
+    PushFree(IndexOf(t));
 }
 
 /// Destructors of the calling thread's TLS values (the oracle's _thread_cleanupspecific): up to
@@ -387,8 +409,11 @@ void RunKeyDestructors() {
     t_specific.reset();
 }
 
+void AbandonRunningOnces();
+
 [[noreturn]] void ExitCurrent(void* value) {
     Thread* t = t_self;
+    AbandonRunningOnces();
     RunKeyDestructors();
     g_host->ThreadExiting();
     bool reap_later;
@@ -447,6 +472,11 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
         attr.policy = self->attr.policy;
     }
 
+    if (attr.stackaddr == nullptr && attr.stacksize > kMaxStackSize) {
+        // stacksize + kExtraStack would wrap; the oracle fails the same way (no memory for it).
+        SSPC_LOG(Kernel, Error, "scePthreadCreate: stack of {:#x} bytes refused", attr.stacksize);
+        return kEagain;
+    }
     ReapPending();
     Thread* t = AllocSlot();
     if (t == nullptr) {
@@ -516,17 +546,20 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
         SSPC_LOG(Kernel, Error, "scePthreadCreate: CreateThread failed ({})", error);
         return kEagain;
     }
+    bool detached;
     {
         std::scoped_lock lk{t->lock};
         t->host = host;
+        detached = t->detached; // another guest thread may detach it already (it has the handle)
     }
     {
         std::scoped_lock lk{g_table_lock};
         ++g_created;
     }
+    // t->name is written only here and by Release (not before this thread is joined or reaped).
     SSPC_LOG(Kernel, Debug, "thread {} \"{}\" created: prio {} policy {} stack {:#x}+{:#x}{}", tid,
              t->name, attr.prio, attr.policy, reinterpret_cast<uintptr_t>(stack), stack_size,
-             t->detached ? " detached" : "");
+             detached ? " detached" : "");
     ResumeThread(host);
     return kOk;
 }
@@ -790,6 +823,12 @@ struct OnceControl {
 };
 static_assert(sizeof(std::atomic<u32>) == 4);
 
+// Once routines running on this thread, innermost last (AbandonRunningOnces). Deeper nesting than
+// kOnceDepth is counted but not tracked.
+constexpr u32 kOnceDepth = 8;
+thread_local OnceControl* t_once[kOnceDepth];
+thread_local u32 t_once_depth = 0;
+
 s32 Once(OnceControl* once, OnceRoutine routine) {
     if (once == nullptr || routine == nullptr) {
         return kEinval;
@@ -814,13 +853,29 @@ s32 Once(OnceControl* once, OnceRoutine routine) {
             return kEinval;
         }
     }
+    if (t_once_depth < kOnceDepth) {
+        t_once[t_once_depth] = once;
+    }
+    ++t_once_depth;
     routine();
+    --t_once_depth;
     u32 s = kInProgress;
     if (!state.compare_exchange_strong(s, kDone, std::memory_order_release)) {
         state.store(kDone, std::memory_order_release); // someone waits
         state.notify_all();
     }
     return kOk;
+}
+
+/// The thread exits inside once routines (scePthreadExit from one): as the oracle's cleanup
+/// handler, each goes back to "never done" and its waiters wake (one of them runs the routine).
+void AbandonRunningOnces() {
+    for (u32 i = std::min(t_once_depth, kOnceDepth); i-- > 0;) {
+        auto& state = t_once[i]->state;
+        state.store(kNeverDone, std::memory_order_release);
+        state.notify_all();
+    }
+    t_once_depth = 0;
 }
 
 s32 KeyCreate(u32* key, KeyDestructor destructor) {
@@ -1073,7 +1128,7 @@ namespace Test {
 
 Counts GetCounts() {
     std::scoped_lock lk{g_table_lock};
-    const u64 in_use = g_table_ready ? kMaxThreads - g_free.size() : 0;
+    const u64 in_use = g_table_ready ? kMaxThreads - g_free_count : 0;
     return {in_use, g_created, g_reaped, g_pending.size(), g_stacks_mapped, g_stacks.size()};
 }
 
