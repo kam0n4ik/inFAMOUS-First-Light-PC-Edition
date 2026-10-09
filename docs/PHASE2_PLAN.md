@@ -113,6 +113,12 @@ commit подложки 8448 МиБ и план P2.3.3: `docs\PHASE2_P232_GPU_ME
 (120 / 275); финальный игровой A/B без регрессий — **P2.3.3 закрыт**. Архитектура, тесты, замеры, точка
 перехода к P2.3.4 (эталон и список шагов): `docs\PHASE2_P233_NATIVE_VMM.md` §8.
 
+**P2.3.4 (2026-10-09; по умолчанию — мост)** — API памяти libkernel моста ходит в менеджер только через
+`Core::Guest*` (патч `0012`), выбор менеджера до первого обращения (`Core::SelectGuestMemory`), флаг
+`--native memory` запускает игру на своём менеджере (`--memory-commit on-demand` — commit по требованию), D19
+исправлен в своём менеджере, самотест запуска (`--selftest --native memory`) и игровой A/B —
+`docs\PHASE2_P234_NATIVE_MEMORY.md`.
+
 Состояние: всё адресное пространство гостя ведёт `Core::MemoryManager` моста. Свой загрузчик
 обращается к нему только через `Loader::Host` (`src\bridge\shadps4\loader_host.cpp`):
 `ReserveModule`, `MapTrampoline`, `MapSegment`, `SetupMemoryRegions`, `MapPrimaryTls`,

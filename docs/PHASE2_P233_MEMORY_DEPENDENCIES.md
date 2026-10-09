@@ -162,7 +162,7 @@ SecondSonPC с адресом и кодом. Второго набора ото�
 
 | # | Что | Почему | Когда уходит |
 |---|---|---|---|
-| E1 | `core\libraries\kernel\memory.cpp` (API памяти моста, U16) | фасад реализации моста: проверки libkernel + её менеджер | NATIVE-группа над своим менеджером (P2.3.4+) |
+| E1 | `core\libraries\kernel\memory.cpp` (API памяти моста, U16) | фасад реализации моста: проверки libkernel + её менеджер | **снято в P2.3.4** (патч `0012`): API ходит в менеджер через `Core::Guest*`, файл — в списке переведённых `check_memory_deps.py` (`docs\PHASE2_P234_NATIVE_MEMORY.md` §3) |
 | E2 | `core\linker.cpp`, `core\module.cpp`, `emulator.cpp` | путь `--loader shadps4` (эталон) и неиспользуемый `Core::Emulator` | с мостом (Phase 5) |
 | E3 | `core\devtools\widget\memory_map.{h,cpp}`; `src\bridge\shadps4\memory_host.cpp` (кроме дампа VMA) | диагностика и склейка **реализации** моста (friend-доступ к картам; `DirectMemoryBackend` P2.3.1) | с мостом / при переключении — свои аналоги |
 | E4 | `avplayer`, `camera`, `vr_tracker`, `np_signaling`, `ime`, `font` | игра не импортирует эти библиотеки (проверяется автоматически) | с мостом |

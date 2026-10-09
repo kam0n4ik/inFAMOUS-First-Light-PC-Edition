@@ -80,7 +80,8 @@ buffer/texture cache, PRT, память GnmDriver и VideoOut. Это один �
    `Core::Guest*`/`Core::GpuMemory`; дифференциальные тесты против моста по шагам, случайными операциями и под
    потоками — `docs\PHASE2_P233_NATIVE_VMM.md`); переключателя в игре ещё нет.
 7. **Переключение `MemoryForGpu` на свой менеджер** — последним. Это P2.3.4: перечень оставшегося —
-   `docs\PHASE2_P233_NATIVE_VMM.md` §8.
+   `docs\PHASE2_P233_NATIVE_VMM.md` §8. **Сделано (2026-10-09), экспериментально:** `--native memory`
+   (по умолчанию — мост), `docs\PHASE2_P234_NATIVE_MEMORY.md`.
 
 ### Тесты и критерии готовности P2.3
 
