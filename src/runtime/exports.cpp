@@ -26,6 +26,12 @@ std::span<const Export> PlayGoExports(); // runtime/playgo/playgo.cpp
 namespace AppContent {
 std::span<const Export> AppContentExports(); // runtime/app_content/app_content.cpp
 }
+namespace Net {
+std::span<const Export> NetUtilExports(); // runtime/net/net_util.cpp
+}
+namespace Libc {
+std::span<const Export> LibcMemExports(); // runtime/libc/libc_mem.cpp
+}
 
 namespace {
 
@@ -67,7 +73,8 @@ std::vector<Export> Collect() {
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
                              AppContent::AppContentExports(), Pad::PadExports(),
                              Kernel::KernelExports(), Kernel::SemaphoreExports(),
-                             Kernel::EventFlagExports(),
+                             Kernel::EventFlagExports(), Kernel::KernelUtilExports(),
+                             Net::NetUtilExports(), Libc::LibcMemExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());
     }

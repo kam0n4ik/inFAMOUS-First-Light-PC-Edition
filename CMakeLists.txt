@@ -40,9 +40,12 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
     src/runtime/kernel/event_flag.cpp
+    src/runtime/kernel/kernel_util.cpp
     src/runtime/kernel/semaphore.cpp
     src/runtime/kernel/time.cpp
     src/runtime/language.cpp
+    src/runtime/libc/libc_mem.cpp
+    src/runtime/net/net_util.cpp
     src/runtime/pad/pad.cpp
     src/runtime/playgo/playgo.cpp
     src/runtime/psf/param_sfo.cpp

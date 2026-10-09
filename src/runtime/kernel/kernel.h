@@ -39,6 +39,7 @@ void Start();
 std::span<const Runtime::Export> KernelExports();
 std::span<const Runtime::Export> SemaphoreExports();
 std::span<const Runtime::Export> EventFlagExports();
+std::span<const Runtime::Export> KernelUtilExports(); // kernel_util.cpp, group "kernel-util"
 
 /// Self-test access to the native semaphores (functions the game does not import, and state).
 namespace SemaphoreTest {

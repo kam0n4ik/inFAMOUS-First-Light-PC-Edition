@@ -1757,6 +1757,81 @@ void TestKernelEventFlag(Totals& t) {
     c.Summary();
 }
 
+// ---------------------------------------------------------------------------- Tier 1 (P2.2.3)
+
+/// The Phase 2.2.3 Tier 1 functions (kernel-util, net-util, libc-mem) on the same inputs; buffers
+/// carry guard bytes around the written range.
+void Tier1Script(Side& s) {
+    const void* equal = s.F("3PtV6p3QNX4");
+    const void* yield = s.F("T72hz6ffq08");
+    const void* sched = s.F("6XG4B33N09g");
+    const void* pagesize = s.F("k+AXqu2-eBc");
+    const void* fill = s.F("VkTAsrZDcJ0");
+    const void* htons = s.F("iWQWrwiSt8A");
+    const void* ntohs = s.F("Rbvt+5Y2iEw");
+    const void* mset = s.F("8zTFvBIAIN8");
+    const void* mcpy = s.F("Q3VBxCXhUHs");
+
+    int x = 0, y = 0;
+    const auto p = [](u64 v) { return reinterpret_cast<const void*>(v); };
+    s.Line("scePthreadEqual same -> {}", Call<s32>(equal, static_cast<const void*>(&x), static_cast<const void*>(&x)));
+    s.Line("scePthreadEqual different -> {}", Call<s32>(equal, static_cast<const void*>(&x), static_cast<const void*>(&y)));
+    s.Line("scePthreadEqual null null -> {}", Call<s32>(equal, p(0), p(0)));
+    s.Line("scePthreadEqual high half differs -> {}", Call<s32>(equal, p(0x100000001ull), p(0x1ull)));
+    Call<void>(yield);
+    s.Line("scePthreadYield returns");
+    Call<void>(sched); // the oracle's sched_yield is void: its return value is not compared
+    s.Line("sched_yield returns");
+    s.Line("getpagesize -> {}", Call<s32>(pagesize));
+    u32 set[6] = {0, 0x12345678, 0, 0, 0x5A5A5A5A, 0x5A5A5A5A}; // [4..5]: guard after the 128-bit set
+    const s32 fr = Call<s32>(fill, static_cast<void*>(set));
+    s.Line("sigfillset -> {}: {:08x} {:08x} {:08x} {:08x} guard {:08x} {:08x}", fr, set[0], set[1], set[2],
+           set[3], set[4], set[5]);
+    for (const u16 v : {u16{0x0000}, u16{0x0001}, u16{0x1234}, u16{0xFF00}, u16{0xFFFF}, u16{0x8001}}) {
+        s.Line("sceNetHtons {:#06x} -> {:#06x}, sceNetNtohs -> {:#06x}", v, Call<u16>(htons, v), Call<u16>(ntohs, v));
+    }
+
+    u8 buf[64];
+    std::memset(buf, 0xEE, sizeof(buf));
+    void* r = Call<void*>(mset, static_cast<void*>(buf + 8), s32{0x1A5}, u64{16}); // c is converted to u8
+    s.Line("memset 16 x 0x1a5 -> returns dest {}, {}", r == buf + 8, Hex(buf, 32));
+    r = Call<void*>(mset, static_cast<void*>(buf + 8), s32{0}, u64{0});
+    s.Line("memset 0 bytes -> returns dest {}, {}", r == buf + 8, Hex(buf, 32));
+    u8 src[40];
+    for (int i = 0; i < 40; ++i) {
+        src[i] = static_cast<u8>(i * 7 + 1);
+    }
+    u8 dst[56];
+    std::memset(dst, 0xCC, sizeof(dst));
+    r = Call<void*>(mcpy, static_cast<void*>(dst + 4), static_cast<const void*>(src), u64{40});
+    s.Line("memcpy 40 -> returns dest {}, {}", r == dst + 4, Hex(dst, sizeof(dst)));
+    r = Call<void*>(mcpy, static_cast<void*>(dst + 4), static_cast<const void*>(src), u64{0});
+    s.Line("memcpy 0 bytes -> returns dest {}", r == dst + 4);
+    // 4 MiB at odd offsets: the whole range written, the bytes around it untouched.
+    std::vector<u8> big((4u << 20) + 64, 0x11);
+    std::vector<u8> from(4u << 20);
+    for (size_t i = 0; i < from.size(); ++i) {
+        from[i] = static_cast<u8>(i * 2654435761u >> 24);
+    }
+    Call<void*>(mcpy, static_cast<void*>(big.data() + 3), static_cast<const void*>(from.data()), u64{from.size()});
+    const bool copy_ok = std::memcmp(big.data() + 3, from.data(), from.size()) == 0 && big[2] == 0x11 &&
+                         big[3 + from.size()] == 0x11;
+    const u8 before_fill = big[4];
+    Call<void*>(mset, static_cast<void*>(big.data() + 5), s32{0x7F}, u64{from.size()});
+    bool fill_ok = big[4] == before_fill && big[5 + from.size()] == 0x11;
+    for (size_t i = 5; i < 5 + from.size() && fill_ok; ++i) {
+        fill_ok = big[i] == 0x7F;
+    }
+    s.Line("4 MiB memcpy (offset 3) {} and memset (offset 5) {}", copy_ok, fill_ok);
+}
+
+void TestTier1(Totals& t) {
+    Side native{"NATIVE", true}, bridge{"BRIDGE", false};
+    Tier1Script(native);
+    Tier1Script(bridge);
+    Compare(t, "Tier1", native, bridge);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- param.sfo (PSF)
@@ -1878,6 +1953,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestKernelTime(t);
     TestKernelSema(t);
     TestKernelEventFlag(t);
+    TestTier1(t);
 
     std::string text = fmt::format("SecondSonPC self-test: NATIVE vs BRIDGE (shadPS4, the oracle's implementation)\n");
     for (const auto& line : t.report) {
