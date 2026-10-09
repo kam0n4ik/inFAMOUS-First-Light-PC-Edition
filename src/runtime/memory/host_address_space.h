@@ -70,7 +70,8 @@ public:
         u64 views = 0;
         u64 privates = 0;
         u64 unmaps = 0;
-        u64 remaps = 0; ///< views mapped again around a partial unmap
+        u64 remaps = 0;           ///< views mapped again around a partial unmap
+        u64 protect_restores = 0; ///< protection runs given back to them (D19)
         u64 splits = 0;
         u64 coalesces = 0;
         u64 protects = 0;
@@ -113,7 +114,8 @@ public:
     /// Whether unmapping [addr, addr + size) would have to split private memory (refused by Unmap).
     bool SplitsPrivate(u64 addr, u64 size) const;
     /// Everything in [addr, addr + size) back to placeholder space; views partly inside are mapped again
-    /// around it (their remaining parts get read/write(+execute) protection again, as in the bridge).
+    /// around it and their remaining parts keep the host protection they had (D19: the bridge gives them
+    /// read/write(+execute) again, losing the guest's mprotect and the GPU's page tracking there).
     /// false when it would split private memory (nothing changed) or the host refuses.
     bool Unmap(u64 addr, u64 size);
     /// Host protection of the mapped parts of [addr, addr + size); placeholder space is skipped. No allocation.

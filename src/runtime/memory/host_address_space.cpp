@@ -5,7 +5,8 @@
 // (MEM_REPLACE_PLACEHOLDER), private memory with VirtualAlloc2 (MEM_REPLACE_PLACEHOLDER). Different from the
 // bridge: the address ranges and the section size are parameters (the bridge takes every free region below
 // 1 TiB and 7936 + 512 MiB), the section may be SEC_RESERVE (commit on demand), a partial unmap of private
-// memory is refused instead of asserting (D17), the host's refusals are returned instead of asserting.
+// memory is refused instead of asserting (D17), what stays of a partly unmapped view keeps its host protection
+// (D19), the host's refusals are returned instead of asserting.
 #include "runtime/memory/host_address_space.h"
 
 #include <algorithm>
@@ -47,6 +48,30 @@ u64 Addr(const void* ptr) {
 
 DWORD MapProtection(bool exec) {
     return exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+}
+
+/// One run of pages with the same host protection.
+struct ProtectionRun {
+    u64 addr;
+    u64 size;
+    DWORD protect;
+};
+
+/// The host protection of the committed pages of [addr, addr + size), run by run.
+bool CaptureProtection(u64 addr, u64 size, std::vector<ProtectionRun>& out) {
+    const u64 end = addr + size;
+    for (u64 cursor = addr; cursor < end;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(Ptr(cursor), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        const u64 run_end = std::min(Addr(mbi.BaseAddress) + mbi.RegionSize, end);
+        if (mbi.State == MEM_COMMIT) {
+            out.push_back({cursor, run_end - cursor, mbi.Protect});
+        }
+        cursor = run_end;
+    }
+    return true;
 }
 
 /// A view of the section at addr: mapped read/write/execute, then lowered to read/write unless executable.
@@ -341,12 +366,20 @@ bool HostAddressSpace::Unmap(u64 addr, u64 size) {
             it->second = Region{.base = r.base, .size = r.size, .range = r.range};
             ++counters_.unmaps;
         } else if (r.kind == Kind::View) {
+            // Windows cannot shorten a view: it is unmapped whole and what stays is mapped again. D19: the host
+            // protection of what stays (the guest's mprotect, the GPU's page tracking) is taken first and given
+            // back afterwards, so for the guest and the GPU nothing outside [lo, hi) changes. A concurrent
+            // ProtectTracking waits for this lock and lands on the final state.
+            std::vector<ProtectionRun> kept;
+            if ((lo > r.base && !CaptureProtection(r.base, lo - r.base, kept)) ||
+                (hi < r_end && !CaptureProtection(hi, r_end - hi, kept))) {
+                return Refused();
+            }
             if (!UnmapViewOfFile2(process_, Ptr(r.base), MEM_PRESERVE_PLACEHOLDER)) {
                 return Refused();
             }
             it->second = Region{.base = r.base, .size = r.size, .range = r.range};
             ++counters_.unmaps;
-            // Windows cannot shorten a view: what stays mapped is mapped again (read/write(+execute)).
             if (lo > r.base) {
                 if (!SplitPlaceholder(it, lo - r.base) ||
                     !MapSectionView(process_, section_, r.base, r.phys, lo - r.base, r.exec)) {
@@ -370,6 +403,17 @@ bool HostAddressSpace::Unmap(u64 addr, u64 size) {
                 tail->second.phys = r.phys + (hi - r.base);
                 tail->second.exec = r.exec;
                 ++counters_.remaps;
+            }
+            const DWORD mapped_with = MapProtection(r.exec);
+            for (const auto& run : kept) {
+                DWORD old = 0;
+                if (run.protect == mapped_with) {
+                    continue;
+                }
+                if (!VirtualProtect(Ptr(run.addr), run.size, run.protect, &old)) {
+                    return Refused();
+                }
+                ++counters_.protect_restores;
             }
         }
         cursor = hi;

@@ -8,7 +8,8 @@
 // each with a test: D5 (an invalid range asserts), D6 (flexible budget checked before the lock), D10 (GPU
 // range check wraps), D11 (a backing write across two physical areas repeats the data), D12 (backing reads
 // past 2^40), D13 (IsValidMapping without a lock), D16 (gaps between the host's regions count as valid), D17
-// (unmapping anonymous memory split into several areas asserts), H4 (allocation in TryWriteBacking).
+// (unmapping anonymous memory split into several areas asserts), D19 (what stays of a partly unmapped view loses
+// its protection: the guest's and the GPU's page tracking), H4 (allocation in TryWriteBacking).
 // Not supported (no user, an explicit error): memory pools (Pooled/PoolReserved), file mappings.
 //
 // Locks, outermost first (the bridge's order): the unmap lock -> the writer/reader lock (readers first) ->

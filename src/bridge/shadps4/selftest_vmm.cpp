@@ -3,7 +3,7 @@
 // assumed free); the bridge's memory and the game's addresses are not touched. Groups:
 //   NativeVmm         operations one by one against the host's state (VirtualQuery), H1/H2/H3, aliases, a view
 //                     unmapped in the middle, a release with views, the stack of D17;
-//   NativeVmm(D)      the bridge's defects fixed (D5, D6, D10, D11, D12, D16) and the parameter checks (alignment,
+//   NativeVmm(D)      the bridge's defects fixed (D5, D6, D10, D11, D12, D16, D19) and the parameter checks (alignment,
 //                     overflow, outside the space);
 //   NativeVmm(model)  thousands of random operations against an independent page model (areas, physical pages,
 //                     host pages and protection, contents), the manager's own invariants after each;
@@ -518,6 +518,38 @@ void TestDefects(TestGroup& g, u32 sdk) {
             mapped == 64 && vm->FlexibleUsed() == kMiB, fmt::format("{} {:#x}", mapped.load(), vm->FlexibleUsed()));
     vm->Unmap(w, kWin);
     inv.After(*vm, "D6");
+
+    // D19: a view unmapped in the middle keeps the host protection of what stays - the guest's (no access, first
+    // page) and the GPU's page tracking (read only, last page); the bridge maps both parts read/write again.
+    {
+        u64 phys = 0, view = 0;
+        vm->AllocateDirect(0, vm->DirectSize(), 0x40000, 0, 0, &phys);
+        const s32 mapped_view = Map(*vm, &view, w, 0x40000, 0x33, MapFlag::kFixed, VmaType::Direct, "D19", phys);
+        std::memset(reinterpret_cast<void*>(w + 0x30000), 0x5C, 0x10000);
+        vm->Protect(w, kPage, Prot::kNone);
+        vm->ProtectTracking(w + 0x3C000, kPage, HostAccess::Read);
+        const u64 restores = vm->GetStats().host.protect_restores;
+        const s32 cut = vm->Unmap(w + 0x10000, 0x20000);
+        const HostPage first = Host(w), second = Host(w + kPage), middle = Host(w + 0x10000),
+                       tail = Host(w + 0x30000), last = Host(w + 0x3C000);
+        const u64 restored = vm->GetStats().host.protect_restores - restores;
+        const bool data_kept = *reinterpret_cast<const u8*>(w + 0x30000) == 0x5C &&
+                               *reinterpret_cast<const u8*>(w + 0x3BFFF) == 0x5C;
+        g.Check("D19: a view unmapped in the middle keeps the host protection of what stays: the guest's no access on "
+                "its first page, the GPU's read-only tracking on its last page, read/write elsewhere; the middle is a "
+                "placeholder; the data stays (the bridge maps both parts read/write again)",
+                mapped_view == kOk && cut == kOk && first.protect == PAGE_NOACCESS &&
+                    second.protect == PAGE_READWRITE && middle.state == MEM_RESERVE &&
+                    tail.protect == PAGE_READWRITE && last.protect == PAGE_READONLY && restored == 2 && data_kept,
+                fmt::format("map {:#x} unmap {:#x} first {:#x} second {:#x} middle {:#x} tail {:#x} last {:#x} restored "
+                            "{} data {}",
+                            static_cast<u32>(mapped_view), static_cast<u32>(cut), first.protect, second.protect,
+                            middle.state, tail.protect, last.protect, restored, data_kept));
+        vm->ProtectTracking(w + 0x3C000, kPage, HostAccess::ReadWrite);
+        vm->Unmap(w, 0x40000);
+        vm->ReleaseDirect(phys, 0x40000, false);
+        inv.After(*vm, "D19");
+    }
     g.Check("invariants", inv.first.empty(), inv.first);
 
     // D16: two ranges with a gap between them.
@@ -845,8 +877,8 @@ private:
             }
             m = ModelPage{};
         }
-        // Windows cannot shorten a view: what is left of a cut view is mapped again, a new view on each side with
-        // read/write(+execute) protection.
+        // Windows cannot shorten a view: what is left of a cut view is mapped again, a new view on each side, and
+        // keeps its host protection (D19; the bridge gives it read/write(+execute) again).
         for (int v : cut_views) {
             int left = -1, right = -1;
             for (u32 i = 0; i < p_.size(); ++i) {
@@ -858,7 +890,6 @@ private:
                     id = next_view_++;
                 }
                 p_[i].view = id;
-                p_[i].host = p_[i].exec ? HostAccess::ExecuteReadWrite : HostAccess::ReadWrite;
             }
         }
     }
