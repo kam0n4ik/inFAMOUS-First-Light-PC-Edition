@@ -18,6 +18,7 @@
 #include "core/guest_memory.h"
 #include "core/libraries/kernel/threads.h"
 #include "core/tls.h"
+#include "runtime/kernel/thread.h"
 
 namespace SecondSon::Bridge {
 
@@ -157,6 +158,14 @@ public:
     }
 
     void StartGuestThread(std::function<void()> body) override {
+        if (Kernel::Threads::Enabled()) {
+            // --native threads (P2.4): the main thread is SecondSonPC's like every other one.
+            if (!Kernel::Threads::StartMainThread(std::move(body))) {
+                Log::Flush();
+                std::quick_exit(1);
+            }
+            return;
+        }
         main_thread_.Run([body = std::move(body)](std::stop_token) { body(); });
     }
 

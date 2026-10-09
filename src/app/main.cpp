@@ -20,7 +20,8 @@
 //     --bridge <group>         sends a NATIVE group back to BRIDGE (fs, system, ...)
 //     --native <group>         enables an EXPERIMENTAL group, BRIDGE by default (kernel-dmem: direct
 //                              memory, P2.3.1; memory: SecondSonPC's memory manager instead of the
-//                              bridge's, P2.3.4; --loader sspc only)
+//                              bridge's, P2.3.4; threads: SecondSonPC's guest thread manager, P2.4;
+//                              --loader sspc only)
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
@@ -166,6 +167,17 @@ int main(int argc, char* argv[]) {
     if (native("memory") && native("kernel-dmem")) {
         return Fail("--native memory and --native kernel-dmem: SecondSonPC's memory manager keeps the direct memory "
                     "itself; kernel-dmem accounts it beside the bridge's manager");
+    }
+    if (native("threads")) {
+        // The bridge's synchronisation objects take the waiting thread from its own Pthread
+        // (g_curthread), which SecondSonPC's guest threads do not have.
+        for (const auto* g : {"kernel-mutex", "kernel-condvar", "kernel-rwlock", "kernel-sema", "kernel-eventflag"}) {
+            if (std::find(config->bridged_groups.begin(), config->bridged_groups.end(), g) !=
+                config->bridged_groups.end()) {
+                return Fail(std::string("--native threads and --bridge ") + g +
+                            ": the bridge's synchronisation objects need the bridge's own threads");
+            }
+        }
     }
     if (config->memory_commit_on_demand && !native("memory")) {
         return Fail("--memory-commit on-demand is a mode of SecondSonPC's memory manager: it needs --native memory");

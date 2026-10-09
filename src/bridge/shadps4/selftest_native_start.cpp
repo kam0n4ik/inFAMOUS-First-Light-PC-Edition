@@ -34,6 +34,7 @@
 #include "base/log.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/native_memory.h"
+#include "bridge/shadps4/selftest_threads.h"
 #include "bridge/shadps4/selftest_vmm.h"
 #include "core/libraries/kernel/memory.h"
 
@@ -552,6 +553,10 @@ int RunNativeMemorySelfTest(const App::Config& cfg) {
     }
     if (game.vm != nullptr) {
         game.gpu->SetListener(rec.next);
+        // P2.4: the native thread manager with its guest stacks in SecondSonPC's memory manager.
+        for (auto& g : TestNativeThreads(true)) {
+            groups.push_back(std::move(g));
+        }
     }
     int checks = 0;
     int failures = 0;

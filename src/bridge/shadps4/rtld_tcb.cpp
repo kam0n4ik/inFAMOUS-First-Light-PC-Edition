@@ -15,6 +15,7 @@
 #include "core/tls.h"
 
 #include "loader/linker.h"
+#include "runtime/kernel/thread.h"
 
 namespace Libraries::Kernel {
 
@@ -30,7 +31,12 @@ static std::shared_mutex RtldLock;
 
 Core::Tcb* TcbCtor(Pthread* thread, int initial) {
     if (auto* loader = SecondSon::Loader::Linker::Active()) {
-        return reinterpret_cast<Core::Tcb*>(loader->CreateTcb(thread, initial != 0));
+        // With --native threads (P2.4) SecondSonPC's manager makes the main thread's TCB itself;
+        // the bridge only creates its own threads (AudioOut), from guest threads that have no
+        // bridge Pthread — which it takes for "the first thread". Their TLS is never the primary
+        // block (that one exists once, and FreeTls would hand it to the guest heap).
+        const bool primary = initial != 0 && !SecondSon::Kernel::Threads::Enabled();
+        return reinterpret_cast<Core::Tcb*>(loader->CreateTcb(thread, primary));
     }
 
     std::scoped_lock lk{RtldLock};

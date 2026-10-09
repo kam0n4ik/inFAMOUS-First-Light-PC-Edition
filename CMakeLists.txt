@@ -46,6 +46,7 @@ add_library(sspc_runtime STATIC
     src/runtime/kernel/mutex.cpp
     src/runtime/kernel/rwlock.cpp
     src/runtime/kernel/semaphore.cpp
+    src/runtime/kernel/thread.cpp
     src/runtime/kernel/time.cpp
     src/runtime/language.cpp
     src/runtime/libc/libc_mem.cpp

@@ -54,6 +54,10 @@ $modeArgs = @{
     # P2.4 shader cache (patch 0013): C0 no persistent cache (every run compiles everything), C1 the
     # test cache logs\p24\sc_test (cold on its first run, warm after it). The user's cache is not used.
     C0 = "--no-shader-cache"; C1 = "--shader-cache E:\SecondSonPC\logs\p24\sc_test"
+    # P2.4 threads: T = SecondSonPC's thread manager (bridge memory), TM = with SecondSonPC's memory
+    # manager too (commit on demand). With M0 (bridge/bridge) and M3 (native memory, bridge threads)
+    # these are the four combinations A-D of docs/PHASE2_P24_NATIVE_THREADS.md.
+    T = "--native threads"; TM = "--native threads --native memory --memory-commit on-demand"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}

@@ -37,6 +37,7 @@
 #include "bridge/shadps4/bridge_exports.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/memory_host.h"
+#include "bridge/shadps4/selftest_threads.h"
 #include "bridge/shadps4/selftest_vmm.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
@@ -4855,6 +4856,10 @@ int RunSelfTest(const App::Config& cfg) {
         native_groups.push_back(std::move(g));
     }
     std::ofstream(cfg.logs_dir / "selftest_native_diff.txt", std::ios::binary) << diff_transcript;
+    // P2.4: the native thread manager (guest stacks in the bridge's memory manager here).
+    for (auto& g : TestNativeThreads(false)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;
