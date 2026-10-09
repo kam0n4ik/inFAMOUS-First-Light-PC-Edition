@@ -1,0 +1,773 @@
+diff --git a/src/core/devtools/widget/memory_map.cpp b/src/core/devtools/widget/memory_map.cpp
+index d1d1eb41..4a3f0854 100644
+--- a/src/core/devtools/widget/memory_map.cpp
++++ b/src/core/devtools/widget/memory_map.cpp
+@@ -68,6 +68,13 @@ void MemoryMapViewer::Draw() {
+         End();
+         return;
+     }
++    if (!BridgeGuestMemorySelected()) {
++        // SecondSonPC patch 0012: the bridge's maps do not exist (creating them would take the guest
++        // address space a second time); SecondSonPC writes its own with --memory-map.
++        Text("SecondSonPC --native memory: the guest memory is not the bridge's; see --memory-map");
++        End();
++        return;
++    }
+ 
+     auto mem = Memory::Instance();
+     std::scoped_lock lck{mem->mutex};
+diff --git a/src/core/gpu_memory.h b/src/core/gpu_memory.h
+index 90ec2f42..d6c69f5e 100644
+--- a/src/core/gpu_memory.h
++++ b/src/core/gpu_memory.h
+@@ -73,7 +73,9 @@ protected:
+     virtual u64 ClampLargeRange(VAddr addr, u64 size) = 0;
+ };
+ 
+-/// The GPU bridge's guest memory: the bridge's MemoryManager. Valid for the process lifetime.
++/// The GPU bridge's guest memory: the bridge's MemoryManager unless another one was selected at
++/// start-up (SecondSonPC patch 0012, core/guest_memory.h SelectGuestMemory). Valid for the process
++/// lifetime.
+ GpuMemory& GetGpuMemory();
+ 
+ } // namespace Core
+diff --git a/src/core/guest_memory.h b/src/core/guest_memory.h
+index 47909c10..e0c11b59 100644
+--- a/src/core/guest_memory.h
++++ b/src/core/guest_memory.h
+@@ -1,9 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ // SecondSonPC patch 0009 (P2.3.3a, docs/PHASE2_P233_MEMORY_DEPENDENCIES.md): the guest memory as
+-// everything but the GPU bridge (core/gpu_memory.h) and libkernel's memory functions uses it: the
+-// loader, the threads' stacks and heap, file reads into guest buffers. Calls are at the memory
+-// manager's level (libkernel's argument checks are the caller's). The implementation is the
+-// bridge's MemoryManager (memory.cpp); another memory manager has to keep the same contract.
++// everything but the GPU bridge (core/gpu_memory.h) uses it: the loader, the threads' stacks and
++// heap, file reads into guest buffers, and since patch 0012 (P2.3.4) libkernel's memory functions.
++// Calls are at the memory manager's level (libkernel's argument checks are the caller's). The
++// implementation is the bridge's MemoryManager (memory.cpp) unless SelectGuestMemory chose another
++// one at start-up; that one has to keep the same contract.
+ 
+ #pragma once
+ 
+@@ -13,8 +14,16 @@
+ #include "common/enum.h"
+ #include "common/types.h"
+ 
++namespace Libraries::Kernel {
++struct OrbisVirtualQueryInfo;
++struct OrbisQueryInfo;
++struct OrbisKernelMemoryPoolBlockStats;
++} // namespace Libraries::Kernel
++
+ namespace Core {
+ 
++class GpuMemory;
++
+ enum class MemoryProt : u32 {
+     NoAccess = 0,
+     CpuRead = 1,
+@@ -110,6 +119,31 @@ public:
+ 
+     /// The areas in use (free ones left out), in address order: a snapshot.
+     virtual std::vector<GuestArea> Areas() = 0;
++
++    // Patch 0012: what libkernel's memory functions need besides the above.
++
++    /// sceKernelVirtualQuery: the area at addr (flags 1: or the next one in use).
++    virtual s32 Query(VAddr addr, s32 flags, Libraries::Kernel::OrbisVirtualQueryInfo* info) = 0;
++
++    /// sceKernelQueryMemoryProtection: the area in use at addr and its protection.
++    virtual s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot) = 0;
++
++    /// sceKernelIsStack: the stack area at addr, or [0, 0) when addr is in use but no stack.
++    virtual s32 IsStack(VAddr addr, void** start, void** end) = 0;
++
++    /// The memory type of the direct (and pooled) memory mapped in [addr, addr + size).
++    virtual s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) = 0;
++
++    /// mmap of a file (no anonymous, stack or void flag): fd's [offset, offset + size).
++    virtual s32 MapFile(void** out_addr, VAddr addr, u64 size, MemoryProt prot, MemoryMapFlags flags,
++                        s32 fd, s64 offset) = 0;
++
++    /// Memory pools: [addr, addr + size) of a reserved pool gets pooled memory, or gives it back.
++    virtual s32 PoolCommit(VAddr addr, u64 size, MemoryProt prot, s32 memory_type) = 0;
++    virtual s32 PoolDecommit(VAddr addr, u64 size) = 0;
++
++    /// A partially resident texture area (sceKernelSetPrtAperture): mapped for the GPU as a whole.
++    virtual void SetPrtArea(u32 id, VAddr addr, u64 size) = 0;
+ };
+ 
+ /// The guest's physical memory: budgets and direct memory.
+@@ -131,6 +165,28 @@ public:
+     /// Unmaps the views of [start, start + size) (the GPU first) and frees it. `checked`: ENOENT
+     /// when a page is not allocated.
+     virtual s32 ReleaseDirect(PAddr start, u64 size, bool checked) = 0;
++
++    // Patch 0012: what libkernel's memory functions need besides the above.
++
++    /// The flexible memory budget (sceKernelConfiguredFlexibleMemorySize) and what is left of it
++    /// (sceKernelAvailableFlexibleMemorySize).
++    virtual u64 FlexibleSize() = 0;
++    virtual u64 FlexibleAvailable() = 0;
++
++    /// sceKernelDirectMemoryQuery: the allocated run at addr (find_next: or the next one).
++    virtual s32 DirectQuery(PAddr addr, bool find_next, Libraries::Kernel::OrbisQueryInfo* info) = 0;
++
++    /// sceKernelAvailableDirectMemorySize: the largest free aligned range in [search_start,
++    /// search_end); *size 0 when there is none.
++    virtual s32 DirectAvailable(PAddr search_start, PAddr search_end, u64 alignment, PAddr* out,
++                                u64* size) = 0;
++
++    /// sceKernelGetDirectMemoryType: the allocated area at addr.
++    virtual s32 DirectMemoryType(PAddr addr, s32* type, void** start, void** end) = 0;
++
++    /// Memory pools: physical memory for them (-1 when nothing fits) and their statistics.
++    virtual PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) = 0;
++    virtual s32 PoolStats(Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats) = 0;
+ };
+ 
+ /// Who must hear of host writes into guest memory (the GPU's page tracking).
+@@ -143,9 +199,27 @@ public:
+     virtual void NotifyHostWrite(VAddr addr, u64 size) = 0;
+ };
+ 
+-/// The guest memory: the bridge's MemoryManager. Valid for the process lifetime.
++/// The guest memory: the bridge's MemoryManager unless another one was selected. Valid for the
++/// process lifetime.
+ GuestVirtualMemory& GetGuestVirtualMemory();
+ GuestPhysicalMemory& GetGuestPhysicalMemory();
+ GuestWriteNotifier& GetGuestWriteNotifier();
+ 
++/// Patch 0012: another implementation of all four interfaces (GetGpuMemory too).
++struct GuestMemoryImpl {
++    GuestVirtualMemory* virtual_memory = nullptr;
++    GuestPhysicalMemory* physical_memory = nullptr;
++    GuestWriteNotifier* write_notifier = nullptr;
++    GpuMemory* gpu_memory = nullptr;
++};
++
++/// Patch 0012: the guest memory is `impl` from now on, for the process lifetime. Only at start-up,
++/// on one thread, before the first Get*() call and before the bridge's MemoryManager exists; false
++/// (nothing changed) otherwise or when a pointer is null. The bridge's MemoryManager may not be
++/// created afterwards (it would take the guest address space a second time).
++bool SelectGuestMemory(const GuestMemoryImpl& impl);
++
++/// Patch 0012: the bridge's MemoryManager is the guest memory (nothing else was selected).
++bool BridgeGuestMemorySelected();
++
+ } // namespace Core
+diff --git a/src/core/libraries/kernel/memory.cpp b/src/core/libraries/kernel/memory.cpp
+index ba3d46ac..bc16652e 100644
+--- a/src/core/libraries/kernel/memory.cpp
++++ b/src/core/libraries/kernel/memory.cpp
+@@ -23,7 +23,9 @@
+ #include "core/libraries/kernel/process.h"
+ #include "core/libraries/libs.h"
+ #include "core/linker.h"
+-#include "core/memory.h"
++// SecondSonPC patch 0012 (P2.3.4): the memory manager only through these interfaces (the bridge's
++// MemoryManager by default, SecondSonPC's own with --native memory).
++#include "core/guest_memory.h"
+ 
+ namespace Libraries::Kernel {
+ 
+@@ -32,8 +34,7 @@ static bool g_alias_dmem = false;
+ 
+ u64 PS4_SYSV_ABI sceKernelGetDirectMemorySize() {
+     LOG_TRACE(Kernel_Vmm, "called");
+-    const auto* memory = Core::Memory::Instance();
+-    return memory->GetTotalDirectSize();
++    return Core::GetGuestPhysicalMemory().DirectSize();
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelEnableDmemAliasing() {
+@@ -74,8 +75,8 @@ s32 PS4_SYSV_ABI sceKernelAllocateDirectMemory(s64 searchStart, s64 searchEnd, u
+         return ORBIS_KERNEL_ERROR_EAGAIN;
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+-    PAddr phys_addr = memory->Allocate(searchStart, searchEnd, len, alignment, memoryType);
++    PAddr phys_addr = Core::GetGuestPhysicalMemory().AllocateDirect(searchStart, searchEnd, len,
++                                                                    alignment, memoryType);
+     if (phys_addr == -1) {
+         return ORBIS_KERNEL_ERROR_EAGAIN;
+     }
+@@ -106,8 +107,7 @@ s32 PS4_SYSV_ABI sceKernelCheckedReleaseDirectMemory(u64 start, u64 len) {
+     if (len == 0) {
+         return ORBIS_OK;
+     }
+-    auto* memory = Core::Memory::Instance();
+-    return memory->Free(start, len, true);
++    return Core::GetGuestPhysicalMemory().ReleaseDirect(start, len, true);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelReleaseDirectMemory(u64 start, u64 len) {
+@@ -120,8 +120,7 @@ s32 PS4_SYSV_ABI sceKernelReleaseDirectMemory(u64 start, u64 len) {
+     if (len == 0) {
+         return ORBIS_OK;
+     }
+-    auto* memory = Core::Memory::Instance();
+-    memory->Free(start, len, false);
++    Core::GetGuestPhysicalMemory().ReleaseDirect(start, len, false);
+     return ORBIS_OK;
+ }
+ 
+@@ -134,11 +133,10 @@ s32 PS4_SYSV_ABI sceKernelAvailableDirectMemorySize(u64 searchStart, u64 searchE
+         return ORBIS_KERNEL_ERROR_EINVAL;
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+-
+     PAddr physAddr{};
+     u64 size{};
+-    s32 result = memory->DirectQueryAvailable(searchStart, searchEnd, alignment, &physAddr, &size);
++    s32 result = Core::GetGuestPhysicalMemory().DirectAvailable(searchStart, searchEnd, alignment,
++                                                                &physAddr, &size);
+ 
+     if (size == 0) {
+         return ORBIS_KERNEL_ERROR_ENOMEM;
+@@ -153,8 +151,7 @@ s32 PS4_SYSV_ABI sceKernelAvailableDirectMemorySize(u64 searchStart, u64 searchE
+ s32 PS4_SYSV_ABI sceKernelVirtualQuery(const void* addr, s32 flags, OrbisVirtualQueryInfo* info,
+                                        u64 infoSize) {
+     LOG_INFO(Kernel_Vmm, "called addr = {}, flags = {:#x}", fmt::ptr(addr), flags);
+-    auto* memory = Core::Memory::Instance();
+-    return memory->VirtualQuery(std::bit_cast<VAddr>(addr), flags, info);
++    return Core::GetGuestVirtualMemory().Query(std::bit_cast<VAddr>(addr), flags, info);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelReserveVirtualRange(void** addr, u64 len, s32 flags, u64 alignment) {
+@@ -176,7 +173,6 @@ s32 PS4_SYSV_ABI sceKernelReserveVirtualRange(void** addr, u64 len, s32 flags, u
+         }
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+     const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
+     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+ 
+@@ -187,8 +183,13 @@ s32 PS4_SYSV_ABI sceKernelReserveVirtualRange(void** addr, u64 len, s32 flags, u
+         map_flags &= ~Core::MemoryMapFlags::Fixed;
+     }
+ 
+-    s32 result = memory->MapMemory(addr, in_addr, len, Core::MemoryProt::NoAccess, map_flags,
+-                                   Core::VMAType::Reserved, "anon", false, -1, alignment);
++    s32 result = Core::GetGuestVirtualMemory().Map(addr, {.addr = in_addr,
++                                                          .size = len,
++                                                          .prot = Core::MemoryProt::NoAccess,
++                                                          .flags = map_flags,
++                                                          .type = Core::VMAType::Reserved,
++                                                          .name = "anon",
++                                                          .alignment = alignment});
+     if (result == 0) {
+         LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr));
+     }
+@@ -233,7 +234,6 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
+     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+     const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
+ 
+-    auto* memory = Core::Memory::Instance();
+     bool should_check = false;
+     if (g_sdk_version >= Common::ElfInfo::FW_250 &&
+         False(map_flags & Core::MemoryMapFlags::Stack)) {
+@@ -248,9 +248,15 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
+         map_flags &= ~Core::MemoryMapFlags::Fixed;
+     }
+ 
+-    const auto ret =
+-        memory->MapMemory(addr, in_addr, len, mem_prot, map_flags, Core::VMAType::Direct, name,
+-                          should_check, phys_addr, alignment);
++    const auto ret = Core::GetGuestVirtualMemory().Map(addr, {.addr = in_addr,
++                                                              .size = len,
++                                                              .prot = mem_prot,
++                                                              .flags = map_flags,
++                                                              .type = Core::VMAType::Direct,
++                                                              .name = name,
++                                                              .phys = static_cast<PAddr>(phys_addr),
++                                                              .exclusive = should_check,
++                                                              .alignment = alignment});
+ 
+     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr));
+     return ret;
+@@ -295,16 +301,21 @@ s32 PS4_SYSV_ABI sceKernelMapDirectMemory2(void** addr, u64 len, s32 type, s32 p
+     const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+     const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
+ 
+-    auto* memory = Core::Memory::Instance();
+-    const auto ret =
+-        memory->MapMemory(addr, in_addr, len, mem_prot, map_flags, Core::VMAType::Direct, "anon",
+-                          !g_alias_dmem, phys_addr, alignment);
++    auto& memory = Core::GetGuestVirtualMemory();
++    const auto ret = memory.Map(addr, {.addr = in_addr,
++                                       .size = len,
++                                       .prot = mem_prot,
++                                       .flags = map_flags,
++                                       .type = Core::VMAType::Direct,
++                                       .name = "anon",
++                                       .phys = static_cast<PAddr>(phys_addr),
++                                       .exclusive = !g_alias_dmem,
++                                       .alignment = alignment});
+ 
+     if (ret == 0) {
+         // If the map call succeeds, set the direct memory type using the output address.
+-        auto* memory = Core::Memory::Instance();
+         const auto out_addr = reinterpret_cast<VAddr>(*addr);
+-        memory->SetDirectMemoryType(out_addr, len, type);
++        memory.SetDirectMemoryType(out_addr, len, type);
+         LOG_INFO(Kernel_Vmm, "out_addr = {:#x}", out_addr);
+     }
+     return ret;
+@@ -332,7 +343,6 @@ s32 PS4_SYSV_ABI sceKernelMapNamedFlexibleMemory(void** addr_in_out, u64 len, s3
+     const VAddr in_addr = reinterpret_cast<VAddr>(*addr_in_out);
+     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
+     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+-    auto* memory = Core::Memory::Instance();
+ 
+     if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
+         if (Common::ElfInfo::FW_170 <= g_sdk_version) {
+@@ -341,8 +351,12 @@ s32 PS4_SYSV_ABI sceKernelMapNamedFlexibleMemory(void** addr_in_out, u64 len, s3
+         map_flags &= ~Core::MemoryMapFlags::Fixed;
+     }
+ 
+-    const auto ret = memory->MapMemory(addr_in_out, in_addr, len, mem_prot, map_flags,
+-                                       Core::VMAType::Flexible, name);
++    const auto ret = Core::GetGuestVirtualMemory().Map(addr_in_out, {.addr = in_addr,
++                                                                     .size = len,
++                                                                     .prot = mem_prot,
++                                                                     .flags = map_flags,
++                                                                     .type = Core::VMAType::Flexible,
++                                                                     .name = name});
+     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr_in_out));
+     return ret;
+ }
+@@ -383,16 +397,19 @@ s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 l
+         in_addr = 0x880000000;
+     }
+     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
+-    auto* memory = Core::Memory::Instance();
+-    const auto ret = memory->MapMemory(addr_in_out, in_addr, len, mem_prot, map_flags,
+-                                       Core::VMAType::System, name);
++    const auto ret = Core::GetGuestVirtualMemory().Map(addr_in_out, {.addr = in_addr,
++                                                                     .size = len,
++                                                                     .prot = mem_prot,
++                                                                     .flags = map_flags,
++                                                                     .type = Core::VMAType::System,
++                                                                     .name = name});
+     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr_in_out));
+     return ret;
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelQueryMemoryProtection(void* addr, void** start, void** end, u32* prot) {
+-    auto* memory = Core::Memory::Instance();
+-    return memory->QueryProtection(std::bit_cast<VAddr>(addr), start, end, prot);
++    return Core::GetGuestVirtualMemory().QueryProtection(std::bit_cast<VAddr>(addr), start, end,
++                                                         prot);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
+@@ -408,12 +425,11 @@ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
+         return ORBIS_OK;
+     }
+ 
+-    Core::MemoryManager* memory_manager = Core::Memory::Instance();
+     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
+ 
+-    s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
++    s32 result = Core::GetGuestVirtualMemory().Protect(aligned_addr, aligned_size, protection_flags);
+     if (result == ORBIS_OK) {
+-        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
++        Core::GetGuestWriteNotifier().NotifyHostWrite(aligned_addr, aligned_size);
+     }
+     return result;
+ }
+@@ -440,13 +456,13 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
+         return ORBIS_OK;
+     }
+ 
+-    Core::MemoryManager* memory_manager = Core::Memory::Instance();
++    auto& memory = Core::GetGuestVirtualMemory();
+     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
+ 
+-    s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
++    s32 result = memory.Protect(aligned_addr, aligned_size, protection_flags);
+     if (result == ORBIS_OK) {
+-        memory_manager->SetDirectMemoryType(aligned_addr, aligned_size, mtype);
+-        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
++        memory.SetDirectMemoryType(aligned_addr, aligned_size, mtype);
++        Core::GetGuestWriteNotifier().NotifyHostWrite(aligned_addr, aligned_size);
+     }
+     return result;
+ }
+@@ -454,13 +470,11 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
+ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInfo* query_info,
+                                             u64 infoSize) {
+     LOG_INFO(Kernel_Vmm, "called offset = {:#x}, flags = {:#x}", offset, flags);
+-    auto* memory = Core::Memory::Instance();
+-    return memory->DirectMemoryQuery(offset, flags == 1, query_info);
++    return Core::GetGuestPhysicalMemory().DirectQuery(offset, flags == 1, query_info);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelAvailableFlexibleMemorySize(u64* out_size) {
+-    auto* memory = Core::Memory::Instance();
+-    *out_size = memory->GetAvailableFlexibleSize();
++    *out_size = Core::GetGuestPhysicalMemory().FlexibleAvailable();
+     LOG_INFO(Kernel_Vmm, "called size = {:#x}", *out_size);
+     return ORBIS_OK;
+ }
+@@ -474,15 +488,13 @@ s32 PS4_SYSV_ABI sceKernelGetDirectMemoryType(u64 addr, s32* directMemoryTypeOut
+                                               void** directMemoryStartOut,
+                                               void** directMemoryEndOut) {
+     LOG_WARNING(Kernel_Vmm, "called, direct memory addr = {:#x}", addr);
+-    auto* memory = Core::Memory::Instance();
+-    return memory->GetDirectMemoryType(addr, directMemoryTypeOut, directMemoryStartOut,
+-                                       directMemoryEndOut);
++    return Core::GetGuestPhysicalMemory().DirectMemoryType(addr, directMemoryTypeOut,
++                                                           directMemoryStartOut, directMemoryEndOut);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelIsStack(void* addr, void** start, void** end) {
+     LOG_DEBUG(Kernel_Vmm, "called, addr = {}", fmt::ptr(addr));
+-    auto* memory = Core::Memory::Instance();
+-    return memory->IsStack(std::bit_cast<VAddr>(addr), start, end);
++    return Core::GetGuestVirtualMemory().IsStack(std::bit_cast<VAddr>(addr), start, end);
+ }
+ 
+ u32 PS4_SYSV_ABI sceKernelIsAddressSanitizerEnabled() {
+@@ -558,14 +570,12 @@ s32 PS4_SYSV_ABI sceKernelSetVirtualRangeName(const void* addr, u64 len, const c
+         return ORBIS_KERNEL_ERROR_ENAMETOOLONG;
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+-    memory->NameVirtualRange(std::bit_cast<VAddr>(addr), len, name);
++    Core::GetGuestVirtualMemory().NameRange(std::bit_cast<VAddr>(addr), len, name);
+     return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelClearVirtualRangeName(const void* addr, u64 len) {
+-    auto* memory = Core::Memory::Instance();
+-    memory->NameVirtualRange(std::bit_cast<VAddr>(addr), len, "");
++    Core::GetGuestVirtualMemory().NameRange(std::bit_cast<VAddr>(addr), len, "");
+     return ORBIS_OK;
+ }
+ 
+@@ -597,8 +607,8 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolExpand(u64 searchStart, u64 searchEnd, u64 l
+         return ORBIS_KERNEL_ERROR_ENOMEM;
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+-    PAddr phys_addr = memory->PoolExpand(searchStart, searchEnd, len, alignment);
++    PAddr phys_addr =
++        Core::GetGuestPhysicalMemory().PoolExpand(searchStart, searchEnd, len, alignment);
+     if (phys_addr == -1) {
+         return ORBIS_KERNEL_ERROR_ENOMEM;
+     }
+@@ -628,14 +638,16 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignmen
+         }
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+-    const VAddr in_addr = reinterpret_cast<VAddr>(addr_in);
+     const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+     u64 map_alignment = alignment == 0 ? 2_MB : alignment;
+ 
+-    return memory->MapMemory(addr_out, std::bit_cast<VAddr>(addr_in), len,
+-                             Core::MemoryProt::NoAccess, map_flags, Core::VMAType::PoolReserved,
+-                             "anon", false, -1, map_alignment);
++    return Core::GetGuestVirtualMemory().Map(addr_out, {.addr = std::bit_cast<VAddr>(addr_in),
++                                                        .size = len,
++                                                        .prot = Core::MemoryProt::NoAccess,
++                                                        .flags = map_flags,
++                                                        .type = Core::VMAType::PoolReserved,
++                                                        .name = "anon",
++                                                        .alignment = map_alignment});
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 prot, s32 flags) {
+@@ -658,8 +670,7 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
+              fmt::ptr(addr), len, type, prot, flags);
+ 
+     const VAddr in_addr = reinterpret_cast<VAddr>(addr);
+-    auto* memory = Core::Memory::Instance();
+-    return memory->PoolCommit(in_addr, len, mem_prot, type);
++    return Core::GetGuestVirtualMemory().PoolCommit(in_addr, len, mem_prot, type);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelMemoryPoolDecommit(void* addr, u64 len, s32 flags) {
+@@ -675,9 +686,7 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolDecommit(void* addr, u64 len, s32 flags) {
+     LOG_INFO(Kernel_Vmm, "addr = {}, len = {:#x}, flags = {:#x}", fmt::ptr(addr), len, flags);
+ 
+     const VAddr pool_addr = reinterpret_cast<VAddr>(addr);
+-    auto* memory = Core::Memory::Instance();
+-
+-    return memory->PoolDecommit(pool_addr, len);
++    return Core::GetGuestVirtualMemory().PoolDecommit(pool_addr, len);
+ }
+ 
+ s32 PS4_SYSV_ABI sceKernelMemoryPoolBatch(const OrbisKernelMemoryPoolBatchEntry* entries, s32 count,
+@@ -736,9 +745,8 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolBatch(const OrbisKernelMemoryPoolBatchEntry*
+ s32 PS4_SYSV_ABI sceKernelMemoryPoolGetBlockStats(OrbisKernelMemoryPoolBlockStats* stats,
+                                                   u64 size) {
+     LOG_WARNING(Kernel_Vmm, "called");
+-    auto* memory = Core::Memory::Instance();
+     OrbisKernelMemoryPoolBlockStats local_stats;
+-    memory->GetMemoryPoolStats(&local_stats);
++    Core::GetGuestPhysicalMemory().PoolStats(&local_stats);
+ 
+     u64 size_to_copy = size < sizeof(OrbisKernelMemoryPoolBlockStats)
+                            ? size
+@@ -764,7 +772,7 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd,
+     }
+ 
+     void* addr_out;
+-    auto* memory = Core::Memory::Instance();
++    auto& memory = Core::GetGuestVirtualMemory();
+     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
+     const auto mem_flags = static_cast<Core::MemoryMapFlags>(flags);
+     const auto vaddr = reinterpret_cast<VAddr>(addr);
+@@ -786,21 +794,32 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd,
+         const Core::VMAType mapping_type = True(mem_flags & Core::MemoryMapFlags::System)
+                                                ? Core::VMAType::System
+                                                : Core::VMAType::Flexible;
+-        result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
+-                                   mapping_type, "anon", false);
++        result = memory.Map(&addr_out, {.addr = aligned_addr,
++                                        .size = aligned_size,
++                                        .prot = mem_prot,
++                                        .flags = mem_flags,
++                                        .type = mapping_type,
++                                        .name = "anon"});
+     } else if (True(mem_flags & Core::MemoryMapFlags::Stack)) {
+         // Maps stack memory
+-        result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
+-                                   Core::VMAType::Stack, "anon", false);
++        result = memory.Map(&addr_out, {.addr = aligned_addr,
++                                        .size = aligned_size,
++                                        .prot = mem_prot,
++                                        .flags = mem_flags,
++                                        .type = Core::VMAType::Stack,
++                                        .name = "anon"});
+     } else if (True(mem_flags & Core::MemoryMapFlags::Void)) {
+         // Reserves memory
+-        result =
+-            memory->MapMemory(&addr_out, aligned_addr, aligned_size, Core::MemoryProt::NoAccess,
+-                              mem_flags, Core::VMAType::Reserved, "anon", false);
++        result = memory.Map(&addr_out, {.addr = aligned_addr,
++                                        .size = aligned_size,
++                                        .prot = Core::MemoryProt::NoAccess,
++                                        .flags = mem_flags,
++                                        .type = Core::VMAType::Reserved,
++                                        .name = "anon"});
+     } else {
+         // Default to file mapping
+-        result = memory->MapFile(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags, fd,
+-                                 phys_addr);
++        result = memory.MapFile(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags, fd,
++                                phys_addr);
+     }
+ 
+     if (result != ORBIS_OK) {
+@@ -834,8 +853,7 @@ s32 PS4_SYSV_ABI sceKernelConfiguredFlexibleMemorySize(u64* sizeOut) {
+         return ORBIS_KERNEL_ERROR_EINVAL;
+     }
+ 
+-    auto* memory = Core::Memory::Instance();
+-    *sizeOut = memory->GetTotalFlexibleSize();
++    *sizeOut = Core::GetGuestPhysicalMemory().FlexibleSize();
+     return ORBIS_OK;
+ }
+ 
+@@ -844,8 +862,7 @@ s32 PS4_SYSV_ABI sceKernelMunmap(void* addr, u64 len) {
+     if (len == 0) {
+         return ORBIS_KERNEL_ERROR_EINVAL;
+     }
+-    auto* memory = Core::Memory::Instance();
+-    return memory->UnmapMemory(std::bit_cast<VAddr>(addr), len);
++    return Core::GetGuestVirtualMemory().Unmap(std::bit_cast<VAddr>(addr), len);
+ }
+ 
+ s32 PS4_SYSV_ABI posix_munmap(void* addr, u64 len) {
+@@ -967,8 +984,7 @@ s32 PS4_SYSV_ABI sceKernelSetPrtAperture(s32 id, VAddr address, u64 size) {
+                 "PRT aperture id = {}, address = {:#x}, size = {:#x} is set but not used", id,
+                 address, size);
+ 
+-    auto* memory = Core::Memory::Instance();
+-    memory->SetPrtArea(id, address, size);
++    Core::GetGuestVirtualMemory().SetPrtArea(id, address, size);
+ 
+     PrtApertures[id] = {address, size};
+     return ORBIS_OK;
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 73b21a4e..291f8c82 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
++
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/debug.h"
+@@ -14,7 +16,19 @@
+ 
+ namespace Core {
+ 
++namespace {
++// SecondSonPC patch 0012: whether this manager is still the guest memory (SelectGuestMemory) and
++// whether it was created (nothing else can be selected then). Start-up only, one thread.
++bool bridge_selected = true;
++bool bridge_created = false;
++} // Anonymous namespace
++
+ MemoryManager::MemoryManager() {
++    // SecondSonPC patch 0012: another memory manager owns the guest address space; a second one would
++    // take it again.
++    ASSERT_MSG(bridge_selected, "the bridge's memory manager was created although another one manages "
++                                "the guest memory (SecondSonPC --native memory)");
++    bridge_created = true;
+     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
+ 
+     // Construct vma_map using the regions reserved by the address space
+@@ -1864,6 +1878,41 @@ public:
+         return Memory::Instance()->GetAreas();
+     }
+ 
++    // Patch 0012: libkernel's memory functions, each the manager call they made before.
++
++    s32 Query(VAddr addr, s32 flags, ::Libraries::Kernel::OrbisVirtualQueryInfo* info) override {
++        return Memory::Instance()->VirtualQuery(addr, flags, info);
++    }
++
++    s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot) override {
++        return Memory::Instance()->QueryProtection(addr, start, end, prot);
++    }
++
++    s32 IsStack(VAddr addr, void** start, void** end) override {
++        return Memory::Instance()->IsStack(addr, start, end);
++    }
++
++    s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) override {
++        return Memory::Instance()->SetDirectMemoryType(addr, size, memory_type);
++    }
++
++    s32 MapFile(void** out_addr, VAddr addr, u64 size, MemoryProt prot, MemoryMapFlags flags, s32 fd,
++                s64 offset) override {
++        return Memory::Instance()->MapFile(out_addr, addr, size, prot, flags, fd, offset);
++    }
++
++    s32 PoolCommit(VAddr addr, u64 size, MemoryProt prot, s32 memory_type) override {
++        return Memory::Instance()->PoolCommit(addr, size, prot, memory_type);
++    }
++
++    s32 PoolDecommit(VAddr addr, u64 size) override {
++        return Memory::Instance()->PoolDecommit(addr, size);
++    }
++
++    void SetPrtArea(u32 id, VAddr addr, u64 size) override {
++        Memory::Instance()->SetPrtArea(id, addr, size);
++    }
++
+     void SetupRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2) override {
+         Memory::Instance()->SetupMemoryRegions(flexible_size, use_extended_mem1, use_extended_mem2);
+     }
+@@ -1881,6 +1930,37 @@ public:
+         return Memory::Instance()->Free(start, size, checked);
+     }
+ 
++    u64 FlexibleSize() override {
++        return Memory::Instance()->GetTotalFlexibleSize();
++    }
++
++    u64 FlexibleAvailable() override {
++        return Memory::Instance()->GetAvailableFlexibleSize();
++    }
++
++    s32 DirectQuery(PAddr addr, bool find_next,
++                    ::Libraries::Kernel::OrbisQueryInfo* info) override {
++        return Memory::Instance()->DirectMemoryQuery(addr, find_next, info);
++    }
++
++    s32 DirectAvailable(PAddr search_start, PAddr search_end, u64 alignment, PAddr* out,
++                        u64* size) override {
++        return Memory::Instance()->DirectQueryAvailable(search_start, search_end, alignment, out,
++                                                        size);
++    }
++
++    s32 DirectMemoryType(PAddr addr, s32* type, void** start, void** end) override {
++        return Memory::Instance()->GetDirectMemoryType(addr, type, start, end);
++    }
++
++    PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) override {
++        return Memory::Instance()->PoolExpand(search_start, search_end, size, alignment);
++    }
++
++    s32 PoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats) override {
++        return Memory::Instance()->GetMemoryPoolStats(stats);
++    }
++
+     void NotifyHostWrite(VAddr addr, u64 size) override {
+         Memory::Instance()->InvalidateMemory(addr, size);
+     }
+@@ -1888,22 +1968,58 @@ public:
+ 
+ BridgeGuestMemory bridge_guest_memory;
+ 
++// SecondSonPC patch 0012: the guest memory in use - these adapters unless SelectGuestMemory chose
++// another implementation before the first Get*() call. GetGpuMemory runs in the access violation
++// handler (ProtectTracking): one relaxed load besides the pointer.
++GuestMemoryImpl selected{&bridge_guest_memory, &bridge_guest_memory, &bridge_guest_memory,
++                         &bridge_gpu_memory};
++std::atomic<bool> selection_closed{false};
++
++void CloseSelection() {
++    if (!selection_closed.load(std::memory_order_relaxed)) {
++        selection_closed.store(true, std::memory_order_relaxed);
++    }
++}
++
+ } // Anonymous namespace
+ 
+ GpuMemory& GetGpuMemory() {
+-    return bridge_gpu_memory;
++    CloseSelection();
++    return *selected.gpu_memory;
+ }
+ 
+ GuestVirtualMemory& GetGuestVirtualMemory() {
+-    return bridge_guest_memory;
++    CloseSelection();
++    return *selected.virtual_memory;
+ }
+ 
+ GuestPhysicalMemory& GetGuestPhysicalMemory() {
+-    return bridge_guest_memory;
++    CloseSelection();
++    return *selected.physical_memory;
+ }
+ 
+ GuestWriteNotifier& GetGuestWriteNotifier() {
+-    return bridge_guest_memory;
++    CloseSelection();
++    return *selected.write_notifier;
++}
++
++bool SelectGuestMemory(const GuestMemoryImpl& impl) {
++    if (selection_closed.load(std::memory_order_relaxed) || bridge_created ||
++        impl.virtual_memory == nullptr || impl.physical_memory == nullptr ||
++        impl.write_notifier == nullptr || impl.gpu_memory == nullptr) {
++        return false;
++    }
++    selected = impl;
++    bridge_selected =
++        impl.virtual_memory == static_cast<GuestVirtualMemory*>(&bridge_guest_memory) &&
++        impl.physical_memory == static_cast<GuestPhysicalMemory*>(&bridge_guest_memory) &&
++        impl.write_notifier == static_cast<GuestWriteNotifier*>(&bridge_guest_memory) &&
++        impl.gpu_memory == &bridge_gpu_memory;
++    return true;
++}
++
++bool BridgeGuestMemorySelected() {
++    return bridge_selected;
+ }
+ 
+ } // namespace Core

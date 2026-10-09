@@ -1,11 +1,26 @@
 // SecondSonPC — the bridge's memory interfaces over SecondSonPC's own memory manager (P2.3.3c).
 #include "bridge/shadps4/native_memory.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include "base/log.h"
+#include "core/libraries/kernel/memory.h"
 
 namespace SecondSon::Bridge {
 
 namespace {
+
+/// What the manager does not have (no user in this game: docs/PHASE2_P234_NATIVE_MEMORY.md): an error in the
+/// log and the code, never a silent answer.
+s32 NotSupported(std::string_view what) {
+    SSPC_LOG(Memory, Critical, "native memory: {} is not supported by SecondSonPC's memory manager", what);
+    return Memory::kErrEinval;
+}
+
+u64 AlignUpTo(u64 value, u64 alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
 
 /// The bridge's AddressSpace::Protect takes these combinations; write implies read on the host.
 Memory::HostAccess TrackingAccess(Core::MemoryPermission perms) {
@@ -84,6 +99,99 @@ std::vector<Core::GuestArea> NativeGuestMemory::Areas() {
     return out;
 }
 
+s32 NativeGuestMemory::Query(VAddr addr, s32 flags, Libraries::Kernel::OrbisVirtualQueryInfo* info) {
+    // The bridge's MemoryManager::VirtualQuery: flags 1 looks for the next area in use. Every field it sets is set
+    // here (the struct's other bits stay as the caller had them, as there).
+    Memory::QueryInfo q;
+    const s32 r = vm_.Query(addr, flags == 1, &q);
+    if (r != Memory::kOk) {
+        return r;
+    }
+    info->start = q.start;
+    info->end = q.end;
+    info->offset = q.offset;
+    info->protection = q.protection;
+    info->memory_type = q.memory_type;
+    info->is_flexible = q.is_flexible ? 1 : 0;
+    info->is_direct = q.is_direct ? 1 : 0;
+    info->is_stack = q.is_stack ? 1 : 0;
+    info->is_pooled = q.is_pooled ? 1 : 0;
+    info->is_committed = q.is_committed ? 1 : 0;
+    std::strncpy(info->name, q.name.c_str(), Libraries::Kernel::ORBIS_KERNEL_MAXIMUM_NAME_LENGTH);
+    return Memory::kOk;
+}
+
+s32 NativeGuestMemory::QueryProtection(VAddr addr, void** start, void** end, u32* prot) {
+    u64 s = 0;
+    u64 e = 0;
+    u32 p = 0;
+    const s32 r = vm_.QueryProtection(addr, &s, &e, &p);
+    if (r != Memory::kOk) {
+        return r;
+    }
+    if (start != nullptr) {
+        *start = reinterpret_cast<void*>(s);
+    }
+    if (end != nullptr) {
+        *end = reinterpret_cast<void*>(e);
+    }
+    if (prot != nullptr) {
+        *prot = p;
+    }
+    return Memory::kOk;
+}
+
+s32 NativeGuestMemory::IsStack(VAddr addr, void** start, void** end) {
+    // The bridge's MemoryManager::IsStack: EACCES on free memory (it asserts outside its map), else the stack's
+    // range or [0, 0).
+    Memory::QueryInfo q;
+    const s32 r = vm_.Query(addr, false, &q);
+    if (r != Memory::kOk) {
+        return r;
+    }
+    if (start != nullptr) {
+        *start = reinterpret_cast<void*>(q.is_stack ? q.start : 0);
+    }
+    if (end != nullptr) {
+        *end = reinterpret_cast<void*>(q.is_stack ? q.end : 0);
+    }
+    return Memory::kOk;
+}
+
+s32 NativeGuestMemory::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
+    (void)addr;
+    (void)size;
+    (void)memory_type;
+    return NotSupported("changing the memory type of mapped direct memory (sceKernelMapDirectMemory2, "
+                        "sceKernelMtypeprotect)");
+}
+
+s32 NativeGuestMemory::MapFile(void** out_addr, VAddr addr, u64 size, Core::MemoryProt prot,
+                               Core::MemoryMapFlags flags, s32 fd, s64 offset) {
+    (void)out_addr;
+    SSPC_LOG(Memory, Error, "native memory: mmap of fd {} [{:#x}, +{:#x}) at {:#x} prot {:#x} flags {:#x}", fd, offset,
+             size, addr, static_cast<u32>(prot), static_cast<u32>(flags));
+    return NotSupported("mapping a file (mmap with a file descriptor)");
+}
+
+s32 NativeGuestMemory::PoolCommit(VAddr addr, u64 size, Core::MemoryProt prot, s32 memory_type) {
+    (void)addr;
+    (void)size;
+    (void)prot;
+    (void)memory_type;
+    return NotSupported("memory pools (sceKernelMemoryPoolCommit)");
+}
+
+s32 NativeGuestMemory::PoolDecommit(VAddr addr, u64 size) {
+    (void)addr;
+    (void)size;
+    return NotSupported("memory pools (sceKernelMemoryPoolDecommit)");
+}
+
+void NativeGuestMemory::SetPrtArea(u32 id, VAddr addr, u64 size) {
+    vm_.SetPrtArea(id, addr, size);
+}
+
 void NativeGuestMemory::SetupRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2) {
     Memory::Budget budget = console_;
     budget.flexible_size = flexible_size;
@@ -112,6 +220,108 @@ PAddr NativeGuestMemory::AllocateDirect(PAddr search_start, PAddr search_end, u6
 
 s32 NativeGuestMemory::ReleaseDirect(PAddr start, u64 size, bool checked) {
     return vm_.ReleaseDirect(start, size, checked);
+}
+
+u64 NativeGuestMemory::FlexibleSize() {
+    return vm_.FlexibleBudget();
+}
+
+u64 NativeGuestMemory::FlexibleAvailable() {
+    const u64 budget = vm_.FlexibleBudget();
+    return budget - std::min(budget, vm_.FlexibleUsed());
+}
+
+s32 NativeGuestMemory::DirectQuery(PAddr addr, bool find_next, Libraries::Kernel::OrbisQueryInfo* info) {
+    // The bridge's MemoryManager::DirectMemoryQuery over the manager's map: the allocated area at addr (or the next
+    // one), extended over the allocated areas of the same memory type right after it. The bridge's map splits an
+    // area where it becomes mapped, the manager's where the number of views changes; neither split shows here.
+    const auto areas = vm_.Direct().Snapshot();
+    if (addr >= vm_.DirectSize()) {
+        return Memory::kErrEacces;
+    }
+    auto it = std::find_if(areas.begin(), areas.end(),
+                           [addr](const Memory::Area& a) { return addr >= a.base && addr - a.base < a.size; });
+    while (it != areas.end() && it->state == Memory::AreaState::Free && find_next) {
+        ++it;
+    }
+    if (it == areas.end() || it->state != Memory::AreaState::Allocated) {
+        return Memory::kErrEacces;
+    }
+    info->start = it->base;
+    info->memoryType = it->memory_type;
+    for (; it != areas.end() && it->memory_type == info->memoryType && it->state == Memory::AreaState::Allocated;
+         ++it) {
+        info->end = it->base + it->size;
+    }
+    return Memory::kOk;
+}
+
+s32 NativeGuestMemory::DirectAvailable(PAddr search_start, PAddr search_end, u64 alignment, PAddr* out, u64* size) {
+    // The bridge's MemoryManager::DirectQueryAvailable, step by step (including how it trims an area that starts
+    // before search_start), over the manager's free areas.
+    const auto areas = vm_.Direct().Snapshot();
+    auto it = std::find_if(areas.rbegin(), areas.rend(), [search_start](const Memory::Area& a) {
+                  return a.base <= search_start;
+              }).base();
+    if (it != areas.begin()) {
+        --it;
+    }
+    PAddr paddr = 0;
+    u64 max_size = 0;
+    for (; it != areas.end(); ++it) {
+        if (it->state != Memory::AreaState::Free) {
+            continue;
+        }
+        u64 aligned_base = alignment > 0 ? AlignUpTo(it->base, alignment) : it->base;
+        const u64 alignment_size = aligned_base - it->base;
+        u64 remaining = it->size >= alignment_size ? it->size - alignment_size : 0;
+        if (it->base < search_start) {
+            remaining = remaining > search_start - it->base ? remaining - (search_start - it->base) : 0;
+            aligned_base = alignment > 0 ? AlignUpTo(search_start, alignment) : search_start;
+        }
+        const u64 end = it->base + it->size;
+        if (end > search_end) {
+            remaining = remaining > end - search_end ? remaining - (end - search_end) : 0;
+        }
+        if (remaining > max_size) {
+            paddr = aligned_base;
+            max_size = remaining;
+        }
+    }
+    *out = paddr;
+    *size = max_size;
+    return Memory::kOk;
+}
+
+s32 NativeGuestMemory::DirectMemoryType(PAddr addr, s32* type, void** start, void** end) {
+    const auto areas = vm_.Direct().Snapshot();
+    const auto it = std::find_if(areas.begin(), areas.end(),
+                                 [addr](const Memory::Area& a) { return addr >= a.base && addr - a.base < a.size; });
+    if (addr >= vm_.DirectSize() || it == areas.end() || it->state != Memory::AreaState::Allocated) {
+        return Memory::kErrEnoent;
+    }
+    *start = reinterpret_cast<void*>(it->base);
+    *end = reinterpret_cast<void*>(it->base + it->size);
+    *type = it->memory_type;
+    return Memory::kOk;
+}
+
+PAddr NativeGuestMemory::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
+    (void)search_start;
+    (void)search_end;
+    (void)size;
+    (void)alignment;
+    NotSupported("memory pools (sceKernelMemoryPoolExpand)");
+    return static_cast<PAddr>(-1);
+}
+
+s32 NativeGuestMemory::PoolStats(Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats) {
+    // No pool memory exists without pools: everything is 0 (the bridge counts its committed pool areas).
+    stats->allocated_flushed_blocks = 0;
+    stats->available_flushed_blocks = 0;
+    stats->allocated_cached_blocks = 0;
+    stats->available_cached_blocks = 0;
+    return Memory::kOk;
 }
 
 void NativeGuestMemory::NotifyHostWrite(VAddr addr, u64 size) {

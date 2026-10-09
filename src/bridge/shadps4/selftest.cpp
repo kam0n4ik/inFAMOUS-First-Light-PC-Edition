@@ -4653,6 +4653,138 @@ void TestParamSfo(Totals& t, const App::Config& cfg) {
                                    rejected == static_cast<int>(damaged.size()) ? "PASS" : "FAIL"));
 }
 
+} // namespace SecondSon::Bridge
+
+namespace Libraries::Kernel { // not in core/libraries/kernel/memory.h
+void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr);
+s32 PS4_SYSV_ABI sceKernelConfiguredFlexibleMemorySize(u64* sizeOut);
+} // namespace Libraries::Kernel
+
+namespace SecondSon::Bridge {
+
+/// P2.3.4 (patch 0012): libkernel's memory functions reach the memory manager only through
+/// Core::GuestVirtualMemory / GuestPhysicalMemory / GuestWriteNotifier. With the bridge selected (the default)
+/// every function answers as the bridge's manager asked directly; the selection is closed after start-up.
+void TestGuestMemoryApi(Totals& t) {
+    namespace K = Libraries::Kernel;
+    InputChecks c(t, "GuestMemory(api)");
+    auto* mm = Core::Memory::Instance();
+    auto& vm = Core::GetGuestVirtualMemory();
+    auto& pm = Core::GetGuestPhysicalMemory();
+    c.Check("the bridge's manager is the guest memory, and nothing can be selected any more (the first Get*() at "
+            "start-up closed the selection)",
+            Core::BridgeGuestMemorySelected() &&
+                !Core::SelectGuestMemory({&vm, &pm, &Core::GetGuestWriteNotifier(), &Core::GetGpuMemory()}),
+            "");
+    const size_t vmas_before = BridgeVmaCount();
+    constexpr u64 kWindow = 0x100000;
+    void* found = nullptr;
+    if (mm->MapMemory(&found, 0, kWindow, Core::MemoryProt::NoAccess, Core::MemoryMapFlags::NoFlags,
+                      Core::VMAType::Reserved, "selftest window", false, -1, 0x10000) != 0) {
+        c.Check("a free window of the game's address space", false, "");
+        c.Summary();
+        return;
+    }
+    mm->UnmapMemory(reinterpret_cast<u64>(found), kWindow);
+    const u64 w = reinterpret_cast<u64>(found);
+    const auto Ptr = [](u64 addr) { return reinterpret_cast<void*>(addr); };
+    std::string bad;
+    const auto Expect = [&bad](std::string_view what, bool ok) {
+        if (!ok) {
+            bad += std::string(what) + "; ";
+        }
+    };
+    const auto Query = [&](u64 addr, s32 flags) {
+        K::OrbisVirtualQueryInfo api, direct;
+        std::memset(&api, 0, sizeof(api));
+        std::memset(&direct, 0, sizeof(direct));
+        const s32 ra = K::sceKernelVirtualQuery(Ptr(addr), flags, &api, sizeof(api));
+        const s32 rd = mm->VirtualQuery(addr, flags, &direct);
+        return ra == rd && std::memcmp(&api, &direct, sizeof(api)) == 0;
+    };
+    const auto Protection = [&](u64 addr) {
+        void* s1 = nullptr;
+        void* e1 = nullptr;
+        void* s2 = nullptr;
+        void* e2 = nullptr;
+        u32 p1 = 0;
+        u32 p2 = 0;
+        const s32 ra = K::sceKernelQueryMemoryProtection(Ptr(addr), &s1, &e1, &p1);
+        const s32 rd = mm->QueryProtection(addr, &s2, &e2, &p2);
+        return ra == rd && s1 == s2 && e1 == e2 && p1 == p2;
+    };
+
+    void* reserved = Ptr(w);
+    Expect("ReserveVirtualRange (fixed)",
+           K::sceKernelReserveVirtualRange(&reserved, 0x40000, 0x10, 0) == 0 && reserved == Ptr(w));
+    Expect("VirtualQuery of the reservation", Query(w, 0));
+    void* flex = Ptr(w + 0x40000);
+    Expect("MapNamedFlexibleMemory (fixed)",
+           K::sceKernelMapNamedFlexibleMemory(&flex, 0x20000, 3, 0x10, "api flexible") == 0 &&
+               flex == Ptr(w + 0x40000));
+    Expect("VirtualQuery and QueryMemoryProtection of it", Query(w + 0x40000, 0) && Protection(w + 0x44000));
+    Expect("Mprotect of a part read-only", K::sceKernelMprotect(Ptr(w + 0x44000), 0x4000, 1) == 0 &&
+                                               Protection(w + 0x44000) && Protection(w + 0x40000) &&
+                                               Query(w + 0x44000, 0));
+    void* s1 = nullptr;
+    void* e1 = nullptr;
+    void* s2 = nullptr;
+    void* e2 = nullptr;
+    Expect("IsStack", K::sceKernelIsStack(flex, &s1, &e1) == mm->IsStack(w + 0x40000, &s2, &e2) && s1 == s2 &&
+                          e1 == e2);
+    u64 available = 0;
+    u64 configured = 0;
+    K::sceKernelAvailableFlexibleMemorySize(&available);
+    K::sceKernelConfiguredFlexibleMemorySize(&configured);
+    Expect("Available/ConfiguredFlexibleMemorySize",
+           available == mm->GetAvailableFlexibleSize() && configured == mm->GetTotalFlexibleSize() &&
+               available < configured);
+
+    const u64 direct_size = K::sceKernelGetDirectMemorySize();
+    Expect("GetDirectMemorySize", direct_size == mm->GetTotalDirectSize());
+    s64 phys = -1;
+    Expect("AllocateDirectMemory",
+           K::sceKernelAllocateDirectMemory(0, static_cast<s64>(direct_size), 0x10000, 0x10000, 3, &phys) == 0);
+    void* direct = Ptr(w + 0x80000);
+    Expect("MapDirectMemory (fixed)", K::sceKernelMapDirectMemory(&direct, 0x10000, 0x33, 0x10, phys, 0) == 0 &&
+                                          direct == Ptr(w + 0x80000));
+    Expect("VirtualQuery of it, and find-next from a free page before it", Query(w + 0x80000, 0) &&
+                                                                               Query(w + 0x60000, 1));
+    K::OrbisQueryInfo qa{};
+    K::OrbisQueryInfo qd{};
+    Expect("DirectMemoryQuery", K::sceKernelDirectMemoryQuery(phys, 0, &qa, sizeof(qa)) ==
+                                        mm->DirectMemoryQuery(phys, false, &qd) &&
+                                    qa.start == qd.start && qa.end == qd.end && qa.memoryType == qd.memoryType);
+    s32 ta = -1;
+    s32 td = -2;
+    Expect("GetDirectMemoryType", K::sceKernelGetDirectMemoryType(phys, &ta, &s1, &e1) ==
+                                          mm->GetDirectMemoryType(phys, &td, &s2, &e2) &&
+                                      ta == td && s1 == s2 && e1 == e2);
+    u64 pa = 1;
+    u64 sa = 1;
+    PAddr pd = 2;
+    u64 sd = 2;
+    Expect("AvailableDirectMemorySize",
+           K::sceKernelAvailableDirectMemorySize(0, direct_size, 0x10000, &pa, &sa) ==
+                   mm->DirectQueryAvailable(0, direct_size, 0x10000, &pd, &sd) &&
+               pa == pd && sa == sd);
+
+    void* anon = K::posix_mmap(nullptr, 0x10000, 3, 0x1002, -1, 0); // MAP_ANON | MAP_PRIVATE: flexible
+    Expect("mmap of anonymous memory, VirtualQuery of it",
+           anon != reinterpret_cast<void*>(-1) && Query(reinterpret_cast<u64>(anon), 0));
+    if (anon != reinterpret_cast<void*>(-1)) {
+        Expect("munmap of it", K::sceKernelMunmap(anon, 0x10000) == 0);
+    }
+    Expect("Munmap of the window", K::sceKernelMunmap(Ptr(w), kWindow) == 0 && Query(w + 0x40000, 0) &&
+                                       Query(w + 0x80000, 0));
+    Expect("CheckedReleaseDirectMemory", K::sceKernelCheckedReleaseDirectMemory(phys, 0x10000) == 0);
+    Expect("everything unmapped and released (the bridge's area count is back)", BridgeVmaCount() == vmas_before);
+    c.Check("libkernel's memory functions (reserve, flexible, mprotect, queries, direct memory, mmap, munmap, "
+            "release) through the interfaces answer as the bridge's manager asked directly",
+            bad.empty(), bad);
+    c.Summary();
+}
+
 int RunSelfTest(const App::Config& cfg) {
     Totals t;
     TestParamSfo(t, cfg);
@@ -4673,6 +4805,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestDirectMemoryBridge(t, cfg);
     TestGpuMemory(t, cfg);
     TestGuestMemory(t);
+    TestGuestMemoryApi(t);
     auto native_groups = TestNativeVirtualMemory(Common::ElfInfo::Instance().CompiledSdkVer());
     std::string diff_transcript;
     for (auto& g : TestNativeMemoryAdapters(Common::ElfInfo::Instance().CompiledSdkVer(), &diff_transcript)) {

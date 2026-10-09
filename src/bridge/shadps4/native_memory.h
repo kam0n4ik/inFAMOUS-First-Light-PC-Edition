@@ -33,12 +33,30 @@ public:
     bool IsValid(VAddr addr, u64 size) override;
     VAddr SystemReservedBase() override;
     std::vector<Core::GuestArea> Areas() override;
+    // patch 0012 (libkernel's memory functions)
+    s32 Query(VAddr addr, s32 flags, Libraries::Kernel::OrbisVirtualQueryInfo* info) override;
+    s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot) override;
+    s32 IsStack(VAddr addr, void** start, void** end) override;
+    s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) override; ///< not supported
+    s32 MapFile(void** out_addr, VAddr addr, u64 size, Core::MemoryProt prot, Core::MemoryMapFlags flags, s32 fd,
+                s64 offset) override; ///< not supported
+    s32 PoolCommit(VAddr addr, u64 size, Core::MemoryProt prot, s32 memory_type) override; ///< not supported
+    s32 PoolDecommit(VAddr addr, u64 size) override;                                        ///< not supported
+    void SetPrtArea(u32 id, VAddr addr, u64 size) override;
 
     // Core::GuestPhysicalMemory
     void SetupRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2) override;
     u64 DirectSize() override;
     PAddr AllocateDirect(PAddr search_start, PAddr search_end, u64 size, u64 alignment, s32 memory_type) override;
     s32 ReleaseDirect(PAddr start, u64 size, bool checked) override;
+    // patch 0012 (libkernel's memory functions)
+    u64 FlexibleSize() override;
+    u64 FlexibleAvailable() override;
+    s32 DirectQuery(PAddr addr, bool find_next, Libraries::Kernel::OrbisQueryInfo* info) override;
+    s32 DirectAvailable(PAddr search_start, PAddr search_end, u64 alignment, PAddr* out, u64* size) override;
+    s32 DirectMemoryType(PAddr addr, s32* type, void** start, void** end) override;
+    PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) override; ///< not supported
+    s32 PoolStats(Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats) override;
 
     // Core::GuestWriteNotifier
     void NotifyHostWrite(VAddr addr, u64 size) override;

@@ -34,7 +34,7 @@ INCLUDE_ONLY = "includes core/memory.h"
 # Exceptions (docs/PHASE2_P233_MEMORY_DEPENDENCIES.md section 6). Paths relative to the repository.
 B = "third_party/shadPS4/src/"
 EXCEPTIONS = {
-    B + "core/libraries/kernel/memory.cpp": ("E1", "libkernel's memory API of the bridge (its own facade)"),
+    # E1 (libkernel's memory API, core/libraries/kernel/memory.cpp) is gone since patch 0012 (P2.3.4): moved.
     B + "core/linker.cpp": ("E2", "--loader shadps4 (the oracle's loader)"),
     B + "core/linker.h": ("E2", "--loader shadps4 (the oracle's loader)"),
     B + "core/module.cpp": ("E2", "--loader shadps4 (the oracle's loader)"),
@@ -83,6 +83,7 @@ MOVED = [
     B + "video_core/texture_cache/texture_cache.cpp",
     B + "video_core/amdgpu/liverpool.cpp",
     B + "core/libraries/gnmdriver/gnmdriver.cpp",
+    B + "core/libraries/kernel/memory.cpp",  # P2.3.4, patch 0012
 ]
 
 
