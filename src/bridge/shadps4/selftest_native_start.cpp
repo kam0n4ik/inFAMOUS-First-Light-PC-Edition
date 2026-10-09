@@ -519,8 +519,12 @@ void TestUnsupported(TestGroup& g) {
     u64 phys = 0;
     const s32 expand = K::sceKernelMemoryPoolExpand(0, K::sceKernelGetDirectMemorySize(), 0x10000, 0, &phys);
     void* file = K::posix_mmap(nullptr, 0x10000, 1, 0, 3, 0);
-    g.Check("memory pools (reserve, expand) and file mappings are refused with an error, not answered silently",
-            reserve != 0 && expand != 0 && file == Ptr(~0ull),
+    // The arguments pass libkernel's checks (2 MiB aligned reservation, 64 KiB expansion in range, a file mmap of
+    // 64 KiB), so the codes are the manager's: EINVAL for the pool reservation (Map refuses pool types), ENOMEM for
+    // the expansion (libkernel's answer to PoolExpand's -1), and mmap's -1 from MapFile's EINVAL.
+    g.Check("memory pools (reserve, expand) and file mappings reach the manager and are refused with an error, not "
+            "answered silently",
+            reserve == Memory::kErrEinval && expand == Memory::kErrEnomem && file == Ptr(~0ull),
             fmt::format("{} {} {}", Code(reserve), Code(expand), file));
 }
 

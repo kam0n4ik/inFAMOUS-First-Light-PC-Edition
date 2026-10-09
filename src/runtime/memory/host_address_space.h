@@ -116,7 +116,8 @@ public:
     /// Everything in [addr, addr + size) back to placeholder space; views partly inside are mapped again
     /// around it and their remaining parts keep the host protection they had (D19: the bridge gives them
     /// read/write(+execute) again, losing the guest's mprotect and the GPU's page tracking there).
-    /// false when it would split private memory (nothing changed) or the host refuses.
+    /// false when it would split private memory (nothing changed) or the host refuses (then the regions may be
+    /// partly changed: VirtualMemory stops the process on it, see HostRefused).
     bool Unmap(u64 addr, u64 size);
     /// Host protection of the mapped parts of [addr, addr + size); placeholder space is skipped. No allocation.
     bool Protect(u64 addr, u64 size, HostAccess access);
