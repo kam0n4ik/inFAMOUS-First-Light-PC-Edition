@@ -1,0 +1,45 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index a620b5dd..a6fb0203 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -22,6 +22,7 @@
+ #include <vk_mem_alloc.h>
+ 
+ #include "bridge/shadps4/gpu_alloc_diag.h" // SecondSonPC SSPC-001 diagnostics
++#include "bridge/shadps4/perf_opts.h"      // SecondSonPC P2.5 optimizations
+ #include "bridge/shadps4/track_diag.h"     // SecondSonPC P2.5 diagnostics
+ 
+ namespace VideoCore {
+@@ -56,7 +57,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
+       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
+       memory{&Core::GetGpuMemory()}, texture_cache{texture_cache_},
+       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
+-      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
++      // SecondSonPC P2.5 (--perf-opt stream-host): the small read-only copies of ObtainBuffer go to
++      // system memory (the GPU reads them over PCIe) instead of CPU-visible video memory, where
++      // every copy is a write over PCIe.
++      stream_buffer{instance, scheduler,
++                    SecondSon::PerfOpts::stream_host ? MemoryType::HostUncached : MemoryType::Stream,
++                    STREAM_BUFFER_SIZE},
+       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
+       memory_semaphore{instance} {
+     const vk::BufferCreateInfo probe_ci = {
+@@ -89,6 +95,18 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
+     bda_pagetable_buffer = std::make_unique<Buffer>(
+         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
+     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
++
++    // SecondSonPC P2.5: where the stream buffer was placed (--perf-opt stream-host).
++    VkMemoryPropertyFlags sspc_flags{};
++    vmaGetAllocationMemoryProperties(instance.GetAllocator(), stream_buffer.buffer.allocation,
++                                     &sspc_flags);
++    LOG_INFO(Render_Vulkan, "Stream buffer: {} MiB, {}; device-local {}, host-visible {}, coherent {}, "
++             "cached {}",
++             STREAM_BUFFER_SIZE >> 20, SecondSon::PerfOpts::stream_host ? "stream-host" : "default",
++             (sspc_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
++             (sspc_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0,
++             (sspc_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0,
++             (sspc_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0);
+ }
+ 
+ BufferCache::~BufferCache() = default;

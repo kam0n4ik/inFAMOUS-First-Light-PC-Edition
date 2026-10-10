@@ -21,4 +21,13 @@ inline bool barrier_memo = true;
 // view 55.6-58.0 -> 60 FPS, dense foliage 32.4-35.2 -> 38.5 FPS); --no-perf-opt image-memo turns it off.
 inline bool image_memo = true;
 
+// BufferCache::stream_buffer (patch 0019): the stream buffer, which receives a copy of every small
+// read-only buffer a draw binds (BufferCache::ObtainBuffer: ~27 000 copies, ~28 MiB per frame looking
+// at dense foliage), in system memory (MemoryType::HostUncached, the GPU reads it over PCIe) instead
+// of CPU-visible video memory (MemoryType::Stream), where each copy is a write over PCIe. Read when the
+// buffer cache is created. On by default since its A/B (beach scene, ABBA: dense foliage 37.9-38.4 ->
+// 40.8-41.1 FPS, median frame 32.5 -> 18 ms; open view 1 % low 43 -> 53; GPU busy +~1 ms per frame,
+// 128 MiB moved from VRAM to shared memory); --no-perf-opt stream-host turns it off.
+inline bool stream_host = true;
+
 } // namespace SecondSon::PerfOpts

@@ -149,9 +149,11 @@ int main(int argc, char* argv[]) {
                 SecondSon::PerfOpts::barrier_memo = on;
             } else if (name == "image-memo") {
                 SecondSon::PerfOpts::image_memo = on;
+            } else if (name == "stream-host") {
+                SecondSon::PerfOpts::stream_host = on;
             } else {
                 return Fail(std::string(arg) + ": unknown change " + std::string(name) +
-                            " (barrier-memo, image-memo)");
+                            " (barrier-memo, image-memo, stream-host)");
             }
         } else if (arg == "--selftest") {
             config->selftest = true;
