@@ -15,6 +15,7 @@
 #   gpu3d_pct           utilisation of the process's busiest GPU engine type (GPU Engine counters,
 #                       summed per engtype; Task Manager's "GPU" column shows the same maximum)
 #   gpu_dedicated_mib / gpu_shared_mib   GPU memory of the process (GPU Process Memory counters)
+#   handles             process handle count (P3.2: leak checks of long sessions)
 param(
     [Parameter(Mandatory)][string]$Out,
     [int]$WaitSeconds = 30,
@@ -81,6 +82,7 @@ $counters = @(
     "\Process($instance)\Private Bytes",
     "\Process($instance)\Working Set - Private",
     "\Process($instance)\Virtual Bytes",
+    "\Process($instance)\Handle Count",
     "\Memory\Committed Bytes",
     "\Memory\Commit Limit",
     "\Memory\Available MBytes",
@@ -90,7 +92,7 @@ $counters = @(
 
 $dir = Split-Path -Parent $Out
 if ($dir) { New-Item -ItemType Directory -Force $dir | Out-Null }
-"t_s,cpu_pct,cpu_total_pct,threads,private_mib,ws_private_mib,virtual_mib,sys_commit_mib,sys_commit_limit_mib,avail_mib,hard_faults_s,ctx_switch_s,gpu3d_pct,gpu_dedicated_mib,gpu_shared_mib" |
+"t_s,cpu_pct,cpu_total_pct,threads,private_mib,ws_private_mib,virtual_mib,sys_commit_mib,sys_commit_limit_mib,avail_mib,hard_faults_s,ctx_switch_s,gpu3d_pct,gpu_dedicated_mib,gpu_shared_mib,handles" |
     Set-Content -Encoding ASCII $Out
 "perf_sampler: pid $procId (counter instance '$instance', $($gpuPaths.Count) GPU counters), $cores logical cores -> $Out"
 Note "pid $procId, instance '$instance', $($counters.Count) counters"
@@ -128,11 +130,12 @@ while (-not $proc.HasExited -and ((Get-Date) - $start).TotalSeconds -lt $MaxSeco
     $gpu3d = 0.0
     foreach ($e in $engines.Values) { if ($e -gt $gpu3d) { $gpu3d = $e } }
     $t = ((Get-Date) - $start).TotalSeconds
-    $row = [string]::Format($inv, "{0:F1},{1:F1},{2:F1},{3:F0},{4:F0},{5:F0},{6:F0},{7:F0},{8:F0},{9:F0},{10:F1},{11:F0},{12:F1},{13:F0},{14:F0}",
+    $handles = if ($null -ne $v['handle count']) { $v['handle count'] } else { 0.0 }
+    $row = [string]::Format($inv, "{0:F1},{1:F1},{2:F1},{3:F0},{4:F0},{5:F0},{6:F0},{7:F0},{8:F0},{9:F0},{10:F1},{11:F0},{12:F1},{13:F0},{14:F0},{15:F0}",
         $t, $v['% processor time'], ($v['% processor time'] / $cores), $v['thread count'],
         ($v['private bytes'] / 1MB), ($v['working set - private'] / 1MB), ($v['virtual bytes'] / 1MB),
         ($v['committed bytes'] / 1MB), ($v['commit limit'] / 1MB), $v['available mbytes'],
-        $v['pages input/sec'], $v['context switches/sec'], $gpu3d, ($ded / 1MB), ($shared / 1MB))
+        $v['pages input/sec'], $v['context switches/sec'], $gpu3d, ($ded / 1MB), ($shared / 1MB), $handles)
     Add-Content -Encoding ASCII $Out $row
 }
 "perf_sampler: done after $([math]::Round(((Get-Date) - $start).TotalSeconds)) s"

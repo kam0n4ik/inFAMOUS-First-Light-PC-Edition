@@ -139,6 +139,10 @@ def sample_stats(path: Path, start_s: float) -> dict:
         "gpu3d_pct_avg": avg("gpu3d_pct"),
         "gpu_dedicated_mib_max": peak("gpu_dedicated_mib"),
         "gpu_shared_mib_max": peak("gpu_shared_mib"),
+        # P3.2 (samples.csv has had the column since then): the process's handles at the start of the
+        # gameplay window, at its end and the most.
+        **({"handles_start": round(game[0]["handles"]), "handles_end": round(game[-1]["handles"]),
+            "handles_max": round(max(r["handles"] for r in rows))} if "handles" in game[0] else {}),
     }
 
 

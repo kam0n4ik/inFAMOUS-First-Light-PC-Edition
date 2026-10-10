@@ -36,6 +36,7 @@ param(
                                                   # real ones, userdata\home. P2.5 scenes: a frozen copy
                                                   # (logs\p25\scene_*\home), so play in between does not
                                                   # move the scene
+    [switch]$Soak,                                # P3.2: one long run allowed (-Seconds up to 2400)
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
@@ -82,6 +83,10 @@ $modeArgs = @{
     # §5), TMF = with SecondSonPC's threads and memory too (the most native runtime so far). PO1 = the bridge's
     # patcher (the TCB slot is SecondSonPC's in every mode).
     F = "--native fs-patch"; TMF = "--native fs-patch --native threads --native memory --memory-commit on-demand"
+    # P3.2 matrix (docs\PHASE3_INDEPENDENT_RUNTIME.md §10): A = PO1 (bridge memory, threads, FS patcher),
+    # B = MF (SecondSonPC's memory + FS patcher, the bridge's threads), C = TF (SecondSonPC's threads + FS
+    # patcher, the bridge's memory), D = TMF; TM = SecondSonPC's memory + threads with the bridge's FS patcher.
+    MF = "--native fs-patch --native memory --memory-commit on-demand"; TF = "--native fs-patch --native threads"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
@@ -118,7 +123,9 @@ function Get-SaveHashes {
 if (-not $modeList.Count -or @($modeList | Where-Object { -not $modeArgs.ContainsKey($_) }).Count) {
     Fail "-Modes must list A, B, C, D (sema/event flags), N0..N3 (Phase 2.2.3 groups) and/or M0..M3 (P2.3 memory)"
 }
-if ($Seconds -lt 30 -or $Seconds -gt 300) { Fail "-Seconds must be 30..300 (short runs only)" }
+$maxSeconds = if ($Soak) { 2400 } else { 300 }
+if ($Seconds -lt 30 -or $Seconds -gt $maxSeconds) { Fail "-Seconds must be 30..$maxSeconds (-Soak for one long run)" }
+if ($Soak -and $runList.Count -ne 1) { Fail "-Soak takes one run" }
 if ($Press -match '\s') { Fail "-Press must not contain spaces" }
 if (-not (Test-Path $defaultExe)) { Fail "not built" }
 foreach ($r in $runList) {
@@ -170,7 +177,8 @@ foreach ($r in $runList) {
     New-Item -ItemType Directory -Force $modeDir | Out-Null
 
     $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\perf_sampler.ps1", "-Out", "$modeDir\samples.csv")
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\perf_sampler.ps1", "-Out", "$modeDir\samples.csv",
+        "-MaxSeconds", "$([math]::Max(900, $Seconds + 120))")
     Remove-Item "$logs\frametimes.csv", "$logs\memory_map.txt" -ErrorAction SilentlyContinue
     $snap = $null
     if ($SnapshotAt -gt 0) {
