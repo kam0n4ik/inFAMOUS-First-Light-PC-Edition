@@ -12,7 +12,7 @@
 # compared with the checkout's src/: equal = applied; src/ as in HEAD = apply them all in order; anything
 # else stops the configure (local changes, or a patch out of date).
 find_package(Git REQUIRED)
-file(GLOB _sspc_shadps4_patches ${CMAKE_SOURCE_DIR}/patches/shadps4/*.patch)
+file(GLOB _sspc_shadps4_patches CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/patches/shadps4/*.patch)
 list(SORT _sspc_shadps4_patches)
 list(LENGTH _sspc_shadps4_patches _sspc_patch_count)
 set(_sspc_shad_dir ${CMAKE_SOURCE_DIR}/third_party/shadPS4)
@@ -54,7 +54,8 @@ endif()
 # the shader recompiler, the video core and common/ (serdes, types, hashes) of "HEAD + every patch", and
 # the compiler (the cache stores structures as raw bytes, so their layout must not change under it). A
 # patch that changes how shaders are translated or cached changes it, and the cache of another
-# generation is never read. A changed patch re-runs this configure step, so the generation follows it.
+# generation is never read. A changed, added or removed patch re-runs this configure step (the glob above
+# is CONFIGURE_DEPENDS), so the check of the chain and the generation follow it.
 _sspc_git(_sspc_gen_recompiler rev-parse ${_sspc_expected}:shader_recompiler)
 _sspc_git(_sspc_gen_video rev-parse ${_sspc_expected}:video_core)
 _sspc_git(_sspc_gen_common rev-parse ${_sspc_expected}:common)
