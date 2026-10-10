@@ -6,6 +6,7 @@
 
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/fs_observer.h"
+#include "runtime/kernel/clock.h"
 #include "runtime/kernel/guest_errno.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/kernel_memory.h"
@@ -81,7 +82,7 @@ std::vector<Export> Collect() {
                              Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
                              Kernel::DirectMemoryExports(), Kernel::Threads::ThreadExports(),
                              Kernel::Signals::SignalExports(), Kernel::GuestErrno::Exports(),
-                             Kernel::MemoryApi::Exports(),
+                             Kernel::MemoryApi::Exports(), Kernel::Clock::Exports(),
                              Net::NetUtilExports(), Libc::LibcMemExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());

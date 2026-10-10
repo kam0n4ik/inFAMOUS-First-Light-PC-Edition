@@ -17,6 +17,7 @@
 
 #include "base/log.h"
 #include "runtime/exports.h"
+#include "runtime/kernel/clock.h"
 
 namespace SecondSon::Kernel {
 
@@ -29,7 +30,7 @@ constexpr s32 kEINTR = 4;
 constexpr s32 kEFAULT = 14;
 constexpr s32 kEINVAL = 22;
 
-enum Clock : u32 {
+enum ClockId : u32 {
     Realtime = 0,
     Virtual = 1,
     Prof = 2,
@@ -66,7 +67,6 @@ struct Timezone {
 Host* g_host = nullptr;
 bool g_neo = false;
 bool g_title_neo = false;
-std::shared_future<u64> g_tsc_frequency;
 std::chrono::system_clock::time_point g_network_boottime = std::chrono::system_clock::now();
 std::chrono::steady_clock::time_point g_initial_uptime = std::chrono::steady_clock::now();
 
@@ -80,41 +80,7 @@ u64 FileTime100Ns(const FILETIME& ft) {
     return (static_cast<u64>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
-// ---- TSC (common/rdtsc.cpp of the oracle)
-
-u64 FencedRdtsc() {
-    _mm_lfence();
-    _ReadWriteBarrier();
-    const u64 t = __rdtsc();
-    _mm_lfence();
-    _ReadWriteBarrier();
-    return t;
-}
-
-u64 WallClockNs() {
-    constexpr u64 kWindowsEpochToUnixEpoch = 0x19DB1DED53E8000LL;
-    FILETIME ft;
-    GetSystemTimePreciseAsFileTime(&ft);
-    return 100 * (FileTime100Ns(ft) - kWindowsEpochToUnixEpoch);
-}
-
-u64 EstimateTscFrequency() {
-    FencedRdtsc(); // the first measurement is discarded
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    FencedRdtsc();
-    const u64 start_time = WallClockNs();
-    const u64 tsc_start = FencedRdtsc();
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
-    const u64 end_time = WallClockNs();
-    const u64 tsc_end = FencedRdtsc();
-    const auto freq = static_cast<u64>(static_cast<unsigned __int128>(tsc_end - tsc_start) *
-                                       1'000'000'000ULL / (end_time - start_time));
-    constexpr u64 kNearest = 100'000;
-    const u64 mod = freq % kNearest;
-    return mod >= kNearest / 2 ? freq - mod + kNearest : freq - mod;
-}
-
-// ---- clocks
+// ---- clocks (the TSC and the process time: runtime/kernel/clock.cpp, P3.5.3)
 
 s32 ClockGettime(u32 clock_id, Timespec* ts) {
     if (ts == nullptr) {
@@ -128,11 +94,13 @@ s32 ClockGettime(u32 clock_id, Timespec* ts) {
     };
     switch (clock_id) {
     case Proctime: {
-        if (g_host == nullptr) {
+        // The process clock's owner: SecondSonPC's with --native clock (the bridge reads it too, patch 0024), else
+        // the bridge's.
+        if (!Clock::Enabled() && g_host == nullptr) {
             SetErrno(kEFAULT);
             return -1;
         }
-        const u64 us = g_host->ProcessTimeUs();
+        const u64 us = Clock::Enabled() ? Clock::ProcessTimeUs() : g_host->ProcessTimeUs();
         ts->tv_sec = static_cast<s64>(us / 1'000'000);
         ts->tv_nsec = static_cast<s64>((us % 1'000'000) * 1000);
         return 0;
@@ -295,7 +263,7 @@ SSPC_SYSV_ABI s32 SceUsleep(u32 microseconds) {
 // ---- TSC, process
 
 SSPC_SYSV_ABI u64 GetTscFrequency() {
-    return g_tsc_frequency.valid() ? g_tsc_frequency.get() : EstimateTscFrequency();
+    return Clock::TscFrequency(); // one measurement for the game and (with --native clock) the bridge
 }
 
 SSPC_SYSV_ABI s32 IsNeoMode() {
@@ -342,7 +310,7 @@ bool NeoMode() {
 void Start() {
     g_network_boottime = std::chrono::system_clock::now();
     g_initial_uptime = std::chrono::steady_clock::now();
-    g_tsc_frequency = std::async(std::launch::async, EstimateTscFrequency).share();
+    Clock::Start(); // already started with --native clock (before the bridge's libraries)
     SSPC_LOG(Kernel, Info, "libkernel time functions NATIVE (TSC frequency measured in the background)");
 }
 

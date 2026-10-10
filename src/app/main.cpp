@@ -30,7 +30,8 @@
 //                              cpu (= fs-patch): SecondSonPC's CPU patcher, P3.3/P3.4; exceptions:
 //                              SecondSonPC's exception dispatcher, P3.4; errno: SecondSonPC's guest errno,
 //                              the bridge's functions use it too, P3.5; kernel-memory: libkernel's memory
-//                              functions on SecondSonPC's memory manager (needs memory), P3.5;
+//                              functions on SecondSonPC's memory manager (needs memory), P3.5; clock:
+//                              SecondSonPC's process clock for the game and the bridge, P3.5;
 //                              --loader sspc only)
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out

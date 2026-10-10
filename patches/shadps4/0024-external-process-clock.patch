@@ -1,0 +1,149 @@
+diff --git a/src/core/debug_state.cpp b/src/core/debug_state.cpp
+index 3d6ec64f..9bbec1d7 100644
+--- a/src/core/debug_state.cpp
++++ b/src/core/debug_state.cpp
+@@ -79,7 +79,7 @@ void DebugStateImpl::PauseGuestThreads() {
+             PauseThread(id);
+         }
+     }
+-    pause_time = Libraries::Kernel::Dev::GetClock()->GetUptime();
++    pause_time = Libraries::Kernel::sceKernelReadTsc(); // SecondSonPC patch 0024: the TSC, whoever owns the clock
+     is_guest_threads_paused = true;
+     lock.unlock();
+     if (self_guest) {
+@@ -93,8 +93,8 @@ void DebugStateImpl::ResumeGuestThreads() {
+         return;
+     }
+ 
+-    u64 delta_time = Libraries::Kernel::Dev::GetClock()->GetUptime() - pause_time;
+-    Libraries::Kernel::Dev::GetInitialPtc() += delta_time;
++    u64 delta_time = Libraries::Kernel::sceKernelReadTsc() - pause_time;
++    Libraries::Kernel::Dev::AdvanceProcessEpoch(delta_time); // the epoch of the process clock's owner
+     for (const auto& id : guest_threads) {
+         ResumeThread(id);
+     }
+diff --git a/src/core/libraries/kernel/time.cpp b/src/core/libraries/kernel/time.cpp
+index 806086b0..0b90de16 100644
+--- a/src/core/libraries/kernel/time.cpp
++++ b/src/core/libraries/kernel/time.cpp
+@@ -1,11 +1,13 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include <ctime>
+ #include <thread>
+ 
+ #include "common/assert.h"
+ #include "common/native_clock.h"
++#include "common/rdtsc.h"
+ #include "common/thread.h"
+ #include "core/libraries/kernel/kernel.h"
+ #include "core/libraries/kernel/orbis_error.h"
+@@ -32,26 +34,45 @@ static u64 initial_ptc;
+ static std::chrono::system_clock::time_point network_boottime;
+ static std::chrono::steady_clock::time_point initial_uptime;
+ static std::unique_ptr<Common::NativeClock> clock;
++// SecondSonPC P3.5.3 (patch 0024): the process clock's owner when set (UseExternalClock): then no NativeClock is
++// made — one TSC measurement and one epoch for the game, VideoOut, AudioOut and the GPU.
++static std::atomic<const ExternalClock*> g_external_clock{nullptr};
++static std::atomic<bool> g_time_registered{false};
++
++bool UseExternalClock(const ExternalClock* external) {
++    const ExternalClock* expected = nullptr;
++    return external != nullptr && !g_time_registered.load() &&
++           g_external_clock.compare_exchange_strong(expected, external);
++}
+ 
+ u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
++    if (const auto* external = g_external_clock.load(std::memory_order_relaxed)) {
++        return external->tsc_frequency();
++    }
+     return clock->GetTscFrequency();
+ }
+ 
+ u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
++    if (const auto* external = g_external_clock.load(std::memory_order_relaxed)) {
++        return external->process_time_us();
++    }
+     // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
+     return clock->GetTimeUS(initial_ptc);
+ }
+ 
+ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
++    if (const auto* external = g_external_clock.load(std::memory_order_relaxed)) {
++        return external->process_time_counter();
++    }
+     return clock->GetUptime() - initial_ptc;
+ }
+ 
+ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
+-    return clock->GetTscFrequency();
++    return sceKernelGetTscFrequency();
+ }
+ 
+ u64 PS4_SYSV_ABI sceKernelReadTsc() {
+-    return clock->GetUptime();
++    return Common::FencedRDTSC(); // the counter itself (NativeClock::GetUptime is the same instruction)
+ }
+ 
+ static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,
+@@ -491,6 +512,14 @@ Common::NativeClock* GetClock() {
+     return clock.get();
+ }
+ 
++void AdvanceProcessEpoch(u64 ticks) {
++    if (const auto* external = g_external_clock.load(std::memory_order_relaxed)) {
++        external->advance_epoch(ticks);
++        return;
++    }
++    initial_ptc += ticks;
++}
++
+ } // namespace Dev
+ 
+ s32 PS4_SYSV_ABI sceKernelConvertUtcToLocaltime(time_t time, time_t* local_time,
+@@ -554,8 +583,13 @@ s32 PS4_SYSV_ABI sceKernelSettimeofday(OrbisKernelTimeval* _tv, OrbisKernelTimez
+ }
+ 
+ void RegisterTime(Core::Loader::SymbolsResolver* sym) {
+-    clock = std::make_unique<Common::NativeClock>();
+-    initial_ptc = clock->GetUptime();
++    g_time_registered = true;
++    if (g_external_clock.load() == nullptr) {
++        clock = std::make_unique<Common::NativeClock>(); // measures the TSC (100 ms)
++        initial_ptc = clock->GetUptime();
++    } else {
++        LOG_INFO(Lib_Kernel, "process clock: SecondSonPC's (P3.5, patch 0024): TSC frequency and epoch are its own");
++    }
+     network_boottime = std::chrono::system_clock::now();
+     initial_uptime = std::chrono::steady_clock::now();
+ 
+diff --git a/src/core/libraries/kernel/time.h b/src/core/libraries/kernel/time.h
+index d876fe7b..502027d5 100644
+--- a/src/core/libraries/kernel/time.h
++++ b/src/core/libraries/kernel/time.h
+@@ -68,8 +68,23 @@ namespace Dev {
+ u64& GetInitialPtc();
+ 
+ Common::NativeClock* GetClock();
++/// The debugger's pause: the paused TSC ticks do not count in the process time (the process clock's owner's epoch).
++void AdvanceProcessEpoch(u64 ticks);
+ } // namespace Dev
+ 
++/// SecondSonPC P3.5.3 (patch 0024): the process clock's owner — its TSC frequency, process time and process time
++/// counter replace the bridge's NativeClock (VideoOut's flip/vblank stamps, AudioOut's pacing, the GPU's timestamp
++/// scale, input timestamps). The TSC itself (sceKernelReadTsc) is the same counter either way.
++struct ExternalClock {
++    u64 (*tsc_frequency)();           ///< TSC ticks per second
++    u64 (*process_time_us)();         ///< microseconds since the process epoch
++    u64 (*process_time_counter)();    ///< TSC ticks since the process epoch
++    void (*advance_epoch)(u64 ticks); ///< the debugger's pause
++};
++/// Once, before RegisterTime (libkernel's RegisterLib); `clock` lives until the process ends. false for nullptr, a
++/// second call, or after RegisterTime (the bridge's own clock is then in use).
++bool UseExternalClock(const ExternalClock* clock);
++
+ u64 PS4_SYSV_ABI sceKernelGetTscFrequency();
+ u64 PS4_SYSV_ABI sceKernelGetProcessTime();
+ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter();

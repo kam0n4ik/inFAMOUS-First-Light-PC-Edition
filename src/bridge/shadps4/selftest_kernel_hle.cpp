@@ -33,6 +33,7 @@
 #include "core/thread.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/fs_host.h"
+#include "runtime/kernel/clock.h"
 #include "runtime/kernel/guest_errno.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/kernel_memory.h"
@@ -688,6 +689,228 @@ void MemThreads(TestGroup& c) {
     vm->SetListener(nullptr);
 }
 
+// ------------------------------------------------------------------------- P3.5.3: the process clock
+
+namespace ClockNs = Kernel::Clock;
+
+u64 QpcMicroseconds() {
+    static const u64 frequency = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return static_cast<u64>(f.QuadPart);
+    }();
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return ClockNs::TicksTo(static_cast<u64>(now.QuadPart), 1'000'000, frequency);
+}
+
+void ClockArithmetic(TestGroup& c) {
+    // TicksTo against the exact 128-bit product, wherever that fits in 64 bits.
+    const u64 frequencies[] = {1, 10'000'000, 1'600'000'000, 3'600'000'000, 4'999'900'000, 1ull << 40};
+    const u64 units[] = {1'000'000, 1'000'000'000};
+    std::vector<u64> ticks = {0, 1, 2, 999, (1ull << 32) - 1, 1ull << 32, 1ull << 52, (1ull << 63) - 1, 1ull << 63,
+                              ~0ull - 1, ~0ull};
+    u64 seed = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < 4000; ++i) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ticks.push_back(seed >> (i % 40));
+    }
+    u64 compared = 0;
+    std::string bad;
+    for (const u64 f : frequencies) {
+        for (const u64 un : units) {
+            std::vector<u64> all = ticks;
+            all.push_back(f - 1);
+            all.push_back(f);
+            all.push_back(f + 1);
+            std::ranges::sort(all);
+            u64 previous = 0;
+            for (const u64 t : all) {
+                const u64 got = ClockNs::TicksTo(t, un, f);
+                const unsigned __int128 exact = static_cast<unsigned __int128>(t) * un / f;
+                if (exact <= ~0ull) {
+                    ++compared;
+                    if (got != static_cast<u64>(exact) && bad.size() < 300) {
+                        bad += fmt::format("{} ticks at {} Hz in 1/{} s: {} not {}; ", t, f, un, got,
+                                           static_cast<u64>(exact));
+                    }
+                    if (got < previous && bad.size() < 300) {
+                        bad += fmt::format("{} ticks went back; ", t);
+                    }
+                    previous = got;
+                }
+            }
+        }
+    }
+    const u64 month = 30ull * 86400 * 5'000'000'000ull; // 30 days of a 5 GHz TSC
+    c.Check(fmt::format("tick conversion exact and monotonic ({} values: 6 frequencies, us and ns, edges up to 2^64-1); "
+                        "30 days of a 5 GHz TSC = 2592000000000 us exactly",
+                        compared),
+            bad.empty() && ClockNs::TicksTo(month, 1'000'000, 5'000'000'000ull) == 2'592'000'000'000ull, bad);
+
+    ClockNs::ProcessClock pc(1'000'000, 1'000'000'000);
+    const bool before = pc.Ticks(999'000) == 0 && pc.Microseconds(999'000) == 0;
+    const bool after = pc.Microseconds(1'000'000 + 2'500'000'000ull) == 2'500'000 && pc.Nanoseconds(1'000'123) == 123;
+    pc.AdvanceEpoch(500'000'000);
+    const bool paused = pc.Microseconds(1'000'000 + 2'500'000'000ull) == 2'000'000;
+    c.Check("a clock of its own: a TSC before the epoch reads 0 (never a wrapped value), microseconds and nanoseconds "
+            "since the epoch, a debugger pause moves the epoch",
+            before && after && paused, "");
+}
+
+void ClockProcess(TestGroup& c) {
+    const u64 f = ClockNs::TscFrequency();
+    const ClockNs::Report r = ClockNs::MeasureDrift();
+    c.Check("the TSC frequency: measured once (the same on every call), a multiple of 100 kHz, an invariant TSC",
+            f > 100'000'000 && f % 100'000 == 0 && ClockNs::TscFrequency() == f && r.tsc_frequency == f && r.invariant_tsc,
+            fmt::format("{} Hz, invariant {}", f, r.invariant_tsc));
+
+    // Rate: 300 ms of the process clock against QueryPerformanceCounter (the measurement's error, rounding included).
+    const u64 q0 = QpcMicroseconds();
+    const u64 p0 = ClockNs::ProcessTimeUs();
+    Sleep(300);
+    const u64 p1 = ClockNs::ProcessTimeUs();
+    const u64 q1 = QpcMicroseconds();
+    const double ppm = (static_cast<double>(p1 - p0) - static_cast<double>(q1 - q0)) * 1e6 / static_cast<double>(q1 - q0);
+    c.Check("rate: 300 ms of process time against QueryPerformanceCounter within 500 ppm (the 100 kHz rounding is "
+            "< 35 ppm on this CPU)",
+            ppm > -500 && ppm < 500, fmt::format("{:+.1f} ppm over {} us; drift since the epoch {:+.1f} ppm", ppm, q1 - q0,
+                                                 r.drift_ppm));
+
+    // One thread: 2 000 000 reads never go back; microseconds and ticks agree.
+    bool back = false;
+    u64 last_us = 0;
+    u64 last_ticks = 0;
+    for (int i = 0; i < 1'000'000; ++i) {
+        const u64 us = ClockNs::ProcessTimeUs();
+        const u64 ticks = ClockNs::ProcessTimeCounter();
+        back |= us < last_us || ticks < last_ticks;
+        last_us = us;
+        last_ticks = ticks;
+    }
+    const u64 a = ClockNs::ProcessTimeUs();
+    const u64 t = ClockNs::ProcessTimeCounter();
+    const u64 b = ClockNs::ProcessTimeUs();
+    const u64 from_ticks = ClockNs::TicksTo(t, 1'000'000, f);
+    c.Check("one thread: 2000000 reads (us and ticks) never go back; ticks -> us lands between the us reads around it",
+            !back && a <= from_ticks && from_ticks <= b, fmt::format("{} {} {}", a, from_ticks, b));
+
+    // Threads: a read after seeing another thread's value is never earlier (the TSC is synchronised across cores).
+    constexpr int kThreads = 8;
+    constexpr int kReads = 200'000;
+    std::atomic<u64> seen_us{0};
+    std::atomic<u64> seen_ticks{0};
+    std::atomic<u64> violations{0};
+    std::atomic<u64> worst_ticks{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&] {
+            u64 v = 0;
+            for (int k = 0; k < kReads; ++k) {
+                const u64 before_us = seen_us.load(std::memory_order_acquire);
+                const u64 before_ticks = seen_ticks.load(std::memory_order_acquire);
+                const u64 ticks = ClockNs::ProcessTimeCounter();
+                const u64 us = ClockNs::ProcessTimeUs();
+                if (us < before_us || ticks < before_ticks) {
+                    ++v;
+                    if (ticks < before_ticks) {
+                        u64 w = worst_ticks.load();
+                        while (before_ticks - ticks > w && !worst_ticks.compare_exchange_weak(w, before_ticks - ticks)) {
+                        }
+                    }
+                }
+                u64 cur = seen_us.load();
+                while (us > cur && !seen_us.compare_exchange_weak(cur, us)) {
+                }
+                cur = seen_ticks.load();
+                while (ticks > cur && !seen_ticks.compare_exchange_weak(cur, ticks)) {
+                }
+            }
+            violations += v;
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    c.Check("8 threads x 200000 reads: a read made after another thread's value was seen is never earlier (us and "
+            "ticks)",
+            violations == 0, fmt::format("{} earlier reads, worst {} ticks", violations.load(), worst_ticks.load()));
+}
+
+void ClockOwner(TestGroup& c) {
+    namespace K = Libraries::Kernel;
+    const u64 f = ClockNs::TscFrequency();
+    using U64Fn = u64(SSPC_SYSV_ABI*)();
+    U64Fn game_frequency = nullptr;
+    Find(Kernel::KernelExports(), "sceKernelGetTscFrequency", "libkernel", game_frequency);
+    U64Fn process_time = nullptr;
+    int experimental = 0;
+    for (const auto& e : ClockNs::Exports()) {
+        experimental += e.experimental && std::string_view(e.group) == "clock" ? 1 : 0;
+        if (std::string_view(e.name) == "sceKernelGetProcessTime") {
+            process_time = reinterpret_cast<U64Fn>(e.function);
+        }
+    }
+    const u64 a = ClockNs::ProcessTimeUs();
+    const u64 x = process_time != nullptr ? process_time() : 0;
+    const u64 b = ClockNs::ProcessTimeUs();
+    c.Check("the game's sceKernelGetTscFrequency is this clock's; sceKernelGetProcessTime (group clock, experimental) "
+            "reads this clock",
+            game_frequency != nullptr && game_frequency() == f && experimental == 1 && a <= x && x <= b, "");
+    if (ClockNs::Enabled()) {
+        c.Info("INFO  --native clock: SecondSonPC owns the process clock in this run");
+        const u64 t0 = ClockNs::ProcessTimeUs();
+        const u64 bridge_us = K::sceKernelGetProcessTime();
+        const u64 t1 = ClockNs::ProcessTimeUs();
+        const u64 k0 = ClockNs::ProcessTimeCounter();
+        const u64 bridge_ticks = K::sceKernelGetProcessTimeCounter();
+        const u64 k1 = ClockNs::ProcessTimeCounter();
+        const u64 r0 = ClockNs::ReadTsc();
+        const u64 bridge_tsc = K::sceKernelReadTsc();
+        const u64 r1 = ClockNs::ReadTsc();
+        Libraries::Kernel::OrbisKernelTimespec ts{};
+        const u64 c0 = ClockNs::ProcessTimeUs();
+        const s32 cr = K::posix_clock_gettime(15, &ts); // the bridge's CLOCK_PROCTIME
+        const u64 c1 = ClockNs::ProcessTimeUs();
+        const u64 bridge_proctime = static_cast<u64>(ts.tv_sec) * 1'000'000 + static_cast<u64>(ts.tv_nsec) / 1000;
+        c.Check("the bridge reads this clock: TSC frequency (and counter frequency) equal, its process time, process time "
+                "counter, TSC and CLOCK_PROCTIME between two reads of this clock; it made no clock of its own",
+                K::sceKernelGetTscFrequency() == f && K::sceKernelGetProcessTimeCounterFrequency() == f && t0 <= bridge_us &&
+                    bridge_us <= t1 && k0 <= bridge_ticks && bridge_ticks <= k1 && r0 <= bridge_tsc && bridge_tsc <= r1 &&
+                    cr == 0 && c0 <= bridge_proctime && bridge_proctime <= c1 && K::Dev::GetClock() == nullptr,
+                fmt::format("{} <= {} <= {}; {} <= {} <= {}", t0, bridge_us, t1, c0, bridge_proctime, c1));
+        // The debugger's pause through the bridge moves this clock's epoch (and back, exactly: modular addition).
+        const u64 step = f / 100; // 10 ms
+        const u64 before = ClockNs::ProcessTimeUs();
+        K::Dev::AdvanceProcessEpoch(step);
+        const u64 paused = ClockNs::ProcessTimeUs();
+        K::Dev::AdvanceProcessEpoch(0 - step);
+        const u64 after = ClockNs::ProcessTimeUs();
+        c.Check("the bridge's debugger pause moves this clock's epoch: 10 ms less while advanced, back after",
+                paused + 9'000 < before + 1'000 && paused + 11'000 > before && after >= before,
+                fmt::format("{} {} {}", before, paused, after));
+        static const K::ExternalClock another{
+            .tsc_frequency = &ClockNs::TscFrequency,
+            .process_time_us = &ClockNs::ProcessTimeUs,
+            .process_time_counter = &ClockNs::ProcessTimeCounter,
+            .advance_epoch = &ClockNs::AdvanceEpoch,
+        };
+        c.Check("the bridge cannot be given another clock now (nullptr or a second one refused)",
+                !K::UseExternalClock(nullptr) && !K::UseExternalClock(&another), "");
+    } else {
+        const u64 bridge = K::sceKernelGetTscFrequency();
+        c.Info(fmt::format("INFO  the bridge owns the process clock in this run (--selftest --native clock checks "
+                           "SecondSonPC's); its own TSC measurement {} Hz, this clock's {} Hz ({:+} Hz)",
+                           bridge, f, static_cast<s64>(bridge) - static_cast<s64>(f)));
+        c.Check("two independent measurements of one TSC (the bridge's and this clock's) agree within 300 kHz "
+                "(< 100 ppm)",
+                bridge % 100'000 == 0 && (bridge > f ? bridge - f : f - bridge) <= 300'000,
+                fmt::format("{} vs {}", bridge, f));
+    }
+}
+
 void MemExports(TestGroup& c) {
     if (MemApi::Installed()) {
         c.Info("INFO  --native kernel-memory installed: the exports are checked on the game's manager (NativeKernelMem(game))");
@@ -741,6 +964,12 @@ std::vector<TestGroup> TestKernelHle(const App::Config& cfg) {
     MemThreads(mem);
     MemExports(mem);
     out.push_back(std::move(mem));
+
+    TestGroup clock{.name = "NativeClock"};
+    ClockArithmetic(clock);
+    ClockProcess(clock);
+    ClockOwner(clock);
+    out.push_back(std::move(clock));
     return out;
 }
 

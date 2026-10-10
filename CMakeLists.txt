@@ -43,6 +43,7 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/file_system.cpp
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
+    src/runtime/kernel/clock.cpp
     src/runtime/kernel/condvar.cpp
     src/runtime/kernel/event_flag.cpp
     src/runtime/kernel/guest_errno.cpp

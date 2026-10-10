@@ -22,6 +22,7 @@
 #include "core/tls.h"
 #include "loader/linker.h"
 #include "runtime/cpu/tcb_slot.h"
+#include "runtime/kernel/clock.h"
 #include "runtime/kernel/guest_errno.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/thread.h"
@@ -118,6 +119,25 @@ bool InstallKernelRuntime(const App::Config& cfg, std::string* error) {
         Kernel::GuestErrno::Enable();
         SSPC_LOG(Kernel, Warning, "EXPERIMENTAL: the guest errno is SecondSonPC's (--native errno): __error and every "
                                   "BRIDGE function use its per-thread cell");
+    }
+    if (native("clock")) {
+        // P3.5.3: one process clock, SecondSonPC's: its TSC measurement and epoch for the game (TSC frequency,
+        // CLOCK_PROCTIME, sceKernelGetProcessTime) and the bridge (VideoOut stamps, AudioOut pacing, GPU timestamps,
+        // input), which then makes no NativeClock of its own (patch 0024). Before libkernel's RegisterLib.
+        Kernel::Clock::Start();
+        static const Libraries::Kernel::ExternalClock external{
+            .tsc_frequency = &Kernel::Clock::TscFrequency,
+            .process_time_us = &Kernel::Clock::ProcessTimeUs,
+            .process_time_counter = &Kernel::Clock::ProcessTimeCounter,
+            .advance_epoch = &Kernel::Clock::AdvanceEpoch,
+        };
+        if (!Libraries::Kernel::UseExternalClock(&external)) {
+            *error = "--native clock: the bridge's process clock has already started";
+            return false;
+        }
+        Kernel::Clock::Enable();
+        SSPC_LOG(Kernel, Warning, "EXPERIMENTAL: the process clock is SecondSonPC's (--native clock): one TSC measurement "
+                                  "and one epoch for the game and the bridge");
     }
     return true;
 }

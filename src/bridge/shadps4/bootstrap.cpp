@@ -60,6 +60,7 @@
 #include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/exports.h"
+#include "runtime/kernel/clock.h"
 #include "runtime/kernel/thread.h"
 #include "runtime/memory/virtual_memory.h"
 #include "runtime/filesystem/fs_host.h"
@@ -82,6 +83,7 @@
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libc_internal/libc_internal.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/save_data/save_backup.h"
@@ -199,6 +201,11 @@ void OnQuickExit() {
         }
     }
     Cpu::Exceptions::LogSummary("at exit"); // P3.4 (nothing without --native exceptions)
+    // P3.5.3: the process clock's drift against QueryPerformanceCounter over the session; the bridge's own TSC
+    // frequency for comparison (only once its clock exists: not in the early test paths).
+    Kernel::Clock::LogSummary("at exit", Kernel::Clock::Enabled() || Libraries::Kernel::Dev::GetClock() != nullptr
+                                             ? Libraries::Kernel::sceKernelGetTscFrequency()
+                                             : 0);
     // P3.2: what the native managers hold at the end, and the process (leak checks of a long session).
     if (Kernel::Threads::Enabled()) {
         Kernel::Threads::LogSummary();
