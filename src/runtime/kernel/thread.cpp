@@ -7,10 +7,16 @@
 // A guest thread is a slot of a table that is never freed: the ScePthread the game holds is the
 // slot's address, so a stale handle can never point at freed memory, and slots come back into use in
 // FIFO order (as late as possible). A thread's resources — its TCB and host thread handle freed,
-// its guest stack kept for the next thread of the same size — are released only once its host
-// thread has ended (the joiner waits for the handle; a detached thread is reaped by the next
-// scePthreadCreate), never while it may still run on them (the bridge returns the stack of an
-// exiting thread to its cache before the thread is gone).
+// its guest stack cached or unmapped — are released only once its host thread has ended (the
+// joiner waits for the handle; a detached thread is reaped by the next scePthreadCreate), never
+// while it may still run on them (the bridge returns the stack of an exiting thread to its cache
+// before the thread is gone).
+//
+// Stacks (P3.2, docs/PHASE3_INDEPENDENT_RUNTIME.md §10): a stack the manager mapped is held from
+// ThreadHost::MapStack to ThreadHost::UnmapStack, either by one slot or in a bounded cache for the
+// next thread of exactly the same size (newest first; over the limits the oldest is unmapped). Every
+// stack handed out is checked against every held one (no overlap) and every stack taken back against
+// what its slot holds (no double free). The memory manager calls run outside the manager's locks.
 // Priorities and affinity are kept and reported but not applied to Windows threads (as the oracle);
 // there is no cancellation and no signal delivery to guest threads (the game imports neither).
 #include <windows.h>
@@ -168,30 +174,55 @@ struct alignas(64) Thread {
 
 Thread g_threads[kMaxThreads];
 
-std::mutex g_table_lock; // g_free*, g_pending, g_stacks, g_table_ready, the counters below
-// Free slots, FIFO. Fixed storage (and g_pending/g_stacks reserved once): an exiting or detaching
-// guest thread never allocates, so it cannot throw (the bridge's VEH ends the process on any C++
+std::mutex g_table_lock; // g_free*, g_pending, the stacks below, g_table_ready, the counters below
+// Free slots, FIFO. Fixed storage (and g_pending reserved once): an exiting or detaching guest
+// thread never allocates, so it cannot throw (the bridge's VEH ends the process on any C++
 // exception) when the system commit limit is reached.
 std::array<u32, kMaxThreads> g_free{};
 u32 g_free_head = 0;
 u32 g_free_count = 0;
 std::vector<u32> g_pending; // detached threads that exited: reaped once their host thread is gone
-// Stacks of gone threads, kept for the next thread of the same size: never unmapped (the bridge's
-// memory manager asserts when a stack whose guard split its area is unmapped, D17; the bridge itself
-// keeps every stack it maps, too).
-struct CachedStack {
-    void* base;
-    u64 size;
-    u64 guard;
-};
-std::vector<CachedStack> g_stacks;
 bool g_table_ready = false;
 u64 g_created = 0;
 u64 g_reaped = 0;
-u64 g_stacks_mapped = 0;
+u64 g_peak_threads = 0;
+
+// A stack the manager mapped: [base - guard, base) no access, [base, base + size) read/write.
+struct StackRange {
+    void* base = nullptr;
+    u64 size = 0;
+    u64 guard = 0;
+    u64 Total() const {
+        return size + guard;
+    }
+    uintptr_t Lo() const {
+        return reinterpret_cast<uintptr_t>(base) - guard;
+    }
+    uintptr_t Hi() const {
+        return reinterpret_cast<uintptr_t>(base) + size;
+    }
+    bool Overlaps(const StackRange& o) const {
+        return Lo() < o.Hi() && o.Lo() < Hi();
+    }
+    bool operator==(const StackRange&) const = default;
+};
+// The game's own use (docs/PHASE3_INDEPENDENT_RUNTIME.md §10): see DefaultStackCacheLimits.
+constexpr StackCacheLimits kDefaultCacheLimits{8, 32ull << 20};
+std::array<StackRange, kMaxThreads> g_stack_of{};             // the stack each slot holds (base null: none)
+std::array<StackRange, kStackCacheCapacity> g_cache{};        // kept for reuse, oldest first
+u32 g_cache_count = 0;
+u64 g_cache_bytes = 0;
+StackCacheLimits g_cache_limits = kDefaultCacheLimits;
+// Held = in a slot or in the cache.
+u64 g_held = 0, g_held_stack_bytes = 0, g_held_guard_bytes = 0;
+u64 g_peak_held = 0, g_peak_held_bytes = 0, g_peak_cache_bytes = 0;
+u64 g_map_calls = 0, g_unmap_calls = 0, g_unmap_failures = 0, g_reuses = 0, g_evictions = 0, g_rejected = 0;
+// Stacks to unmap once g_table_lock is released (at most the cache plus the one coming in).
+using UnmapList = std::array<StackRange, kStackCacheCapacity + 1>;
 
 ThreadHost* g_host = nullptr;
 std::atomic<bool> g_enabled{false};
+std::atomic<bool> g_event_log{true}; // a line per created / released thread (off in the stress tests)
 std::atomic<u32> g_next_tid{1};
 
 thread_local Thread* t_self = nullptr;
@@ -284,21 +315,108 @@ void SetHostThreadName(const std::string& name) {
     SetThreadDescription(GetCurrentThread(), wide.c_str());
 }
 
+// --- stacks (g_table_lock held unless said otherwise)
+
+/// `s` overlaps a stack held by a slot other than `except` or a cached one.
+bool OverlapsHeld(const StackRange& s, u32 except) {
+    for (u32 i = 0; i < kMaxThreads; ++i) {
+        if (i != except && g_stack_of[i].base != nullptr && g_stack_of[i].Overlaps(s)) {
+            return true;
+        }
+    }
+    for (u32 i = 0; i < g_cache_count; ++i) {
+        if (g_cache[i].Overlaps(s)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CountHeld(const StackRange& s) {
+    ++g_held;
+    g_held_stack_bytes += s.size;
+    g_held_guard_bytes += s.guard;
+    g_peak_held = std::max(g_peak_held, g_held);
+    g_peak_held_bytes = std::max(g_peak_held_bytes, g_held_stack_bytes + g_held_guard_bytes);
+}
+
+void UncountHeld(const StackRange& s) {
+    --g_held;
+    g_held_stack_bytes -= s.size;
+    g_held_guard_bytes -= s.guard;
+}
+
+/// Removes cache entry `i` (order kept: oldest first).
+StackRange TakeCacheEntry(u32 i) {
+    const StackRange s = g_cache[i];
+    for (u32 j = i + 1; j < g_cache_count; ++j) {
+        g_cache[j - 1] = g_cache[j];
+    }
+    g_cache[--g_cache_count] = {};
+    g_cache_bytes -= s.Total();
+    return s;
+}
+
+/// Unmaps the oldest cached stacks until the cache is within its limits and has room for `incoming`
+/// more bytes in one more entry (incoming = 0: only within the limits).
+void EvictFor(u64 incoming, UnmapList& out, u32& n) {
+    const bool one_more = incoming != 0;
+    while (g_cache_count > 0 && (g_cache_count + (one_more ? 1 : 0) > g_cache_limits.count ||
+                                 g_cache_bytes + incoming > g_cache_limits.bytes)) {
+        const StackRange s = TakeCacheEntry(0);
+        UncountHeld(s);
+        ++g_evictions;
+        out[n++] = s;
+    }
+}
+
+/// A gone thread's stack: into the cache (newest last), or out with the oldest ones (P3.2).
+void CacheOrUnmap(const StackRange& s, UnmapList& out, u32& n) {
+    if (g_cache_limits.count == 0 || s.Total() > g_cache_limits.bytes) {
+        UncountHeld(s);
+        ++g_evictions;
+        out[n++] = s;
+        return;
+    }
+    EvictFor(s.Total(), out, n);
+    g_cache[g_cache_count++] = s;
+    g_cache_bytes += s.Total();
+    g_peak_cache_bytes = std::max(g_peak_cache_bytes, g_cache_bytes);
+}
+
+/// The memory manager calls; g_table_lock NOT held.
+void UnmapStacks(const UnmapList& list, u32 n) {
+    for (u32 i = 0; i < n; ++i) {
+        const StackRange& s = list[i];
+        const bool ok = g_host->UnmapStack(s.base, s.size, s.guard);
+        {
+            std::scoped_lock lk{g_table_lock};
+            ++(ok ? g_unmap_calls : g_unmap_failures);
+        }
+        if (!ok) {
+            SSPC_LOG(Kernel, Error, "guest stack {:#x}+{:#x} (guard {:#x}) could not be unmapped: forgotten ({} bytes "
+                     "of address space stay taken)",
+                     reinterpret_cast<uintptr_t>(s.base), s.size, s.guard, s.Total());
+        }
+    }
+}
+
 /// Frees what a thread used and returns its slot. Its host thread has ended (or never ran).
 void Release(Thread* t) {
     void* tcb;
-    void* stack;
-    u64 size, guard;
+    StackRange stack;
     bool own;
     HANDLE host;
+    u32 tid;
+    std::string name; // Release never runs on the exiting thread: allocating is fine here
     {
         std::scoped_lock lk{t->lock};
         tcb = t->tcb;
-        stack = t->stack;
-        size = t->stack_size;
-        guard = t->stack_guard;
+        stack = {t->stack, t->stack_size, t->stack_guard};
         own = t->own_stack;
         host = t->host;
+        tid = t->tid;
+        name = std::move(t->name);
         t->magic = 0;
         t->state = State::Free;
         t->tcb = nullptr;
@@ -314,25 +432,78 @@ void Release(Thread* t) {
     if (host != nullptr) {
         CloseHandle(host);
     }
-    std::scoped_lock lk{g_table_lock};
-    if (own) {
-        // Reserved for kMaxThreads; grows (allocates) only past that many distinct stacks kept.
-        g_stacks.push_back({stack, size, guard});
+    const u32 index = IndexOf(t);
+    UnmapList unmap;
+    u32 unmap_count = 0;
+    StackRange held_before;
+    bool mismatch = false;
+    u64 live, cached, cache_bytes;
+    {
+        std::scoped_lock lk{g_table_lock};
+        if (own) {
+            held_before = g_stack_of[index];
+            if (held_before == stack) {
+                g_stack_of[index] = {};
+                CacheOrUnmap(stack, unmap, unmap_count);
+            } else {
+                // Not what this slot was given: never cached, never unmapped (it may be someone's).
+                mismatch = true;
+                ++g_rejected;
+            }
+        }
+        PushFree(index);
+        ++g_reaped;
+        live = kMaxThreads - g_free_count;
+        cached = g_cache_count;
+        cache_bytes = g_cache_bytes;
     }
-    PushFree(IndexOf(t));
-    ++g_reaped;
+    if (mismatch) {
+        SSPC_LOG(Kernel, Critical, "thread slot {} gives back stack {:#x}+{:#x} but holds {:#x}+{:#x}: not taken back",
+                 index, reinterpret_cast<uintptr_t>(stack.base), stack.size,
+                 reinterpret_cast<uintptr_t>(held_before.base), held_before.size);
+    }
+    UnmapStacks(unmap, unmap_count);
+    if (tid != 0 && g_event_log.load(std::memory_order_relaxed)) {
+        SSPC_LOG(Kernel, Info, "thread {} \"{}\" released: stack {}, {} unmapped; threads {}, cached {} ({} KiB)", tid,
+                 name, !own ? "the caller's" : mismatch ? "refused" : "given back", unmap_count, live, cached,
+                 cache_bytes >> 10);
+    }
 }
 
-/// A kept stack of exactly this size and guard, or nullptr.
-void* TakeCachedStack(u64 size, u64 guard) {
+/// A cached stack of exactly this size and guard for slot `index` (the most recently cached one), or
+/// nullptr. Taken out of the cache and given to the slot in one step.
+void* TakeCachedStack(u32 index, u64 size, u64 guard) {
     std::scoped_lock lk{g_table_lock};
-    const auto it = std::ranges::find_if(g_stacks, [&](const CachedStack& s) { return s.size == size && s.guard == guard; });
-    if (it == g_stacks.end()) {
-        return nullptr;
+    for (u32 i = g_cache_count; i-- > 0;) {
+        if (g_cache[i].size == size && g_cache[i].guard == guard) {
+            const StackRange s = TakeCacheEntry(i);
+            if (OverlapsHeld(s, index)) {
+                // A cached stack that overlaps a held one: the bookkeeping is broken somewhere.
+                // Forgotten, not handed out (not unmapped either: the other one may be live).
+                UncountHeld(s);
+                ++g_rejected;
+                return nullptr;
+            }
+            g_stack_of[index] = s;
+            ++g_reuses;
+            return s.base;
+        }
     }
-    void* base = it->base;
-    g_stacks.erase(it);
-    return base;
+    return nullptr;
+}
+
+/// A stack MapStack just returned, given to slot `index`; false (not given) when it overlaps a held
+/// one.
+bool AdoptNewStack(u32 index, const StackRange& s) {
+    std::scoped_lock lk{g_table_lock};
+    ++g_map_calls;
+    if (OverlapsHeld(s, index)) {
+        ++g_rejected;
+        return false;
+    }
+    g_stack_of[index] = s;
+    CountHeld(s);
+    return true;
 }
 
 void ReapPending() {
@@ -363,13 +534,14 @@ Thread* AllocSlot() {
         }
         // Every later push_back stays within this (see g_free): one entry per slot at most.
         g_pending.reserve(kMaxThreads);
-        g_stacks.reserve(kMaxThreads);
         g_table_ready = true;
     }
     if (g_free_count == 0) {
         return nullptr;
     }
-    return &g_threads[PopFree()];
+    Thread* t = &g_threads[PopFree()];
+    g_peak_threads = std::max<u64>(g_peak_threads, kMaxThreads - g_free_count);
+    return t;
 }
 
 void FreeSlot(Thread* t) {
@@ -488,11 +660,13 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
     u64 stack_size = attr.stacksize;
     u64 guard = 0;
     const bool own = stack == nullptr;
+    bool reused = false;
     if (own) {
         stack_size = RoundUp(attr.stacksize + kExtraStack, kPage);
         guard = RoundUp(std::max(attr.guardsize, kStackGuard), kPage);
-        stack = TakeCachedStack(stack_size, guard);
+        stack = TakeCachedStack(IndexOf(t), stack_size, guard);
         if (stack != nullptr) {
+            reused = true;
             std::memset(stack, 0, stack_size); // as a fresh mapping (the oracle clears reused stacks too)
         } else {
             stack = g_host->MapStack(stack_size, guard);
@@ -501,16 +675,24 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
                 SSPC_LOG(Kernel, Error, "scePthreadCreate: no guest memory for a {:#x}-byte stack", stack_size);
                 return kEagain;
             }
-            std::scoped_lock lk{g_table_lock};
-            ++g_stacks_mapped;
+            if (!AdoptNewStack(IndexOf(t), {stack, stack_size, guard})) {
+                // The memory manager handed out what this manager holds: refused, and left mapped (it
+                // may be in use).
+                FreeSlot(t);
+                SSPC_LOG(Kernel, Critical, "scePthreadCreate: new stack {:#x}+{:#x} overlaps a held stack: refused",
+                         reinterpret_cast<uintptr_t>(stack), stack_size);
+                return kEagain;
+            }
         }
         attr.stacksize = stack_size; // what scePthreadAttrGet reports (as the oracle)
     }
     const u32 tid = g_next_tid.fetch_add(1) + 1;
+    // The main thread's name is SecondSonPC's own string, not guest memory (IsReadable says no to it).
+    std::string thread_name = host_body && name != nullptr ? std::string(name) : GuestName(name, tid);
     {
         std::scoped_lock lk{t->lock};
         t->attr = attr;
-        t->name = GuestName(name, tid);
+        t->name = std::move(thread_name);
         t->entry = entry;
         t->arg = arg;
         t->host_body = std::move(host_body);
@@ -528,7 +710,7 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
     void* tcb = g_host->CreateTcb(t, initial);
     if (tcb == nullptr) {
         SSPC_LOG(Kernel, Error, "scePthreadCreate: no TCB for thread {}", tid);
-        Release(t); // keeps the stack for reuse, returns the slot
+        Release(t); // caches (or unmaps) the stack, returns the slot
         return kEagain;
     }
     {
@@ -552,14 +734,25 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
         t->host = host;
         detached = t->detached; // another guest thread may detach it already (it has the handle)
     }
+    u64 live, held, cached, cache_bytes;
     {
         std::scoped_lock lk{g_table_lock};
         ++g_created;
+        live = kMaxThreads - g_free_count;
+        held = g_held;
+        cached = g_cache_count;
+        cache_bytes = g_cache_bytes;
     }
     // t->name is written only here and by Release (not before this thread is joined or reaped).
-    SSPC_LOG(Kernel, Debug, "thread {} \"{}\" created: prio {} policy {} stack {:#x}+{:#x}{}", tid,
-             t->name, attr.prio, attr.policy, reinterpret_cast<uintptr_t>(stack), stack_size,
-             detached ? " detached" : "");
+    // Rare (tens per session): Info, so that a long session shows the stacks over time.
+    if (g_event_log.load(std::memory_order_relaxed)) {
+        SSPC_LOG(Kernel, Info,
+                 "thread {} \"{}\" created: prio {} policy {} stack {:#x}+{:#x}{}{}; threads {}, stacks held {}, "
+                 "cached {} ({} KiB)",
+                 tid, t->name, attr.prio, attr.policy, reinterpret_cast<uintptr_t>(stack), stack_size,
+                 own ? (reused ? " (reused)" : " (new)") : " (the caller's)", detached ? " detached" : "", live, held,
+                 cached, cache_bytes >> 10);
+    }
     ResumeThread(host);
     return kOk;
 }
@@ -1124,27 +1317,107 @@ std::span<const Runtime::Export> ThreadExports() {
     return kExports;
 }
 
-namespace Test {
-
-Counts GetCounts() {
-    std::scoped_lock lk{g_table_lock};
-    const u64 in_use = g_table_ready ? kMaxThreads - g_free_count : 0;
-    return {in_use, g_created, g_reaped, g_pending.size(), g_stacks_mapped, g_stacks.size()};
+StackCacheLimits DefaultStackCacheLimits() {
+    return kDefaultCacheLimits;
 }
+
+Stats GetStats() {
+    std::scoped_lock lk{g_table_lock};
+    Stats s{};
+    s.slots_in_use = g_table_ready ? kMaxThreads - g_free_count : 0;
+    s.created = g_created;
+    s.reaped = g_reaped;
+    s.pending_reap = g_pending.size();
+    s.peak_threads = g_peak_threads;
+    s.stacks_mapped = g_held;
+    s.stack_bytes = g_held_stack_bytes;
+    s.guard_bytes = g_held_guard_bytes;
+    s.peak_stacks_mapped = g_peak_held;
+    s.peak_stack_bytes = g_peak_held_bytes;
+    s.stacks_cached = g_cache_count;
+    s.cache_bytes = g_cache_bytes;
+    s.peak_cache_bytes = g_peak_cache_bytes;
+    s.map_calls = g_map_calls;
+    s.unmap_calls = g_unmap_calls;
+    s.unmap_failures = g_unmap_failures;
+    s.reuses = g_reuses;
+    s.evictions = g_evictions;
+    s.rejected = g_rejected;
+    return s;
+}
+
+void LogSummary() {
+    const Stats s = GetStats();
+    StackCacheLimits limits;
+    {
+        std::scoped_lock lk{g_table_lock};
+        limits = g_cache_limits;
+    }
+    SSPC_LOG(Kernel, Info,
+             "native threads at exit: created {}, released {}, live {} (peak {}), detached not yet released {}; stacks "
+             "held {} ({} KiB + {} KiB guard; peak {}, {} KiB), cached {} ({} KiB, peak {} KiB, limit {} / {} KiB), "
+             "mapped {}, reused {}, unmapped {} ({} for the cache limit), unmap failures {}, rejected {}",
+             s.created, s.reaped, s.slots_in_use, s.peak_threads, s.pending_reap, s.stacks_mapped, s.stack_bytes >> 10,
+             s.guard_bytes >> 10, s.peak_stacks_mapped, s.peak_stack_bytes >> 10, s.stacks_cached, s.cache_bytes >> 10,
+             s.peak_cache_bytes >> 10, limits.count, limits.bytes >> 10, s.map_calls, s.reuses,
+             s.unmap_calls, s.evictions, s.unmap_failures, s.rejected);
+}
+
+namespace Test {
 
 void ReapDetached() {
     ReapPending();
+}
+
+StackCacheLimits SetStackCacheLimits(StackCacheLimits limits) {
+    limits.count = std::min(limits.count, kStackCacheCapacity);
+    UnmapList unmap;
+    u32 n = 0;
+    StackCacheLimits old;
+    {
+        std::scoped_lock lk{g_table_lock};
+        old = g_cache_limits;
+        g_cache_limits = limits;
+        EvictFor(0, unmap, n);
+    }
+    UnmapStacks(unmap, n);
+    return old;
+}
+
+bool SetEventLog(bool on) {
+    return g_event_log.exchange(on);
+}
+
+u64 DrainStackCache() {
+    UnmapList unmap;
+    u32 n = 0;
+    {
+        std::scoped_lock lk{g_table_lock};
+        while (g_cache_count > 0) {
+            const StackRange s = TakeCacheEntry(0);
+            UncountHeld(s);
+            unmap[n++] = s;
+        }
+    }
+    UnmapStacks(unmap, n);
+    return n;
 }
 
 bool WaitDetached(u32 ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     for (;;) {
         ReapPending();
-        {
-            std::scoped_lock lk{g_table_lock};
-            if (g_pending.empty()) {
-                return true;
+        // Gone = reaped: no detached thread still running, none exited and waiting for the reaper.
+        bool left = false;
+        for (auto& t : g_threads) {
+            std::scoped_lock lk{t.lock};
+            if (Live(t) && t.detached) {
+                left = true;
+                break;
             }
+        }
+        if (!left) {
+            return true;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             return false;

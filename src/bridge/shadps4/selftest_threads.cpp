@@ -6,12 +6,14 @@
 
 #include <windows.h>
 
+#include <psapi.h>
 #include <xmmintrin.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -24,6 +26,7 @@
 #include <fmt/format.h>
 
 #include "base/log.h"
+#include "bridge/shadps4/guest_stack.h"
 #include "core/guest_memory.h"
 #include "runtime/exports.h"
 #include "runtime/kernel/kernel.h"
@@ -148,31 +151,35 @@ bool LoadApi() {
 
 thread_local void* t_tcb = nullptr; // what SetTcbBase gave this thread
 
-/// Guest stacks from the selected guest memory manager (the bridge's or SecondSonPC's), TCBs of
-/// the test (self pointer and thread at the libkernel offsets 0x00/0x10). Failures can be injected.
+/// Guest stacks from the selected guest memory manager (the bridge's or SecondSonPC's) through the
+/// game's own code (guest_stack.cpp), TCBs of the test (self pointer and thread at the libkernel
+/// offsets 0x00/0x10). Failures can be injected.
 class TestHost final : public Threads::ThreadHost {
 public:
     void* MapStack(u64 size, u64 guard) override {
         if (fail_map.exchange(false)) {
             return nullptr;
         }
-        auto& memory = Core::GetGuestVirtualMemory();
-        void* addr = nullptr;
-        if (memory.Map(&addr, {.addr = 0x7E0000000ULL,
-                               .size = size + guard,
-                               .prot = Core::MemoryProt::CpuReadWrite,
-                               .flags = Core::MemoryMapFlags::NoFlags,
-                               .type = Core::VMAType::Stack}) != 0) {
-            return nullptr;
-        }
-        const auto base = reinterpret_cast<VAddr>(addr);
-        if (guard != 0 && memory.Protect(base, guard, Core::MemoryProt::NoAccess) != 0) {
-            memory.Unmap(base, size + guard);
+        void* stack = MapGuestStack(0x7E0000000ULL, size, guard);
+        if (stack == nullptr) {
             return nullptr;
         }
         ++stacks;
-        last_stack = reinterpret_cast<void*>(base + guard);
-        return last_stack.load();
+        last_stack = stack;
+        return stack;
+    }
+    bool UnmapStack(void* stack, u64 size, u64 guard) override {
+        if (fail_unmap.exchange(false)) {
+            ++leaked; // stays mapped; the test unmaps it at the end
+            std::scoped_lock lk{leak_lock};
+            leaked_stack = {stack, size, guard};
+            return false;
+        }
+        if (!UnmapGuestStack(stack, size, guard)) {
+            return false;
+        }
+        --stacks;
+        return true;
     }
     void* CreateTcb(void* thread, bool) override {
         if (fail_tcb.exchange(false)) {
@@ -202,10 +209,18 @@ public:
         ++exiting;
     }
 
-    std::atomic<s64> stacks{0}, tcbs{0};
+    struct Leaked {
+        void* stack = nullptr;
+        u64 size = 0;
+        u64 guard = 0;
+    };
+
+    std::atomic<s64> stacks{0}, tcbs{0}, leaked{0}; // stacks: mapped and not unmapped (leaked ones too)
     std::atomic<u64> started{0}, exiting{0};
-    std::atomic<bool> fail_map{false}, fail_tcb{false};
+    std::atomic<bool> fail_map{false}, fail_tcb{false}, fail_unmap{false};
     std::atomic<void*> last_stack{nullptr};
+    std::mutex leak_lock;
+    Leaked leaked_stack;
 };
 
 TestHost& Host() {
@@ -375,6 +390,146 @@ SSPC_SYSV_ABI void* CondWaiter(void*) {
     return nullptr;
 }
 
+// P3.2 stacks. A thread checks that its stack is all zeros below it (a new mapping, or a cached one the
+// manager cleared) and has the size asked, then dirties it for the next thread that may get it.
+constexpr u64 kExtraStack = 128 * 1024; // the manager's (and the oracle's) addition for HLE
+u64 StackSizeFor(u64 attr_size) {
+    return (attr_size + kExtraStack + 0x3FFF) & ~u64{0x3FFF};
+}
+struct StackCheck {
+    u64 expect = 0; // usable bytes
+    bool zero = false;
+    bool size = false;
+    uintptr_t base = 0;
+};
+SSPC_SYSV_ABI void* StackFill(void* arg) {
+    auto* p = static_cast<StackCheck*>(arg);
+    volatile u8 marker = 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    VirtualQuery(const_cast<u8*>(&marker), &mbi, sizeof(mbi));
+    const auto base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+    MEMORY_BASIC_INFORMATION whole{};
+    VirtualQuery(mbi.AllocationBase, &whole, sizeof(whole));
+    p->base = base;
+    p->size = whole.RegionSize == p->expect;
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(&marker) - 4096) & ~uintptr_t{7};
+    bool zero = true;
+    for (uintptr_t a = base; a < end; a += 8) {
+        if (*reinterpret_cast<const u64*>(a) != 0) {
+            zero = false;
+            break;
+        }
+    }
+    p->zero = zero;
+    std::memset(reinterpret_cast<void*>(base), 0xA5, end - base);
+    return reinterpret_cast<void*>(1);
+}
+
+/// Creates a thread with a stack of `attr_size` bytes running StackFill and joins it; true when it ran
+/// and its checks passed.
+bool RunStackCheck(u64 attr_size, StackCheck* out = nullptr) {
+    void* attr = nullptr;
+    g.attr_init(&attr);
+    g.attr_setstacksize(&attr, attr_size);
+    StackCheck check{.expect = StackSizeFor(attr_size)};
+    Handle h = nullptr;
+    void* r = nullptr;
+    const bool ok = g.create(&h, &attr, &StackFill, &check, "stack-check") == 0 && g.join(h, &r) == 0 && r != nullptr;
+    g.attr_destroy(&attr);
+    if (out != nullptr) {
+        *out = check;
+    }
+    return ok && check.zero && check.size;
+}
+
+constexpr u64 kChurnSizes[] = {16 * 1024, 64 * 1024, 256 * 1024, 1ull << 20, 2ull << 20, (3ull << 20) + 16 * 1024,
+                               6ull << 20};
+constexpr size_t kChurnKinds = std::size(kChurnSizes);
+
+/// One of the churn's creators: `iterations` threads of random sizes, a third detached, the joinable
+/// ones joined at once or later (up to 8 waiting), in random order. Returns the failures.
+struct Churn {
+    u32 seed;
+    u32 iterations;
+};
+SSPC_SYSV_ABI void* ChurnWorker(void* arg) {
+    const auto* p = static_cast<const Churn*>(arg);
+    std::minstd_rand rng(p->seed);
+    // A running thread writes into its own StackCheck: entries never move, a slot is free again only
+    // after the join.
+    constexpr u32 kWaiting = 8;
+    Handle waiting[kWaiting]{};
+    StackCheck checks[kWaiting]{};
+    uintptr_t bad = 0;
+    void* attr = nullptr;
+    g.attr_init(&attr);
+    const auto join_slot = [&](u32 i) {
+        void* r = nullptr;
+        if (g.join(waiting[i], &r) != 0 || r == nullptr || !checks[i].zero || !checks[i].size) {
+            ++bad;
+        }
+        waiting[i] = nullptr;
+    };
+    const auto join_random = [&] {
+        u32 used[kWaiting];
+        u32 n = 0;
+        for (u32 i = 0; i < kWaiting; ++i) {
+            if (waiting[i] != nullptr) {
+                used[n++] = i;
+            }
+        }
+        if (n > 0) {
+            join_slot(used[rng() % n]);
+        }
+        return n;
+    };
+    for (u32 i = 0; i < p->iterations; ++i) {
+        const u64 size = kChurnSizes[rng() % kChurnKinds];
+        g.attr_setstacksize(&attr, size);
+        const bool detached = rng() % 3 == 0;
+        g.attr_setdetachstate(&attr, detached ? 1 : 0);
+        Handle h = nullptr;
+        if (detached) {
+            if (g.create(&h, &attr, &ReturnArgPlusOne, nullptr, "churn-detached") != 0) {
+                ++bad;
+            }
+            continue;
+        }
+        u32 slot = kWaiting;
+        for (u32 s = 0; s < kWaiting && slot == kWaiting; ++s) {
+            slot = waiting[s] == nullptr ? s : kWaiting;
+        }
+        if (slot == kWaiting) {
+            slot = static_cast<u32>(rng() % kWaiting);
+            join_slot(slot);
+        }
+        checks[slot] = StackCheck{.expect = StackSizeFor(size)};
+        if (g.create(&h, &attr, &StackFill, &checks[slot], "churn") != 0) {
+            ++bad;
+            continue;
+        }
+        waiting[slot] = h;
+        if (rng() % 2 == 0) {
+            join_slot(slot);
+        }
+    }
+    while (join_random() > 0) {
+    }
+    g.attr_destroy(&attr);
+    return reinterpret_cast<void*>(bad);
+}
+
+// TLS destructors under stack churn.
+u32 g_churn_key = 0;
+std::atomic<u64> g_churn_dtors{0};
+SSPC_SYSV_ABI void ChurnDestructor(void*) {
+    ++g_churn_dtors;
+}
+SSPC_SYSV_ABI void* SetChurnKey(void*) {
+    g.setspecific(g_churn_key, reinterpret_cast<void*>(1));
+    return nullptr;
+}
+
 /// Waits until `pred` holds or `ms` passed.
 template <typename P>
 bool WaitFor(u32 ms, P&& pred) {
@@ -454,17 +609,38 @@ void TestLifecycle(TestGroup& c) {
     c.Check("Getprio in the thread: default 0x2bc", p.prio_ret == 0 && p.prio == 0x2BC, Hex(p.prio));
     c.Check("Getaffinity in the thread: every CPU", p.affinity == ~0ull, fmt::format("{:#x}", p.affinity));
 
-    // The guard below the stack: no access.
+    // The guard below the stack: address space without pages (P3.2: a Reserved range of its own).
     {
+        const auto old = Threads::Test::SetStackCacheLimits({0, 0}); // a new stack, mapped now
         Probe q;
         Handle hq = nullptr;
         g.create(&hq, nullptr, &ProbeEntry, &q, "guard");
-        MEMORY_BASIC_INFORMATION mbi{};
-        const void* below = static_cast<u8*>(host.last_stack.load()) - 1;
-        const bool queried = VirtualQuery(below, &mbi, sizeof(mbi)) == sizeof(mbi);
+        const auto* stack = static_cast<u8*>(host.last_stack.load());
+        MEMORY_BASIC_INFORMATION top{}, bottom{}, usable{};
+        const bool queried = VirtualQuery(stack - 1, &top, sizeof(top)) == sizeof(top) &&
+                             VirtualQuery(stack - 16 * 1024, &bottom, sizeof(bottom)) == sizeof(bottom) &&
+                             VirtualQuery(stack, &usable, sizeof(usable)) == sizeof(usable);
+        bool guard_area = false, stack_area = false;
+        const auto s = reinterpret_cast<VAddr>(stack);
+        for (const auto& a : Core::GetGuestVirtualMemory().Areas()) {
+            if (a.base + a.size == s && a.size >= 16 * 1024 && a.type == Core::VMAType::Reserved &&
+                a.name == "stack guard") {
+                guard_area = true;
+            }
+            if (a.base == s && a.type == Core::VMAType::Stack &&
+                (static_cast<u32>(a.prot) & static_cast<u32>(Core::MemoryProt::CpuWrite)) != 0) {
+                stack_area = true;
+            }
+        }
         g.join(hq, nullptr);
-        c.Check("16 KiB no-access guard below the stack", queried && mbi.Protect == PAGE_NOACCESS,
-                fmt::format("protect {:#x}", mbi.Protect));
+        Threads::Test::SetStackCacheLimits(old);
+        c.Check("16 KiB guard below the stack: no committed pages (any access faults); the stack committed RW",
+                queried && top.State != MEM_COMMIT && bottom.State != MEM_COMMIT && usable.State == MEM_COMMIT &&
+                    (usable.Protect == PAGE_READWRITE || usable.Protect == PAGE_EXECUTE_READWRITE),
+                fmt::format("guard {:#x}/{:#x}, stack {:#x} {:#x}", top.State, bottom.State, usable.State,
+                            usable.Protect));
+        c.Check("the guard and the stack are two areas: Reserved \"stack guard\" + read/write Stack",
+                guard_area && stack_area, fmt::format("guard {} stack {}", guard_area, stack_area));
     }
 
     // scePthreadExit from deep in the thread.
@@ -522,7 +698,7 @@ void TestLifecycle(TestGroup& c) {
     CloseHandle(ev);
 
     // Detached threads: joined -> EINVAL; reaped once gone.
-    const auto before = Threads::Test::GetCounts();
+    const auto before = Threads::GetStats();
     void* attr = nullptr;
     g.attr_init(&attr);
     g.attr_setdetachstate(&attr, 1);
@@ -534,7 +710,7 @@ void TestLifecycle(TestGroup& c) {
     SetEvent(ev);
     const bool reaped = WaitFor(5000, [&] {
         Threads::Test::ReapDetached();
-        return Threads::Test::GetCounts().slots_in_use == before.slots_in_use;
+        return Threads::GetStats().slots_in_use == before.slots_in_use;
     });
     c.Check("a detached thread that ended is reaped (slot, stack, TCB)", reaped, "");
     CloseHandle(ev);
@@ -546,7 +722,7 @@ void TestLifecycle(TestGroup& c) {
     const s32 late = g.detach(h);
     const bool late_reaped = WaitFor(5000, [&] {
         Threads::Test::ReapDetached();
-        return Threads::Test::GetCounts().slots_in_use == before.slots_in_use;
+        return Threads::GetStats().slots_in_use == before.slots_in_use;
     });
     c.Check("detach after the thread ended: 0, then reaped", late == 0 && late_reaped, Hex(late));
     g.attr_destroy(&attr);
@@ -673,7 +849,7 @@ void TestKeysOnce(TestGroup& c) {
 
 void TestStress(TestGroup& c) {
     auto& host = Host();
-    const auto base = Threads::Test::GetCounts();
+    const auto base = Threads::GetStats();
     const auto handle_count = [] {
         DWORD n = 0;
         GetProcessHandleCount(GetCurrentProcess(), &n);
@@ -694,13 +870,15 @@ void TestStress(TestGroup& c) {
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const DWORD handles_after = handle_count();
-    const auto after = Threads::Test::GetCounts();
+    const auto after = Threads::GetStats();
     c.Check("1000 create+join in a row", ok == kCycles, fmt::format("{} ok", ok));
-    c.Check("no leaked slots, stacks, TCBs", after.slots_in_use == base.slots_in_use &&
-                                                 after.stacks_mapped == base.stacks_mapped &&
-                                                 host.tcbs.load() == static_cast<s64>(base.slots_in_use),
-            fmt::format("slots {}->{}, stacks {}->{}, tcbs {}", base.slots_in_use, after.slots_in_use,
-                        base.stacks_mapped, after.stacks_mapped, host.tcbs.load()));
+    // One stack size: at most one more stack held (the cache's), reused every time after it.
+    c.Check("no leaked slots, stacks, TCBs (one stack size: reused, at most one more held)",
+            after.slots_in_use == base.slots_in_use && after.stacks_mapped <= base.stacks_mapped + 1 &&
+                after.reuses >= base.reuses + kCycles - 1 &&
+                host.tcbs.load() == static_cast<s64>(base.slots_in_use),
+            fmt::format("slots {}->{}, stacks {}->{}, reused {}, tcbs {}", base.slots_in_use, after.slots_in_use,
+                        base.stacks_mapped, after.stacks_mapped, after.reuses - base.reuses, host.tcbs.load()));
     c.Check("no leaked host handles", handles_after <= handles_before + 4,
             fmt::format("{} -> {}", handles_before, handles_after));
     c.Info(fmt::format("1000 short threads: {:.1f} ms ({:.0f} us per create+join)", ms, ms * 1000 / kCycles));
@@ -716,7 +894,7 @@ void TestStress(TestGroup& c) {
         g.join(h, &r);
         children += reinterpret_cast<uintptr_t>(r);
     }
-    const auto after2 = Threads::Test::GetCounts();
+    const auto after2 = Threads::GetStats();
     c.Check("16 threads creating and joining 50 each at once", children == kCreators * kChildren &&
                                                                    after2.slots_in_use == base.slots_in_use,
             fmt::format("{} of {}, slots {}", children, kCreators * kChildren, after2.slots_in_use));
@@ -742,40 +920,45 @@ void TestStress(TestGroup& c) {
     }
     const bool all_reaped = WaitFor(10000, [&] {
         Threads::Test::ReapDetached();
-        return Threads::Test::GetCounts().slots_in_use == base.slots_in_use;
+        return Threads::GetStats().slots_in_use == base.slots_in_use;
     });
     for (HANDLE ev : events) {
         CloseHandle(ev);
     }
     g.attr_destroy(&attr);
-    const auto after3 = Threads::Test::GetCounts();
+    const auto after3 = Threads::GetStats();
     c.Check("300 detached threads ending in random order are all reaped", all_reaped,
             fmt::format("slots {} pending {}", after3.slots_in_use, after3.pending_reap));
-    c.Check("stacks are kept and reused: mapped = in use + kept, never more than the peak",
-            after3.stacks_mapped == static_cast<u64>(host.stacks.load()) &&
-                after3.stacks_cached == after3.stacks_mapped - after3.slots_in_use && after3.stacks_mapped <= 300 + 40,
-            fmt::format("mapped {} kept {} in use {}", after3.stacks_mapped, after3.stacks_cached,
-                        after3.slots_in_use));
+    const auto limits = Threads::DefaultStackCacheLimits();
+    c.Check("stacks: held = in use + cached, the cache within its limits, the rest unmapped",
+            after3.stacks_mapped == static_cast<u64>(host.stacks.load() - host.leaked.load()) &&
+                after3.stacks_cached == after3.stacks_mapped - after3.slots_in_use &&
+                after3.stacks_cached <= limits.count && after3.cache_bytes <= limits.bytes &&
+                after3.evictions > base.evictions,
+            fmt::format("held {} cached {} ({} KiB) in use {}, unmapped for the limit {}", after3.stacks_mapped,
+                        after3.stacks_cached, after3.cache_bytes >> 10, after3.slots_in_use,
+                        after3.evictions - base.evictions));
 }
 
 void TestFailures(TestGroup& c) {
     auto& host = Host();
-    // A stack size no kept stack has, so that the manager maps a new one.
+    // A stack size no kept stack has, so that the manager maps a new one; an empty cache.
+    Threads::Test::DrainStackCache();
     void* attr = nullptr;
     g.attr_init(&attr);
     g.attr_setstacksize(&attr, 2u << 20);
-    const auto base = Threads::Test::GetCounts();
+    const auto base = Threads::GetStats();
     host.fail_map = true;
     Handle h = reinterpret_cast<Handle>(1);
     const s32 r1 = g.create(&h, &attr, &ReturnArgPlusOne, nullptr, "no-stack");
-    const auto c1 = Threads::Test::GetCounts();
+    const auto c1 = Threads::GetStats();
     c.Check("no memory for the stack -> EAGAIN, nothing left behind",
             r1 == kEagain && c1.slots_in_use == base.slots_in_use && c1.stacks_mapped == base.stacks_mapped,
             Hex(r1));
     host.fail_tcb = true;
     const s32 r2 = g.create(&h, &attr, &ReturnArgPlusOne, nullptr, "no-tcb");
-    const auto c2 = Threads::Test::GetCounts();
-    c.Check("no TCB -> EAGAIN, its new stack kept for reuse, no slot taken",
+    const auto c2 = Threads::GetStats();
+    c.Check("no TCB -> EAGAIN, its new stack cached for reuse, no slot taken",
             r2 == kEagain && c2.slots_in_use == base.slots_in_use && c2.stacks_mapped == base.stacks_mapped + 1 &&
                 c2.stacks_cached == base.stacks_cached + 1,
             fmt::format("{} mapped {} kept {}", Hex(r2), c2.stacks_mapped, c2.stacks_cached));
@@ -783,11 +966,338 @@ void TestFailures(TestGroup& c) {
     void* ret = nullptr;
     const s32 r3 = g.create(&h, &attr, &ReturnArgPlusOne, reinterpret_cast<void*>(9), "reuse");
     const bool joined = r3 == 0 && g.join(h, &ret) == 0;
-    const auto c3 = Threads::Test::GetCounts();
+    const auto c3 = Threads::GetStats();
     c.Check("a kept stack is reused (no new mapping)", joined && ret == reinterpret_cast<void*>(10) &&
                                                            c3.stacks_mapped == c2.stacks_mapped,
             fmt::format("mapped {}", c3.stacks_mapped));
     g.attr_destroy(&attr);
+}
+
+/// P3.2: the lifecycle of guest stacks (docs/PHASE3_INDEPENDENT_RUNTIME.md §10) on the selected memory
+/// manager: unmapped for real, reused only at the exact size and cleared, the cache bounded, nothing left
+/// behind (stacks, areas, commit, handles) after thousands of threads.
+void TestStacks(TestGroup& c) {
+    auto& host = Host();
+    auto& memory = Core::GetGuestVirtualMemory();
+    const auto handle_count = [] {
+        DWORD n = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &n);
+        return n;
+    };
+    const auto private_bytes = [] {
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+        return static_cast<s64>(pmc.PrivateUsage);
+    };
+    const auto defaults = Threads::DefaultStackCacheLimits();
+    Threads::Test::DrainStackCache();
+    const size_t areas0 = memory.Areas().size();
+    const auto s0 = Threads::GetStats();
+    const s64 priv0 = private_bytes();
+    const DWORD h0 = handle_count();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string step_private; // private commit after each step (diagnostics)
+    s64 step_last = priv0;
+    // TEMP diagnostics: committed private memory of the process by allocation size.
+    const auto census = [] {
+        std::map<u64, std::pair<u64, u64>> by_alloc; // allocation base -> (committed bytes, reserved bytes)
+        MEMORY_BASIC_INFORMATION mbi{};
+        for (uintptr_t a = 0; VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) == sizeof(mbi);
+             a = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
+            if (mbi.Type == MEM_PRIVATE && mbi.State != MEM_FREE) {
+                auto& e = by_alloc[reinterpret_cast<u64>(mbi.AllocationBase)];
+                e.second += mbi.RegionSize;
+                if (mbi.State == MEM_COMMIT) {
+                    e.first += mbi.RegionSize;
+                }
+            }
+            if (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize < a) {
+                break;
+            }
+        }
+        std::map<u64, std::pair<u64, u64>> hist; // reserved size of the allocation -> (count, committed)
+        for (const auto& [base, e] : by_alloc) {
+            auto& h = hist[e.second];
+            ++h.first;
+            h.second += e.first;
+        }
+        return hist;
+    };
+    const auto census0 = census();
+    s64 step_delta[2] = {0, 0};
+    /// Private commit since the last mark; the allocations that grew by more than 8 MiB after step 8a.
+    const auto mark = [&](const char* step) {
+        const s64 now = private_bytes();
+        const s64 delta = now - step_last;
+        step_private += fmt::format(" {}:{:+}MiB", step, delta >> 20);
+        step_last = now;
+        if (std::string_view(step) == "8a") {
+            for (const auto& [size, h] : census()) {
+                const auto it = census0.find(size);
+                const u64 n0 = it == census0.end() ? 0 : it->second.first;
+                const u64 c0 = it == census0.end() ? 0 : it->second.second;
+                if (h.second > c0 + (8ull << 20)) {
+                    step_private += fmt::format(" [allocations of {} KiB: {} -> {}, committed {:+} MiB]", size >> 10,
+                                                n0, h.first, (static_cast<s64>(h.second) - static_cast<s64>(c0)) >> 20);
+                }
+            }
+        }
+        return delta;
+    };
+
+    // 1. No cache: the stack and its guard go back to the memory manager (D17: one call, no split).
+    Threads::Test::SetStackCacheLimits({0, 0});
+    StackCheck first;
+    const bool ran = RunStackCheck(3ull << 20, &first);
+    const auto s1 = Threads::GetStats();
+    MEMORY_BASIC_INFORMATION gone{};
+    VirtualQuery(reinterpret_cast<void*>(first.base), &gone, sizeof(gone));
+    c.Check("no cache: the stack + guard are unmapped at once (D17), the area is free again",
+            ran && s1.stacks_mapped == s0.stacks_mapped && s1.unmap_calls == s0.unmap_calls + 1 &&
+                s1.unmap_failures == 0 && memory.Areas().size() == areas0 && gone.State != MEM_COMMIT,
+            fmt::format("ran {} held {}->{} unmapped {} areas {}->{} state {:#x}", ran, s0.stacks_mapped,
+                        s1.stacks_mapped, s1.unmap_calls - s0.unmap_calls, areas0, memory.Areas().size(), gone.State));
+
+    mark("1");
+    // 2. Reuse at the same size, cleared; another size is a new mapping.
+    Threads::Test::SetStackCacheLimits({4, 16ull << 20});
+    StackCheck a, b, other;
+    RunStackCheck(1ull << 20, &a);
+    const auto s2a = Threads::GetStats();
+    const bool b_ok = RunStackCheck(1ull << 20, &b);
+    const auto s2b = Threads::GetStats();
+    const bool o_ok = RunStackCheck(512 * 1024, &other);
+    const auto s2c = Threads::GetStats();
+    c.Check("a cached stack is reused at exactly its size, all zeros again (the last thread dirtied it)",
+            b_ok && b.base == a.base && s2b.reuses == s2a.reuses + 1 && s2b.map_calls == s2a.map_calls,
+            fmt::format("same base {} zeros {} reused {}", b.base == a.base, b.zero, s2b.reuses - s2a.reuses));
+    c.Check("another size: a new mapping, not the cached stack", o_ok && other.base != a.base &&
+                                                                     s2c.map_calls == s2b.map_calls + 1,
+            fmt::format("maps {}", s2c.map_calls - s2b.map_calls));
+
+    mark("2");
+    // 3. A burst over the limits: 12 threads alive at once, then all gone; at most 4 stacks / 8 MiB stay.
+    Threads::Test::SetStackCacheLimits({4, 8ull << 20});
+    {
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::vector<Handle> hs(12);
+        for (auto& h : hs) {
+            g.create(&h, nullptr, &WaitEvent, ev, "burst");
+        }
+        const auto during = Threads::GetStats();
+        SetEvent(ev);
+        for (auto h : hs) {
+            g.join(h, nullptr);
+        }
+        CloseHandle(ev);
+        const auto after = Threads::GetStats();
+        c.Check("burst of 12: the cache keeps 4 (limit), 8 unmapped; held = cached",
+                during.slots_in_use >= 12 && after.stacks_cached == 4 && after.cache_bytes <= (8ull << 20) &&
+                    after.stacks_mapped == s0.stacks_mapped + after.stacks_cached &&
+                    static_cast<u64>(host.stacks.load() - host.leaked.load()) == after.stacks_mapped,
+                fmt::format("cached {} ({} KiB) held {} evicted {}", after.stacks_cached, after.cache_bytes >> 10,
+                            after.stacks_mapped, after.evictions - during.evictions));
+    }
+
+    mark("3");
+    // 4. 1200 threads of 7 sizes one after another, default limits: a plateau, never above the limits.
+    Threads::Test::SetStackCacheLimits(defaults);
+    std::minstd_rand rng(4321);
+    u64 bad = 0;
+    s64 priv_mid = 0; // private commit without the held stacks' (the cache's sizes change)
+    u64 held_mid = 0;
+    for (int i = 0; i < 1200; ++i) {
+        if (!RunStackCheck(kChurnSizes[rng() % kChurnKinds])) {
+            ++bad;
+        }
+        if (i == 399) {
+            const auto s = Threads::GetStats();
+            priv_mid = private_bytes() - static_cast<s64>(s.stack_bytes);
+            held_mid = s.stacks_mapped;
+        }
+    }
+    const auto s4 = Threads::GetStats();
+    const s64 priv_end = private_bytes() - static_cast<s64>(s4.stack_bytes);
+    c.Check("1200 threads of 7 stack sizes in a row: zeros + size every time, held <= the cache limit",
+            bad == 0 && s4.stacks_mapped - s0.stacks_mapped <= defaults.count &&
+                s4.peak_cache_bytes <= defaults.bytes && s4.reuses > s0.reuses,
+            fmt::format("bad {} held {} peak cache {} KiB reused {} mapped {}", bad, s4.stacks_mapped,
+                        s4.peak_cache_bytes >> 10, s4.reuses - s0.reuses, s4.map_calls - s0.map_calls));
+    c.Check("... a plateau: no growth of held stacks or of private commit (less the held stacks') from thread 400 "
+            "to 1200",
+            s4.stacks_mapped <= std::max<u64>(held_mid, s0.stacks_mapped + defaults.count) &&
+                priv_end - priv_mid < (8ll << 20),
+            fmt::format("held {} -> {}, private {:+} KiB", held_mid, s4.stacks_mapped, (priv_end - priv_mid) >> 10));
+
+    mark("4");
+    // 5. Churn: 8 manager threads create 250 threads each (random sizes, a third detached, joins now or
+    // later in random order) at once.
+    {
+        constexpr u32 kCreators = 8;
+        constexpr u32 kEach = 250;
+        std::vector<Churn> params(kCreators);
+        std::vector<Handle> creators(kCreators);
+        for (u32 i = 0; i < kCreators; ++i) {
+            params[i] = {1000u + i, kEach};
+            g.create(&creators[i], nullptr, &ChurnWorker, &params[i], "churn-creator");
+        }
+        u64 failures = 0;
+        for (auto h : creators) {
+            void* r = nullptr;
+            g.join(h, &r);
+            failures += reinterpret_cast<uintptr_t>(r);
+        }
+        const bool reaped = Threads::Test::WaitDetached(10000);
+        const auto s5 = Threads::GetStats();
+        c.Check("churn: 8 creators x 250 threads (sizes, detached, joins in random order) without a failure",
+                failures == 0 && reaped && s5.slots_in_use == s0.slots_in_use && s5.rejected == 0,
+                fmt::format("failures {} reaped {} slots {} rejected {}", failures, reaped, s5.slots_in_use,
+                            s5.rejected));
+        c.Check("... held = cached, within the limits; the manager's count = the memory manager's",
+                s5.stacks_mapped == s0.stacks_mapped + s5.stacks_cached && s5.stacks_cached <= defaults.count &&
+                    s5.cache_bytes <= defaults.bytes &&
+                    static_cast<u64>(host.stacks.load() - host.leaked.load()) == s5.stacks_mapped,
+                fmt::format("held {} cached {} ({} KiB) host {}", s5.stacks_mapped, s5.stacks_cached,
+                            s5.cache_bytes >> 10, host.stacks.load() - host.leaked.load()));
+    }
+
+    mark("5");
+    // 6. 500 detached threads at once.
+    {
+        void* attr = nullptr;
+        g.attr_init(&attr);
+        g.attr_setdetachstate(&attr, 1);
+        u64 created = 0;
+        for (int i = 0; i < 500; ++i) {
+            Handle h = nullptr;
+            created += g.create(&h, &attr, &ReturnArgPlusOne, nullptr, "mass-detached") == 0 ? 1 : 0;
+        }
+        g.attr_destroy(&attr);
+        const bool reaped = Threads::Test::WaitDetached(10000);
+        const auto s6 = Threads::GetStats();
+        c.Check("500 detached threads: all reaped, the cache within its limits",
+                created == 500 && reaped && s6.slots_in_use == s0.slots_in_use &&
+                    s6.stacks_cached <= defaults.count && s6.stacks_mapped == s0.stacks_mapped + s6.stacks_cached,
+                fmt::format("created {} reaped {} held {} cached {}", created, reaped, s6.stacks_mapped,
+                            s6.stacks_cached));
+    }
+
+    mark("6");
+    // 7. TLS destructors of 200 threads while stacks come and go (a small cache).
+    {
+        Threads::Test::SetStackCacheLimits({2, 4ull << 20});
+        g_churn_dtors = 0;
+        g.key_create(&g_churn_key, &ChurnDestructor);
+        void* attr = nullptr;
+        g.attr_init(&attr);
+        for (int i = 0; i < 200; ++i) {
+            g.attr_setstacksize(&attr, kChurnSizes[i % kChurnKinds]);
+            Handle h = nullptr;
+            if (g.create(&h, &attr, &SetChurnKey, nullptr, "tls-churn") == 0) {
+                g.join(h, nullptr);
+            }
+        }
+        g.attr_destroy(&attr);
+        g.key_delete(g_churn_key);
+        c.Check("200 threads with a TLS value: 200 destructor calls, before the stack went away",
+                g_churn_dtors == 200, fmt::format("{}", g_churn_dtors.load()));
+        Threads::Test::SetStackCacheLimits(defaults);
+    }
+
+    mark("7");
+    // 8. Every slot taken: EAGAIN for the next, nothing held for it; then all gone.
+    for (int round = 0; round < 2; ++round) { // twice: is the memory kept for reuse, or does it grow?
+        Threads::Test::DrainStackCache(); // every stack below is a new one
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        void* attr = nullptr;
+        g.attr_init(&attr);
+        g.attr_setstacksize(&attr, 16 * 1024);
+        const auto before = Threads::GetStats();
+        std::vector<Handle> hs;
+        s32 last = 0;
+        for (;;) {
+            Handle h = nullptr;
+            last = g.create(&h, &attr, &WaitEvent, ev, "fill");
+            if (last != 0) {
+                break;
+            }
+            hs.push_back(h);
+        }
+        const auto full = Threads::GetStats();
+        SetEvent(ev);
+        for (auto h : hs) {
+            g.join(h, nullptr);
+        }
+        g.attr_destroy(&attr);
+        CloseHandle(ev);
+        const auto after = Threads::GetStats();
+        c.Check("all 1024 slots taken: the next create -> EAGAIN, no stack held for it; all joined after",
+                last == kEagain && full.slots_in_use == 1024 && hs.size() == 1024 - before.slots_in_use &&
+                    full.stacks_mapped == before.stacks_mapped + hs.size() &&
+                    after.slots_in_use == before.slots_in_use,
+                fmt::format("{} threads, {}, held {}", hs.size(), Hex(last), full.stacks_mapped));
+        step_delta[round] = mark(round == 0 ? "8a" : "8b");
+    }
+    // 1024 host threads alive at once leave a high-water mark that is not the thread manager's: the
+    // bridge's profiler (Tracy, on in every build but Release: its rpmalloc maps 4 MiB per thread and
+    // keeps it for later threads). Repeating it must not add another one.
+    c.Check("1024 threads at once, twice: the second time adds no memory (a high-water mark, not a leak)",
+            step_delta[1] < std::max<s64>(step_delta[0] / 4, 64ll << 20),
+            fmt::format("{:+} MiB, then {:+} MiB", step_delta[0] >> 20, step_delta[1] >> 20));
+
+    // 9. The memory manager refuses an unmap: the stack is forgotten (never handed out again), the next
+    // thread gets a new one.
+    {
+        Threads::Test::SetStackCacheLimits({0, 0});
+        const auto before = Threads::GetStats();
+        host.fail_unmap = true;
+        StackCheck x, y;
+        RunStackCheck(5ull << 20, &x);
+        const auto mid = Threads::GetStats();
+        const bool y_ok = RunStackCheck(5ull << 20, &y);
+        const auto after = Threads::GetStats();
+        c.Check("unmap refused: counted, forgotten (not reused); the next thread maps a new stack",
+                mid.unmap_failures == before.unmap_failures + 1 && mid.stacks_mapped == before.stacks_mapped &&
+                    y_ok && y.base != x.base && after.map_calls == mid.map_calls + 1,
+                fmt::format("failures {} held {} new base {}", mid.unmap_failures - before.unmap_failures,
+                            mid.stacks_mapped, y.base != x.base));
+        TestHost::Leaked l;
+        {
+            std::scoped_lock lk{host.leak_lock};
+            l = host.leaked_stack;
+        }
+        if (l.stack != nullptr && UnmapGuestStack(l.stack, l.size, l.guard)) {
+            --host.leaked;
+            --host.stacks;
+        }
+        Threads::Test::SetStackCacheLimits(defaults);
+    }
+
+    mark("9");
+    // 10. Everything back: drained cache, the areas, private commit and handles of the start.
+    Threads::Test::DrainStackCache();
+    const auto s10 = Threads::GetStats();
+    const size_t areas10 = memory.Areas().size();
+    const s64 priv10 = private_bytes();
+    const DWORD h10 = handle_count();
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    c.Check("afterwards: no stack held, the memory manager's areas as at the start, nothing rejected",
+            s10.stacks_mapped == s0.stacks_mapped && s10.stacks_cached == 0 && areas10 == areas0 &&
+                s10.rejected == 0 && host.leaked.load() == 0,
+            fmt::format("held {} areas {}->{} rejected {} leaked {}", s10.stacks_mapped, areas0, areas10, s10.rejected,
+                        host.leaked.load()));
+    mark("10");
+    const s64 outside_step8 = priv10 - priv0 - step_delta[0] - step_delta[1];
+    c.Check("afterwards: private commit (outside the 1024-thread step) and handles back at the start (16 MiB, +8)",
+            outside_step8 < (16ll << 20) && h10 <= h0 + 8,
+            fmt::format("private {:+} KiB, handles {} -> {}", outside_step8 >> 10, h0, h10));
+    c.Info("private commit per step:" + step_private);
+    c.Info(fmt::format("{} threads in {:.1f} s; stacks mapped {}, unmapped {} ({} for the limit), reused {}, "
+                       "peak held {} ({} KiB), peak cache {} KiB",
+                       s10.created - s0.created, secs, s10.map_calls - s0.map_calls, s10.unmap_calls - s0.unmap_calls,
+                       s10.evictions - s0.evictions, s10.reuses - s0.reuses, s10.peak_stacks_mapped,
+                       s10.peak_stack_bytes >> 10, s10.peak_cache_bytes >> 10));
 }
 
 void TestSync(TestGroup& c) {
@@ -881,10 +1391,17 @@ std::vector<TestGroup> TestNativeThreads(bool guest_stacks) {
     TestKeysOnce(keys);
     groups.push_back(std::move(keys));
 
+    // Thousands of threads below: without the line per created / released thread.
+    const bool event_log = Threads::Test::SetEventLog(false);
     TestGroup stress{.name = "NativeThreads(mt)"};
     TestStress(stress);
     TestFailures(stress);
     groups.push_back(std::move(stress));
+
+    TestGroup stacks{.name = "NativeThreads(stacks)"};
+    TestStacks(stacks);
+    groups.push_back(std::move(stacks));
+    Threads::Test::SetEventLog(event_log);
 
     TestGroup sync{.name = "NativeThreads(sync)"};
     TestSync(sync);
@@ -896,8 +1413,8 @@ std::vector<TestGroup> TestNativeThreads(bool guest_stacks) {
         Handle h = nullptr;
         g.create(&h, nullptr, &WaitEvent, never, "left-running");
     }
-    const bool all_started = WaitFor(5000, [] { return Host().started.load() == Threads::Test::GetCounts().created; });
-    const auto counts = Threads::Test::GetCounts();
+    const bool all_started = WaitFor(5000, [] { return Host().started.load() == Threads::GetStats().created; });
+    const auto counts = Threads::GetStats();
     sync.Info(fmt::format("4 threads left running at exit; manager: created {}, reaped {}, slots in use {}, "
                           "stacks mapped {}; host: started {} exited {}",
                           counts.created, counts.reaped, counts.slots_in_use, counts.stacks_mapped,

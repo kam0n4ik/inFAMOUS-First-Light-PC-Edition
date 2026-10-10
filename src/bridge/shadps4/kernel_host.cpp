@@ -10,6 +10,7 @@
 
 #include "app/config.h"
 #include "base/log.h"
+#include "bridge/shadps4/guest_stack.h"
 #include "bridge/shadps4/loader_host.h"
 #include "core/debug_state.h"
 #include "core/guest_memory.h"
@@ -47,37 +48,16 @@ public:
 class ThreadHostImpl final : public Kernel::Threads::ThreadHost {
 public:
     void* MapStack(u64 size, u64 guard) override {
-        // Below the area the bridge's own stacks start from (threads/stack.cpp: usrstack -
-        // ThrStackInitial - ThrGuardDefault), going down; the address is a hint, the manager finds
-        // a free range, so stacks of the bridge's own threads (AudioOut) never overlap these.
-        constexpr VAddr kUsrStack = 0x7EFFF8000ULL;
-        constexpr VAddr kFirst = kUsrStack - 0x200000 - 0x4000;
-        VAddr hint;
-        {
-            std::scoped_lock lk{mutex_};
-            if (cursor_ == 0) {
-                cursor_ = kFirst;
-            }
-            cursor_ -= size + guard;
-            hint = cursor_;
-        }
-        auto& memory = Core::GetGuestVirtualMemory();
-        void* addr = nullptr;
-        if (memory.Map(&addr, {.addr = hint,
-                               .size = size + guard,
-                               .prot = Core::MemoryProt::CpuReadWrite,
-                               .flags = Core::MemoryMapFlags::NoFlags,
-                               .type = Core::VMAType::Stack}) != 0) {
-            SSPC_LOG(Kernel, Error, "guest stack of {:#x} bytes could not be mapped", size + guard);
-            return nullptr;
-        }
-        const VAddr base = reinterpret_cast<VAddr>(addr);
-        if (guard != 0 && memory.Protect(base, guard, Core::MemoryProt::NoAccess) != 0) {
-            SSPC_LOG(Kernel, Error, "guard of the guest stack at {:#x} could not be protected", base);
-            memory.Unmap(base, size + guard);
-            return nullptr;
-        }
-        return reinterpret_cast<void*>(base + guard);
+        // The search goes up from a fixed address 1 GiB below where the bridge's own stacks start
+        // (threads/stack.cpp: usrstack - ThrStackInitial - ThrGuardDefault, going down; AudioOut's
+        // two): the lowest free range that fits, so the ranges of unmapped stacks are used again
+        // (P3.2) and the two kinds do not meet unless a GiB of stacks is mapped. The address is a
+        // hint; the memory manager decides.
+        constexpr VAddr kStackArena = 0x7B0000000ULL;
+        return MapGuestStack(kStackArena, size, guard);
+    }
+    bool UnmapStack(void* stack, u64 size, u64 guard) override {
+        return UnmapGuestStack(stack, size, guard);
     }
     void* CreateTcb(void* thread, bool initial) override {
         auto* loader = Loader::Linker::Active();
@@ -100,10 +80,6 @@ public:
     void ThreadExiting() override {
         DebugState.RemoveCurrentThreadFromGuestList();
     }
-
-private:
-    std::mutex mutex_;
-    VAddr cursor_ = 0;
 };
 
 } // namespace

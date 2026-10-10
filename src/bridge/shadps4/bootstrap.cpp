@@ -20,6 +20,9 @@
 #include <WinSock2.h>
 #include <windows.h>
 
+#include <psapi.h>
+#include <tlhelp32.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -56,6 +59,8 @@
 #include "loader/snapshot.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/exports.h"
+#include "runtime/kernel/thread.h"
+#include "runtime/memory/virtual_memory.h"
 #include "runtime/filesystem/fs_host.h"
 #include "runtime/filesystem/vfs.h"
 #include "runtime/psf/param_sfo.h"
@@ -185,6 +190,38 @@ void OnQuickExit() {
                  s.unsupported,
                  s.first_unsupported != 0 ? fmt::format(" (first met at {:#x})", s.first_unsupported) : std::string{},
                  s.trampoline_bytes);
+    }
+    // P3.2: what the native managers hold at the end, and the process (leak checks of a long session).
+    if (Kernel::Threads::Enabled()) {
+        Kernel::Threads::LogSummary();
+    }
+    if (const auto native = GetNativeGame(); native.vm != nullptr) {
+        const auto m = native.vm->GetStats();
+        SSPC_LOG(Memory, Info,
+                 "native memory at exit: {} areas, maps {}, unmaps {}, protects {}, refused {}; host: views {}, private "
+                 "{}, unmaps {}, remaps {}, protection restores {}, commits {}, protect failures {}, coalesce "
+                 "failures {}",
+                 m.vma_count, m.maps, m.unmaps, m.protects, m.failures, m.host.views, m.host.privates, m.host.unmaps,
+                 m.host.remaps, m.host.protect_restores, m.host.commits, m.host.protect_failures,
+                 m.host.coalesce_failures);
+    }
+    {
+        DWORD handles = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &handles);
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+        u32 threads = 0;
+        if (HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te{};
+            te.dwSize = sizeof(te);
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                threads += te.th32OwnerProcessID == GetCurrentProcessId() ? 1 : 0;
+            }
+            CloseHandle(snap);
+        }
+        SSPC_LOG(Bridge, Info, "process at exit: {} handles, {} threads, private commit {} MiB (peak {} MiB)", handles,
+                 threads, pmc.PrivateUsage >> 20, pmc.PeakPagefileUsage >> 20);
     }
     SSPC_LOG(Bridge, Info, "session end");
     Log::Flush();
