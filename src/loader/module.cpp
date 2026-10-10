@@ -153,13 +153,14 @@ bool Module::Map(Host& host, const ImageFile& file, u32& max_tls_index, std::str
         error = fmt::format("cannot map the trampoline area of {}", name);
         return false;
     }
-    host.RegisterPatchModule(base_, aligned_base_size, trampoline, kTrampolineSize);
+    host.RegisterPatchModule(base_, aligned_base_size, trampoline, kTrampolineSize, name);
     SSPC_LOG(Loader, Info, "{}: base {:#x}, size {:#x}, aligned {:#x}", name, base_, base_size,
              aligned_base_size);
 
     const bool static_patching = host.StaticPatchingEnabled();
     std::vector<std::pair<u64, u64>> executable_segments;
     std::vector<uintptr_t> function_starts;
+    std::vector<CodeRange> functions;
 
     const auto add_segment_info = [this](const Elf::ProgramHeader& p) {
         if (segment_count < segments.size()) {
@@ -242,6 +243,21 @@ bool Module::Map(Host& host, const ImageFile& file, u32& max_tls_index, std::str
                 if (static_patching && !DecodeEhFrameTable(hdr, end, function_starts, eh_error)) {
                     SSPC_LOG(Loader, Error, "{}: .eh_frame_hdr table: {}", name, eh_error);
                 }
+                if (static_patching) {
+                    // Exact function ranges for SecondSonPC's FS patcher. A range inside
+                    // .eh_frame/.eh_frame_hdr is data, never decoded as code (the FDEs of functions the
+                    // linker discarded point there; eboot.bin has ~3400, none of them in the search table).
+                    const u64 frame_end = hdr.eh_frame_ptr < start ? start : base_ + aligned_base_size;
+                    std::string fde_error;
+                    if (!DecodeEhFrameFunctions(hdr, end, frame_end, functions, fde_error)) {
+                        SSPC_LOG(Loader, Error, "{}: .eh_frame FDEs: {}", name, fde_error);
+                        functions.clear();
+                    }
+                    const u64 data_lo = std::min(hdr.eh_frame_ptr, start);
+                    const u64 data_hi = std::max(frame_end, end);
+                    std::erase_if(functions,
+                                  [&](const CodeRange& f) { return f.begin < data_hi && data_lo < f.end; });
+                }
                 eh_frame_addr = hdr.eh_frame_ptr - base_;
                 eh_frame_size = static_cast<u32>(eh_frame_hdr_addr > eh_frame_addr
                                                      ? eh_frame_hdr_addr - eh_frame_addr
@@ -261,7 +277,7 @@ bool Module::Map(Host& host, const ImageFile& file, u32& max_tls_index, std::str
     if (static_patching) {
         StaticPatchSummary total;
         for (const auto& [address, size] : executable_segments) {
-            const auto r = host.StaticPatch(address, size, function_starts);
+            const auto r = host.StaticPatch(address, size, function_starts, functions);
             total.functions += r.functions;
             total.patched += r.patched;
             total.unsupported += r.unsupported;

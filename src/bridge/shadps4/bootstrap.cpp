@@ -54,6 +54,7 @@
 #include "loader/image_file.h"
 #include "loader/linker.h"
 #include "loader/snapshot.h"
+#include "runtime/cpu/fs_patcher.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/fs_host.h"
 #include "runtime/filesystem/vfs.h"
@@ -174,6 +175,17 @@ using LoaderBackend = App::Config::LoaderBackend;
 
 void OnQuickExit() {
     Trace::FinalDump();
+    if (NativeFsPatcher()) {
+        const auto s = Cpu::GetStats();
+        SSPC_LOG(Cpu, Info,
+                 "FS patcher at exit: {} modules, {} sites patched at load time, {} on first use ({} repeats), {} threads "
+                 "sent back to a site being patched ({} reported as privileged instruction), {} unsupported{}, {} "
+                 "trampoline bytes",
+                 s.modules, s.static_sites, s.runtime_sites, s.runtime_repeats, s.breakpoints, s.misreported,
+                 s.unsupported,
+                 s.first_unsupported != 0 ? fmt::format(" (first met at {:#x})", s.first_unsupported) : std::string{},
+                 s.trampoline_bytes);
+    }
     SSPC_LOG(Bridge, Info, "session end");
     Log::Flush();
     Common::Log::Flush();
@@ -545,8 +557,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         }
     }
     for (const auto& g : cfg.native_groups) {
-        if (g == "memory") {
-            continue; // not exports: the memory manager, selected in RunGame (P2.3.4)
+        if (g == "memory" || g == "fs-patch") {
+            continue; // not exports: the memory manager (P2.3.4) / the FS patcher (P3.3), selected in RunGame
         }
         if (std::ranges::none_of(Runtime::Exports(),
                                  [&g](const Runtime::Export& e) { return e.experimental && g == e.group; })) {
@@ -990,6 +1002,11 @@ void RunGame(const App::Config& cfg) {
     std::filesystem::create_directories(cfg.user_data_dir / "home", ec);
     ApplyBridgeSettings(cfg);
     Common::Log::Switch("bridge_shadps4.log", false); // applies the filter
+    // P3.3: SecondSonPC's TCB slot (the bridge's TLS code is pointed at it) and the FS patcher, before
+    // any thread, trampoline or module exists.
+    if (own_loader && !InstallGuestCpu(cfg)) {
+        Fatal("the guest TCB slot could not be set up, see SecondSonPC.log");
+    }
     if (cfg.patch_race_test) {
         // Before the game window exists: a window that pumps no messages for half a minute looks hung.
         std::quick_exit(RunPatchRaceTest(cfg));

@@ -7,8 +7,10 @@
 // through Core::GuestVirtualMemory / GuestPhysicalMemory (patch 0009, P2.3.3a).
 #include "bridge/shadps4/loader_host.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "base/log.h"
 #include "bridge/shadps4/memory_host.h"
@@ -18,11 +20,17 @@
 #include "core/guest_memory.h"
 #include "core/libraries/kernel/threads.h"
 #include "core/tls.h"
+#include "app/config.h"
+#include "runtime/cpu/fs_patcher.h"
+#include "runtime/cpu/tcb_slot.h"
 #include "runtime/kernel/thread.h"
 
 namespace SecondSon::Bridge {
 
 namespace {
+
+/// SecondSonPC's FS patcher owns the guest's code (InstallGuestCpu; never changes after start-up).
+bool g_native_fs = false;
 
 using Core::MemoryMapFlags;
 using Core::MemoryProt;
@@ -134,22 +142,47 @@ public:
         return ret == 0;
     }
 
-    void RegisterPatchModule(u64 module, u64 module_size, u64 trampoline,
-                             u64 trampoline_size) override {
+    void RegisterPatchModule(u64 module, u64 module_size, u64 trampoline, u64 trampoline_size,
+                             std::string_view name) override {
+        if (g_native_fs) {
+            if (!Cpu::RegisterModule(module, module_size, trampoline, trampoline_size, name)) {
+                SSPC_LOG(Loader, Critical, "{}: SecondSonPC's FS patcher cannot take the module, stopping", name);
+                Log::Flush();
+                std::quick_exit(1);
+            }
+            return;
+        }
         Core::RegisterPatchModule(reinterpret_cast<void*>(module), module_size,
                                   reinterpret_cast<void*>(trampoline), trampoline_size);
     }
 
     void PrePatch(u64 segment, u64 size) override {
-        Core::PrePatchInstructions(segment, size);
+        if (!g_native_fs) {
+            Core::PrePatchInstructions(segment, size); // nothing on Windows
+        }
     }
 
     bool StaticPatchingEnabled() override {
-        return Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+        return g_native_fs || Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
     }
 
-    Loader::StaticPatchSummary StaticPatch(u64 segment, u64 size,
-                                           std::span<const uintptr_t> function_starts) override {
+    Loader::StaticPatchSummary StaticPatch(u64 segment, u64 size, std::span<const uintptr_t> function_starts,
+                                           std::span<const Loader::CodeRange> functions) override {
+        if (g_native_fs) {
+            std::vector<Cpu::FunctionRange> ranges;
+            ranges.reserve(functions.size());
+            for (const auto& f : functions) {
+                ranges.push_back({f.begin, f.end});
+            }
+            const auto r = Cpu::PatchModuleStatically(segment, size, ranges);
+            if (r.undecodable != 0) {
+                SSPC_LOG(Loader, Info,
+                         "FS patcher: {} of {} functions at {:#x} not decoded to their end (data such as jump "
+                         "tables: trusted up to their last ret/jmp); {} FS instructions past that left to first use",
+                         r.undecodable, r.functions, segment, r.left_to_runtime);
+            }
+            return {r.functions, r.patched, r.unsupported};
+        }
         const auto r = Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()
                            ? Core::PatchRedZoneMemoryInstructions(segment, size, function_starts)
                            : Core::PatchCpuInstructionsStatically(segment, size, function_starts);
@@ -174,7 +207,7 @@ public:
     }
 
     void* CurrentTcb() override {
-        return Core::GetTcbBase();
+        return Cpu::CurrentTcb(); // the same slot the bridge's threads write (patch 0021)
     }
 
 private:
@@ -187,6 +220,43 @@ private:
 
 std::unique_ptr<Loader::Host> CreateLoaderHost() {
     return std::make_unique<LoaderHost>();
+}
+
+bool InstallGuestCpu(const App::Config& cfg) {
+    // One slot for every guest thread, owned by SecondSonPC: the bridge's TLS code (its threads'
+    // SetTcbBase, its patcher's trampolines) is pointed at it before it allocates one of its own.
+    if (!Cpu::InitTcbSlot()) {
+        return false;
+    }
+    if (!Core::UseTcbKey(Cpu::TcbSlot())) {
+        SSPC_LOG(Cpu, Critical, "the bridge already has a TCB slot of its own ({}): one slot per thread is required",
+                 Core::GetTcbKey());
+        return false;
+    }
+    const bool wanted = std::ranges::find(cfg.native_groups, "fs-patch") != cfg.native_groups.end();
+    if (!wanted) {
+        SSPC_LOG(Cpu, Info, "FS patcher: the bridge's (core/cpu_patches.cpp, run-time patches with patch 0016); "
+                            "TCB slot {} is SecondSonPC's",
+                 Cpu::TcbSlot());
+        return true;
+    }
+    std::string why_not;
+    if (!Cpu::CpuNeedsOnlyFsPatches(&why_not)) {
+        SSPC_LOG(Cpu, Warning, "--native fs-patch: {}; the bridge's patcher stays (it also emulates those)", why_not);
+        return true;
+    }
+    if (!Cpu::InstallFsPatcher()) {
+        SSPC_LOG(Cpu, Error, "--native fs-patch: the exception handler could not be added; the bridge's patcher stays");
+        return true;
+    }
+    g_native_fs = true;
+    SSPC_LOG(Cpu, Warning, "EXPERIMENTAL: SecondSonPC's FS patcher (load-time patches, run-time fallback), TCB slot {}",
+             Cpu::TcbSlot());
+    return true;
+}
+
+bool NativeFsPatcher() {
+    return g_native_fs;
 }
 
 } // namespace SecondSon::Bridge

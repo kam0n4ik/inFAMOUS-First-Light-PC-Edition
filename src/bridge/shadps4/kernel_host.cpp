@@ -2,8 +2,8 @@
 // errno and the process clock are still shadPS4's (shared with BRIDGE functions and with the
 // VideoOut/AudioOut timestamps), and so are the guest threads whose priority orders waiters —
 // unless --native threads (P2.4) runs them on SecondSonPC's thread manager, whose host is here too:
-// guest stacks from the selected guest memory manager, TCBs from SecondSonPC's loader, the FS base
-// of the bridge's CPU patcher, the bridge's debug thread list.
+// guest stacks from the selected guest memory manager, TCBs from SecondSonPC's loader, the FS base in
+// SecondSonPC's TCB slot (P3.3, runtime/cpu/tcb_slot.h), the bridge's debug thread list.
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -18,6 +18,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/tls.h"
 #include "loader/linker.h"
+#include "runtime/cpu/tcb_slot.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/thread.h"
 
@@ -88,7 +89,7 @@ public:
         }
     }
     void SetTcbBase(void* tcb) override {
-        Core::SetTcbBase(tcb); // the slot the bridge's fs: trampolines read (core/tls.cpp)
+        Cpu::SetCurrentTcb(tcb); // SecondSonPC's slot: every FS trampoline reads it (P3.3)
     }
     bool IsReadable(const void* p, u64 size) override {
         return Core::GetGuestVirtualMemory().IsValid(reinterpret_cast<VAddr>(p), size);

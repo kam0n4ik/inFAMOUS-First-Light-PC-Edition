@@ -34,6 +34,8 @@ add_library(sspc_runtime STATIC
     src/loader/rtld.cpp
     src/loader/snapshot.cpp
     src/runtime/app_content/app_content.cpp
+    src/runtime/cpu/fs_patcher.cpp
+    src/runtime/cpu/tcb_slot.cpp
     src/runtime/exports.cpp
     src/runtime/filesystem/directory.cpp
     src/runtime/filesystem/file_system.cpp
@@ -70,5 +72,8 @@ target_compile_options(sspc_runtime PRIVATE /utf-8 /W4)
 # SDL3: SecondSonPC's own input layer (src/input) reads SDL events; the library comes from the
 # bridge's externals until SecondSonPC has its own window (Phase 4).
 target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi SDL3::SDL3)
+# Zydis (x86 decoder, MIT): SecondSonPC's FS patcher (src/runtime/cpu, P3.3). An independent library that
+# comes from the bridge's externals until SecondSonPC vendors its own copy (Phase 5).
+target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
 
 sspc_attach_bootstrap(sspc_runtime)

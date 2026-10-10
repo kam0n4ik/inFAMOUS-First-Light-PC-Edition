@@ -25,6 +25,7 @@ enum class Category : unsigned char {
     Bridge, // temporary shadPS4 bootstrap (Phase 0-4)
     Trace,  // import call counter
     Memory, // guest memory (direct memory, P2.3)
+    Cpu,    // guest TCB slot, FS instruction patcher (P3.3)
     Count,
 };
 

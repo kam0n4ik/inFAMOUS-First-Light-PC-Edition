@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "base/abi.h"
+#include "loader/eh_frame.h"
 
 namespace SecondSon::Loader {
 
@@ -41,11 +42,13 @@ public:
 
     // --- CPU patches (guest TCB access through FS etc.) -------------------------------------
     virtual void RegisterPatchModule(u64 module, u64 module_size, u64 trampoline,
-                                     u64 trampoline_size) = 0;
+                                     u64 trampoline_size, std::string_view name) = 0;
     virtual void PrePatch(u64 segment, u64 size) = 0;
     virtual bool StaticPatchingEnabled() = 0;
-    virtual StaticPatchSummary StaticPatch(u64 segment, u64 size,
-                                           std::span<const uintptr_t> function_starts) = 0;
+    /// Before the module runs. `function_starts`: .eh_frame_hdr table (the bridge's static patcher);
+    /// `functions`: the FDE code ranges (SecondSonPC's FS patcher, P3.3), empty if not decoded.
+    virtual StaticPatchSummary StaticPatch(u64 segment, u64 size, std::span<const uintptr_t> function_starts,
+                                           std::span<const CodeRange> functions) = 0;
 
     // --- threads ----------------------------------------------------------------------------
     /// Runs `body` on a new guest thread (default attributes). The thread's TCB is created by

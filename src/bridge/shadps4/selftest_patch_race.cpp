@@ -34,6 +34,8 @@
 #include "core/cpu_patches.h"
 #include "core/signals.h"
 #include "core/tls.h"
+#include "runtime/cpu/fs_patcher.h"
+#include "runtime/cpu/tcb_slot.h"
 
 namespace SecondSon::Bridge {
 
@@ -90,10 +92,31 @@ int RunPatchRaceTest(const App::Config& cfg) {
         std::memcpy(base + s * kSiteStride, kSite, sizeof(kSite));
     }
     FlushInstructionCache(GetCurrentProcess(), base, kCodeSize);
-    Core::RegisterPatchModule(base, kCodeSize, base + kCodeSize, kTrampolineSize);
+    // P3.3: the patcher InstallGuestCpu chose (--native fs-patch = SecondSonPC's; its run-time path is
+    // tested here: the module is registered but not patched at load time).
+    const bool native = NativeFsPatcher();
+    if (native) {
+        if (!Cpu::RegisterModule(reinterpret_cast<u64>(base), kCodeSize, reinterpret_cast<u64>(base) + kCodeSize,
+                                 kTrampolineSize, "patch-race-test")) {
+            line("FAIL: SecondSonPC's FS patcher refused the test module");
+            return 1;
+        }
+    } else {
+        Core::RegisterPatchModule(base, kCodeSize, base + kCodeSize, kTrampolineSize);
+    }
+    // The TCB goes where the chosen patcher's trampolines read it (one slot with --loader sspc, P3.3; the
+    // bridge's own on its Phase 0 path, where SecondSonPC's slot is not set up).
+    const auto set_tcb = [native](void* tcb) {
+        if (native) {
+            Cpu::SetCurrentTcb(tcb);
+        } else {
+            Core::SetTcbBase(tcb);
+        }
+    };
     const u64 ticks_per_us = TicksPerUs();
-    line(fmt::format("module {:#x}: {} sites, {} threads x {} calls each at random moments within {} us",
-                     reinterpret_cast<uintptr_t>(base), kSites, kThreads, kCallsPerThread, kSpreadUs));
+    line(fmt::format("module {:#x}: {} sites, {} threads x {} calls each at random moments within {} us; patcher: {}",
+                     reinterpret_cast<uintptr_t>(base), kSites, kThreads, kCallsPerThread, kSpreadUs,
+                     native ? "SecondSonPC (run-time path)" : "the bridge's"));
 
     std::atomic<u32> ready{0};
     std::atomic<u32> round{0};
@@ -102,7 +125,7 @@ int RunPatchRaceTest(const App::Config& cfg) {
     for (u32 t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             t_dummy_tcb[0] = reinterpret_cast<u64>(&t_dummy_tcb[0]);
-            Core::SetTcbBase(t_dummy_tcb);
+            set_tcb(t_dummy_tcb);
             u64 rng = 0x9E3779B97F4A7C15ull * (t + 1);
             const auto next = [&rng] {
                 rng ^= rng << 13;
@@ -145,13 +168,41 @@ int RunPatchRaceTest(const App::Config& cfg) {
     for (u32 s = 0; s < kSites; ++s) {
         patched += base[s * kSiteStride] == 0xE9 ? 1 : 0;
     }
-    const bool ok = patched == kSites;
+    // Every call read its thread's TCB through the trampoline: the value it returned must be checked too,
+    // or a wrong slot would pass. Four threads on TCBs of their own call every site once more (each a quarter
+    // of them) and compare.
+    std::atomic<u32> wrong{0};
+    std::vector<std::thread> checkers;
+    for (u32 t = 0; t < 4; ++t) {
+        checkers.emplace_back([&, t] {
+            alignas(16) static thread_local u64 tcb[4];
+            tcb[0] = reinterpret_cast<u64>(&tcb[0]); // a TCB starts with its self pointer (per thread)
+            set_tcb(tcb);
+            for (u32 s = t; s < kSites; s += 4) {
+                const auto site = reinterpret_cast<u64 (*)()>(base + s * kSiteStride);
+                if (site() != tcb[0]) {
+                    wrong.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& t : checkers) {
+        t.join();
+    }
+    const u64 breakpoints = native ? Cpu::GetStats().breakpoints : Core::PatchBreakpointsHandled();
+    const u64 misreported = native ? Cpu::GetStats().misreported : Core::PatchBreakpointsMisreported();
+    const bool ok = patched == kSites && wrong.load() == 0;
     line(fmt::format("{} of {} sites patched (jmp to a trampoline), {} calls, {:.0f} ms; {} threads reached a "
                      "patch while it was written and were sent back to it ({} of them reported as a privileged "
-                     "instruction); {}",
+                     "instruction); fs:[0] read back wrong {} times; {}",
                      patched, kSites, u64{kSites} * kThreads * kCallsPerThread,
-                     double(t1.QuadPart - t0.QuadPart) * 1e3 / double(f.QuadPart), Core::PatchBreakpointsHandled(),
-                     Core::PatchBreakpointsMisreported(), ok ? "PASS" : "FAIL"));
+                     double(t1.QuadPart - t0.QuadPart) * 1e3 / double(f.QuadPart), breakpoints, misreported,
+                     wrong.load(), ok ? "PASS" : "FAIL"));
+    if (native) {
+        const auto st = Cpu::GetStats();
+        line(fmt::format("SecondSonPC FS patcher: {} run-time sites, {} repeats, {} unsupported, {} trampoline bytes",
+                         st.runtime_sites, st.runtime_repeats, st.unsupported, st.trampoline_bytes));
+    }
     return ok ? 0 : 1;
 }
 

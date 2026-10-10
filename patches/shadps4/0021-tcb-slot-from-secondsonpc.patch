@@ -1,0 +1,37 @@
+diff --git a/src/core/tls.cpp b/src/core/tls.cpp
+index e0d7f3f8..a7a1c82b 100644
+--- a/src/core/tls.cpp
++++ b/src/core/tls.cpp
+@@ -44,6 +44,17 @@ u32 GetTcbKey() {
+     return slot;
+ }
+ 
++// SecondSonPC P3.3 (patch 0021): the TCB slot is SecondSonPC's; the bridge's threads and patcher use it
++// instead of allocating one. Only before the bridge has taken a slot of its own.
++bool UseTcbKey(u32 key) {
++    bool taken = false;
++    std::call_once(slot_alloc_flag, [&] {
++        slot = key;
++        taken = true;
++    });
++    return taken || slot == key;
++}
++
+ void SetTcbBase(void* image_address) {
+     const BOOL result = TlsSetValue(GetTcbKey(), image_address);
+     ASSERT(result != 0);
+diff --git a/src/core/tls.h b/src/core/tls.h
+index 37f788d8..f4b80953 100644
+--- a/src/core/tls.h
++++ b/src/core/tls.h
+@@ -36,6 +36,10 @@ struct Tcb {
+ #ifdef _WIN32
+ /// Gets the thread local storage key for the TCB block.
+ u32 GetTcbKey();
++
++/// SecondSonPC P3.3 (patch 0021): use this TLS slot (SecondSonPC's) for the TCB. false if the bridge
++/// already allocated a different one.
++bool UseTcbKey(u32 key);
+ #endif
+ 
+ /// Sets the data pointer to the TCB block.

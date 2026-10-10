@@ -4860,6 +4860,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestNativeThreads(false)) {
         native_groups.push_back(std::move(g));
     }
+    // P3.3: SecondSonPC's TCB slot and FS patcher.
+    for (auto& g : TestNativeFs(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

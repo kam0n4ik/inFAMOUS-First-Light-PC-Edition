@@ -9,8 +9,15 @@
 
 #include "bridge/shadps4/selftest_vmm.h"
 
+namespace SecondSon::App {
+struct Config;
+}
+
 namespace SecondSon::Bridge {
 
 std::vector<TestGroup> TestNativeThreads(bool guest_stacks);
+
+/// P3.3 (src/bridge/shadps4/selftest_fs.cpp): SecondSonPC's TCB slot and FS patcher.
+std::vector<TestGroup> TestNativeFs(const App::Config& cfg);
 
 } // namespace SecondSon::Bridge

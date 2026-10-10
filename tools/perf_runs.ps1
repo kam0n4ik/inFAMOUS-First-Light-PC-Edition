@@ -78,6 +78,10 @@ $modeArgs = @{
     # a default, so PR = PO1). That session's PC (stream buffer in cached system memory) was rejected and
     # removed.
     PR = "--perf-opt stream-reads"
+    # P3.3: F = SecondSonPC's FS patcher (load-time patches, TCB slot of its own; docs\PHASE3_INDEPENDENT_RUNTIME.md
+    # §5), TMF = with SecondSonPC's threads and memory too (the most native runtime so far). PO1 = the bridge's
+    # patcher (the TCB slot is SecondSonPC's in every mode).
+    F = "--native fs-patch"; TMF = "--native fs-patch --native threads --native memory --memory-commit on-demand"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}

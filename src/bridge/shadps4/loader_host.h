@@ -19,6 +19,14 @@ namespace SecondSon::Bridge {
 
 std::unique_ptr<Loader::Host> CreateLoaderHost();
 
+/// P3.3: the guest TCB slot becomes SecondSonPC's (the bridge's TLS code uses it through patch 0021)
+/// and the FS patcher is chosen — SecondSonPC's with --native fs-patch (if the CPU needs no other
+/// patch), else the bridge's. Once, at start-up, before anything reads the slot or loads a module.
+/// false: the slot could not be taken (the caller stops).
+bool InstallGuestCpu(const App::Config& cfg);
+/// SecondSonPC's FS patcher owns the guest's code (chosen by InstallGuestCpu).
+bool NativeFsPatcher();
+
 /// Filesystem::FsHost on the shadPS4 core (src/bridge/shadps4/fs_host.cpp).
 std::unique_ptr<Filesystem::FsHost> CreateFsHost();
 
