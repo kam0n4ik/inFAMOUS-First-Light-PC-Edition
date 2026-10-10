@@ -34,6 +34,10 @@
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/selftest_vmm.h"
 #include "runtime/cpu/exceptions.h"
+#include "runtime/exports.h"
+#include "runtime/kernel/signal.h"
+
+#include <tuple>
 
 // ------------------------------------------------------------------------------------- the stubs
 // Microsoft x64 calling convention (called from this file): rcx, rdx, r8; rax returned. They only
@@ -366,6 +370,99 @@ void TestRedZone(TestGroup& g) {
     X::Test::ResetStats();
 }
 
+// ---- guest signals (runtime/kernel/signal.h): the exported functions and delivery
+
+namespace Sig = Kernel::Signals;
+
+std::atomic<u32> g_sigill_seen{0}, g_sigsegv_seen{0};
+s32 g_sigill_signo = 0, g_sigill_code = 0;
+bool g_sigill_masked = false;
+u8* g_noaccess = nullptr;
+
+SSPC_SYSV_ABI void SigillHandler(s32 sig, Sig::Siginfo* si, Sig::Ucontext* uc) {
+    g_sigill_signo = si->si_signo;
+    g_sigill_code = si->si_code;
+    const auto mask = Sig::Test::CurrentMask();
+    g_sigill_masked = ((mask.bits[(sig - 1) >> 5] >> ((sig - 1) & 31)) & 1) != 0;
+    uc->uc_mcontext.mc_rip += 2; // past the ud2
+    g_sigill_seen.fetch_add(1);
+}
+
+SSPC_SYSV_ABI void SigsegvHandler(s32) {
+    DWORD old = 0;
+    VirtualProtect(g_noaccess, 0x1000, PAGE_READWRITE, &old); // the faulting read is executed again
+    g_sigsegv_seen.fetch_add(1);
+}
+
+void* SignalExport(std::string_view name) {
+    for (const auto& e : Sig::SignalExports()) {
+        if (name == e.name && std::string_view(e.library) == "libkernel") {
+            return e.function;
+        }
+    }
+    return nullptr;
+}
+
+void TestSignals(TestGroup& g) {
+    using SignalFn = u64(SSPC_SYSV_ABI*)(s32, u64);
+    using MaskFn = s32(SSPC_SYSV_ABI*)(s32, const Sig::Sigset*, Sig::Sigset*);
+    using FillFn = s32(SSPC_SYSV_ABI*)(Sig::Sigset*);
+    const auto signal_fn = reinterpret_cast<SignalFn>(SignalExport("signal"));
+    const auto mask_fn = reinterpret_cast<MaskFn>(SignalExport("sigprocmask"));
+    const auto sys_mask_fn = reinterpret_cast<MaskFn>(SignalExport("_sigprocmask"));
+    const auto fill_fn = reinterpret_cast<FillFn>(SignalExport("sigfillset"));
+    if (!signal_fn || !mask_fn || !sys_mask_fn || !fill_fn) {
+        g.Check("the game's signal imports are exported", false, "");
+        return;
+    }
+    // signal(): argument checks and the previous handler.
+    g.Check("signal(0 / SIGKILL / 129) refused with SIG_ERR",
+            signal_fn(0, 0) == ~0ull && signal_fn(9, 0) == ~0ull && signal_fn(129, 0) == ~0ull, "");
+    const u64 first = signal_fn(30, 0x1234);
+    const u64 second = signal_fn(30, 0);
+    g.Check("signal() returns the previous handler", first == 0 && second == 0x1234,
+            fmt::format("{:#x} {:#x}", first, second));
+    // sigprocmask(): block, unblock, set, the old mask, refusals; SIGKILL never blocked.
+    Sig::Sigset set{}, old{};
+    set.bits[0] = (1u << (30 - 1)) | (1u << (9 - 1)); // SIGUSR1 and SIGKILL
+    bool ok = mask_fn(1, &set, nullptr) == 0;
+    const auto m = Sig::Test::CurrentMask();
+    ok = ok && (m.bits[0] & (1u << 29)) != 0 && (m.bits[0] & (1u << 8)) == 0;
+    ok = ok && sys_mask_fn(2, &set, &old) == 0 && (old.bits[0] & (1u << 29)) != 0 &&
+         (Sig::Test::CurrentMask().bits[0] & (1u << 29)) == 0;
+    Sig::Sigset none{};
+    ok = ok && mask_fn(3, &none, nullptr) == 0 && mask_fn(7, &set, nullptr) == -1;
+    g.Check("sigprocmask/_sigprocmask: block, unblock, set mask, old mask; SIGKILL never blocked; bad 'how' refused",
+            ok, "");
+    Sig::Sigset filled{};
+    g.Check("sigfillset sets all 128 signals", fill_fn(&filled) == 0 && filled.bits[0] == ~0u && filled.bits[3] == ~0u,
+            "");
+
+    // Delivery: SIGILL to a SA_SIGINFO handler that moves rip past the ud2.
+    Sig::Test::SetAction(Sig::kSigIll, reinterpret_cast<u64>(&SigillHandler), Sig::kSaSigInfo);
+    const u64 delivered = Sig::Test::Delivered();
+    sspc_xt_ud2();
+    g.Check("SIGILL from guest code: the handler gets signo/code, runs with SIGILL blocked, resumes at its rip",
+            g_sigill_seen.load() == 1 && g_sigill_signo == Sig::kSigIll && g_sigill_code == 1 && g_sigill_masked &&
+                (Sig::Test::CurrentMask().bits[0] & (1u << (Sig::kSigIll - 1))) == 0 &&
+                Sig::Test::Delivered() == delivered + 1,
+            fmt::format("seen {}, signo {}, code {}, masked {}", g_sigill_seen.load(), g_sigill_signo, g_sigill_code,
+                        g_sigill_masked));
+    Sig::Test::SetAction(Sig::kSigIll, 0, 0);
+    // Delivery: SIGSEGV to a signal() handler that makes the page readable; the read runs again.
+    g_noaccess = static_cast<u8*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    *reinterpret_cast<u64*>(g_noaccess) = 0xC0FFEE;
+    DWORD prev = 0;
+    VirtualProtect(g_noaccess, 0x1000, PAGE_NOACCESS, &prev);
+    signal_fn(Sig::kSigSegv, reinterpret_cast<u64>(&SigsegvHandler));
+    const u64 value = sspc_xt_load(reinterpret_cast<u64*>(g_noaccess));
+    signal_fn(Sig::kSigSegv, 0);
+    g.Check("SIGSEGV from guest code: a signal() handler fixes the page, the read is executed again",
+            g_sigsegv_seen.load() == 1 && value == 0xC0FFEE,
+            fmt::format("seen {}, value {:#x}", g_sigsegv_seen.load(), value));
+    VirtualFree(g_noaccess, 0, MEM_RELEASE);
+}
+
 // ---- the fatal path in child processes
 
 struct ChildResult {
@@ -444,6 +541,15 @@ void TestFatal(TestGroup& g, const std::filesystem::path& logs_dir) {
                 fmt::format("finished {}, exit {:#x}, reports {}, module {}, {:.1f} s", r.finished, r.exit_code,
                             r.reports, module, r.seconds));
     }
+    for (const auto& [name, code, what] :
+         {std::tuple{"blocked-signal", static_cast<DWORD>(EXCEPTION_ILLEGAL_INSTRUCTION), "SIGILL with a handler but blocked"},
+          std::tuple{"ignored-signal", static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION), "SIGSEGV set to SIG_IGN"}}) {
+        const auto r = RunChild(name, base / name);
+        g.Check(fmt::format("fatal: {}: the default action (a report), not a handler or an endless retry", what),
+                r.finished && r.exit_code == code && r.reports == 1 && r.seconds < 30,
+                fmt::format("finished {}, exit {:#x}, reports {}, {:.1f} s", r.finished, r.exit_code, r.reports,
+                            r.seconds));
+    }
     {
         const auto r = RunChild("reporter-hangs", base / "reporter-hangs");
         g.Check("fatal: the reporter never finishes: the faulting thread writes its own line and ends the process",
@@ -472,20 +578,23 @@ void BlockForever() {
 } // namespace
 
 std::vector<TestGroup> TestNativeExceptions(const App::Config& cfg) {
-    std::vector<TestGroup> out(3);
+    std::vector<TestGroup> out(4);
     out[0].name = "NativeExceptions";
     out[1].name = "NativeExc(red zone)";
-    out[2].name = "NativeExc(fatal)";
+    out[2].name = "NativeSignals";
+    out[3].name = "NativeExc(fatal)";
     if (X::Installed()) {
         RegisterStubs();
         g_pages = static_cast<u8*>(VirtualAlloc(nullptr, kPages * 0x1000ull, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
         TestInProcess(out[0]);
         TestRedZone(out[1]);
+        TestSignals(out[2]);
     } else {
-        out[0].Info("INFO  the dispatcher is not installed in this run (--selftest --native exceptions runs these)");
-        out[1].Info("INFO  the dispatcher is not installed in this run (--selftest --native exceptions runs these)");
+        for (int i = 0; i < 3; ++i) {
+            out[i].Info("INFO  the dispatcher is not installed in this run (--selftest --native exceptions runs these)");
+        }
     }
-    TestFatal(out[2], cfg.logs_dir);
+    TestFatal(out[3], cfg.logs_dir);
     return out;
 }
 
@@ -512,7 +621,19 @@ int RunExceptionsChild(int argc, char** argv) {
     }
     RegisterStubs();
     g_pages = static_cast<u8*>(VirtualAlloc(nullptr, kPages * 0x1000ull, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (name == "guest-av" || name == "reporter-hangs") {
+    if (name == "blocked-signal") {
+        Sig::Install();
+        Sig::Test::SetAction(Sig::kSigIll, reinterpret_cast<u64>(&SigillHandler), Sig::kSaSigInfo);
+        Sig::Sigset set{};
+        set.bits[0] = 1u << (Sig::kSigIll - 1);
+        reinterpret_cast<s32(SSPC_SYSV_ABI*)(s32, const Sig::Sigset*, Sig::Sigset*)>(SignalExport("sigprocmask"))(
+            1, &set, nullptr);
+        sspc_xt_ud2();
+    } else if (name == "ignored-signal") {
+        Sig::Install();
+        Sig::Test::SetAction(Sig::kSigSegv, 1, 0); // SIG_IGN
+        sspc_xt_load(reinterpret_cast<u64*>(g_null_target));
+    } else if (name == "guest-av" || name == "reporter-hangs") {
         sspc_xt_load(reinterpret_cast<u64*>(g_null_target));
     } else if (name == "guest-ud2") {
         sspc_xt_ud2();

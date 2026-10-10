@@ -7,6 +7,7 @@
 #include "runtime/filesystem/file_system.h"
 #include "runtime/filesystem/fs_observer.h"
 #include "runtime/kernel/kernel.h"
+#include "runtime/kernel/signal.h"
 #include "runtime/kernel/thread.h"
 #include "runtime/pad/pad.h"
 #include "runtime/system/system_service.h"
@@ -77,6 +78,7 @@ std::vector<Export> Collect() {
                              Kernel::EventFlagExports(), Kernel::KernelUtilExports(),
                              Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
                              Kernel::DirectMemoryExports(), Kernel::Threads::ThreadExports(),
+                             Kernel::Signals::SignalExports(),
                              Net::NetUtilExports(), Libc::LibcMemExports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());

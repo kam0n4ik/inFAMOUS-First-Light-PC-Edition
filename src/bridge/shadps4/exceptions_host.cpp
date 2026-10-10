@@ -24,6 +24,7 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/signals.h"
 #include "runtime/cpu/exceptions.h"
+#include "runtime/kernel/signal.h"
 #include "runtime/kernel/thread.h"
 
 namespace SecondSon::Bridge {
@@ -111,6 +112,7 @@ bool InstallExceptionRuntime(const App::Config& cfg, bool native_cpu) {
     if (!Cpu::Exceptions::Install(options)) {
         return false;
     }
+    Kernel::Signals::Install(); // guest signals (group "exceptions") are delivered by the dispatcher
     Base::SetFirstChanceStatsHook(&LogExceptionStats);
     g_native_exceptions = true;
     SSPC_LOG(Cpu, Warning, "EXPERIMENTAL: SecondSonPC's exception dispatcher ({})", g_backends);
