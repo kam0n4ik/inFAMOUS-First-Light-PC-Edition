@@ -31,8 +31,8 @@
 //                              SecondSonPC's exception dispatcher, P3.4; errno: SecondSonPC's guest errno,
 //                              the bridge's functions use it too, P3.5; kernel-memory: libkernel's memory
 //                              functions on SecondSonPC's memory manager (needs memory), P3.5; clock:
-//                              SecondSonPC's process clock for the game and the bridge, P3.5;
-//                              --loader sspc only)
+//                              SecondSonPC's process clock for the game and the bridge, P3.5; exit: the
+//                              guest's _exit through SecondSonPC's orderly exit, P3.6; --loader sspc only)
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
@@ -75,6 +75,9 @@ int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     if (argc >= 2 && std::string_view(argv[1]) == "--exceptions-child") {
         return Bridge::RunExceptionsChild(argc, argv); // P3.4 self-test: a fatal exception in a child process
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "--lifecycle-child") {
+        return Bridge::RunLifecycleChild(argc, argv); // P3.6 self-test: one way out of a process
     }
 
     std::vector<std::string> errors;

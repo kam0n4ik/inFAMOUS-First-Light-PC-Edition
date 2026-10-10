@@ -4881,6 +4881,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestEventQueues()) {
         native_groups.push_back(std::move(g));
     }
+    // P3.6: the process's end (child processes).
+    for (auto& g : TestLifecycle(cfg.logs_dir)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

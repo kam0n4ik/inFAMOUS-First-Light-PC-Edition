@@ -80,7 +80,7 @@ std::vector<Export> Collect() {
                              Kernel::KernelExports(), Kernel::SemaphoreExports(),
                              Kernel::EventFlagExports(), Kernel::KernelUtilExports(),
                              Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
-                             Kernel::DirectMemoryExports(), Kernel::Threads::ThreadExports(),
+                             Kernel::DirectMemoryExports(), Kernel::ProcessExports(), Kernel::Threads::ThreadExports(),
                              Kernel::Signals::SignalExports(), Kernel::GuestErrno::Exports(),
                              Kernel::MemoryApi::Exports(), Kernel::Clock::Exports(),
                              Net::NetUtilExports(), Libc::LibcMemExports(),

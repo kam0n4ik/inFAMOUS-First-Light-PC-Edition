@@ -1,0 +1,55 @@
+diff --git a/src/emulator.cpp b/src/emulator.cpp
+index 0b3bae00..a2e93d35 100644
+--- a/src/emulator.cpp
++++ b/src/emulator.cpp
+@@ -68,7 +68,23 @@ namespace Core {
+ 
+ std::mutex exit_mutex{};
+ 
++// SecondSonPC (P3.6, patch 0026): SecondSonPC owns the end of the process. Its asserts (common/assert.cpp)
++// and its vectored handler (core/signals.cpp) still reach Emulator::Shutdown — then only the hook runs (it
++// flushes the logs); the process ends on SecondSonPC's paths, nothing is stopped or closed from here.
++static void (*g_external_shutdown)() = nullptr;
++
++void UseExternalShutdown(void (*hook)()) {
++    g_external_shutdown = hook;
++}
++
+ Emulator::Emulator() {
++    if (g_external_shutdown != nullptr) {
++        // Made only by the paths above (SecondSonPC runs no Emulator): no start-up work, no exit handler.
++        memory = nullptr;
++        controllers = nullptr;
++        linker = nullptr;
++        return;
++    }
+     // Initialize NT API functions, set high priority and disable WER
+ #ifdef _WIN32
+     Common::NtApi::Initialize();
+@@ -85,6 +101,10 @@ Emulator::Emulator() {
+ Emulator::~Emulator() {}
+ 
+ void Emulator::Shutdown() {
++    if (g_external_shutdown != nullptr) {
++        g_external_shutdown();
++        return;
++    }
+     static bool exit_done = false;
+     std::scoped_lock l{exit_mutex};
+     if (exit_done) {
+diff --git a/src/emulator.h b/src/emulator.h
+index 251fc138..7b0d410f 100644
+--- a/src/emulator.h
++++ b/src/emulator.h
+@@ -16,6 +16,11 @@ namespace Core {
+ 
+ using HLEInitDef = void (*)(Core::Loader::SymbolsResolver* sym);
+ 
++/// SecondSonPC (P3.6, patch 0026): SecondSonPC owns the end of the process. With a hook set, Emulator::Shutdown
++/// (reached from asserts and the vectored handler) only calls it, and an Emulator made by those paths does no
++/// start-up work and registers no exit handler. Call before anything may assert.
++void UseExternalShutdown(void (*hook)());
++
+ struct SysModules {
+     std::string_view module_name;
+     HLEInitDef callback;

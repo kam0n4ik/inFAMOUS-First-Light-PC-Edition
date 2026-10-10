@@ -21,6 +21,7 @@ add_library(sspc_runtime STATIC
     src/app/config.cpp
     src/app/paths.cpp
     src/base/crash.cpp
+    src/base/lifecycle.cpp
     src/base/log.cpp
     src/base/vram_monitor.cpp
     src/input/keyboard_mouse.cpp
@@ -52,6 +53,7 @@ add_library(sspc_runtime STATIC
     src/runtime/kernel/kernel_util.cpp
     src/runtime/kernel/memory.cpp
     src/runtime/kernel/mutex.cpp
+    src/runtime/kernel/process.cpp
     src/runtime/kernel/rwlock.cpp
     src/runtime/kernel/semaphore.cpp
     src/runtime/kernel/signal.cpp

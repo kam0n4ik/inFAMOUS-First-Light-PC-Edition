@@ -13,6 +13,7 @@
 
 #include <fmt/format.h>
 
+#include "base/lifecycle.h"
 #include "base/log.h"
 
 namespace SecondSon::Memory {
@@ -56,14 +57,12 @@ HostAccess GuestToHost(u32 prot) {
              "native virtual memory: the host refused to {} [{:#x}, +{:#x}) (Windows error {}); the guest address "
              "space no longer matches its areas, stopping",
              what, addr, size, error);
-    Log::Flush();
-    std::quick_exit(6);
+    Lifecycle::Exit(6, "native virtual memory: the host refused an operation on its own mapping");
 }
 
 [[noreturn]] void Inconsistent(std::string_view what, u64 addr) {
     SSPC_LOG(Memory, Critical, "native virtual memory: internal inconsistency ({} at {:#x}), stopping", what, addr);
-    Log::Flush();
-    std::quick_exit(6);
+    Lifecycle::Exit(6, "native virtual memory: internal inconsistency");
 }
 
 } // namespace

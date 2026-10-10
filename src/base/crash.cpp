@@ -27,6 +27,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "base/vram_monitor.h"
 
@@ -420,6 +421,7 @@ LONG WINAPI DataFaultFilter(EXCEPTION_POINTERS* info) {
 // ---------------------------------------------------------------------------- unhandled filter
 
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
+    Lifecycle::EnterFatal("unhandled exception"); // P3.6: the OS ends the process after this filter
     const auto* rec = info->ExceptionRecord;
     const auto* ctx = info->ContextRecord;
     const u64 address = reinterpret_cast<u64>(rec->ExceptionAddress);

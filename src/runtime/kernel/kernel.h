@@ -47,6 +47,7 @@ std::span<const Runtime::Export> MutexExports();      // mutex.cpp, group "kerne
 std::span<const Runtime::Export> CondvarExports();    // condvar.cpp, group "kernel-mutex" (waits on mutexes)
 std::span<const Runtime::Export> RwlockExports();     // rwlock.cpp, group "kernel-rwlock"
 std::span<const Runtime::Export> DirectMemoryExports(); // memory.cpp, group "kernel-dmem" (experimental)
+std::span<const Runtime::Export> ProcessExports();      // process.cpp, group "exit" (experimental, P3.6)
 
 /// Self-test access to the native semaphores (functions the game does not import, and state).
 namespace SemaphoreTest {

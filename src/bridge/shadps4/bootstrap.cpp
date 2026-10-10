@@ -45,6 +45,7 @@
 
 #include "app/config.h"
 #include "base/crash.h"
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "bridge/shadps4/bootstrap.h"
 #include "bridge/shadps4/bridge_exports.h"
@@ -181,8 +182,13 @@ using LoaderBackend = App::Config::LoaderBackend;
 
 ::Input::GameControllers* g_controllers = nullptr; // shadPS4's (not SecondSon::Input)
 
-void OnQuickExit() {
+// P3.6: the end of the process, step by step (base/lifecycle.h). The steps run once, on the exiting thread,
+// while the other threads still run; the process then exits (ExitProcess ends the bridge's threads).
+void ExitStepCallCounts() {
     Trace::FinalDump();
+}
+
+void ExitStepRuntimeSummaries() {
     if (NativeFsPatcher()) {
         const auto s = Cpu::GetStats();
         SSPC_LOG(Cpu, Info,
@@ -220,6 +226,9 @@ void OnQuickExit() {
                  m.host.remaps, m.host.protect_restores, m.host.commits, m.host.protect_failures,
                  m.host.coalesce_failures);
     }
+}
+
+void ExitStepProcessSummary() {
     {
         DWORD handles = 0;
         GetProcessHandleCount(GetCurrentProcess(), &handles);
@@ -238,23 +247,50 @@ void OnQuickExit() {
         SSPC_LOG(Bridge, Info, "process at exit: {} handles, {} threads, private commit {} MiB (peak {} MiB)", handles,
                  threads, pmc.PrivateUsage >> 20, pmc.PeakPagefileUsage >> 20);
     }
-    SSPC_LOG(Bridge, Info, "session end");
+    // Before the steps that wait for the bridge's threads: what is written so far survives their watchdog.
     Log::Flush();
     Common::Log::Flush();
-    Libraries::SaveData::Backup::StopThread();
-    Storage::DataBase::Instance().Close();
-    Common::Log::Flush(); // the cache's last lines (its statistics, tools\perf_report.py reads them)
+}
+
+void ExitStepSaveDataBackup() {
+    Libraries::SaveData::Backup::StopThread(); // waits for a backup being written
+}
+
+void ExitStepShaderCache() {
+    Storage::DataBase::Instance().Close(); // writes what is queued; its statistics go to the bridge's log
+}
+
+void ExitStepControllerLights() {
     if (g_controllers != nullptr) {
         g_controllers->ResetLightbarColors();
-        Sleep(10);
+        Sleep(10); // SDL sends it
     }
+}
+
+void ExitStepLogs() {
+    SSPC_LOG(Bridge, Info, "session end");
+    Log::Flush();
+    Common::Log::Flush(); // the cache's last lines (its statistics, tools\perf_report.py reads them)
+}
+
+void InstallLifecycle() {
+    using Lifecycle::Stage;
+    Lifecycle::AddExitStep(Stage::Reports, "import call counts", &ExitStepCallCounts);
+    Lifecycle::AddExitStep(Stage::Reports, "runtime summaries", &ExitStepRuntimeSummaries);
+    Lifecycle::AddExitStep(Stage::Reports, "process summary", &ExitStepProcessSummary);
+    Lifecycle::AddExitStep(Stage::Services, "save data backup thread (bridge)", &ExitStepSaveDataBackup);
+    Lifecycle::AddExitStep(Stage::Storage, "shader cache (bridge)", &ExitStepShaderCache);
+    Lifecycle::AddExitStep(Stage::Devices, "controller lights (bridge)", &ExitStepControllerLights);
+    Lifecycle::AddExitStep(Stage::Logs, "logs", &ExitStepLogs);
+    Lifecycle::Install(30000);
+    InstallBridgeShutdownHook(); // the bridge starts no shutdown of its own (patch 0026)
 }
 
 [[noreturn]] void Fatal(std::string_view message) {
     SSPC_LOG(Bridge, Critical, "{}", message);
     Log::Flush();
     MessageBoxA(nullptr, std::string(message).c_str(), "SecondSonPC", MB_ICONERROR | MB_OK);
-    std::quick_exit(1);
+    Lifecycle::Exit(1, "a start-up failure");
 }
 
 std::string NidName(const std::string& nid) {
@@ -1000,7 +1036,7 @@ void RunGame(const App::Config& cfg) {
     SetErrorMode(SetErrorMode(0) | SEM_NOGPFAULTERRORBOX);
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
-    std::at_quick_exit(OnQuickExit);
+    InstallLifecycle(); // P3.6: one owner of the process's end, before any bridge code may assert
     Trace::SetCallOrderCapacity(cfg.call_order);
 
     // The shadPS4 core keeps its own log file; SecondSonPC.log is written by SecondSonPC only.
@@ -1184,7 +1220,7 @@ void RunGame(const App::Config& cfg) {
         window->WaitEvent();
     }
     SSPC_LOG(App, Info, "window closed");
-    std::quick_exit(0);
+    Lifecycle::Exit(0, "the window was closed");
 }
 
 void RunStockForDiagnostics(const App::Config& cfg) {

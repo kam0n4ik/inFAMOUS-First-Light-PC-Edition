@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "bridge/shadps4/memory_host.h"
 #include "common/elf_info.h"
@@ -92,8 +93,7 @@ public:
         physical_.SetupRegions(flexible_size, extended1, extended2);
         if (!ConfigureNativeDirectMemory(flexible_size, extended1, extended2)) {
             SSPC_LOG(Loader, Critical, "--native kernel-dmem: direct memory budget mismatch, stopping");
-            Log::Flush();
-            std::quick_exit(1);
+            Lifecycle::Exit(1, "--native kernel-dmem: direct memory budget mismatch");
         }
     }
 
@@ -152,8 +152,7 @@ public:
         if (g_native_fs) {
             if (!Cpu::RegisterModule(module, module_size, trampoline, trampoline_size, name)) {
                 SSPC_LOG(Loader, Critical, "{}: SecondSonPC's FS patcher cannot take the module, stopping", name);
-                Log::Flush();
-                std::quick_exit(1);
+                Lifecycle::Exit(1, "SecondSonPC's FS patcher cannot take a module");
             }
             return;
         }
@@ -216,8 +215,7 @@ public:
         if (Kernel::Threads::Enabled()) {
             // --native threads (P2.4): the main thread is SecondSonPC's like every other one.
             if (!Kernel::Threads::StartMainThread(std::move(body))) {
-                Log::Flush();
-                std::quick_exit(1);
+                Lifecycle::Exit(1, "the guest's main thread could not start");
             }
             return;
         }

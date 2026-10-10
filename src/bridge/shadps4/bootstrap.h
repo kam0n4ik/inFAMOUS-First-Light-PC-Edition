@@ -9,7 +9,7 @@ struct Config;
 namespace SecondSon::Bridge {
 
 /// Loads eboot.bin with the shadPS4 core, binds SecondSonPC exports first, runs the game.
-/// Does not return (the session ends with std::quick_exit).
+/// Does not return (the session ends through base/lifecycle.h: Lifecycle::Exit, P3.6).
 [[noreturn]] void RunGame(const App::Config& config);
 
 /// DIAGNOSTIC ONLY (--stock-bootstrap): shadPS4's own Core::Emulator::Run inside this binary, to

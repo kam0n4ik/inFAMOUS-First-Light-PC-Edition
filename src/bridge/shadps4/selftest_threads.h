@@ -5,6 +5,7 @@
 // System V functions of the test that call the manager's exports as the game does.
 #pragma once
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,10 @@ std::vector<TestGroup> TestKernelHle(const App::Config& cfg);
 
 /// P3.6 (src/bridge/shadps4/selftest_equeue.cpp): the game's event queues, their guest API and contract.
 std::vector<TestGroup> TestEventQueues();
+
+/// P3.6 (src/bridge/shadps4/selftest_lifecycle.cpp): the process's end, in child processes (logs in
+/// <logs_dir>\selftest_lifecycle\<case>).
+std::vector<TestGroup> TestLifecycle(const std::filesystem::path& logs_dir);
 
 /// The executable segment of the game's eboot.bin copied into host memory (read/write; trampoline area after
 /// it) and its .eh_frame function ranges (selftest_fs.cpp). The game's files are only read.

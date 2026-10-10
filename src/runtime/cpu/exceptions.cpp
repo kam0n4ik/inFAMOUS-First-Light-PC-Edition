@@ -12,6 +12,7 @@
 #include <windows.h>
 
 #include "base/crash.h"
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/cpu/tcb_slot.h"
@@ -691,6 +692,8 @@ void Fatal(EXCEPTION_POINTERS* info, const char* reason) {
             Sleep(INFINITE); // another thread is reporting; the process ends with its report
         }
     }
+    // P3.6: no orderly exit runs its steps from now on (an atomic store; the process ends below).
+    Lifecycle::EnterFatal(reason);
     g_job.record = *info->ExceptionRecord;
     g_job.record.ExceptionRecord = nullptr;
     std::memcpy(&g_job.context, info->ContextRecord, sizeof(CONTEXT));

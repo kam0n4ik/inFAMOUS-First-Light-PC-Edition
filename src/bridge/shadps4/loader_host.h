@@ -67,6 +67,16 @@ bool InstallKernelRuntime(const App::Config& cfg, std::string* error);
 /// libkernel, the owner of the game's event queues (patch 0025). Called by InstallKernelHost.
 void InstallEventQueueHost();
 
+/// P3.6 (src/bridge/shadps4/lifecycle_host.cpp, patch 0026): the bridge's Emulator::Shutdown (its asserts, its
+/// vectored handler) only flushes the logs; SecondSonPC owns the end of the process (base/lifecycle.h). Before
+/// anything of the bridge may assert. BridgeShutdownRequests: how often the bridge asked (self-test).
+void InstallBridgeShutdownHook();
+u32 BridgeShutdownRequests();
+
+/// P3.6 (src/bridge/shadps4/selftest_lifecycle.cpp): SecondSonPC.exe --lifecycle-child <case> <dir>, the
+/// self-test's child process for the ways out of a process. Before anything else in main.
+int RunLifecycleChild(int argc, char** argv);
+
 /// --selftest (src/bridge/shadps4/selftest.cpp): exit code 0 = every check passed.
 int RunSelfTest(const App::Config& cfg);
 
