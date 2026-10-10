@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <mutex>
+#include <io.h>
 #include <windows.h>
 
 namespace SecondSon::Log {
@@ -79,6 +80,18 @@ void Flush() {
     if (g_file != nullptr) {
         std::fflush(g_file);
     }
+}
+
+void EmergencyWrite(const char* text, size_t size) {
+    std::FILE* const file = g_file;
+    const HANDLE handle =
+        file != nullptr ? reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file))) : GetStdHandle(STD_ERROR_HANDLE);
+    if (handle == INVALID_HANDLE_VALUE || handle == nullptr) {
+        return;
+    }
+    DWORD written = 0;
+    WriteFile(handle, text, static_cast<DWORD>(size), &written, nullptr);
+    FlushFileBuffers(handle);
 }
 
 std::optional<Level> ParseLevel(std::string_view name) {

@@ -18,6 +18,7 @@
 #include <Zydis/Zydis.h>
 
 #include "base/log.h"
+#include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/tcb_slot.h"
 
 namespace SecondSon::Cpu {
@@ -415,12 +416,29 @@ LONG WINAPI FsHandler(EXCEPTION_POINTERS* info) {
         return OnPatchTrap(info, false);
     case EXCEPTION_PRIV_INSTRUCTION:
         return OnPatchTrap(info, true);
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        return HandleIllegalInstruction(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
 }
 
+std::atomic<bool> g_ready{false}; // InstallFsPatcher ran (with or without its own handler)
+
 } // namespace
+
+bool HandlePatcherAccessViolation(EXCEPTION_POINTERS* info) {
+    return OnAccessViolation(info) == EXCEPTION_CONTINUE_EXECUTION;
+}
+
+bool HandlePatcherTrap(EXCEPTION_POINTERS* info, bool misreported) {
+    return OnPatchTrap(info, misreported) == EXCEPTION_CONTINUE_EXECUTION;
+}
+
+bool HandleIllegalInstruction(EXCEPTION_POINTERS* info) {
+    (void)info; // SSE4a emulation (P3.4) is added with the instruction patches
+    return false;
+}
 
 // ------------------------------------------------------------------------------------- interface
 
@@ -549,19 +567,20 @@ bool CpuNeedsOnlyFsPatches(std::string* why_not) {
     return false;
 }
 
-bool InstallFsPatcher() {
+bool InstallFsPatcher(bool own_handler) {
     AcquireSRWLockExclusive(&g_register_lock);
-    if (g_handler.load() == nullptr) {
-        (void)Decoder();
+    (void)Decoder();
+    if (own_handler && g_handler.load() == nullptr) {
         g_handler.store(AddVectoredExceptionHandler(1, &FsHandler));
     }
-    const bool ok = g_handler.load() != nullptr;
+    const bool ok = !own_handler || g_handler.load() != nullptr;
+    g_ready.store(g_ready.load() || ok);
     ReleaseSRWLockExclusive(&g_register_lock);
     return ok;
 }
 
 bool FsPatcherInstalled() {
-    return g_handler.load() != nullptr;
+    return g_ready.load();
 }
 
 bool RegisterModule(u64 code, u64 code_size, u64 trampoline, u64 trampoline_size, std::string_view name) {
@@ -599,6 +618,85 @@ bool RegisterModule(u64 code, u64 code_size, u64 trampoline, u64 trampoline_size
     return true;
 }
 
+namespace {
+
+/// Whether a function keeps data below rsp (the System V red zone), from its instructions: an operand (or
+/// an address taken) below rsp, or below rbp deeper than the frame set up under it (sub rsp, pushes after
+/// mov rbp, rsp). An upper bound — the red zone need not be live at every instruction — for the exception
+/// dispatcher's exposure counters (P3.4 §6).
+struct RedZoneScan {
+    bool frame_pointer = false;
+    bool below_rsp = false;
+    u64 below_rbp = 0;
+    u64 frame = 0;
+
+    void Add(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops) {
+        for (u8 i = 0; i < insn.operand_count_visible; ++i) {
+            const auto& op = ops[i];
+            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || op.mem.disp.value >= 0) {
+                continue;
+            }
+            if (op.mem.base == ZYDIS_REGISTER_RSP) {
+                below_rsp = true;
+            } else if (op.mem.base == ZYDIS_REGISTER_RBP) {
+                below_rbp = std::max<u64>(below_rbp, static_cast<u64>(-op.mem.disp.value));
+            }
+        }
+        const bool two = insn.operand_count_visible >= 2;
+        switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_MOV:
+            if (two && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].reg.value == ZYDIS_REGISTER_RBP &&
+                ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[1].reg.value == ZYDIS_REGISTER_RSP) {
+                frame_pointer = true;
+            }
+            break;
+        case ZYDIS_MNEMONIC_SUB:
+            if (two && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].reg.value == ZYDIS_REGISTER_RSP &&
+                ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                frame += ops[1].imm.value.u;
+            }
+            break;
+        case ZYDIS_MNEMONIC_PUSH:
+            if (frame_pointer) {
+                frame += 8;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    bool Uses() const {
+        return below_rsp || (frame_pointer && below_rbp > frame);
+    }
+};
+
+} // namespace
+
+u64 AnalyzeRedZone(std::span<const FunctionRange> functions) {
+    u64 marked = 0;
+    for (const auto& f : functions) {
+        if (f.end <= f.begin) {
+            continue;
+        }
+        RedZoneScan scan;
+        for (u64 pc = f.begin; pc < f.end;) {
+            ZydisDecodedInstruction insn;
+            ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+            if (!ZYAN_SUCCESS(
+                    ZydisDecoderDecodeFull(&Decoder(), reinterpret_cast<const void*>(pc), f.end - pc, &insn, ops))) {
+                break;
+            }
+            scan.Add(insn, ops);
+            pc += insn.length;
+        }
+        if (scan.Uses()) {
+            Exceptions::MarkRedZoneFunction(f.begin, f.end);
+            ++marked;
+        }
+    }
+    return marked;
+}
+
 StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const FunctionRange> functions) {
     StaticResult r;
     Module* m = FindModule(segment);
@@ -623,6 +721,7 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
         u64 unsupported = 0;
         u64 unsupported_before_end = 0; // ... before the last unconditional transfer (see below)
         u64 last_transfer_end = f.begin;
+        RedZoneScan red_zone;
         u64 pc = f.begin;
         while (pc < f.end) {
             ZydisDecodedInstruction insn;
@@ -632,6 +731,7 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
                 clean = false;
                 break;
             }
+            red_zone.Add(insn, ops);
             if ((insn.attributes & ZYDIS_ATTRIB_HAS_SEGMENT_FS) != 0) {
                 bool fs_relative = false;
                 if (const auto fs = DecodeFs(reinterpret_cast<const u8*>(pc), f.end - pc, &fs_relative)) {
@@ -667,6 +767,10 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
             unsupported = unsupported_before_end;
         }
         r.unsupported += unsupported;
+        if (red_zone.Uses()) {
+            Exceptions::MarkRedZoneFunction(f.begin, f.end);
+            ++r.red_zone_functions;
+        }
         for (const auto& s : sites) {
             if (s.address + s.insn.length > trusted_end) {
                 ++r.left_to_runtime;

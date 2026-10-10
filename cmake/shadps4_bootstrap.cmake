@@ -86,6 +86,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/user_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/input_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/kernel_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/exceptions_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/guest_stack.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_vmm.cpp
@@ -94,6 +95,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_threads.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_patch_race.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_fs.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_exceptions.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/native_memory.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/loader_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/memory_host.cpp

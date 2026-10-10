@@ -15,6 +15,7 @@
 #include "base/crash.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -192,7 +193,7 @@ DWORD WINAPI DumpThread(void* param) {
 
 /// Writes the minidump on a helper thread (MiniDumpWriteDump on the faulting thread can deadlock
 /// on locks it holds); waits at most kDumpTimeoutMs. True when the dump was written.
-bool WriteDump(EXCEPTION_POINTERS* info) {
+bool WriteDump(EXCEPTION_POINTERS* info, DWORD thread_id = GetCurrentThreadId()) {
     SYSTEMTIME t{};
     GetLocalTime(&t);
     CreateDirectoryW(g_dump_dir.c_str(), nullptr);
@@ -203,7 +204,7 @@ bool WriteDump(EXCEPTION_POINTERS* info) {
     job->record = *info->ExceptionRecord;
     job->record.ExceptionRecord = nullptr; // no chained record outlives this handler
     job->context = *info->ContextRecord;
-    job->thread_id = GetCurrentThreadId();
+    job->thread_id = thread_id;
     job->path = g_dump_dir + name;
     const std::string path = Narrow(job->path);
     const HANDLE thread = CreateThread(nullptr, 0, &DumpThread, job, 0, nullptr);
@@ -474,7 +475,13 @@ FaultRecord LastFaultRecord() {
     return r;
 }
 
+void (*g_first_chance_stats_hook)(const char*) = nullptr;
+
 void LogFirstChanceStats(const char* reason) {
+    if (g_first_chance_stats_hook != nullptr) {
+        g_first_chance_stats_hook(reason);
+        return;
+    }
     if (!g_first_chance_installed) {
         SSPC_LOG(App, Info, "first-chance stats {}: recorder off (--no-fault-recorder)", reason);
         return;
@@ -521,6 +528,84 @@ void EnableFirstChanceStamp() {
 
 u64 FirstChanceStamp() {
     return t_first_chance_tsc;
+}
+
+void RecordExecuteFault(EXCEPTION_POINTERS* info) {
+    if (t_recording || info->ExceptionRecord->NumberParameters < 2) {
+        return;
+    }
+    t_recording = true;
+    Record(info, Facts(info), FaultKind::Execute);
+    t_recording = false;
+}
+
+void StampFirstChance() {
+    if (g_stamp_first_chance) {
+        t_first_chance_tsc = __rdtsc();
+    }
+}
+
+void SetFirstChanceStatsHook(void (*hook)(const char* reason)) {
+    g_first_chance_stats_hook = hook;
+}
+
+std::string DescribeAddress(u64 address) {
+    return Describe(address);
+}
+
+std::string ThreadDescription(u32 thread_id) {
+    if (g_thread_description == nullptr) {
+        return "";
+    }
+    const HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, thread_id);
+    if (thread == nullptr) {
+        return "";
+    }
+    PWSTR wide = nullptr;
+    std::string name;
+    if (SUCCEEDED(g_thread_description(thread, &wide)) && wide != nullptr) {
+        name = Narrow(std::wstring(wide).substr(0, 64));
+        LocalFree(wide);
+    }
+    CloseHandle(thread);
+    return name;
+}
+
+std::string StackDump(u64 rsp) {
+    const auto region = Query(rsp);
+    if (!region.ok || region.state != MEM_COMMIT || region.end <= rsp) {
+        return fmt::format("  stack: rsp {:#x} is not readable ({})\n", rsp, Describe(rsp));
+    }
+    std::array<u64, 512> stack{};
+    const size_t count = static_cast<size_t>(std::min<u64>((region.end - rsp) / 8, stack.size()));
+    if (!ReadMemory(rsp, stack.data(), count * 8)) {
+        return fmt::format("  stack: rsp {:#x} could not be read\n", rsp);
+    }
+    std::string out = fmt::format("  stack: rsp {:#x} ({}), {} qwords read\n", rsp, Describe(rsp), count);
+    for (size_t i = 0; i < std::min<size_t>(count, 16); i += 4) {
+        out += fmt::format("  [rsp+{:#05x}]", i * 8);
+        for (size_t j = i; j < std::min(count, i + 4); ++j) {
+            out += fmt::format(" {:016x}", stack[j]);
+        }
+        out += "\n";
+    }
+    int shown = 0;
+    for (size_t i = 0; i < count && shown < 24; ++i) {
+        const u64 v = stack[i];
+        if (v < 0x10000 || !IsExecutable(Query(v))) {
+            continue;
+        }
+        out += fmt::format("  code ptr [rsp+{:#x}] {:#x} {}\n", i * 8, v, Describe(v));
+        ++shown;
+    }
+    return out;
+}
+
+bool WriteMinidumpFor(EXCEPTION_POINTERS* info, u32 thread_id) {
+    if (g_mini_dump == nullptr || g_dump_taken.exchange(true)) {
+        return false;
+    }
+    return WriteDump(info, thread_id);
 }
 
 void InstallLateFaultRecorder() {

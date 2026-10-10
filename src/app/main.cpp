@@ -27,7 +27,8 @@
 //     --native <group>         enables an EXPERIMENTAL group, BRIDGE by default (kernel-dmem: direct
 //                              memory, P2.3.1; memory: SecondSonPC's memory manager instead of the
 //                              bridge's, P2.3.4; threads: SecondSonPC's guest thread manager, P2.4;
-//                              --loader sspc only)
+//                              cpu (= fs-patch): SecondSonPC's CPU patcher, P3.3/P3.4; exceptions:
+//                              SecondSonPC's exception dispatcher, P3.4; --loader sspc only)
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
@@ -50,6 +51,7 @@
 #include "base/log.h"
 #include "base/vram_monitor.h"
 #include "bridge/shadps4/bootstrap.h"
+#include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
@@ -67,6 +69,9 @@ int Fail(const std::string& message) {
 int main(int argc, char* argv[]) {
     using namespace SecondSon;
     SetConsoleOutputCP(CP_UTF8);
+    if (argc >= 2 && std::string_view(argv[1]) == "--exceptions-child") {
+        return Bridge::RunExceptionsChild(argc, argv); // P3.4 self-test: a fatal exception in a child process
+    }
 
     std::vector<std::string> errors;
     auto config = App::LoadConfig(App::RootDir(), errors);
@@ -209,11 +214,17 @@ int main(int argc, char* argv[]) {
     if (config->memory_commit_on_demand && !native("memory")) {
         return Fail("--memory-commit on-demand is a mode of SecondSonPC's memory manager: it needs --native memory");
     }
+    if (native("exceptions") && config->fault_test) {
+        return Fail("--fault-test checks the first-chance recorder's own handlers, which --native exceptions replaces; "
+                    "run it without (the dispatcher has its own self-test: --selftest --native exceptions)");
+    }
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
     }
+    // P3.4: SecondSonPC's exception dispatcher records execute faults itself; the first-chance recorder's
+    // vectored handlers are then not added (the unhandled exception filter is).
     Base::InstallCrashLogger(config->logs_dir / "crash", config->crash_dump,
-                             config->fault_recorder || config->fault_test);
+                             (config->fault_recorder || config->fault_test) && !native("exceptions"));
     if (config->fault_test) {
         return Base::RunFaultSelfTest(config->logs_dir); // before any bridge code: no other handlers
     }

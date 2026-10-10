@@ -2,8 +2,11 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 #include "base/abi.h"
+
+struct _EXCEPTION_POINTERS;
 
 namespace SecondSon::Base {
 
@@ -69,6 +72,24 @@ struct FaultRecord {
 };
 
 FaultRecord LastFaultRecord();
+
+// ---- P3.4: pieces SecondSonPC's exception dispatcher (runtime/cpu/exceptions.h) uses in place of the
+// first-chance and data-fault filters (which it replaces with --native exceptions).
+
+/// Records an execute fault (the first-chance recorder's report; one minidump per process).
+void RecordExecuteFault(_EXCEPTION_POINTERS* info);
+/// --track-stats: the time stamp FirstChanceStamp() returns, taken by the dispatcher.
+void StampFirstChance();
+/// Replaces LogFirstChanceStats' own line (the dispatcher logs its counters instead).
+void SetFirstChanceStatsHook(void (*hook)(const char* reason));
+/// "exe+0x..." / "committed private prot 0x4, allocation ..." / "free (unmapped)" (VirtualQuery).
+std::string DescribeAddress(u64 address);
+/// The thread's description (SetThreadDescription), "" if none or not readable.
+std::string ThreadDescription(u32 thread_id);
+/// The stack from rsp (read safely): the first qwords and the values pointing into executable memory.
+std::string StackDump(u64 rsp);
+/// A minidump of the exception of thread `thread_id` (once per process; on a helper thread, 20 s).
+bool WriteMinidumpFor(_EXCEPTION_POINTERS* info, u32 thread_id);
 
 /// --fault-test: provokes faults in its own code (execute faults through call, ret and jmp reg,
 /// a read of reserved memory from private code, host and protected-page faults that must be

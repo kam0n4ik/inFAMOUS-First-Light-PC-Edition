@@ -57,6 +57,7 @@
 #include "loader/image_file.h"
 #include "loader/linker.h"
 #include "loader/snapshot.h"
+#include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/exports.h"
 #include "runtime/kernel/thread.h"
@@ -191,6 +192,7 @@ void OnQuickExit() {
                  s.first_unsupported != 0 ? fmt::format(" (first met at {:#x})", s.first_unsupported) : std::string{},
                  s.trampoline_bytes);
     }
+    Cpu::Exceptions::LogSummary("at exit"); // P3.4 (nothing without --native exceptions)
     // P3.2: what the native managers hold at the end, and the process (leak checks of a long session).
     if (Kernel::Threads::Enabled()) {
         Kernel::Threads::LogSummary();
@@ -594,8 +596,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         }
     }
     for (const auto& g : cfg.native_groups) {
-        if (g == "memory" || g == "fs-patch") {
-            continue; // not exports: the memory manager (P2.3.4) / the FS patcher (P3.3), selected in RunGame
+        if (g == "memory" || g == "fs-patch" || g == "cpu" || g == "exceptions") {
+            continue; // not exports: the memory manager (P2.3.4), the CPU patcher (P3.3), the exception
+                      // dispatcher (P3.4), selected in RunGame
         }
         if (std::ranges::none_of(Runtime::Exports(),
                                  [&g](const Runtime::Export& e) { return e.experimental && g == e.group; })) {

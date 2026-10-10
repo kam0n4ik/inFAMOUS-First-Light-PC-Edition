@@ -27,6 +27,15 @@ bool InstallGuestCpu(const App::Config& cfg);
 /// SecondSonPC's FS patcher owns the guest's code (chosen by InstallGuestCpu).
 bool NativeFsPatcher();
 
+/// P3.4 (src/bridge/shadps4/exceptions_host.cpp), --native exceptions: SecondSonPC's exception dispatcher
+/// owns the vectored handler, the bridge's handlers are reached through it (patch 0022). Called by
+/// InstallGuestCpu, before the first Core::Signals::Instance() and before any guest module is registered.
+bool InstallExceptionRuntime(const App::Config& cfg, bool native_cpu);
+bool NativeExceptions();
+/// The self-test's child process (src/bridge/shadps4/selftest_exceptions.cpp):
+/// SecondSonPC.exe --exceptions-child <case> <dir>. Before anything else in main.
+int RunExceptionsChild(int argc, char** argv);
+
 /// Filesystem::FsHost on the shadPS4 core (src/bridge/shadps4/fs_host.cpp).
 std::unique_ptr<Filesystem::FsHost> CreateFsHost();
 

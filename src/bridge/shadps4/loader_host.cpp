@@ -21,6 +21,7 @@
 #include "core/libraries/kernel/threads.h"
 #include "core/tls.h"
 #include "app/config.h"
+#include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/cpu/tcb_slot.h"
 #include "runtime/kernel/thread.h"
@@ -144,6 +145,9 @@ public:
 
     void RegisterPatchModule(u64 module, u64 module_size, u64 trampoline, u64 trampoline_size,
                              std::string_view name) override {
+        // Guest code for the exception dispatcher (P3.4): signals, fatal reports with module + offset.
+        Cpu::Exceptions::RegisterGuestCode(module, module + module_size, name);
+        Cpu::Exceptions::RegisterGuestCode(trampoline, trampoline + trampoline_size, std::string(name) + " (trampolines)");
         if (g_native_fs) {
             if (!Cpu::RegisterModule(module, module_size, trampoline, trampoline_size, name)) {
                 SSPC_LOG(Loader, Critical, "{}: SecondSonPC's FS patcher cannot take the module, stopping", name);
@@ -163,7 +167,9 @@ public:
     }
 
     bool StaticPatchingEnabled() override {
-        return g_native_fs || Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+        // P3.4: with SecondSonPC's dispatcher the functions are decoded at load time for the red-zone marks
+        // even when the bridge's patcher owns the code.
+        return g_native_fs || NativeExceptions() || Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
     }
 
     Loader::StaticPatchSummary StaticPatch(u64 segment, u64 size, std::span<const uintptr_t> function_starts,
@@ -181,7 +187,22 @@ public:
                          "tables: trusted up to their last ret/jmp); {} FS instructions past that left to first use",
                          r.undecodable, r.functions, segment, r.left_to_runtime);
             }
+            SSPC_LOG(Loader, Info, "{} of {} functions at {:#x} keep data below rsp (red zone)", r.red_zone_functions,
+                     r.functions, segment);
             return {r.functions, r.patched, r.unsupported};
+        }
+        if (NativeExceptions() && !Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
+            // The bridge's patcher patches at run time only: here just the red-zone marks.
+            std::vector<Cpu::FunctionRange> ranges;
+            for (const auto& f : functions) {
+                if (f.begin >= segment && f.end <= segment + size) {
+                    ranges.push_back({f.begin, f.end});
+                }
+            }
+            const u64 marked = Cpu::AnalyzeRedZone(ranges);
+            SSPC_LOG(Loader, Info, "{} of {} functions at {:#x} keep data below rsp (red zone)", marked, ranges.size(),
+                     segment);
+            return {ranges.size(), 0, 0};
         }
         const auto r = Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()
                            ? Core::PatchRedZoneMemoryInstructions(segment, size, function_starts)
@@ -233,25 +254,30 @@ bool InstallGuestCpu(const App::Config& cfg) {
                  Core::GetTcbKey());
         return false;
     }
-    const bool wanted = std::ranges::find(cfg.native_groups, "fs-patch") != cfg.native_groups.end();
+    const auto listed = [&cfg](std::string_view g) {
+        return std::ranges::find(cfg.native_groups, g) != cfg.native_groups.end();
+    };
+    const bool exceptions = listed("exceptions");
+    const bool wanted = listed("fs-patch") || listed("cpu");
     if (!wanted) {
         SSPC_LOG(Cpu, Info, "FS patcher: the bridge's (core/cpu_patches.cpp, run-time patches with patch 0016); "
                             "TCB slot {} is SecondSonPC's",
                  Cpu::TcbSlot());
-        return true;
+    } else if (std::string why_not; !Cpu::CpuNeedsOnlyFsPatches(&why_not)) {
+        SSPC_LOG(Cpu, Warning, "--native cpu: {}; the bridge's patcher stays (it also emulates those)", why_not);
+    } else if (!Cpu::InstallFsPatcher(!exceptions)) {
+        SSPC_LOG(Cpu, Error, "--native cpu: the exception handler could not be added; the bridge's patcher stays");
+    } else {
+        g_native_fs = true;
+        SSPC_LOG(Cpu, Warning,
+                 "EXPERIMENTAL: SecondSonPC's CPU patcher (FS: load-time patches, run-time fallback), TCB slot {}",
+                 Cpu::TcbSlot());
     }
-    std::string why_not;
-    if (!Cpu::CpuNeedsOnlyFsPatches(&why_not)) {
-        SSPC_LOG(Cpu, Warning, "--native fs-patch: {}; the bridge's patcher stays (it also emulates those)", why_not);
-        return true;
+    // P3.4: the dispatcher before anything creates the bridge's (its first Signals::Instance()).
+    if (exceptions && !InstallExceptionRuntime(cfg, g_native_fs)) {
+        SSPC_LOG(Cpu, Critical, "--native exceptions: SecondSonPC's exception dispatcher could not be installed");
+        return false;
     }
-    if (!Cpu::InstallFsPatcher()) {
-        SSPC_LOG(Cpu, Error, "--native fs-patch: the exception handler could not be added; the bridge's patcher stays");
-        return true;
-    }
-    g_native_fs = true;
-    SSPC_LOG(Cpu, Warning, "EXPERIMENTAL: SecondSonPC's FS patcher (load-time patches, run-time fallback), TCB slot {}",
-             Cpu::TcbSlot());
     return true;
 }
 

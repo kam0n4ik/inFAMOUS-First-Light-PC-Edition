@@ -1,0 +1,61 @@
+diff --git a/src/core/signals.cpp b/src/core/signals.cpp
+index 43b3f83d..6d724249 100644
+--- a/src/core/signals.cpp
++++ b/src/core/signals.cpp
+@@ -350,8 +350,24 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
+ 
+ #endif
+ 
++// SecondSonPC (P3.4, patch 0022): SecondSonPC's exception dispatcher in place of this handler.
++static bool g_external_dispatch = false;
++static void (*g_external_on_remove)() = nullptr;
++
++void UseExternalExceptionDispatch(void (*on_remove)()) {
++    g_external_dispatch = true;
++    g_external_on_remove = on_remove;
++}
++
++bool ExternalExceptionDispatch() {
++    return g_external_dispatch;
++}
++
+ SignalDispatch::SignalDispatch() {
+ #if defined(_WIN32)
++    if (g_external_dispatch) {
++        return; // the handlers below are called by SecondSonPC's dispatcher
++    }
+     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
+                "Failed to register exception handler.");
+ #else
+@@ -373,6 +389,12 @@ void SignalDispatch::RemoveHandlers() {
+     // asserting here would get into an infinite loop until too
+     // many nested exceptions makes the OS kill the process
+ #if defined(_WIN32)
++    if (g_external_dispatch) {
++        if (g_external_on_remove != nullptr) {
++            g_external_on_remove();
++        }
++        return;
++    }
+     if (!(RemoveVectoredExceptionHandler(handle))) {
+         LOG_CRITICAL(Core, "Failed to remove exception handler.");
+         std::quick_exit(1);
+diff --git a/src/core/signals.h b/src/core/signals.h
+index 932ee9e7..2cf84e97 100644
+--- a/src/core/signals.h
++++ b/src/core/signals.h
+@@ -22,6 +22,14 @@ using IllegalInstructionHandler = bool (*)(void* context);
+ void SignalHandler(int sig, siginfo_t* info, void* raw_context);
+ #endif
+ 
++/// SecondSonPC (P3.4, patch 0022): SecondSonPC's exception dispatcher owns the process's vectored
++/// exception handler and calls the bridge's handlers itself (DispatchAccessViolation for the GPU write
++/// tracking and the SRT walker, DispatchIllegalInstruction for the CPU patcher, HandlePatchBreakpoint).
++/// Then SignalDispatch registers no handler of its own, and RemoveHandlers (an assert failing in the
++/// bridge) calls `on_remove` instead. Call before the first Signals::Instance().
++void UseExternalExceptionDispatch(void (*on_remove)());
++bool ExternalExceptionDispatch();
++
+ /// Receives OS signals and dispatches to the appropriate handlers.
+ class SignalDispatch {
+ public:

@@ -58,6 +58,10 @@ bool StartMainThread(std::function<void()> body);
 /// Scheduling priority of the calling native guest thread; nullopt on any other thread.
 std::optional<s32> CurrentPriority();
 
+/// The calling native guest thread's id and name (fatal reports, P3.4): no lock, no allocation. false on
+/// any other thread.
+bool CurrentThreadInfo(u32* tid, const char** name);
+
 std::span<const Runtime::Export> ThreadExports(); // group "threads" (experimental)
 
 /// The stacks of gone threads kept for the next thread of the same size (P3.2): at most `count`

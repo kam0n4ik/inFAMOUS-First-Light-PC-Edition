@@ -26,6 +26,8 @@
 
 #include "base/abi.h"
 
+struct _EXCEPTION_POINTERS;
+
 namespace SecondSon::Cpu {
 
 /// The operation of an FS-relative instruction this patcher can rewrite: `op reg, fs:[disp]` (load
@@ -54,10 +56,20 @@ u64 EncodeTrampoline(const FsInstruction& insn, u64 site, u32 slot, u64 at, u8* 
 /// without it and AMD's rcpps/rsqrtps precision on Intel): this patcher can own the guest's code.
 bool CpuNeedsOnlyFsPatches(std::string* why_not = nullptr);
 
-/// Registers the vectored exception handler (first in the chain). Call once, after InitTcbSlot,
-/// before any registered module runs. false: the handler could not be added.
-bool InstallFsPatcher();
+/// Makes the patcher ready for its exceptions. `own_handler`: registers its own vectored exception
+/// handler (first in the chain); without it SecondSonPC's exception dispatcher (exceptions.h, P3.4)
+/// calls the Handle* functions below. Call once, after InitTcbSlot, before any registered module runs.
+/// false: the handler could not be added.
+bool InstallFsPatcher(bool own_handler = true);
 bool FsPatcherInstalled();
+
+/// The patcher's part of exception handling (true: resolved, resume the context). An access violation
+/// at an FS-relative instruction of a registered module (patched now, or found patched); ...
+bool HandlePatcherAccessViolation(_EXCEPTION_POINTERS* info);
+/// ... the int3 of a site being patched (misreported: reported as a privileged instruction) ...
+bool HandlePatcherTrap(_EXCEPTION_POINTERS* info, bool misreported);
+/// ... an instruction the host CPU lacks, at a site of a registered module (emulated in place).
+bool HandleIllegalInstruction(_EXCEPTION_POINTERS* info);
 
 /// A guest module: code [code, code + code_size), trampolines [trampoline, + trampoline_size)
 /// (read/write/execute, within ±2 GiB of every code byte). Before the module runs. false: table full
@@ -70,6 +82,7 @@ struct StaticResult {
     u64 unsupported = 0;     // FS instructions of a form this patcher cannot rewrite
     u64 undecodable = 0;     // functions whose decoding did not end exactly at their end (data in the range)
     u64 left_to_runtime = 0; // FS instructions found past the trusted part of such a function
+    u64 red_zone_functions = 0; // functions that keep data below rsp (marked for the exception dispatcher)
 };
 
 /// A function's code [begin, end): the range of its .eh_frame FDE.
@@ -84,6 +97,10 @@ struct FunctionRange {
 /// (ret/jmp/ud2/int3/hlt) before decoding stopped; sites beyond are left to the run-time path. The
 /// module must be registered and must not be running.
 StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const FunctionRange> functions);
+
+/// P3.4: only marks the functions that keep data below rsp (Exceptions::MarkRedZoneFunction) — when the
+/// bridge's patcher owns the code and PatchModuleStatically does not run. Returns how many were marked.
+u64 AnalyzeRedZone(std::span<const FunctionRange> functions);
 
 struct Stats {
     u64 modules;

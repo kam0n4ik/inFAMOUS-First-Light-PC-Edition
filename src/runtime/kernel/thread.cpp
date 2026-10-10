@@ -1321,6 +1321,16 @@ std::optional<s32> CurrentPriority() {
     return t->attr.prio;
 }
 
+bool CurrentThreadInfo(u32* tid, const char** name) {
+    Thread* t = t_self;
+    if (t == nullptr) {
+        return false;
+    }
+    *tid = t->tid;
+    *name = t->name.c_str(); // read without the lock: a fatal report, not exact if renamed meanwhile
+    return true;
+}
+
 std::span<const Runtime::Export> ThreadExports() {
     return kExports;
 }

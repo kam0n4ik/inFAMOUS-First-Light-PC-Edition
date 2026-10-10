@@ -34,6 +34,7 @@ add_library(sspc_runtime STATIC
     src/loader/rtld.cpp
     src/loader/snapshot.cpp
     src/runtime/app_content/app_content.cpp
+    src/runtime/cpu/exceptions.cpp
     src/runtime/cpu/fs_patcher.cpp
     src/runtime/cpu/tcb_slot.cpp
     src/runtime/exports.cpp
@@ -75,5 +76,11 @@ target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi SDL3::SDL
 # Zydis (x86 decoder, MIT): SecondSonPC's FS patcher (src/runtime/cpu, P3.3). An independent library that
 # comes from the bridge's externals until SecondSonPC vendors its own copy (Phase 5).
 target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
+# P3.4: the commit in fatal exception reports (as of the last configure; "-dirty" with local changes then).
+execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=10
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE SSPC_GIT_REV
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+set_source_files_properties(src/runtime/cpu/exceptions.cpp PROPERTIES
+    COMPILE_DEFINITIONS "SSPC_GIT_REV=\"${SSPC_GIT_REV}\"")
 
 sspc_attach_bootstrap(sspc_runtime)

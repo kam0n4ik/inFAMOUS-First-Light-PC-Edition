@@ -4864,6 +4864,11 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestNativeFs(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    // P3.4: the exception dispatcher (in this process with --native exceptions; its fatal path always, in
+    // child processes).
+    for (auto& g : TestNativeExceptions(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

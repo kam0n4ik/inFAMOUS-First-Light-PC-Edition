@@ -36,6 +36,9 @@ void SetLevel(Level level);
 bool Enabled(Level level);
 void Write(Category category, Level level, std::string_view text);
 void Flush();
+/// The last resort of a fatal exception (P3.4): writes `size` bytes straight to the log file's system
+/// handle — no lock, no heap, no CRT buffer (every line is flushed, so the file position is current).
+void EmergencyWrite(const char* text, size_t size);
 
 std::optional<Level> ParseLevel(std::string_view name);
 std::string_view LevelName(Level level);
