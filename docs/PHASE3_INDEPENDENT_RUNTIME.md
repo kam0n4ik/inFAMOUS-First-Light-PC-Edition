@@ -17,7 +17,7 @@ Phase 4. Таблица гостевых импортов — `docs\PHASE3_BRIDG
 | P3.3 Native TLS/TCB & FS Runtime | свой слот TCB (все потоки обоих менеджеров), свой патчер `fs:` (загрузочный проход + запасной путь с протоколом int3), свой VEH для своих событий | **сделан**: слот — по умолчанию; патчер — проверен в игре, экспериментально (§5.6) |
 | P3.2 Native Memory/Threads Consolidation | жизненный цикл стеков (D17: ограниченный кэш, настоящее снятие на своём VMM), длительная сессия → свои потоки и память по умолчанию | **частично** (§10): стеки/D17/кэш/тесты/матрица/30-мин soak — сделано; ручная 30-мин игра, ABBA производительности и переключение по умолчанию — осталось |
 | P3.4 Native Exception & CPU Patch Runtime | единый диспетчер исключений SecondSonPC по владельцу события, доставка/отказ гостевых сигналов, фатальный путь, CPU-эмуляция (SSE4a/RCP для Intel) | **сделан, экспериментально** (`docs\PHASE3_P34_EXCEPTIONS_CPU.md`): диспетчер `--native exceptions` (патч 0022), SSE4a в своём патчере `--native cpu`, сигналы, фатальный путь, проверка CPU при запуске (по умолчанию); проверено в игре (серия `p34_ab`, 8/8 чисто); не сделано: точность RCP на Intel, трамплины для коротких `extrq` (SSPC-011); red zone — риск SSPC-010 |
-| P3.5 Remaining Kernel HLE | `__error`, API памяти libkernel поверх выбранного менеджера, часы процесса (с адаптером для VideoOut/AudioOut) | дальше |
+| P3.5 Remaining Kernel HLE | `__error`, API памяти libkernel поверх выбранного менеджера, часы процесса (с адаптером для VideoOut/AudioOut) | **сделан, экспериментально** (`docs\PHASE3_P35_KERNEL_HLE.md`): свой errno `--native errno` (патч 0023), функции памяти libkernel на своём VMM `--native kernel-memory` (нужен `--native memory`), одни часы процесса `--native clock` (патч 0024); остальные функции libkernel — аудит, новых переносов нет (очереди событий, `_exit` → P3.6) |
 | P3.6 Runtime Integration & Bridge Isolation | явные адаптеры для графического моста (очереди событий, часы, память, исключения), интерфейсы Phase 4, сквозные и длительные проверки | дальше |
 
 **Почему P3.3 раньше P3.2.** SSPC-002 (самый опасный класс сбоев — гонка записи живого кода) живёт в патчере `fs:`,
@@ -72,8 +72,8 @@ Phase 4. Таблица гостевых импортов — `docs\PHASE3_BRIDG
 | SRT-walker (AV при обходе SRT шейдеров) | `flatten_extended_userdata_pass.cpp` через VEH моста | мост | мост | Phase 4 |
 | Менеджер гостевой памяти | `core\memory.cpp` | выбор при старте: мост / свой (`--native memory`) | без изменений | P3.2: свой по умолчанию после длительной сессии |
 | Менеджер потоков, главный поток | `threads\*.cpp`, `Libraries::Kernel::Thread` | выбор: мост / свой (`--native threads`) | без изменений; TCB своих потоков — в своём слоте | P3.2 |
-| errno гостя (`__error`) | `kernel.cpp` (`thread_local` хоста) | мост; NATIVE-функции пишут его через `Kernel::Host::Errno` | без изменений | P3.5 (один владелец + адаптер) |
-| Часы процесса | `kernel\time.cpp`, общие с метками VideoOut/AudioOut | мост | без изменений | P3.5 (свои часы, мост их читает) |
+| errno гостя (`__error`) | `kernel.cpp` (`thread_local` хоста) | мост; NATIVE-функции пишут его через `Kernel::Host::Errno` | без изменений | **P3.5**: с `--native errno` — ячейка SecondSonPC на поток, `__Error()` моста возвращает её (патч 0023); по умолчанию — мост |
+| Часы процесса | `kernel\time.cpp`, общие с метками VideoOut/AudioOut | мост | без изменений | **P3.5**: с `--native clock` — одно измерение TSC и эпоха SecondSonPC, мост читает их (патч 0024) и своих не создаёт; по умолчанию — мост (частота TSC игры — SecondSonPC, как с P2.2); таймер vblank презентации — мост (Phase 4) |
 | Старт libkernel моста | `RegisterLib`: сервисный поток, часы, AIO, таблица семафоров, сетевые хуки | мост | без изменений | P3.5/P3.6 |
 | Очереди событий | `kernel\equeue.cpp`; VideoOut/Gnm доставляют туда флипы/EOP | мост | без изменений | Phase 4 через адаптер P3.6 |
 | Потоки моста | GpuCommandProcessor, PresentThread, AudioOut (2 гостевых потока моста), кэш шейдеров, SaveData backup | мост | без изменений; гостевые потоки AudioOut пишут TCB в слот SecondSonPC | AudioOut — подсистема; графика — Phase 4 |
@@ -302,6 +302,9 @@ errno, часы, очереди событий, старт libkernel, мосто
 | `98c1e3a` | docs(p3): таблица коммитов P3.3 |
 | `de42ebb` | feat(kernel): P3.2 — ограниченный кэш стеков, настоящее снятие стеков на обоих менеджерах памяти (D17), самотест `NativeThreads(stacks)`, итоги при выходе |
 | `a887ebf` | tools(perf): режимы матрицы `MF`/`TF`, `-Soak`, число HANDLE в `samples.csv` и отчёте |
+| `7bf3d47` | feat(kernel): P3.5.1 — errno SecondSonPC (`--native errno`, патч 0023), самотесты `NativeErrno`, `NativeThreads(errno)` |
+| `154b5ed` | feat(kernel): P3.5.2 — функции памяти libkernel на своём VMM (`--native kernel-memory`), `NativeKernelMem`, `NativeKernelMem(game)` |
+| `b334391` | feat(kernel): P3.5.3 — одни часы процесса (`--native clock`, патч 0024), `NativeClock`, дрейф часов при выходе |
 
 ## 10. P3.2 — консолидация своей памяти и потоков
 
