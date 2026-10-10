@@ -82,6 +82,8 @@ struct Config {
     std::vector<std::string> bridged_groups; // --bridge <group>: NATIVE group back to BRIDGE
     std::vector<std::string> native_groups;  // --native <group>: EXPERIMENTAL group enabled (BRIDGE by default);
                                              // --native memory: SecondSonPC's memory manager (P2.3.4)
+    bool cpu_emulate_sse4a = false;          // --cpu-emulate sse4a: with --native cpu, SSE4a emulated on a CPU that has
+                                             // it (diagnostics of the Intel path, P3.4)
     bool memory_commit_on_demand = false;    // --memory-commit on-demand: with --native memory, physical memory
                                              // charged to the system commit when handed out (E1), not at start
     u32 memory_map_s = 0;                    // --memory-map <s>: guest memory maps -> logs\memory_map.txt

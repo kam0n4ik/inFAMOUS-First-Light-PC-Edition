@@ -60,6 +60,8 @@ struct Options {
 /// before any guest code runs. false: the handler or the thread could not be created.
 bool Install(const Options& options);
 bool Installed();
+/// The CPU patcher's exceptions go through the dispatcher (Options::cpu_patcher).
+bool CpuPatcherDelegated();
 
 /// The bridge asserted (patch 0022: RemoveHandlers): from now on every exception is passed on, so its
 /// own int3 reaches the unhandled exception filter instead of looping through the dispatcher.

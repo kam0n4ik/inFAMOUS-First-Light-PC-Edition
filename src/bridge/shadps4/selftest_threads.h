@@ -5,9 +5,11 @@
 // System V functions of the test that call the manager's exports as the game does.
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "bridge/shadps4/selftest_vmm.h"
+#include "runtime/cpu/fs_patcher.h"
 
 namespace SecondSon::App {
 struct Config;
@@ -22,5 +24,22 @@ std::vector<TestGroup> TestNativeFs(const App::Config& cfg);
 
 /// P3.4 (src/bridge/shadps4/selftest_exceptions.cpp): SecondSonPC's exception dispatcher.
 std::vector<TestGroup> TestNativeExceptions(const App::Config& cfg);
+
+/// P3.4 (src/bridge/shadps4/selftest_cpu.cpp): SSE4a emulation of the CPU patcher.
+std::vector<TestGroup> TestNativeCpu(const App::Config& cfg);
+
+/// The executable segment of the game's eboot.bin copied into host memory (read/write; trampoline area after
+/// it) and its .eh_frame function ranges (selftest_fs.cpp). The game's files are only read.
+struct EbootCopy {
+    u8* copy = nullptr;
+    u64 filesz = 0;          // bytes of code copied
+    u64 code_size = 0;       // of the region before the trampolines
+    u64 trampoline_size = 0; // of the trampoline area at copy + code_size
+    std::vector<u8> original;
+    std::vector<Cpu::FunctionRange> ranges;
+    u64 fdes = 0;
+    u64 dead = 0;            // FDEs inside .eh_frame (discarded by the linker): skipped
+};
+bool CopyEbootCode(const App::Config& cfg, EbootCopy& out, std::string& error);
 
 } // namespace SecondSon::Bridge

@@ -4869,6 +4869,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestNativeExceptions(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    // P3.4: the CPU patcher's SSE4a emulation against this CPU's own SSE4a.
+    for (auto& g : TestNativeCpu(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

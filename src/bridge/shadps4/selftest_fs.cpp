@@ -21,10 +21,12 @@
 #include <fmt/format.h>
 
 #include "app/config.h"
+#include "bridge/shadps4/selftest_threads.h"
 #include "bridge/shadps4/selftest_vmm.h"
 #include "loader/eh_frame.h"
 #include "loader/elf.h"
 #include "loader/image_file.h"
+#include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/cpu/tcb_slot.h"
 
@@ -175,7 +177,9 @@ DWORD WINAPI OtherThreadBody(void* p) {
 }
 
 void TestExecution(TestGroup& g) {
-    if (!Cpu::InstallFsPatcher()) {
+    // With SecondSonPC's dispatcher owning the CPU patcher's exceptions (--native cpu --native exceptions)
+    // the patcher's faults and traps here go through the dispatcher; otherwise through its own handler.
+    if (!Cpu::InstallFsPatcher(!(Cpu::Exceptions::Installed() && Cpu::Exceptions::CpuPatcherDelegated()))) {
         g.Check("the FS patcher's exception handler is installed", false, "AddVectoredExceptionHandler failed");
         return;
     }
@@ -307,12 +311,13 @@ void TestExecution(TestGroup& g) {
 
 // ------------------------------------------------------------------------------- the game's code
 
-void TestGame(TestGroup& g, const App::Config& cfg) {
+} // namespace
+
+bool CopyEbootCode(const App::Config& cfg, EbootCopy& out, std::string& error) {
     Loader::ImageFile file;
-    std::string error;
     if (!file.Open(cfg.game_dir / "eboot.bin", error)) {
-        g.Check("eboot.bin readable", false, error);
-        return;
+        error = "eboot.bin not readable: " + error;
+        return false;
     }
     const Elf::ProgramHeader* exec = nullptr;
     const Elf::ProgramHeader* eh = nullptr;
@@ -325,17 +330,17 @@ void TestGame(TestGroup& g, const App::Config& cfg) {
     }
     if (exec == nullptr || eh == nullptr || eh->vaddr < exec->vaddr ||
         eh->vaddr + eh->memsz > exec->vaddr + exec->filesz) {
-        g.Check("eboot.bin: an executable segment holding .eh_frame_hdr", false, "");
-        return;
+        error = "eboot.bin: no executable segment holding .eh_frame_hdr";
+        return false;
     }
     const u64 code_size = (exec->memsz + 0xFFFF) & ~u64{0xFFFF};
     constexpr u64 kTramp = 4ull << 20;
     auto* copy = static_cast<u8*>(VirtualAlloc(nullptr, code_size + kTramp, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    std::vector<u8> original(exec->filesz);
+    out.original.resize(exec->filesz);
     if (copy == nullptr || !file.Read(exec->offset, exec->filesz, copy) ||
-        !file.Read(exec->offset, exec->filesz, original.data())) {
-        g.Check("eboot.bin: executable segment copied into host memory", false, "");
-        return;
+        !file.Read(exec->offset, exec->filesz, out.original.data())) {
+        error = "eboot.bin: executable segment not copied into host memory";
+        return false;
     }
     const u64 base = reinterpret_cast<u64>(copy) - exec->vaddr; // the segment at its place relative to the base
     const u64 hdr = base + eh->vaddr;
@@ -343,39 +348,58 @@ void TestGame(TestGroup& g, const App::Config& cfg) {
     Loader::EhFrameHeader header;
     std::vector<Loader::CodeRange> fdes;
     if (!Loader::DecodeEhFrameHeader(hdr, hdr_end, header, error)) {
-        g.Check("eboot.bin: .eh_frame_hdr decoded", false, error);
-        return;
+        error = "eboot.bin: .eh_frame_hdr: " + error;
+        return false;
     }
     const u64 frame_end = header.eh_frame_ptr < hdr ? hdr : base + exec->vaddr + exec->filesz;
     if (!Loader::DecodeEhFrameFunctions(header, hdr_end, frame_end, fdes, error)) {
-        g.Check("eboot.bin: .eh_frame functions decoded", false, error);
-        return;
+        error = "eboot.bin: .eh_frame functions: " + error;
+        return false;
     }
     const u64 data_lo = std::min(header.eh_frame_ptr, hdr);
     const u64 data_hi = std::max(frame_end, hdr_end);
-    std::vector<Cpu::FunctionRange> ranges;
-    u64 dead = 0;
+    out.ranges.clear();
+    out.dead = 0;
     for (const auto& f : fdes) {
         if (f.begin < data_hi && data_lo < f.end) {
-            ++dead;
+            ++out.dead;
         } else {
-            ranges.push_back({f.begin, f.end});
+            out.ranges.push_back({f.begin, f.end});
         }
     }
+    out.copy = copy;
+    out.filesz = exec->filesz;
+    out.code_size = code_size;
+    out.trampoline_size = kTramp;
+    out.fdes = fdes.size();
+    return true;
+}
+
+namespace {
+
+void TestGame(TestGroup& g, const App::Config& cfg) {
+    EbootCopy e;
+    std::string error;
+    if (!CopyEbootCode(cfg, e, error)) {
+        g.Check("eboot.bin: executable segment and functions in host memory", false, error);
+        return;
+    }
+    u8* const copy = e.copy;
+    const auto& original = e.original;
     // The exact counts below are those of the audited eboot.bin (CUSA00004 EU, App 01.07: 42483 FDEs); another
     // build of the game is checked for the properties only.
-    const bool audited = fdes.size() == 42483;
+    const bool audited = e.fdes == 42483;
     if (!audited) {
-        g.Info(fmt::format("INFO  eboot.bin has {} FDEs, not the audited 42483: exact counts not checked", fdes.size()));
+        g.Info(fmt::format("INFO  eboot.bin has {} FDEs, not the audited 42483: exact counts not checked", e.fdes));
     }
-    g.Info(fmt::format("INFO  eboot.bin: {} FDEs, {} of them describe .eh_frame itself (dead, skipped)", fdes.size(),
-                       dead));
+    g.Info(fmt::format("INFO  eboot.bin: {} FDEs, {} of them describe .eh_frame itself (dead, skipped)", e.fdes,
+                       e.dead));
     const u64 c = reinterpret_cast<u64>(copy);
-    if (!Cpu::RegisterModule(c, code_size, c + code_size, kTramp, "eboot.bin (self-test copy)")) {
+    if (!Cpu::RegisterModule(c, e.code_size, c + e.code_size, e.trampoline_size, "eboot.bin (self-test copy)")) {
         g.Check("copy registered", false, "");
         return;
     }
-    const auto r = Cpu::PatchModuleStatically(c, exec->filesz, ranges);
+    const auto r = Cpu::PatchModuleStatically(c, e.filesz, e.ranges);
     g.Info(fmt::format("INFO  eboot.bin copy: {} functions, {} FS instructions patched at load time, {} functions not "
                        "decoded to their end (jump tables), {} sites left to run time, {} unsupported",
                        r.functions, r.patched, r.undecodable, r.left_to_runtime, r.unsupported));
@@ -389,12 +413,12 @@ void TestGame(TestGroup& g, const App::Config& cfg) {
     // No byte changed outside a patched instruction: each differing byte lies in a 9-byte site that now
     // starts with the jump.
     u64 stray = 0, sites = 0;
-    for (u64 i = 0; i < exec->filesz;) {
+    for (u64 i = 0; i < e.filesz;) {
         if (copy[i] == original[i]) {
             ++i;
             continue;
         }
-        if (copy[i] == 0xE9 && i + 9 <= exec->filesz && original[i] == 0x64 && original[i + 4] == 0x25) {
+        if (copy[i] == 0xE9 && i + 9 <= e.filesz && original[i] == 0x64 && original[i + 4] == 0x25) {
             ++sites;
             i += 9;
         } else {

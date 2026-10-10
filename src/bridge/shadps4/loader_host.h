@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "loader/host.h"
 
@@ -23,7 +24,8 @@ std::unique_ptr<Loader::Host> CreateLoaderHost();
 /// and the FS patcher is chosen — SecondSonPC's with --native fs-patch (if the CPU needs no other
 /// patch), else the bridge's. Once, at start-up, before anything reads the slot or loads a module.
 /// false: the slot could not be taken (the caller stops).
-bool InstallGuestCpu(const App::Config& cfg);
+/// P3.4: first checks the CPU's instruction sets against the game's needs. false: `error` says why (shown).
+bool InstallGuestCpu(const App::Config& cfg, std::string* error);
 /// SecondSonPC's FS patcher owns the guest's code (chosen by InstallGuestCpu).
 bool NativeFsPatcher();
 

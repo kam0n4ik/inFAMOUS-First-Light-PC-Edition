@@ -191,6 +191,12 @@ void OnQuickExit() {
                  s.unsupported,
                  s.first_unsupported != 0 ? fmt::format(" (first met at {:#x})", s.first_unsupported) : std::string{},
                  s.trampoline_bytes);
+        if (Cpu::Sse4aEmulated()) {
+            SSPC_LOG(Cpu, Info,
+                     "SSE4a at exit: {} sites to trampolines, {} movnt* rewritten, {} executed from their exception "
+                     "({} executions)",
+                     s.sse4a_trampolines, s.sse4a_inplace, s.sse4a_short, s.sse4a_emulated);
+        }
     }
     Cpu::Exceptions::LogSummary("at exit"); // P3.4 (nothing without --native exceptions)
     // P3.2: what the native managers hold at the end, and the process (leak checks of a long session).
@@ -1044,8 +1050,8 @@ void RunGame(const App::Config& cfg) {
     Common::Log::Switch("bridge_shadps4.log", false); // applies the filter
     // P3.3: SecondSonPC's TCB slot (the bridge's TLS code is pointed at it) and the FS patcher, before
     // any thread, trampoline or module exists.
-    if (own_loader && !InstallGuestCpu(cfg)) {
-        Fatal("the guest TCB slot could not be set up, see SecondSonPC.log");
+    if (std::string error; own_loader && !InstallGuestCpu(cfg, &error)) {
+        Fatal(error);
     }
     if (cfg.patch_race_test) {
         // Before the game window exists: a window that pumps no messages for half a minute looks hung.

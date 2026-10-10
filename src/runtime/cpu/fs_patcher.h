@@ -52,8 +52,9 @@ std::optional<FsInstruction> DecodeFs(const u8* code, u64 available, bool* fs_re
 /// site + insn.length. Exposed for the self-test.
 u64 EncodeTrampoline(const FsInstruction& insn, u64 site, u32 slot, u64 at, u8* out, u64 capacity);
 
-/// The CPU needs no patch other than FS (the bridge's patcher would also emulate SSE4a on CPUs
-/// without it and AMD's rcpps/rsqrtps precision on Intel): this patcher can own the guest's code.
+/// This patcher can own the guest's code (since P3.4 always: it emulates SSE4a too). `why_not` (a note,
+/// despite the name kept for its callers): what it does not reproduce on this CPU — on Intel, AMD's
+/// rcpps/rsqrtps precision.
 bool CpuNeedsOnlyFsPatches(std::string* why_not = nullptr);
 
 /// Makes the patcher ready for its exceptions. `own_handler`: registers its own vectored exception
@@ -83,6 +84,11 @@ struct StaticResult {
     u64 undecodable = 0;     // functions whose decoding did not end exactly at their end (data in the range)
     u64 left_to_runtime = 0; // FS instructions found past the trusted part of such a function
     u64 red_zone_functions = 0; // functions that keep data below rsp (marked for the exception dispatcher)
+    // SSE4a (P3.4), only while it is emulated (SetSse4aEmulation):
+    u64 sse4a_trampolines = 0;     // extrq/insertq of 5+ bytes rewritten to jump to a trampoline
+    u64 sse4a_inplace = 0;         // movntss/movntsd rewritten to movss/movsd
+    u64 sse4a_short = 0;           // too short for a jump: executed from the illegal-instruction exception
+    u64 sse4a_left_to_runtime = 0; // past the trusted part of a function: the same exception, decoded then
 };
 
 /// A function's code [begin, end): the range of its .eh_frame FDE.
@@ -112,8 +118,21 @@ struct Stats {
     u64 unsupported;      // FS instructions that could not be patched (left to fault)
     u64 trampoline_bytes; // used in all trampoline areas
     u64 first_unsupported; // address of the first one the handler met (0: none); logged at exit
+    u64 sse4a_trampolines; // SSE4a sites (P3.4): rewritten to trampolines ...
+    u64 sse4a_inplace;     // ... movnt* rewritten in place ...
+    u64 sse4a_short;       // ... executed from their exception ...
+    u64 sse4a_emulated;    // ... executions through that exception
 };
 Stats GetStats();
+
+/// P3.4: SSE4a is emulated when the host has none, or `forced` (--cpu-emulate sse4a, diagnostics: the
+/// short sites are made to trap on an AMD CPU as they would on an Intel one). Before any module is patched.
+void SetSse4aEmulation(bool forced);
+bool Sse4aEmulated();
+
+/// The instruction sets the game's code uses besides x86-64 and SSE4a (tools/cpu_audit.py): SSE2-SSE4.2,
+/// POPCNT, MOVBE, AVX (with the system saving ymm), F16C, BMI1, LZCNT. false: `missing` lists what the CPU lacks.
+bool HostMeetsGameRequirements(std::string* missing);
 
 namespace Test {
 /// Whether the handler would take a breakpoint (`misreported`: privileged instruction) at `address`

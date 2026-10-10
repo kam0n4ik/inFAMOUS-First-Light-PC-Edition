@@ -19,6 +19,7 @@
 
 #include "base/log.h"
 #include "runtime/cpu/exceptions.h"
+#include "runtime/cpu/sse4a.h"
 #include "runtime/cpu/tcb_slot.h"
 
 namespace SecondSon::Cpu {
@@ -295,6 +296,54 @@ u64 MakeTrampoline(Module& m, const FsInstruction& insn, u64 site) {
     return at;
 }
 
+// ------------------------------------------------------------------------------------ SSE4a (P3.4)
+
+std::atomic<bool> g_sse4a{false}; // the patcher emulates SSE4a: the host has none, or forced
+bool g_sse4a_forced = false;      // ... on a host that has it: short sites made to trap (--cpu-emulate sse4a)
+
+/// Sites too short for a jump (and those the trampoline area had no room for): executed from their
+/// illegal-instruction exception. Written at load time only; read lock-free by the handler.
+struct ShortSite {
+    u64 address;
+    Sse4a::Insn insn;
+};
+constexpr u32 kMaxShortSites = 4096;
+std::array<ShortSite, kMaxShortSites> g_short_sites;
+std::atomic<u32> g_short_count{0};
+
+std::atomic<u64> g_sse4a_trampolines{0}, g_sse4a_inplace{0}, g_sse4a_short{0}, g_sse4a_emulated{0};
+
+bool AddShortSite(u64 address, const Sse4a::Insn& insn) {
+    const u32 index = g_short_count.load(std::memory_order_relaxed);
+    if (index == kMaxShortSites) {
+        return false;
+    }
+    g_short_sites[index] = {address, insn};
+    g_short_count.store(index + 1, std::memory_order_release);
+    return true;
+}
+
+u64 MakeSse4aTrampoline(Module& m, const Sse4a::Insn& insn, u64 site) {
+    constexpr u64 kMax = 160; // the longest (insertq, register form) is ~100 bytes
+    if (m.trampoline_end - m.cursor < kMax) {
+        return 0;
+    }
+    const u64 at = m.cursor;
+    const u64 size = Sse4a::EncodeTrampoline(insn, site, at, reinterpret_cast<u8*>(at), kMax);
+    if (size == 0) {
+        return 0;
+    }
+    m.cursor += (size + 15) & ~u64{15};
+    g_trampoline_bytes.fetch_add(size, std::memory_order_relaxed);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
+    return at;
+}
+
+bool IsSse4aMnemonic(ZydisMnemonic mnemonic) {
+    return mnemonic == ZYDIS_MNEMONIC_EXTRQ || mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
+           mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
+}
+
 /// Replaces the `size` bytes at `code` while other threads may execute them (as Linux text_poke_bp):
 /// int3 into the first byte, the rest, then the first byte; FlushProcessWriteBuffers after each step
 /// interrupts every processor running a thread of this process, which serializes its instruction
@@ -436,8 +485,75 @@ bool HandlePatcherTrap(EXCEPTION_POINTERS* info, bool misreported) {
 }
 
 bool HandleIllegalInstruction(EXCEPTION_POINTERS* info) {
-    (void)info; // SSE4a emulation (P3.4) is added with the instruction patches
-    return false;
+    if (!g_sse4a.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const u64 rip = info->ContextRecord->Rip;
+    const Module* m = FindModule(rip);
+    if (m == nullptr) {
+        return false;
+    }
+    const u32 count = g_short_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < count; ++i) {
+        if (g_short_sites[i].address == rip) {
+            g_sse4a_emulated.fetch_add(1, std::memory_order_relaxed);
+            return Sse4a::EmulateInContext(g_short_sites[i].insn, info->ContextRecord);
+        }
+    }
+    // Not seen at load time (past a function's trusted part): the original instruction, on a host without
+    // SSE4a. Only extrq/insertq (a movnt* store is not emulated: the exception goes on).
+    const auto insn = Sse4a::Decode(reinterpret_cast<const u8*>(rip), m->code_end - rip);
+    if (!insn || insn->op == Sse4a::Op::Movntss || insn->op == Sse4a::Op::Movntsd) {
+        return false;
+    }
+    g_sse4a_emulated.fetch_add(1, std::memory_order_relaxed);
+    return Sse4a::EmulateInContext(*insn, info->ContextRecord);
+}
+
+void SetSse4aEmulation(bool forced) {
+    const bool host = Sse4a::HostHasSse4a();
+    g_sse4a.store(forced || !host);
+    g_sse4a_forced = forced && host;
+}
+
+bool Sse4aEmulated() {
+    return g_sse4a.load();
+}
+
+bool HostMeetsGameRequirements(std::string* missing) {
+    int r1[4]{}, r7[4]{}, re[4]{};
+    __cpuid(r1, 1);
+    __cpuidex(r7, 7, 0);
+    __cpuid(re, static_cast<int>(0x80000000u));
+    const bool has_ext = static_cast<u32>(re[0]) >= 0x80000001u;
+    if (has_ext) {
+        __cpuid(re, static_cast<int>(0x80000001u));
+    }
+    const bool osxsave = (r1[2] & (1 << 27)) != 0;
+    const bool avx_os = osxsave && (_xgetbv(0) & 6) == 6; // the system saves xmm and ymm state
+    struct Need {
+        const char* name;
+        bool present;
+    };
+    // tools/cpu_audit.py: what the game's modules use besides SSE4a (emulated) and x86-64 itself.
+    const Need needs[] = {
+        {"SSE2", (r1[3] & (1 << 26)) != 0},  {"SSE3", (r1[2] & 1) != 0},
+        {"SSSE3", (r1[2] & (1 << 9)) != 0},  {"SSE4.1", (r1[2] & (1 << 19)) != 0},
+        {"SSE4.2", (r1[2] & (1 << 20)) != 0}, {"POPCNT", (r1[2] & (1 << 23)) != 0},
+        {"MOVBE", (r1[2] & (1 << 22)) != 0}, {"AVX", (r1[2] & (1 << 28)) != 0 && avx_os},
+        {"F16C", (r1[2] & (1 << 29)) != 0},  {"BMI1", (r7[1] & (1 << 3)) != 0},
+        {"LZCNT", has_ext && (re[2] & (1 << 5)) != 0},
+    };
+    std::string list;
+    for (const auto& n : needs) {
+        if (!n.present) {
+            list += list.empty() ? n.name : std::string(", ") + n.name;
+        }
+    }
+    if (missing != nullptr) {
+        *missing = list;
+    }
+    return list.empty();
 }
 
 // ------------------------------------------------------------------------------------- interface
@@ -557,14 +673,15 @@ bool CpuNeedsOnlyFsPatches(std::string* why_not) {
         sse4a = (regs[2] & (1 << 6)) != 0;
     }
     const bool intel = std::strcmp(vendor, "GenuineIntel") == 0;
-    if (sse4a && !intel) {
-        return true;
-    }
+    // P3.4: SSE4a is emulated by this patcher too (sse4a.h). What it does not reproduce on Intel is AMD's
+    // rcpps/rsqrtps precision: 4383 vrcpps/vrsqrtps in eboot.bin, 4296 of them 4 bytes long (no jump fits;
+    // the bridge's patcher corrected only the 87 longer ones). Not verified on an Intel CPU.
     if (why_not != nullptr) {
-        *why_not = !sse4a ? "the CPU has no SSE4a (the bridge emulates extrq/insertq/movntss/movntsd)"
-                          : "Intel CPU (the bridge emulates AMD's rcpps/rsqrtps precision)";
+        *why_not = intel ? "Intel CPU: AMD's reciprocal (vrcpps/vrsqrtps) precision is not reproduced"
+                   : !sse4a ? "no SSE4a: emulated by SecondSonPC's patcher (not verified on such a CPU)"
+                            : "";
     }
-    return false;
+    return true;
 }
 
 bool InstallFsPatcher(bool own_handler) {
@@ -710,6 +827,12 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
         FsInstruction insn;
     };
     std::vector<Site> sites; // of one function
+    struct Sse4aSite {
+        u64 address;
+        Sse4a::Insn insn;
+    };
+    std::vector<Sse4aSite> sse4a_sites; // of one function
+    const bool sse4a = g_sse4a.load();
     AcquireSRWLockExclusive(&m->lock);
     for (const auto& f : functions) {
         if (f.begin < segment || f.end > segment_end || f.end <= f.begin || f.end > m->code_end) {
@@ -717,6 +840,7 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
         }
         ++r.functions;
         sites.clear();
+        sse4a_sites.clear();
         bool clean = true;
         u64 unsupported = 0;
         u64 unsupported_before_end = 0; // ... before the last unconditional transfer (see below)
@@ -738,6 +862,11 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
                     sites.push_back({pc, *fs});
                 } else if (fs_relative) {
                     ++unsupported;
+                }
+            }
+            if (sse4a && IsSse4aMnemonic(insn.mnemonic)) {
+                if (const auto s = Sse4a::Decode(reinterpret_cast<const u8*>(pc), f.end - pc)) {
+                    sse4a_sites.push_back({pc, *s});
                 }
             }
             pc += insn.length;
@@ -771,6 +900,38 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
             Exceptions::MarkRedZoneFunction(f.begin, f.end);
             ++r.red_zone_functions;
         }
+        // SSE4a (P3.4): movnt* in place, the rest into trampolines; what a jump does not fit is executed from
+        // its illegal-instruction exception (made to trap here on a host that has SSE4a, forced mode only).
+        for (const auto& s : sse4a_sites) {
+            if (s.address + s.insn.length > trusted_end) {
+                ++r.sse4a_left_to_runtime;
+                continue;
+            }
+            auto* code = reinterpret_cast<u8*>(s.address); // not running yet
+            if (s.insn.op == Sse4a::Op::Movntss || s.insn.op == Sse4a::Op::Movntsd) {
+                code[s.insn.opcode_at] = 0x11; // movss/movsd m, xmm: the store without the non-temporal hint
+                ++r.sse4a_inplace;
+                continue;
+            }
+            if (s.insn.length >= kNearJump) {
+                if (const u64 trampoline = MakeSse4aTrampoline(*m, s.insn, s.address)) {
+                    const auto jump = JumpBytes(s.address, trampoline);
+                    std::memcpy(code, jump.data(), s.insn.length);
+                    ++r.sse4a_trampolines;
+                    continue;
+                }
+            }
+            if (!AddShortSite(s.address, s.insn)) {
+                ++r.unsupported;
+                continue;
+            }
+            if (g_sse4a_forced) {
+                code[0] = 0x0F; // ud2: traps as the instruction itself would on a host without SSE4a
+                code[1] = 0x0B;
+                std::memset(code + 2, 0xCC, s.insn.length - 2);
+            }
+            ++r.sse4a_short;
+        }
         for (const auto& s : sites) {
             if (s.address + s.insn.length > trusted_end) {
                 ++r.left_to_runtime;
@@ -789,6 +950,9 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
     ReleaseSRWLockExclusive(&m->lock);
     FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(segment), size);
     g_static_sites.fetch_add(r.patched, std::memory_order_relaxed);
+    g_sse4a_trampolines.fetch_add(r.sse4a_trampolines, std::memory_order_relaxed);
+    g_sse4a_inplace.fetch_add(r.sse4a_inplace, std::memory_order_relaxed);
+    g_sse4a_short.fetch_add(r.sse4a_short, std::memory_order_relaxed);
     if (r.unsupported != 0) {
         g_unsupported.fetch_add(r.unsupported, std::memory_order_relaxed);
     }
@@ -796,9 +960,11 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
 }
 
 Stats GetStats() {
-    return {g_module_count.load(), g_static_sites.load(),      g_runtime_sites.load(), g_runtime_repeats.load(),
-            g_breakpoints.load(),  g_misreported.load(),       g_unsupported.load(),   g_trampoline_bytes.load(),
-            g_first_unsupported.load()};
+    return {g_module_count.load(),      g_static_sites.load(),      g_runtime_sites.load(),
+            g_runtime_repeats.load(),   g_breakpoints.load(),       g_misreported.load(),
+            g_unsupported.load(),       g_trampoline_bytes.load(),  g_first_unsupported.load(),
+            g_sse4a_trampolines.load(), g_sse4a_inplace.load(),     g_sse4a_short.load(),
+            g_sse4a_emulated.load()};
 }
 
 namespace Test {

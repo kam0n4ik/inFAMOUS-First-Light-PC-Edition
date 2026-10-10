@@ -126,6 +126,11 @@ int main(int argc, char* argv[]) {
                 return Fail("--memory-commit must be upfront|on-demand");
             }
             config->memory_commit_on_demand = mode == "on-demand";
+        } else if (arg == "--cpu-emulate" && has_value) {
+            if (std::string_view(argv[++i]) != "sse4a") {
+                return Fail("--cpu-emulate: only sse4a");
+            }
+            config->cpu_emulate_sse4a = true; // diagnostics (P3.4)
         } else if (arg == "--memory-map" && has_value) {
             config->memory_map_s = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--call-order" && has_value) {
@@ -213,6 +218,9 @@ int main(int argc, char* argv[]) {
     }
     if (config->memory_commit_on_demand && !native("memory")) {
         return Fail("--memory-commit on-demand is a mode of SecondSonPC's memory manager: it needs --native memory");
+    }
+    if (config->cpu_emulate_sse4a && !native("cpu") && !native("fs-patch")) {
+        return Fail("--cpu-emulate sse4a is a mode of SecondSonPC's CPU patcher: it needs --native cpu");
     }
     if (native("exceptions") && config->fault_test) {
         return Fail("--fault-test checks the first-chance recorder's own handlers, which --native exceptions replaces; "

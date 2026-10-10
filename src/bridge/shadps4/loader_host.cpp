@@ -23,6 +23,7 @@
 #include "app/config.h"
 #include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/fs_patcher.h"
+#include "runtime/cpu/sse4a.h"
 #include "runtime/cpu/tcb_slot.h"
 #include "runtime/kernel/thread.h"
 
@@ -243,15 +244,29 @@ std::unique_ptr<Loader::Host> CreateLoaderHost() {
     return std::make_unique<LoaderHost>();
 }
 
-bool InstallGuestCpu(const App::Config& cfg) {
+bool InstallGuestCpu(const App::Config& cfg, std::string* error) {
+    // P3.4: the instruction sets the game's code needs (tools/cpu_audit.py). Without one of them the game
+    // would stop at its first such instruction; say so before it starts.
+    if (std::string missing; !Cpu::HostMeetsGameRequirements(&missing)) {
+        *error = fmt::format("This CPU lacks instruction sets the game's code uses: {}.\nSecondSonPC needs "
+                             "SSE2-SSE4.2, POPCNT, MOVBE, AVX, F16C, BMI1 and LZCNT (an AMD Ryzen / FX or an Intel "
+                             "Core of the 4th generation or later).",
+                             missing);
+        SSPC_LOG(Cpu, Critical, "CPU: missing {}", missing);
+        return false;
+    }
+    SSPC_LOG(Cpu, Info, "CPU: SSE2-SSE4.2, POPCNT, MOVBE, AVX, F16C, BMI1, LZCNT present; SSE4a {}",
+             Cpu::Sse4a::HostHasSse4a() ? "present" : "absent (emulated by the CPU patcher)");
     // One slot for every guest thread, owned by SecondSonPC: the bridge's TLS code (its threads'
     // SetTcbBase, its patcher's trampolines) is pointed at it before it allocates one of its own.
     if (!Cpu::InitTcbSlot()) {
+        *error = "the guest TCB slot could not be set up (no TLS slot left), see SecondSonPC.log";
         return false;
     }
     if (!Core::UseTcbKey(Cpu::TcbSlot())) {
         SSPC_LOG(Cpu, Critical, "the bridge already has a TCB slot of its own ({}): one slot per thread is required",
                  Core::GetTcbKey());
+        *error = "the guest TCB slot could not be set up, see SecondSonPC.log";
         return false;
     }
     const auto listed = [&cfg](std::string_view g) {
@@ -260,22 +275,28 @@ bool InstallGuestCpu(const App::Config& cfg) {
     const bool exceptions = listed("exceptions");
     const bool wanted = listed("fs-patch") || listed("cpu");
     if (!wanted) {
-        SSPC_LOG(Cpu, Info, "FS patcher: the bridge's (core/cpu_patches.cpp, run-time patches with patch 0016); "
+        SSPC_LOG(Cpu, Info, "CPU patcher: the bridge's (core/cpu_patches.cpp, run-time patches with patch 0016); "
                             "TCB slot {} is SecondSonPC's",
                  Cpu::TcbSlot());
-    } else if (std::string why_not; !Cpu::CpuNeedsOnlyFsPatches(&why_not)) {
-        SSPC_LOG(Cpu, Warning, "--native cpu: {}; the bridge's patcher stays (it also emulates those)", why_not);
     } else if (!Cpu::InstallFsPatcher(!exceptions)) {
         SSPC_LOG(Cpu, Error, "--native cpu: the exception handler could not be added; the bridge's patcher stays");
     } else {
+        std::string note;
+        Cpu::CpuNeedsOnlyFsPatches(&note);
+        Cpu::SetSse4aEmulation(cfg.cpu_emulate_sse4a);
         g_native_fs = true;
         SSPC_LOG(Cpu, Warning,
-                 "EXPERIMENTAL: SecondSonPC's CPU patcher (FS: load-time patches, run-time fallback), TCB slot {}",
-                 Cpu::TcbSlot());
+                 "EXPERIMENTAL: SecondSonPC's CPU patcher (FS: load-time patches, run-time fallback; SSE4a {}), TCB "
+                 "slot {}{}",
+                 !Cpu::Sse4aEmulated()        ? "native"
+                 : cfg.cpu_emulate_sse4a      ? "emulated: FORCED on a CPU that has it (--cpu-emulate sse4a)"
+                                              : "emulated",
+                 Cpu::TcbSlot(), note.empty() ? std::string{} : "; " + note);
     }
     // P3.4: the dispatcher before anything creates the bridge's (its first Signals::Instance()).
     if (exceptions && !InstallExceptionRuntime(cfg, g_native_fs)) {
         SSPC_LOG(Cpu, Critical, "--native exceptions: SecondSonPC's exception dispatcher could not be installed");
+        *error = "--native exceptions: SecondSonPC's exception dispatcher could not be installed, see SecondSonPC.log";
         return false;
     }
     return true;

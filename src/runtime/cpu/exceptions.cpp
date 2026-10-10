@@ -603,6 +603,10 @@ bool Installed() {
     return g_installed.load(std::memory_order_relaxed);
 }
 
+bool CpuPatcherDelegated() {
+    return Installed() && g_options.cpu_patcher;
+}
+
 void PassEverything() {
     g_pass_everything.store(true);
 }

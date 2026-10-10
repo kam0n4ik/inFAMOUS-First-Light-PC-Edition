@@ -36,6 +36,7 @@ add_library(sspc_runtime STATIC
     src/runtime/app_content/app_content.cpp
     src/runtime/cpu/exceptions.cpp
     src/runtime/cpu/fs_patcher.cpp
+    src/runtime/cpu/sse4a.cpp
     src/runtime/cpu/tcb_slot.cpp
     src/runtime/exports.cpp
     src/runtime/filesystem/directory.cpp
