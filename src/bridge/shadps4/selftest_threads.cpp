@@ -431,15 +431,21 @@ bool RunStackCheck(u64 attr_size, StackCheck* out = nullptr) {
     void* attr = nullptr;
     g.attr_init(&attr);
     g.attr_setstacksize(&attr, attr_size);
-    StackCheck check{.expect = StackSizeFor(attr_size)};
+    // On the heap: if the join fails, the thread may still write it (then it is left behind).
+    auto* check = new StackCheck{.expect = StackSizeFor(attr_size)};
     Handle h = nullptr;
     void* r = nullptr;
-    const bool ok = g.create(&h, &attr, &StackFill, &check, "stack-check") == 0 && g.join(h, &r) == 0 && r != nullptr;
+    const bool created = g.create(&h, &attr, &StackFill, check, "stack-check") == 0;
+    const bool joined = created && g.join(h, &r) == 0;
     g.attr_destroy(&attr);
-    if (out != nullptr) {
-        *out = check;
+    const StackCheck result = *check;
+    if (joined || !created) {
+        delete check;
     }
-    return ok && check.zero && check.size;
+    if (out != nullptr) {
+        *out = result;
+    }
+    return joined && r != nullptr && result.zero && result.size;
 }
 
 constexpr u64 kChurnSizes[] = {16 * 1024, 64 * 1024, 256 * 1024, 1ull << 20, 2ull << 20, (3ull << 20) + 16 * 1024,
@@ -459,13 +465,20 @@ SSPC_SYSV_ABI void* ChurnWorker(void* arg) {
     // after the join.
     constexpr u32 kWaiting = 8;
     Handle waiting[kWaiting]{};
-    StackCheck checks[kWaiting]{};
+    // On the heap: a slot whose join failed keeps its StackCheck (the thread may still write it).
+    StackCheck* checks[kWaiting]{};
+    for (auto& ck : checks) {
+        ck = new StackCheck{};
+    }
     uintptr_t bad = 0;
     void* attr = nullptr;
     g.attr_init(&attr);
     const auto join_slot = [&](u32 i) {
         void* r = nullptr;
-        if (g.join(waiting[i], &r) != 0 || r == nullptr || !checks[i].zero || !checks[i].size) {
+        if (g.join(waiting[i], &r) != 0) {
+            ++bad;
+            checks[i] = new StackCheck{}; // the old one is left to the thread
+        } else if (r == nullptr || !checks[i]->zero || !checks[i]->size) {
             ++bad;
         }
         waiting[i] = nullptr;
@@ -503,8 +516,8 @@ SSPC_SYSV_ABI void* ChurnWorker(void* arg) {
             slot = static_cast<u32>(rng() % kWaiting);
             join_slot(slot);
         }
-        checks[slot] = StackCheck{.expect = StackSizeFor(size)};
-        if (g.create(&h, &attr, &StackFill, &checks[slot], "churn") != 0) {
+        *checks[slot] = StackCheck{.expect = StackSizeFor(size)};
+        if (g.create(&h, &attr, &StackFill, checks[slot], "churn") != 0) {
             ++bad;
             continue;
         }
@@ -516,6 +529,9 @@ SSPC_SYSV_ABI void* ChurnWorker(void* arg) {
     while (join_random() > 0) {
     }
     g.attr_destroy(&attr);
+    for (auto* ck : checks) {
+        delete ck;
+    }
     return reinterpret_cast<void*>(bad);
 }
 

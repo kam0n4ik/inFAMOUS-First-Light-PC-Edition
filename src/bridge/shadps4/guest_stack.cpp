@@ -31,10 +31,15 @@ void* MapGuestStack(VAddr hint, u64 size, u64 guard) {
     if (r != 0 || reinterpret_cast<VAddr>(stack) != base + guard) {
         SSPC_LOG(Kernel, Error, "guest stack: {:#x} bytes at {:#x} could not be mapped ({:#x})", size, base + guard,
                  static_cast<u32>(r));
-        if (r == 0) {
-            memory.Unmap(reinterpret_cast<VAddr>(stack), size);
+        // MAP_FIXED never maps elsewhere; if it did, that mapping and the intact reservation go separately.
+        if (r == 0 && memory.Unmap(reinterpret_cast<VAddr>(stack), size) != 0) {
+            SSPC_LOG(Kernel, Error, "guest stack: the stray mapping at {:#x} could not be unmapped",
+                     reinterpret_cast<VAddr>(stack));
         }
-        memory.Unmap(base, size + guard);
+        if (memory.Unmap(base, size + guard) != 0) {
+            SSPC_LOG(Kernel, Error, "guest stack: the reservation [{:#x}, +{:#x}) could not be given back", base,
+                     size + guard);
+        }
         return nullptr;
     }
     return stack;

@@ -402,7 +402,8 @@ void UnmapStacks(const UnmapList& list, u32 n) {
 }
 
 /// Frees what a thread used and returns its slot. Its host thread has ended (or never ran).
-void Release(Thread* t) {
+/// `created`: the thread was counted as created (false on Create's own failure paths).
+void Release(Thread* t, bool created = true) {
     void* tcb;
     StackRange stack;
     bool own;
@@ -446,13 +447,20 @@ void Release(Thread* t) {
                 g_stack_of[index] = {};
                 CacheOrUnmap(stack, unmap, unmap_count);
             } else {
-                // Not what this slot was given: never cached, never unmapped (it may be someone's).
+                // Not what this slot was given: neither stack is cached or unmapped (either may be
+                // someone's); both are forgotten, so the slot starts clean.
                 mismatch = true;
                 ++g_rejected;
+                if (held_before.base != nullptr) {
+                    UncountHeld(held_before);
+                    g_stack_of[index] = {};
+                }
             }
         }
         PushFree(index);
-        ++g_reaped;
+        if (created) {
+            ++g_reaped;
+        }
         live = kMaxThreads - g_free_count;
         cached = g_cache_count;
         cache_bytes = g_cache_bytes;
@@ -710,7 +718,7 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
     void* tcb = g_host->CreateTcb(t, initial);
     if (tcb == nullptr) {
         SSPC_LOG(Kernel, Error, "scePthreadCreate: no TCB for thread {}", tid);
-        Release(t); // caches (or unmaps) the stack, returns the slot
+        Release(t, false); // caches (or unmaps) the stack, returns the slot
         return kEagain;
     }
     {
@@ -724,7 +732,7 @@ s32 Create(Thread** out, const AttrT* attrp, Entry entry, void* arg, const char*
     if (host == nullptr) {
         const DWORD error = GetLastError();
         *out = nullptr;
-        Release(t);
+        Release(t, false);
         SSPC_LOG(Kernel, Error, "scePthreadCreate: CreateThread failed ({})", error);
         return kEagain;
     }
