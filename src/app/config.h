@@ -108,6 +108,12 @@ struct Config {
     std::filesystem::path gpu_replay;        // --gpu-replay <trace>: replay a trace offline, no game -> gpu_replay.txt
     u32 gpu_replay_bench = 0;                // --gpu-replay-bench <n>: and time n passes (microbenchmarks)
     bool frame_pacing = false;               // --frame-pacing: flip timeline -> logs\frame_pacing.csv (SSPC-015)
+    // P4.3 (docs/PHASE4_P43_SHADER_TRANSLATION.md): SecondSonPC's shader frontend.
+    bool gpu_shaders = false;                // --gpu-shaders: in the shadow at every draw, compared with the bridge
+    bool gpu_shaders_per_bind = false;       // --gpu-shader-validation per-bind: programs re-read at every bind
+    bool gpu_shaders_translate = true;       // --gpu-shaders-no-translate: resources only
+    bool gpu_shader_capture = false;         // --gpu-shader-capture: the bridge's translations -> logs\gpu_shaders\*
+    std::filesystem::path gpu_shader_verify; // --gpu-shader-verify <capture>: offline comparison, no game
     bool patch_race_test = false;            // --patch-race-test: SSPC-002 regression test, no game
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input

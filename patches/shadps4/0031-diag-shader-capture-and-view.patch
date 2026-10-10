@@ -1,0 +1,56 @@
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index ce0da934bd..bf6a80cb3a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -21,6 +21,9 @@
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+ // SecondSonPC patch 0027 (P4.1.2): --gpu-stats counts the pipelines created and the programs translated.
+ #include "runtime/gpu/pm4_stats.h"
++// SecondSonPC patch 0031 (P4.3): the modules it translates and the pipelines it picks, for SecondSonPC's shader
++// frontend (--gpu-shader-capture, --gpu-shaders).
++#include "bridge/shadps4/shader_bridge_hooks.h"
+ 
+ namespace Vulkan {
+ 
+@@ -418,6 +421,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
+     if (call_compile_us != 0) {
+         EndCompileStall();
+     }
++    if (SecondSon::Bridge::ShaderHooks::ViewEnabled()) [[unlikely]] {
++        SecondSon::Bridge::ShaderHooks::OnPipeline(false, infos, modules, runtime_infos, it->second.get());
++    }
+     return it->second.get();
+ }
+ 
+@@ -462,6 +468,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
+     if (call_compile_us != 0) {
+         EndCompileStall();
+     }
++    if (SecondSon::Bridge::ShaderHooks::ViewEnabled()) [[unlikely]] {
++        SecondSon::Bridge::ShaderHooks::OnPipeline(true, infos, modules, runtime_infos, it->second.get());
++    }
+     return it->second.get();
+ }
+ 
+@@ -702,6 +711,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
+              perm_idx != 0 ? "(permutation)" : "");
+     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+ 
++    const auto binding_start = binding; // SecondSonPC patch 0031
++    const auto runtime_before = runtime_info; // the translation may change it (clip distance emulation)
+     const auto t0 = std::chrono::steady_clock::now();
+     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+     const u64 translate_us = MicrosSince(t0);
+@@ -709,6 +720,12 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
+     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+     const u64 emit_us = MicrosSince(t1);
+     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
++    if (SecondSon::Bridge::ShaderHooks::CaptureEnabled()) [[unlikely]] {
++        SecondSon::Bridge::ShaderHooks::OnModuleCompiled(
++            info, runtime_before, code, perm_idx, binding_start, spv, profile, liverpool->regs,
++            liverpool->GetCsRegs(), draw_indirect_params.vertex_sgpr_offset,
++            draw_indirect_params.instance_sgpr_offset);
++    }
+ 
+     vk::ShaderModule module;
+ 

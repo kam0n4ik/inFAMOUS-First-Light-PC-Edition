@@ -51,6 +51,10 @@ struct Options {
     u32 trace_frames = 0;       ///< frames to record
     u32 trace_full_every = 256; ///< a full bridge register snapshot every Nth checkpoint of the trace
     bool exit_step = true;      ///< write the report at the process's exit (Lifecycle)
+    bool shaders = false;       ///< --gpu-shaders: SecondSonPC's shader frontend (P4.3) at every draw/dispatch,
+                                ///< compared with the pipeline the bridge picks (patch 0031)
+    bool shaders_per_bind = false; ///< programs revalidated at every bind (else once a frame)
+    bool shaders_translate = true; ///< translations on the frontend's worker (else resources only)
 };
 
 /// --gpu-shadow / --gpu-trace: before the GPU command processor takes a packet. Once.

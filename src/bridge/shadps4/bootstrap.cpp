@@ -66,6 +66,8 @@
 #include "runtime/gpu/cp_shadow.h"
 #include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/pm4_stats.h"
+#include "runtime/gpu/shader/shader_capture.h"
+#include "bridge/shadps4/shader_bridge_hooks.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/kernel/thread.h"
 #include "runtime/memory/virtual_memory.h"
@@ -676,6 +678,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // P4.1.3: SecondSonPC's GPU memory contract over the selected manager; for the game, the bridge's renderer (its
     // GnmDriver starts below) is recorded as the one owner of the guest GPU — no other backend may take a part of it.
     InstallGpuGuestMemory();
+    // P4.3: SecondSonPC's translator interface over the bridge's recompiler (used only by SecondSonPC's frontend:
+    // --gpu-shaders, --gpu-shader-verify, the self-test)
+    InstallShaderTranslatorAdapter();
     if (!cfg.selftest) {
         std::string gpu_error;
         bool gpu_ok = Gpu::SelectBackend(Gpu::BackendKind::Bridge, &gpu_error);
@@ -696,6 +701,10 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     }
     SetupFilesystem(cfg, serial);
     bindings.LogSummary(); // also for --selftest: the NATIVE/BRIDGE split without running the game
+    if (!cfg.gpu_shader_verify.empty()) {
+        // P4.3: a capture of the bridge's translations through SecondSonPC's frontend parts and translator interface
+        std::quick_exit(Gpu::Shader::RunShaderVerify(cfg.gpu_shader_verify, cfg.logs_dir));
+    }
     if (cfg.selftest) {
         // The self-test compares with the bridge's manager; with --native memory there is none: the native
         // manager's own start-up test runs instead.
@@ -1199,7 +1208,29 @@ void RunGame(const App::Config& cfg) {
         // memory through the GPU memory contract installed above; claims nothing)
         Gpu::CpShadow::Enable({.dir = cfg.logs_dir,
                                .trace_start_s = cfg.gpu_trace_start_s,
-                               .trace_frames = cfg.gpu_trace_frames});
+                               .trace_frames = cfg.gpu_trace_frames,
+                               .shaders = cfg.gpu_shaders,
+                               .shaders_per_bind = cfg.gpu_shaders_per_bind,
+                               .shaders_translate = cfg.gpu_shaders_translate});
+        // P4.3: the bridge's pipeline cache reports its pipeline at each draw (patch 0031)
+        ShaderHooks::g_view.store(cfg.gpu_shaders, std::memory_order_relaxed);
+    }
+    if (cfg.gpu_shader_capture) {
+        // P4.3: every module the bridge translates from now on, with its inputs (patch 0031). With the persistent
+        // shader cache warm the bridge translates nothing: capture with --no-shader-cache.
+        const auto path = cfg.logs_dir / "gpu_shaders" /
+                          fmt::format("capture_{}.sspcshd", std::chrono::duration_cast<std::chrono::seconds>(
+                                                                std::chrono::system_clock::now().time_since_epoch())
+                                                                .count());
+        if (!Gpu::Shader::StartCapture(path)) {
+            Fatal("--gpu-shader-capture: cannot write " + path.string());
+        }
+        ShaderHooks::g_capture.store(true, std::memory_order_relaxed);
+        Lifecycle::AddExitStep(Lifecycle::Stage::Reports, "shader capture", [] {
+            ShaderHooks::g_capture.store(false, std::memory_order_relaxed);
+            Gpu::Shader::StopCapture();
+        });
+        SSPC_LOG(Shader, Info, "--gpu-shader-capture: the bridge's translations -> {}", path.string());
     }
     if (cfg.frame_log) {
         StartFrameLog(cfg.logs_dir / "frametimes.csv");

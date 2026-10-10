@@ -106,6 +106,9 @@ $modeArgs = @{
     # (a diagnostic mode: not for FPS comparisons with plain runs); ST/ST2 = the shadow recording 3 frames from 40 s
     # (the beach) / 75 s (the foliage) for --gpu-replay; FP = the flip timeline (SSPC-015).
     SH = "--gpu-shadow"; ST = "--gpu-trace 40:3"; ST2 = "--gpu-trace 75:3"; FP = "--frame-pacing"
+    # P4.3 (docs\PHASE4_P43_SHADER_TRANSLATION.md): SS = SecondSonPC's shader frontend in the shadow, compared with the
+    # bridge's pipelines (diagnostic); SC = the bridge's translations captured, cold (no persistent shader cache).
+    SS = "--gpu-shaders"; SC = "--no-shader-cache --gpu-shader-capture"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}

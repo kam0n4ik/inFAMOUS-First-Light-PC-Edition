@@ -4893,6 +4893,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestGpuCommandProcessor(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    // P4.3: SecondSonPC's shader frontend (programs, resources, SRT walk, translations, caches, captures).
+    for (auto& g : TestShaderFrontend(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

@@ -16,6 +16,10 @@
 
 #include "base/abi.h"
 
+namespace SecondSon::Gpu::Shader {
+struct DeviceProfile;
+}
+
 namespace SecondSon::Gpu::Vk {
 
 struct DeviceInfo {
@@ -73,6 +77,12 @@ public:
     /// `seconds` (or until closed); all destroyed. `frames`: presented.
     bool ShowTestWindow(u32 seconds, u32 rgba, u32& frames, std::string& detail);
 
+    /// P4.3: what the device supports that a shader translation depends on.
+    void QueryShaderProfile(Gpu::Shader::DeviceProfile& out) const;
+    /// P4.3: each SPIR-V module through vkCreateShaderModule (then destroyed): accepted / refused by the driver.
+    void CreateShaderModules(const std::vector<std::vector<u32>>& spirv, u32& accepted, u32& refused,
+                             std::string& detail);
+
     struct Impl;
 
 private:
@@ -87,5 +97,10 @@ s64 LiveObjects();
 /// --gpu-probe: Create (level A), CheckResources, and with window_seconds > 0 the test window (level B); the report
 /// in <logs_dir>\gpu_probe.txt and on stdout. 0 if every level asked for passed.
 int RunProbe(const std::filesystem::path& logs_dir, s32 device_index, u32 window_seconds, bool validation);
+
+/// P4.3: a level-A foundation on the chosen device (-1: the policy's), its shader profile, everything destroyed.
+bool QueryDeviceProfile(s32 device_index, Gpu::Shader::DeviceProfile& out, std::string& error);
+/// P4.3: the modules through vkCreateShaderModule on the policy's device. false: no device (`detail`).
+bool CheckShaderModules(const std::vector<std::vector<u32>>& spirv, u32& accepted, u32& refused, std::string& detail);
 
 } // namespace SecondSon::Gpu::Vk

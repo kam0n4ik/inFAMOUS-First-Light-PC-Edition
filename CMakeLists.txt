@@ -53,6 +53,14 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/frame_pacing.cpp
     src/runtime/gpu/pm4.cpp
     src/runtime/gpu/pm4_stats.cpp
+    src/runtime/gpu/shader/gcn_program.cpp
+    src/runtime/gpu/shader/pipeline_state.cpp
+    src/runtime/gpu/shader/runtime_params.cpp
+    src/runtime/gpu/shader/shader_cache.cpp
+    src/runtime/gpu/shader/shader_capture.cpp
+    src/runtime/gpu/shader/shader_frontend.cpp
+    src/runtime/gpu/shader/shader_resources.cpp
+    src/runtime/gpu/shader/shader_translator.cpp
     src/runtime/gpu/vulkan/vk_foundation.cpp
     src/runtime/kernel/clock.cpp
     src/runtime/kernel/condvar.cpp
@@ -97,6 +105,8 @@ target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
 # (src/runtime/gpu/vulkan). No loader is linked: the system vulkan-1.dll is loaded at run time, as the bridge does.
 target_link_libraries(sspc_runtime PRIVATE Vulkan::Headers)
+# P4.3: xxHash (BSD-2, from the bridge's externals like Zydis): programs' content identity, cache keys.
+target_link_libraries(sspc_runtime PRIVATE xxHash::xxhash)
 # P3.4: the commit in fatal exception reports (as of the last configure; "-dirty" with local changes then).
 execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=10
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE SSPC_GIT_REV

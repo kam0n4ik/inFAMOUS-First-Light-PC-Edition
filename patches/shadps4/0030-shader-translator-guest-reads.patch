@@ -1,0 +1,179 @@
+diff --git a/src/shader_recompiler/frontend/fetch_shader.cpp b/src/shader_recompiler/frontend/fetch_shader.cpp
+index c48e91cdcf..e36b1c1fc8 100644
+--- a/src/shader_recompiler/frontend/fetch_shader.cpp
++++ b/src/shader_recompiler/frontend/fetch_shader.cpp
+@@ -37,6 +37,9 @@ namespace Shader::Gcn {
+ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
+     const u32* code;
+     std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
++    if (GuestReads* reads = CurrentGuestReads()) { // SecondSonPC (patch 0030): a copy the adapter read
++        return reads->FetchShaderCode(reinterpret_cast<VAddr>(code));
++    }
+     return code;
+ }
+ 
+diff --git a/src/shader_recompiler/info.h b/src/shader_recompiler/info.h
+index 75dcac52a3..4a7bd71bbe 100644
+--- a/src/shader_recompiler/info.h
++++ b/src/shader_recompiler/info.h
+@@ -25,6 +25,23 @@ struct Archive;
+ 
+ namespace Shader {
+ 
++/// SecondSonPC (patch 0030): the guest memory reads of a translation SecondSonPC's adapter drives
++/// (src/bridge/shadps4/shader_translator_host.cpp). While it is set on a thread, the translator reads the vertex
++/// buffer descriptors, the fetch shader and tessellation constants through it and leaves the SRT walk to it, never
++/// dereferencing a guest address. nullptr (the bridge's own translations): direct reads, as before.
++struct GuestReads {
++    virtual ~GuestReads() = default;
++    /// [addr, addr + bytes) of guest memory into `dst`; false: unreadable (the caller zeroes `dst`).
++    virtual bool Read(VAddr addr, void* dst, size_t bytes) = 0;
++    /// The flattened user data: `flat` (flat_dwords, the registers already at its start) from the SRT walker the
++    /// translation generated (`walker`, `walker_size`; none when nullptr).
++    virtual void Flatten(const u8* walker, size_t walker_size, const u32* user_data, u32* flat,
++                         size_t flat_dwords) = 0;
++    /// The fetch shader at `addr`: code the hook owns, ending with s_setpc_b64 (never nullptr).
++    virtual const u32* FetchShaderCode(VAddr addr) = 0;
++};
++GuestReads*& CurrentGuestReads();
++
+ enum class Qualifier : u8 {
+     None,
+     Smooth,
+@@ -154,6 +171,12 @@ struct Info : InfoPersistent {
+         if (ptr_index != IR::NumScalarRegs) {
+             std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
++            if (GuestReads* reads = CurrentGuestReads()) { // SecondSonPC (patch 0030)
++                if (!reads->Read(VAddr(base) + VAddr{dword_offset} * 4, &data, sizeof(T))) {
++                    std::memset(&data, 0, sizeof(T));
++                }
++                return data;
++            }
+         }
+         std::memcpy(&data, base + dword_offset, sizeof(T));
+         return data;
+@@ -168,6 +191,11 @@ struct Info : InfoPersistent {
+         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
+         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
++        if (GuestReads* reads = CurrentGuestReads()) { // SecondSonPC (patch 0030): the adapter walks
++            reads->Flatten(reinterpret_cast<const u8*>(srt_info.walker_func), srt_info.walker_func_size,
++                           user_data.data(), flattened_ud_buf.data(), flattened_ud_buf.size());
++            return;
++        }
+         if (srt_info.walker_func) {
+             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+         }
+@@ -178,6 +206,12 @@ struct Info : InfoPersistent {
+         auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),
+                                              static_cast<u32>(tess_consts_dword_offset));
+         VAddr tess_constants_addr = buf.base_address;
++        if (GuestReads* reads = CurrentGuestReads()) { // SecondSonPC (patch 0030)
++            if (!reads->Read(tess_constants_addr, &tess_constants, sizeof(tess_constants))) {
++                std::memset(&tess_constants, 0, sizeof(tess_constants));
++            }
++            return;
++        }
+         memcpy(&tess_constants,
+                reinterpret_cast<TessellationDataConstantBuffer*>(tess_constants_addr),
+                sizeof(tess_constants));
+diff --git a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+index 87ff100673..217f1a87e8 100644
+--- a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
++++ b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <memory>
++#include <mutex>
+ #include <unordered_map>
+ #include <boost/container/flat_map.hpp>
+ #include <queue>
+@@ -29,12 +31,16 @@ using namespace Xbyak::util;
+ 
+ static Xbyak::CodeGenerator g_srt_codegen(32_MB);
+ static const u8* g_srt_codegen_start = nullptr;
++// SecondSonPC (patch 0030): SecondSonPC's adapter translates on its own thread beside the bridge's GPU thread; the
++// one code buffer is written under this lock (walkers already written are not moved).
++static std::mutex g_srt_codegen_mutex;
+ 
+ static void EnsureSrtWalkerSignalHandler();
+ 
+ namespace Shader {
+ 
+ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
++    std::scoped_lock lock{g_srt_codegen_mutex};
+     EnsureSrtWalkerSignalHandler();
+     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
+     g_srt_codegen.db(ptr, size);
+@@ -651,14 +657,28 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
+ }
+ 
+ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+-    Xbyak::CodeGenerator& c = g_srt_codegen;
++    // SecondSonPC (patch 0030): a translation SecondSonPC's adapter drives generates its walker into a scratch buffer
++    // of its own thread — never executed (its bytes are interpreted), so it neither fills the shared buffer nor waits
++    // for the bridge's translations.
++    static thread_local std::unique_ptr<Xbyak::CodeGenerator> scratch;
++    const bool adapter = CurrentGuestReads() != nullptr;
++    if (adapter) {
++        if (!scratch) {
++            scratch = std::make_unique<Xbyak::CodeGenerator>(1_MB);
++        }
++        scratch->reset();
++    }
++    Xbyak::CodeGenerator& c = adapter ? *scratch : g_srt_codegen;
+ 
+     if (pass_info.srt_roots.empty()) {
+         return;
+     }
+-
+-    // Register the signal handler for SRT walker, if not already registered
+-    EnsureSrtWalkerSignalHandler();
++    std::unique_lock lock{g_srt_codegen_mutex, std::defer_lock}; // SecondSonPC (patch 0030)
++    if (!adapter) {
++        lock.lock();
++        // Register the signal handler for SRT walker, if not already registered
++        EnsureSrtWalkerSignalHandler();
++    }
+ 
+     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
+     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
+diff --git a/src/shader_recompiler/recompiler.cpp b/src/shader_recompiler/recompiler.cpp
+index a6d8549377..52d1cfde31 100644
+--- a/src/shader_recompiler/recompiler.cpp
++++ b/src/shader_recompiler/recompiler.cpp
+@@ -14,6 +14,11 @@
+ 
+ namespace Shader {
+ 
++GuestReads*& CurrentGuestReads() {
++    static thread_local GuestReads* reads = nullptr;
++    return reads;
++}
++
+ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
+     size_t num_syntax_blocks{};
+     for (const auto& [_, type] : syntax_list) {
+@@ -45,6 +50,9 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
+         program.blocks.push_back(ir_block);
+     }
+     translator.EmitPrologue(program.blocks.front());
++    if (program.info.translation_failed && CurrentGuestReads() != nullptr) {
++        return; // SecondSonPC (patch 0030): its adapter reports the failure instead of the process ending
++    }
+     ASSERT_MSG(!program.info.translation_failed, "Shader translation has failed");
+     for (auto& block : cfg) {
+         auto* ir_block = block.ir_block;
+@@ -85,6 +93,9 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
+     Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
+     Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+     EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
++    if (info.translation_failed) {
++        return program; // only with SecondSonPC's adapter (patch 0030); the bridge asserted above
++    }
+ 
+     // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate
+     // it with expensive discard in PS.

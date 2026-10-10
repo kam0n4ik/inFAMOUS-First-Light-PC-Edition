@@ -31,6 +31,13 @@
 //                              -> logs\gpu_trace\*.sspctrace
 //     --gpu-replay <trace>     the command processor on a recorded trace, compared with the bridge's recorded state
 //                              -> logs\gpu_replay.txt, no game; --gpu-replay-bench <n>: and n timed passes
+//     --gpu-shaders            SecondSonPC's shader frontend (P4.3) in the shadow at every draw/dispatch: programs by
+//                              content, resources, specializations, pipelines, translations on a worker thread;
+//                              compared with the bridge's pipeline at the same packet -> logs\gpu_shadow.txt
+//                              (--gpu-shader-validation per-frame|per-bind, --gpu-shaders-no-translate)
+//     --gpu-shader-capture     every module the bridge translates, with its inputs -> logs\gpu_shaders\*.sspcshd
+//     --gpu-shader-verify <f>  a capture replayed through SecondSonPC's frontend and translator interface, compared
+//                              with the bridge's SPIR-V and runtime information -> logs\gpu_shader_verify.txt, no game
 //     --frame-pacing           the flip timeline (submit, GPU thread, flip, vblank) -> logs\frame_pacing.csv
 //     --gpu-backend bridge|sspc   the game's GPU backend (bridge, the default; sspc is refused for the game in
 //                              P4.1: it executes no GPU command of the game yet)
@@ -231,6 +238,23 @@ int main(int argc, char* argv[]) {
                 return Fail("--gpu-replay-bench <passes 1..1000>");
             }
             config->gpu_replay_bench = static_cast<u32>(n);
+        } else if (arg == "--gpu-shaders") {
+            // diagnostics only (P4.3): SecondSonPC's shader frontend in the shadow, compared with the bridge's pipelines
+            config->gpu_shaders = true;
+            config->gpu_shadow = true;
+        } else if (arg == "--gpu-shader-validation" && has_value) {
+            const std::string_view v = argv[++i];
+            if (v != "per-frame" && v != "per-bind") {
+                return Fail("--gpu-shader-validation per-frame|per-bind");
+            }
+            config->gpu_shaders_per_bind = v == "per-bind";
+        } else if (arg == "--gpu-shaders-no-translate") {
+            config->gpu_shaders_translate = false;
+        } else if (arg == "--gpu-shader-capture") {
+            config->gpu_shader_capture = true; // diagnostics only (P4.3): the bridge's translations for --gpu-shader-verify
+        } else if (arg == "--gpu-shader-verify" && has_value) {
+            config->gpu_shader_verify = std::filesystem::absolute(argv[++i]);
+            config->selftest = true; // the bridge's libraries as for the self-test; no game
         } else if (arg == "--frame-pacing") {
             config->frame_pacing = true; // diagnostics only (P4.2, SSPC-015): the flip timeline
         } else if (arg == "--patch-race-test") {

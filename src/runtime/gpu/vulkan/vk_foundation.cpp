@@ -22,6 +22,7 @@
 #include <fmt/ranges.h>
 
 #include "base/log.h"
+#include "runtime/gpu/shader/shader_types.h"
 
 // Vulkan's structures are filled with designated initializers naming only the fields that matter (pNext, flags and
 // the rest stay zero), the usual way to write them.
@@ -47,6 +48,7 @@ void Track(s64 delta) {
     X(vkDestroyInstance)                                                                                               \
     X(vkEnumeratePhysicalDevices)                                                                                      \
     X(vkGetPhysicalDeviceProperties)                                                                                   \
+    X(vkGetPhysicalDeviceProperties2)                                                                                  \
     X(vkGetPhysicalDeviceFeatures2)                                                                                    \
     X(vkGetPhysicalDeviceQueueFamilyProperties)                                                                        \
     X(vkGetPhysicalDeviceMemoryProperties)                                                                             \
@@ -90,7 +92,9 @@ void Track(s64 delta) {
     X(vkBindBufferMemory)                                                                                              \
     X(vkBindImageMemory)                                                                                               \
     X(vkMapMemory)                                                                                                     \
-    X(vkUnmapMemory)
+    X(vkUnmapMemory)                                                                                                   \
+    X(vkCreateShaderModule)                                                                                            \
+    X(vkDestroyShaderModule)
 #define SSPC_VK_SWAPCHAIN(X)                                                                                           \
     X(vkCreateSwapchainKHR)                                                                                            \
     X(vkDestroySwapchainKHR)                                                                                           \
@@ -567,6 +571,93 @@ struct Foundation::Impl {
         f.vkDestroyFence(device, fence, nullptr);
         Track(-1);
         return ok;
+    }
+
+    /// P4.3: what the selected device supports that a shader translation depends on (the bridge's Profile rules).
+    void QueryProfile(Gpu::Shader::DeviceProfile& out) {
+        u32 ne = 0;
+        f.vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+        std::vector<VkExtensionProperties> exts(ne);
+        f.vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, exts.data());
+        VkPhysicalDeviceVulkan12Properties p12{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceVulkan11Properties p11{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+                                               .pNext = &p12};
+        VkPhysicalDeviceProperties2 p2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p11};
+        f.vkGetPhysicalDeviceProperties2(physical, &p2);
+        VkPhysicalDeviceVulkan12Features v12{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 f2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12};
+        f.vkGetPhysicalDeviceFeatures2(physical, &f2);
+        const VkPhysicalDeviceLimits& lim = p2.properties.limits;
+        const bool nvidia = p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+        out = {};
+        out.max_viewport_width = lim.maxViewportDimensions[0];
+        out.max_viewport_height = lim.maxViewportDimensions[1];
+        out.max_shared_memory_size = lim.maxComputeSharedMemorySize;
+        out.supported_spirv = 0x00010600;
+        out.subgroup_size = p11.subgroupSize;
+        out.sparse_page_shift = 16; // the bridge's buffer cache: the sparse binding granularity (64 KiB on this device class)
+        out.support_int8 = v12.shaderInt8 != 0;
+        out.support_int16 = f2.features.shaderInt16 != 0;
+        out.support_int64 = f2.features.shaderInt64 != 0;
+        out.support_float16 = v12.shaderFloat16 != 0;
+        out.support_float64 = f2.features.shaderFloat64 != 0;
+        out.supports_denorm_behavior_independence =
+            p12.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        out.supports_rounding_mode_independence =
+            p12.roundingModeIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        out.support_fp16_denorm_preserve = p12.shaderDenormPreserveFloat16 != 0;
+        out.support_fp16_denorm_flush = p12.shaderDenormFlushToZeroFloat16 != 0;
+        out.support_fp16_round_to_zero = p12.shaderRoundingModeRTZFloat16 != 0;
+        out.support_fp32_denorm_preserve = p12.shaderDenormPreserveFloat32 != 0;
+        out.support_fp32_denorm_flush = p12.shaderDenormFlushToZeroFloat32 != 0;
+        out.support_fp32_round_to_zero = p12.shaderRoundingModeRTZFloat32 != 0;
+        out.support_fp64_denorm_preserve = p12.shaderDenormPreserveFloat64 != 0;
+        out.support_fp64_denorm_flush = p12.shaderDenormFlushToZeroFloat64 != 0;
+        out.support_fp64_round_to_zero = p12.shaderRoundingModeRTZFloat64 != 0;
+        out.support_fp16_signed_zero_inf_nan_preserve = p12.shaderSignedZeroInfNanPreserveFloat16 != 0;
+        out.support_fp32_signed_zero_inf_nan_preserve = p12.shaderSignedZeroInfNanPreserveFloat32 != 0;
+        out.support_fp64_signed_zero_inf_nan_preserve = p12.shaderSignedZeroInfNanPreserveFloat64 != 0;
+        out.supports_image_load_store_lod = Has(exts, "VK_AMD_shader_image_load_store_lod");
+        out.supports_native_cube_calc = Has(exts, "VK_AMD_gcn_shader");
+        out.supports_trinary_minmax = Has(exts, "VK_AMD_shader_trinary_minmax");
+        // VK_EXT_shader_atomic_float2's min/max features are not queried here (reported against the bridge's)
+        out.supports_buffer_int64_atomics = v12.shaderBufferInt64Atomics != 0;
+        out.supports_shared_int64_atomics = v12.shaderSharedInt64Atomics != 0;
+        out.supports_workgroup_explicit_memory_layout = Has(exts, "VK_KHR_workgroup_memory_explicit_layout");
+        out.supports_amd_shader_explicit_vertex_parameter = Has(exts, "VK_AMD_shader_explicit_vertex_parameter");
+        out.supports_fragment_shader_barycentric = Has(exts, "VK_KHR_fragment_shader_barycentric");
+        out.supports_shader_subgroup_clock = Has(exts, "VK_KHR_shader_clock");
+        out.needs_manual_interpolation = out.supports_fragment_shader_barycentric && nvidia;
+        out.needs_lds_barriers = nvidia;
+        out.needs_buffer_offsets = lim.minStorageBufferOffsetAlignment > 4;
+        out.needs_clip_distance_emulation = nvidia;
+        out.supports_shader_stencil_export = Has(exts, "VK_EXT_shader_stencil_export");
+        out.depth_clip_control = Has(exts, "VK_EXT_depth_clip_control");
+        out.source = fmt::format("{} (driver {:#x})", info.name, info.driver_version);
+    }
+
+    /// P4.3: every module through vkCreateShaderModule (and destroyed): the driver's acceptance of the SPIR-V.
+    void CreateModules(const std::vector<std::vector<u32>>& spirv, u32& accepted, u32& refused, std::string& detail) {
+        for (size_t i = 0; i < spirv.size(); ++i) {
+            const auto& code = spirv[i];
+            const VkShaderModuleCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                              .codeSize = code.size() * 4,
+                                              .pCode = code.data()};
+            VkShaderModule module = VK_NULL_HANDLE;
+            const VkResult r = code.empty() ? VK_ERROR_INITIALIZATION_FAILED
+                                            : f.vkCreateShaderModule(device, &ci, nullptr, &module);
+            if (r == VK_SUCCESS) {
+                Track(+1);
+                f.vkDestroyShaderModule(device, module, nullptr);
+                Track(-1);
+                ++accepted;
+            } else {
+                ++refused;
+                if (detail.empty()) {
+                    detail = fmt::format("module {}: VkResult {}", i, static_cast<int>(r));
+                }
+            }
+        }
     }
 };
 
@@ -1057,6 +1148,38 @@ bool Foundation::ShowTestWindow(u32 seconds, u32 rgba, u32& frames, std::string&
 
 s64 LiveObjects() {
     return g_live.load(std::memory_order_relaxed);
+}
+
+void Foundation::QueryShaderProfile(Gpu::Shader::DeviceProfile& out) const {
+    impl_->QueryProfile(out);
+}
+
+void Foundation::CreateShaderModules(const std::vector<std::vector<u32>>& spirv, u32& accepted, u32& refused,
+                                     std::string& detail) {
+    impl_->CreateModules(spirv, accepted, refused, detail);
+}
+
+bool QueryDeviceProfile(s32 device_index, Gpu::Shader::DeviceProfile& out, std::string& error) {
+    Options options;
+    options.device_index = device_index;
+    Report report;
+    const auto foundation = Foundation::Create(options, report, error);
+    if (foundation == nullptr) {
+        return false;
+    }
+    foundation->QueryShaderProfile(out);
+    return true;
+}
+
+bool CheckShaderModules(const std::vector<std::vector<u32>>& spirv, u32& accepted, u32& refused, std::string& detail) {
+    Options options;
+    Report report;
+    const auto foundation = Foundation::Create(options, report, detail);
+    if (foundation == nullptr) {
+        return false;
+    }
+    foundation->CreateShaderModules(spirv, accepted, refused, detail);
+    return true;
 }
 
 int RunProbe(const std::filesystem::path& logs_dir, s32 device_index, u32 window_seconds, bool validation) {

@@ -46,6 +46,9 @@ std::vector<TestGroup> TestGpu(const App::Config& cfg);
 /// P4.2 (src/bridge/shadps4/selftest_gpu_cp.cpp): SecondSonPC's GPU command processor.
 std::vector<TestGroup> TestGpuCommandProcessor(const App::Config& cfg);
 
+/// P4.3 (src/bridge/shadps4/selftest_shader.cpp): SecondSonPC's shader frontend.
+std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg);
+
 /// The executable segment of the game's eboot.bin copied into host memory (read/write; trampoline area after
 /// it) and its .eh_frame function ranges (selftest_fs.cpp). The game's files are only read.
 struct EbootCopy {
