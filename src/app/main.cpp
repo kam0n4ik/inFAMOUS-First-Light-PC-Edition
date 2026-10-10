@@ -11,6 +11,8 @@
 //     --reloc-snapshot <file>  writes every relocation slot at the first ParamGetInt call
 //     --selftest               NATIVE vs BRIDGE subsystem self-test -> logs\selftest.txt, no game
 //     --fault-test             first-chance crash recorder test -> logs\faulttest.txt, no game
+//     --patch-race-test        SSPC-002: threads run guest fs: accesses while the bridge patches them
+//                              -> logs\patchrace.txt, no game
 //     --no-fault-recorder      no first-chance crash recorder (A/B performance diagnostics)
 //     --frame-log              presented frame times -> logs\frametimes.csv (tools\perf_runs.ps1)
 //     --track-stats            GPU write tracking statistics (access violations, protection changes,
@@ -137,6 +139,8 @@ int main(int argc, char* argv[]) {
             config->frame_log = true; // diagnostics only
         } else if (arg == "--track-stats") {
             config->track_stats = true; // diagnostics only (P2.5)
+        } else if (arg == "--patch-race-test") {
+            config->patch_race_test = true; // SSPC-002 regression test -> logs\patchrace.txt
         } else if ((arg == "--perf-opt" || arg == "--no-perf-opt") && has_value) {
             // P2.5: one bridge performance change on or off (bridge/shadps4/perf_opts.h).
             const std::string_view name = argv[++i];

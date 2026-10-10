@@ -42,4 +42,8 @@ void InstallKernelHost(const App::Config& cfg, u32 psf_attributes);
 /// --selftest (src/bridge/shadps4/selftest.cpp): exit code 0 = every check passed.
 int RunSelfTest(const App::Config& cfg);
 
+/// --patch-race-test (src/bridge/shadps4/selftest_patch_race.cpp, SSPC-002): many threads run guest
+/// fs: accesses for the first time while the bridge patches them; 0 = every site patched, no crash.
+int RunPatchRaceTest(const App::Config& cfg);
+
 } // namespace SecondSon::Bridge

@@ -990,6 +990,10 @@ void RunGame(const App::Config& cfg) {
     std::filesystem::create_directories(cfg.user_data_dir / "home", ec);
     ApplyBridgeSettings(cfg);
     Common::Log::Switch("bridge_shadps4.log", false); // applies the filter
+    if (cfg.patch_race_test) {
+        // Before the game window exists: a window that pumps no messages for half a minute looks hung.
+        std::quick_exit(RunPatchRaceTest(cfg));
+    }
 
     SSPC_LOG(Bridge, Info, "game {} \"{}\" v{} fw {:#x}", id, title, app_version, fw_version);
     SSPC_LOG(SaveData, Info, "/savedata0 root: {}\\<user>\\savedata\\{}\\<dir>",

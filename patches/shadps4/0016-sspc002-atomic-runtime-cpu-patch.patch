@@ -1,0 +1,191 @@
+diff --git a/src/core/cpu_patches.cpp b/src/core/cpu_patches.cpp
+index 605fcf36..b6c6da8d 100644
+--- a/src/core/cpu_patches.cpp
++++ b/src/core/cpu_patches.cpp
+@@ -811,6 +811,31 @@ static PatchModule* GetContainingModule(const void* ptr) {
+     return module != nullptr && address < module->end ? module : nullptr;
+ }
+ 
++/// SecondSonPC SSPC-002: number of guest threads that reached a patch while it was being written
++/// (HandlePatchBreakpoint) - diagnostics for --patch-race-test and the log.
++static std::atomic<u64> patch_breakpoints{0};
++static std::atomic<u64> patch_breakpoints_misreported{0};
++
++/// SecondSonPC SSPC-002: replaces `size` bytes of an instruction other threads may be executing so
++/// that none of them can ever decode a mix of old and new bytes (as Linux's text_poke_bp): an int3
++/// goes into the first byte, then the rest of the new bytes behind it, then the new first byte;
++/// FlushProcessWriteBuffers between the steps serializes every processor running this process. A
++/// thread that reaches the int3 meanwhile traps and HandlePatchBreakpoint sends it back to the
++/// instruction once the patch is complete (the caller holds the module's mutex until then).
++static void WriteLiveCode(u8* code, const u8* bytes, size_t size) {
++#if defined(_WIN32)
++    std::atomic_ref<u8>(code[0]).store(0xCC, std::memory_order_seq_cst);
++    FlushProcessWriteBuffers();
++    std::memcpy(code + 1, bytes + 1, size - 1);
++    FlushProcessWriteBuffers();
++    std::atomic_ref<u8>(code[0]).store(bytes[0], std::memory_order_seq_cst);
++    FlushProcessWriteBuffers();
++    FlushInstructionCache(GetCurrentProcess(), code, size);
++#else
++    std::memcpy(code, bytes, size);
++#endif
++}
++
+ /// Returns a boolean indicating whether the instruction was patched, and the offset to advance past
+ /// whatever is at the current code pointer.
+ static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module, bool allow_trampoline = true) {
+@@ -862,7 +887,24 @@ static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module, bool allow_t
+                     }
+ 
+                     // Replace instruction with near jump to the trampoline.
+-                    patch_gen.jmp(trampoline_ptr, Xbyak::CodeGenerator::LabelType::T_NEAR);
++                    // SecondSonPC SSPC-002: other guest threads may be running this very instruction.
++                    // Written byte by byte (Xbyak) one of them could fetch a torn jump - the new
++                    // opcode with old displacement bytes, a jump to module + 0x25xxxxxx - so the
++                    // whole jump (nops after it) goes in with WriteLiveCode.
++                    const s64 displacement = trampoline_ptr - (code + NearJumpSize);
++                    ASSERT_MSG(displacement == static_cast<s32>(displacement),
++                               "Trampoline {} is out of reach of {}", fmt::ptr(trampoline_ptr),
++                               fmt::ptr(code));
++                    std::array<u8, 16> jump;
++                    jump.fill(0x90); // nop: never executed, the jump comes first
++                    jump[0] = 0xE9;
++                    const s32 rel32 = static_cast<s32>(displacement);
++                    std::memcpy(&jump[1], &rel32, sizeof(rel32));
++                    WriteLiveCode(code, jump.data(), instruction.length);
++                    module->patched.insert(code);
++                    LOG_DEBUG(Core, "Patched instruction '{}' at: {}",
++                              ZydisMnemonicGetString(instruction.mnemonic), fmt::ptr(code));
++                    return std::make_pair(true, instruction.length);
+                 } else {
+                     patch_info.generator(code, instruction, operands, patch_gen);
+                 }
+@@ -1106,6 +1148,57 @@ static bool TryPatchJit(void* code_address) {
+     return TryPatch(code, module).first;
+ }
+ 
++bool HandlePatchBreakpoint(void* context, void* exception_address, bool misreported) {
++    // SecondSonPC SSPC-002: the int3 of a patch WriteLiveCode is writing (or has just written). The
++    // exception address is the int3; one byte later is accepted too, whichever the system reports.
++    // Reported as a privileged instruction (misreported) only at the instruction itself.
++    auto* const address = static_cast<u8*>(exception_address);
++    if (misreported) {
++        auto* module = GetContainingModule(address);
++        if (module == nullptr) {
++            return false;
++        }
++        std::unique_lock lock{module->mutex};
++        if (!module->patched.contains(address)) {
++            return false;
++        }
++#if defined(_WIN32)
++        static_cast<CONTEXT*>(context)->Rip = reinterpret_cast<DWORD64>(address);
++#else
++        (void)context;
++#endif
++        patch_breakpoints.fetch_add(1, std::memory_order_relaxed);
++        patch_breakpoints_misreported.fetch_add(1, std::memory_order_relaxed);
++        return true;
++    }
++    for (u8* site : {address, address - 1}) {
++        auto* module = GetContainingModule(site);
++        if (module == nullptr) {
++            continue;
++        }
++        std::unique_lock lock{module->mutex}; // the patch being written holds it until it is complete
++        if (!module->patched.contains(site)) {
++            continue;
++        }
++#if defined(_WIN32)
++        static_cast<CONTEXT*>(context)->Rip = reinterpret_cast<DWORD64>(site);
++#else
++        (void)context; // only Windows writes patches with an int3 first
++#endif
++        patch_breakpoints.fetch_add(1, std::memory_order_relaxed);
++        return true;
++    }
++    return false;
++}
++
++u64 PatchBreakpointsHandled() {
++    return patch_breakpoints.load(std::memory_order_relaxed);
++}
++
++u64 PatchBreakpointsMisreported() {
++    return patch_breakpoints_misreported.load(std::memory_order_relaxed);
++}
++
+ static void TryPatchAot(void* code_address, u64 code_size) {
+     auto* code = static_cast<u8*>(code_address);
+     auto* module = GetModule(code);
+diff --git a/src/core/cpu_patches.h b/src/core/cpu_patches.h
+index 1af2eab0..6bd0b6b6 100644
+--- a/src/core/cpu_patches.h
++++ b/src/core/cpu_patches.h
+@@ -79,6 +79,17 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
+ /// Applies CPU patches that need to be done before beginning executions.
+ void PrePatchInstructions(u64 segment_addr, u64 segment_size);
+ 
++/// SecondSonPC SSPC-002: a breakpoint exception at a runtime CPU patch that is being written (its
++/// first byte is an int3 meanwhile): waits for the patch, points the context back at the instruction
++/// and returns true; false for any other breakpoint. `misreported`: the same trap reported as a
++/// privileged instruction (the patch already replaced the int3 when the kernel looked at it).
++bool HandlePatchBreakpoint(void* context, void* exception_address, bool misreported);
++
++/// SecondSonPC SSPC-002: how many times HandlePatchBreakpoint sent a thread back to a patch (all
++/// of them / those reported as a privileged instruction).
++u64 PatchBreakpointsHandled();
++u64 PatchBreakpointsMisreported();
++
+ // Windows static guest red-zone protection
+ /// Keeps Windows exception dispatch outside live guest red zones at faultable memory accesses.
+ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
+diff --git a/src/core/signals.cpp b/src/core/signals.cpp
+index 67472b2d..43b3f83d 100644
+--- a/src/core/signals.cpp
++++ b/src/core/signals.cpp
+@@ -76,6 +76,11 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+         handled = signals->DispatchIllegalInstruction(pExp);
+         break;
+     case EXCEPTION_PRIV_INSTRUCTION: // Windows static guest red-zone protection
++        // SecondSonPC SSPC-002: the int3 of a CPU patch, reported after the patch replaced it (the
++        // kernel finds a jmp, not an int3, at the trap address). Never a real one at a patched jmp.
++        if (HandlePatchBreakpoint(pExp->ContextRecord, address, true)) {
++            return EXCEPTION_CONTINUE_EXECUTION;
++        }
+         if (use_static_windows_guest_red_zone_protection) {
+             static_protection_exception = true;
+             handled = signals->DispatchIllegalInstruction(pExp);
+@@ -122,6 +127,11 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+         guest_info._si_code = POSIX_ILL_BADSTK; // i am not sure about this one either
+         break;
+     case EXCEPTION_BREAKPOINT:
++        // SecondSonPC SSPC-002: a guest thread reached a CPU patch while it was being written.
++        if (HandlePatchBreakpoint(pExp->ContextRecord, address, false)) {
++            return EXCEPTION_CONTINUE_EXECUTION;
++        }
++        [[fallthrough]];
+     case EXCEPTION_SINGLE_STEP:
+         guest_info._si_signo = POSIX_SIGTRAP;
+         guest_info._si_code = POSIX_TRAP_BRKPT;
+@@ -152,6 +162,20 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
+     if (report_unhandled) {
+         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
++        // SecondSonPC: what was executing (the bytes may have changed since, e.g. a CPU patch).
++        u8 bytes[16]{};
++        SIZE_T read = 0;
++        const auto rip = pExp->ContextRecord->Rip;
++        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(rip), bytes, sizeof(bytes), &read);
++        const auto* rec = pExp->ExceptionRecord;
++        std::string hex;
++        for (SIZE_T i = 0; i < read; ++i) {
++            hex += fmt::format("{:02x} ", bytes[i]);
++        }
++        LOG_CRITICAL(Debug, "  rip {:#x}, {} bytes there: {}; parameters {} [{:#x} {:#x}]", rip, read, hex,
++                     rec->NumberParameters,
++                     rec->NumberParameters > 0 ? rec->ExceptionInformation[0] : 0,
++                     rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0);
+         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+     }
+ 

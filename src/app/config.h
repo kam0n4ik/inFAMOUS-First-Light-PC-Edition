@@ -91,6 +91,7 @@ struct Config {
     bool fault_recorder = true;              // --no-fault-recorder: no first-chance handler (A/B diagnostics)
     bool frame_log = false;                  // --frame-log: presented frame times -> logs\frametimes.csv
     bool track_stats = false;                // --track-stats: GPU write tracking statistics (P2.5 diagnostics)
+    bool patch_race_test = false;            // --patch-race-test: SSPC-002 regression test, no game
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input
     // [ShaderCache]: translated shaders and pipelines kept between runs (bridge, patch 0013) in
