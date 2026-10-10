@@ -1,0 +1,41 @@
+# SecondSonPC <-> bridge boundary: the adapter layer's allowed direct dependencies on shadPS4 headers (P3.6.6;
+# docs/PHASE3_P36_BRIDGE_ISOLATION.md §2). Checked at every build by cmake/sspc_boundary_check.cmake:
+#   * a file of SecondSonPC's own runtime (src/ except src/bridge and src/app/main.cpp) includes only SecondSonPC's
+#     headers and names no namespace of the bridge (not listed here: none is allowed);
+#   * an adapter-layer file (src/bridge/**, src/app/main.cpp) includes a shadPS4 header only if it is listed on the
+#     file's line below (a new one fails the build until it is added here with its owner and reason);
+#   * the bridge's patches include only the SecondSonPC headers listed under "bridge ->" below.
+# src/bridge/shadps4/generated/* is generated from the import table (every BRIDGE export's declaration): exempt.
+# Format: <file> | <owner> | <reason> | <headers, space-separated>
+# Lines starting with "bridge -> " list the SecondSonPC headers the patched bridge may include.
+
+src/app/main.cpp | app | the executable's entry point is built in the bridge's target (stock link options) |
+src/bridge/shadps4/bootstrap.cpp | start-up and lifecycle | starts the bridge (log, settings, mounts, ElfInfo, libraries, window, signals), the Phase 0 loader path, the exit steps that stop bridge services | common/elf_info.h common/key_manager.h common/logging/log.h common/ntapi.h common/path_util.h common/scm_rev.h common/singleton.h common/thread.h core/aerolib/aerolib.h core/emulator_settings.h core/file_format/psf.h core/file_sys/fs.h core/libraries/kernel/kernel.h core/libraries/kernel/time.h core/libraries/libc_internal/libc_internal.h core/libraries/libs.h core/libraries/save_data/save_backup.h core/linker.h core/debug_state.h core/guest_memory.h core/signals.h core/user_settings.h emulator.h input/controller.h sdl_window.h video_core/cache_storage.h video_core/renderdoc.h
+src/bridge/shadps4/event_queue_host.cpp | kernel (event queues) | Kernel::EventQueues over the bridge's libkernel, the queues' owner (patch 0025) | core/libraries/kernel/equeue.h
+src/bridge/shadps4/exceptions_host.cpp | cpu (exceptions) | the bridge's handlers behind SecondSonPC's dispatcher (patch 0022), bridge thread descriptions | common/logging/log.h core/cpu_patches.h core/libraries/kernel/threads/pthread.h core/signals.h
+src/bridge/shadps4/fs_host.cpp | filesystem | FsHost: descriptors in the bridge's handle table, its mounts, foreign descriptors | common/singleton.h core/file_sys/fs.h core/guest_memory.h core/libraries/kernel/file_system.h core/libraries/kernel/kernel.h
+src/bridge/shadps4/gpu_alloc_diag.cpp | diagnostics (SSPC-001) | Vulkan allocation wrappers of patch 0004 | video_core/renderer_vulkan/vk_common.h
+src/bridge/shadps4/gpu_alloc_diag.h | diagnostics (SSPC-001) | included by the patched bridge (patch 0004) | video_core/renderer_vulkan/vk_common.h
+src/bridge/shadps4/guest_stack.cpp | kernel (threads) | guest stacks in the selected guest memory manager | core/guest_memory.h
+src/bridge/shadps4/guest_stack.h | kernel (threads) | VAddr | common/types.h
+src/bridge/shadps4/input_host.cpp | input | Pad::Host over the bridge's SDL controllers, overlay, clock | common/elf_info.h common/singleton.h core/libraries/kernel/time.h imgui/renderer/imgui_core.h input/controller.h input/input_handler.h sdl_window.h
+src/bridge/shadps4/kernel_host.cpp | kernel | Kernel::Host and ThreadHost: errno and clock adapters (patches 0023/0024), TCB slot, debugger thread list | core/debug_state.h core/guest_memory.h core/libraries/kernel/kernel.h core/libraries/kernel/threads/pthread.h core/libraries/kernel/time.h core/tls.h
+src/bridge/shadps4/lifecycle_host.cpp | lifecycle | the bridge's Emulator::Shutdown hook (patch 0026), its log flush | common/logging/log.h emulator.h
+src/bridge/shadps4/loader_host.cpp | loader, cpu | Loader::Host over the guest memory interfaces, TCB slot (patch 0021), the bridge's CPU patcher | common/elf_info.h common/thread.h core/cpu_patches.h core/guest_memory.h core/libraries/kernel/threads.h core/tls.h
+src/bridge/shadps4/memory_host.cpp | memory | native direct memory beside the bridge's manager (patch 0007), memory map dumps | common/thread.h core/memory.h
+src/bridge/shadps4/native_memory.cpp | memory | SecondSonPC's memory manager behind the bridge's guest/GPU memory interfaces (patch 0012) | core/libraries/kernel/memory.h
+src/bridge/shadps4/native_memory.h | memory | the interfaces it implements | core/gpu_memory.h core/guest_memory.h
+src/bridge/shadps4/rtld_tcb.cpp | loader (TLS) | the bridge's pthread TCB glue on SecondSonPC's loader (replaces threads/tcb.cpp) | common/assert.h common/singleton.h core/libraries/kernel/threads/pthread.h core/libraries/libs.h core/linker.h core/tls.h
+src/bridge/shadps4/user_host.cpp | user service | the bridge's NP and user settings get SecondSonPC's UserService events (patch 0003) | core/libraries/np/np_manager.h core/libraries/system/userservice.h core/user_settings.h
+src/bridge/shadps4/selftest.cpp | tests | NATIVE vs BRIDGE comparisons call the bridge's implementations | common/elf_info.h common/singleton.h core/file_format/psf.h core/file_sys/fs.h core/libraries/gnmdriver/gnmdriver.h core/libraries/kernel/kernel.h core/libraries/kernel/memory.h core/memory.h video_core/renderer_vulkan/vk_presenter.h video_core/renderer_vulkan/vk_rasterizer.h core/libraries/kernel/threads/pthread.h core/libraries/kernel/threads/sleepq.h core/user_settings.h
+src/bridge/shadps4/selftest_equeue.cpp | tests | the event queues' guest API and GPU interrupts | core/libraries/gnmdriver/gnmdriver.h core/libraries/kernel/equeue.h core/libraries/kernel/orbis_error.h core/platform.h
+src/bridge/shadps4/selftest_kernel_hle.cpp | tests | errno, memory functions and clock against the bridge | core/libraries/kernel/kernel.h core/libraries/kernel/memory.h core/libraries/kernel/time.h core/thread.h
+src/bridge/shadps4/selftest_lifecycle.cpp | tests | the bridge's shutdown request and an event queue wait in child processes | common/singleton.h core/libraries/kernel/equeue.h emulator.h
+src/bridge/shadps4/selftest_native_start.cpp | tests | SecondSonPC's memory manager started as for the game | common/elf_info.h core/libraries/kernel/kernel.h core/libraries/kernel/memory.h
+src/bridge/shadps4/selftest_patch_race.cpp | tests | the bridge's CPU patcher under a race (SSPC-002) | core/cpu_patches.h core/signals.h core/tls.h
+src/bridge/shadps4/selftest_threads.cpp | tests | guest stacks in the selected manager | core/guest_memory.h
+src/bridge/shadps4/selftest_vmm.cpp | tests | the bridge's memory manager as the oracle | core/memory.h
+
+bridge -> bridge/shadps4/track_diag.h | diagnostics (P2.5) | GPU write tracking statistics hooks (patch 0014)
+bridge -> bridge/shadps4/gpu_alloc_diag.h | diagnostics (SSPC-001) | Vulkan allocation diagnostics (patch 0004)
+bridge -> bridge/shadps4/perf_opts.h | performance switches (P2.5) | barrier-memo, image-memo, stream-host, stream-reads (patches 0015, 0018-0020)

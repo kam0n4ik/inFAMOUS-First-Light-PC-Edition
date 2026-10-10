@@ -92,3 +92,23 @@ set_source_files_properties(src/runtime/cpu/exceptions.cpp PROPERTIES
     COMPILE_DEFINITIONS "SSPC_GIT_REV=\"${SSPC_GIT_REV}\"")
 
 sspc_attach_bootstrap(sspc_runtime)
+
+# P3.6.6: the SecondSonPC <-> bridge boundary, checked whenever a source, a patch or the allowlist changes
+# (cmake/sspc_boundary_check.cmake; report in the build directory). A violation fails the build.
+file(GLOB_RECURSE _sspc_boundary_inputs CONFIGURE_DEPENDS
+     ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.h ${CMAKE_SOURCE_DIR}/src/*.inc)
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/sspc_boundary.stamp
+    COMMAND ${CMAKE_COMMAND} -DSSPC_SRC=${CMAKE_SOURCE_DIR}/src
+            -DSSPC_SHAD=${CMAKE_SOURCE_DIR}/third_party/shadPS4/src
+            -DSSPC_PATCHES=${CMAKE_SOURCE_DIR}/patches/shadps4
+            -DSSPC_ALLOWLIST=${CMAKE_SOURCE_DIR}/cmake/sspc_boundary_allowlist.txt
+            -DSSPC_REPORT=${CMAKE_BINARY_DIR}/sspc_boundary_report.txt
+            -DSSPC_STAMP=${CMAKE_BINARY_DIR}/sspc_boundary.stamp
+            -P ${CMAKE_SOURCE_DIR}/cmake/sspc_boundary_check.cmake
+    DEPENDS ${_sspc_boundary_inputs} ${_sspc_shadps4_patches} ${CMAKE_SOURCE_DIR}/cmake/sspc_boundary_allowlist.txt
+            ${CMAKE_SOURCE_DIR}/cmake/sspc_boundary_check.cmake
+    COMMENT "SecondSonPC: checking the runtime/bridge boundary"
+    VERBATIM)
+add_custom_target(sspc_boundary_check DEPENDS ${CMAKE_BINARY_DIR}/sspc_boundary.stamp)
+add_dependencies(sspc_runtime sspc_boundary_check)
