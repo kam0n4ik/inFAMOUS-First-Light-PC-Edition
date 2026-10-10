@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -36,7 +37,12 @@
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/selftest_threads.h"
 #include "bridge/shadps4/selftest_vmm.h"
+#include "common/elf_info.h"
+#include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
+#include "runtime/exports.h"
+#include "runtime/kernel/kernel.h"
+#include "runtime/kernel/kernel_memory.h"
 
 namespace Libraries::Kernel { // not in core/libraries/kernel/memory.h
 void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr);
@@ -529,6 +535,246 @@ void TestUnsupported(TestGroup& g) {
             fmt::format("{} {} {}", Code(reserve), Code(expand), file));
 }
 
+// ---------------------------------------------------------------------------- NativeKernelMem(game) (P3.5.2)
+
+/// One way to call libkernel's memory functions on the game's manager: the bridge's (through its adapter), SecondSonPC's
+/// (Kernel::MemoryApi::Api), or the exports the game binds with --native kernel-memory.
+struct MemorySide {
+    std::function<void*(void*, u64, s32, s32, s32*)> mmap; // the errno value into the s32*
+    std::function<s32(void**, u64, s32, s32, const char*)> map_flexible;
+    std::function<s32(const void*, u64, s32)> mprotect;
+    std::function<s32(void*, void**, void**, u32*)> query_protection;
+    std::function<s32(s64, s64, u64, u64, s32, s64*)> allocate;
+    std::function<s32(void**, u64, s32, s32, s64, u64)> map_direct;
+    std::function<s32(void*, u64)> munmap;
+    std::function<s32(u64, u64)> release;
+    std::function<u64()> direct_size;
+};
+
+constexpr u64 kApiWindow = 16 * kMiB;
+
+/// "w+offset" inside the window, else the address.
+std::string Rel(u64 addr, u64 w) {
+    return addr >= w && addr - w < kApiWindow ? fmt::format("w+{:#x}", addr - w) : fmt::format("{:#x}", addr);
+}
+
+/// The recorder's notifications ("K0xaddr+0xsize ...") with window-relative addresses.
+std::string RelNotes(const std::string& notes, u64 w) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < notes.size()) {
+        const size_t end = notes.find(' ', pos);
+        const std::string token = notes.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        pos = end == std::string::npos ? notes.size() : end + 1;
+        const size_t plus = token.find('+');
+        if (token.size() < 2 || plus == std::string::npos) {
+            continue;
+        }
+        const u64 addr = std::strtoull(token.substr(1, plus - 1).c_str(), nullptr, 16);
+        out += fmt::format("{}{}{} ", token[0], Rel(addr, w), token.substr(plus));
+    }
+    return out;
+}
+
+std::string AreasIn(const NativeGame& game, u64 w) {
+    std::string out;
+    for (const auto& a : game.vm->Areas(false)) {
+        if (a.base >= w && a.base - w < kApiWindow) {
+            out += fmt::format("[{} +{:#x} t{} p{:#x} '{}'] ", Rel(a.base, w), a.size, static_cast<int>(a.type), a.prot,
+                               a.name);
+        }
+    }
+    return out;
+}
+
+/// The same steps on one side; the transcript has only window-relative addresses, so two sides compare as text.
+std::string MemoryScenario(MemorySide& s, const NativeGame& game, Recorder& rec) {
+    void* const failed = Ptr(~0ull);
+    s32 err = 0;
+    rec.Take();
+    void* const window = s.mmap(nullptr, kApiWindow, 0, 0x100, &err); // MAP_VOID: a reserved window to work in
+    if (window == failed) {
+        return fmt::format("no window (errno {})", err);
+    }
+    const u64 w = reinterpret_cast<u64>(window);
+    std::string t;
+    // `extra` runs after the call (a function argument would be evaluated in any order relative to it).
+    const auto Step = [&](std::string_view what, s64 result, const std::function<std::string()>& extra = {}) {
+        const std::string more = extra ? extra() : std::string();
+        t += fmt::format("{}: {} {} | {}\n", what, Code(result), more, RelNotes(rec.Take(), w));
+    };
+    const auto Areas = [&] { return AreasIn(game, w); };
+    const auto At = [w](void* const& p) { return [w, &p] { return Rel(reinterpret_cast<u64>(p), w); }; };
+    Step("reserve the window (mmap MAP_VOID)", 0, Areas);
+    void* p = Ptr(w);
+    Step("flexible, fixed", s.map_flexible(&p, 0x20000, 3, 0x10, "kmem flex"), At(p));
+    Step("mprotect a page read-only", s.mprotect(Ptr(w + 0x4000), 0x4000, 1));
+    void* qs = nullptr;
+    void* qe = nullptr;
+    u32 qp = 0;
+    Step("query its protection", s.query_protection(Ptr(w + 0x4000), &qs, &qe, &qp), [&] {
+        return fmt::format("{} {} {:#x}", Rel(reinterpret_cast<u64>(qs), w), Rel(reinterpret_cast<u64>(qe), w), qp);
+    });
+    Step("mprotect from an unaligned address (whole pages)", s.mprotect(Ptr(w + 0x8100), 0x100, 3), Areas);
+    s64 phys = -1;
+    Step("allocate 64 KiB of direct memory", s.allocate(0, static_cast<s64>(s.direct_size()), 0x10000, 0x10000, 3, &phys),
+         [&] { return std::string(phys >= 0 && phys % 0x10000 == 0 ? "aligned" : "?"); });
+    void* d = Ptr(w + 0x100000);
+    Step("map it, fixed", s.map_direct(&d, 0x10000, 0x33, 0x10, phys, 0), At(d));
+    void* alias = Ptr(w + 0x200000);
+    Step("map it again (an alias; SDK >= 2.50: exclusive)", s.map_direct(&alias, 0x10000, 0x33, 0x10, phys, 0));
+    void* exec = Ptr(w + 0x200000);
+    Step("map direct memory with CPU execute", s.map_direct(&exec, 0x10000, 0x7, 0x10, phys, 0));
+    void* zero = nullptr;
+    Step("map direct memory fixed at address 0 (SDK >= 1.70)", s.map_direct(&zero, 0x10000, 0x3, 0x10, phys, 0));
+    void* anon = s.mmap(Ptr(w + 0x300000), 0x10000, 3, 0x1012, &err); // MAP_ANON | MAP_FIXED | MAP_PRIVATE
+    Step("mmap anonymous, fixed", anon == failed ? err : 0, At(anon));
+    void* stack = s.mmap(Ptr(w + 0x400000), 0x10000, 3, 0x410, &err); // MAP_STACK | MAP_FIXED
+    Step("mmap a stack, fixed", stack == failed ? err : 0, At(stack));
+    Step("munmap part of the stack (private memory: D17)", s.munmap(Ptr(w + 0x404000), 0x4000), Areas);
+    err = 0;
+    const bool none = s.mmap(nullptr, 0, 3, 0x1002, &err) == failed;
+    Step("mmap of 0 bytes", none ? -1 : 0, [&] { return fmt::format("errno {}", err); });
+    err = 0;
+    const bool odd = s.mmap(Ptr(w + 0x500100), 0x4000, 3, 0x1012, &err) == failed;
+    Step("mmap fixed at an unaligned address", odd ? -1 : 0, [&] { return fmt::format("errno {}", err); });
+    void* longname = Ptr(w + 0x600000);
+    Step("flexible with a 32-character name", s.map_flexible(&longname, 0x4000, 3, 0x10, "0123456789abcdef0123456789abcdef"));
+    Step("munmap of 0 bytes", s.munmap(Ptr(w), 0));
+    Step("munmap a page inside the flexible mapping", s.munmap(Ptr(w + 0x8000), 0x4000), Areas);
+    Step("munmap the window", s.munmap(Ptr(w), kApiWindow), Areas);
+    Step("munmap it again (free memory)", s.munmap(Ptr(w), kApiWindow));
+    Step("release the direct memory", s.release(static_cast<u64>(phys), 0x10000));
+    Step("release it again (unchecked: 0)", s.release(static_cast<u64>(phys), 0x10000));
+    Step("release misaligned", s.release(0x2000, 0x4000));
+    s64 unused = 0;
+    Step("allocate with a negative start", s.allocate(-0x4000, 0x10000000, 0x4000, 0, 0, &unused));
+    Step("allocate memory type 11", s.allocate(0, 0x10000000, 0x4000, 0, 11, &unused));
+    Step("allocate with end <= start", s.allocate(0x10000, 0x10000, 0x4000, 0, 0, &unused));
+    Step("allocate more than the range", s.allocate(0, 0x4000, 0x8000, 0, 0, &unused));
+    return t;
+}
+
+void TestKernelMemoryApi(TestGroup& g, const App::Config& cfg, const NativeGame& game, Recorder& rec) {
+    const auto transcript = cfg.logs_dir / "selftest_kernel_memory.txt";
+    namespace Api = Kernel::MemoryApi;
+    MemorySide bridge{
+        .mmap = [](void* a, u64 l, s32 p, s32 f, s32* e) {
+            void* const r = K::posix_mmap(a, l, p, f, -1, 0);
+            *e = *K::__Error();
+            return r;
+        },
+        .map_flexible = [](void** a, u64 l, s32 p, s32 f, const char* n) {
+            return K::sceKernelMapNamedFlexibleMemory(a, l, p, f, n);
+        },
+        .mprotect = [](const void* a, u64 l, s32 p) { return K::sceKernelMprotect(a, l, p); },
+        .query_protection = [](void* a, void** s, void** e, u32* p) {
+            return K::sceKernelQueryMemoryProtection(a, s, e, p);
+        },
+        .allocate = [](s64 s, s64 e, u64 l, u64 al, s32 t, s64* o) {
+            return K::sceKernelAllocateDirectMemory(s, e, l, al, t, o);
+        },
+        .map_direct = [](void** a, u64 l, s32 p, s32 f, s64 ph, u64 al) {
+            return K::sceKernelMapDirectMemory(a, l, p, f, ph, al);
+        },
+        .munmap = [](void* a, u64 l) { return K::sceKernelMunmap(a, l); },
+        .release = [](u64 s, u64 l) { return K::sceKernelReleaseDirectMemory(s, l); },
+        .direct_size = [] { return K::sceKernelGetDirectMemorySize(); },
+    };
+    Api::Api api(*game.vm, Common::ElfInfo::Instance().CompiledSdkVer());
+    MemorySide own{
+        .mmap = [&api](void* a, u64 l, s32 p, s32 f, s32* e) { return api.Mmap(a, l, p, f, -1, 0, e); },
+        .map_flexible = [&api](void** a, u64 l, s32 p, s32 f, const char* n) {
+            return api.MapNamedFlexibleMemory(a, l, p, f, n);
+        },
+        .mprotect = [&api](const void* a, u64 l, s32 p) { return api.Mprotect(a, l, p); },
+        .query_protection = [&api](void* a, void** s, void** e, u32* p) {
+            return api.QueryMemoryProtection(a, s, e, p);
+        },
+        .allocate = [&api](s64 s, s64 e, u64 l, u64 al, s32 t, s64* o) {
+            return api.AllocateDirectMemory(s, e, l, al, t, o);
+        },
+        .map_direct = [&api](void** a, u64 l, s32 p, s32 f, s64 ph, u64 al) {
+            return api.MapDirectMemory(a, l, p, f, ph, al);
+        },
+        .munmap = [&api](void* a, u64 l) { return api.Munmap(a, l); },
+        .release = [&api](u64 s, u64 l) { return api.ReleaseDirectMemory(s, l); },
+        .direct_size = [&api] { return api.GetDirectMemorySize(); },
+    };
+    const std::string inv_before = game.vm->CheckInvariants();
+    const std::string b = MemoryScenario(bridge, game, rec);
+    const std::string o = MemoryScenario(own, game, rec);
+    std::ofstream(transcript, std::ios::binary)
+        << "--- the bridge's functions (through its adapter)\n"
+        << b << "--- SecondSonPC's functions (Kernel::MemoryApi)\n"
+        << o;
+    g.Check("the same 30 steps (reserve, flexible, mprotect, queries, direct allocate/map/alias/exec/fixed-at-0, mmap "
+            "anon/stack/0 bytes/unaligned, D17 part of a stack, long name, munmaps, releases, allocation errors) through "
+            "the bridge's functions and through SecondSonPC's on the game's manager: the same results, addresses, areas "
+            "and GPU notifications (logs/selftest_kernel_memory.txt)",
+            b == o && !b.empty() && b.find("no window") == std::string::npos, b == o ? "" : "transcripts differ");
+
+    if (Api::Installed()) {
+        // --native kernel-memory: the exports the game binds (System V), errno through the guest errno's owner.
+        const auto Fn = [](std::string_view name) -> void* {
+            for (const auto& e : Api::Exports()) {
+                if (name == e.name) {
+                    return e.function;
+                }
+            }
+            return nullptr;
+        };
+        using MmapFn = void*(SSPC_SYSV_ABI*)(void*, u64, s32, s32, s32, s64);
+        using FlexFn = s32(SSPC_SYSV_ABI*)(void**, u64, s32, s32, const char*);
+        using ProtFn = s32(SSPC_SYSV_ABI*)(const void*, u64, s32);
+        using QueryFn = s32(SSPC_SYSV_ABI*)(void*, void**, void**, u32*);
+        using AllocFn = s32(SSPC_SYSV_ABI*)(s64, s64, u64, u64, s32, s64*);
+        using DirectFn = s32(SSPC_SYSV_ABI*)(void**, u64, s32, s32, s64, u64);
+        using UnmapFn = s32(SSPC_SYSV_ABI*)(void*, u64);
+        using ReleaseFn = s32(SSPC_SYSV_ABI*)(u64, u64);
+        using SizeFn = u64(SSPC_SYSV_ABI*)();
+        const auto mmap_fn = reinterpret_cast<MmapFn>(Fn("mmap"));
+        const auto flex_fn = reinterpret_cast<FlexFn>(Fn("sceKernelMapNamedFlexibleMemory"));
+        const auto prot_fn = reinterpret_cast<ProtFn>(Fn("sceKernelMprotect"));
+        const auto query_fn = reinterpret_cast<QueryFn>(Fn("sceKernelQueryMemoryProtection"));
+        const auto alloc_fn = reinterpret_cast<AllocFn>(Fn("sceKernelAllocateDirectMemory"));
+        const auto direct_fn = reinterpret_cast<DirectFn>(Fn("sceKernelMapDirectMemory"));
+        const auto unmap_fn = reinterpret_cast<UnmapFn>(Fn("sceKernelMunmap"));
+        const auto release_fn = reinterpret_cast<ReleaseFn>(Fn("sceKernelReleaseDirectMemory"));
+        const auto size_fn = reinterpret_cast<SizeFn>(Fn("sceKernelGetDirectMemorySize"));
+        MemorySide exports{
+            .mmap = [mmap_fn](void* a, u64 l, s32 p, s32 f, s32* e) {
+                void* const r = mmap_fn(a, l, p, f, -1, 0);
+                *e = *Kernel::GetHost()->Errno();
+                return r;
+            },
+            .map_flexible = [flex_fn](void** a, u64 l, s32 p, s32 f, const char* n) { return flex_fn(a, l, p, f, n); },
+            .mprotect = [prot_fn](const void* a, u64 l, s32 p) { return prot_fn(a, l, p); },
+            .query_protection = [query_fn](void* a, void** s, void** e, u32* p) { return query_fn(a, s, e, p); },
+            .allocate = [alloc_fn](s64 s, s64 e, u64 l, u64 al, s32 t, s64* o) { return alloc_fn(s, e, l, al, t, o); },
+            .map_direct = [direct_fn](void** a, u64 l, s32 p, s32 f, s64 ph, u64 al) {
+                return direct_fn(a, l, p, f, ph, al);
+            },
+            .munmap = [unmap_fn](void* a, u64 l) { return unmap_fn(a, l); },
+            .release = [release_fn](u64 s, u64 l) { return release_fn(s, l); },
+            .direct_size = [size_fn] { return size_fn(); },
+        };
+        const std::string x = MemoryScenario(exports, game, rec);
+        g.Check("--native kernel-memory: the game's exports (System V; mmap's errno through the guest errno's owner) give "
+                "the same transcript",
+                x == b, x == b ? "" : "transcripts differ");
+        std::ofstream(transcript, std::ios::binary | std::ios::app)
+            << "--- the game's exports (--native kernel-memory)\n"
+            << x;
+    } else {
+        g.Info("INFO  the exports are not installed in this run (--native kernel-memory checks them too)");
+    }
+    const std::string inv = game.vm->CheckInvariants();
+    g.Check("the manager's areas, host regions, backing table and physical maps agree before and after", inv_before.empty() &&
+                                                                                                         inv.empty(),
+            inv_before + inv);
+}
+
 } // namespace
 
 int RunNativeMemorySelfTest(const App::Config& cfg) {
@@ -550,6 +796,8 @@ int RunNativeMemorySelfTest(const App::Config& cfg) {
         Run("NativeStart(prot)", [&](TestGroup& g) { TestProtection(g, game); });
         Run("NativeStart(mt)", [&](TestGroup& g) { TestThreads(g, game, rec); });
         Run("NativeStart(none)", [&](TestGroup& g) { TestUnsupported(g); });
+        // P3.5.2: libkernel's memory functions, the bridge's and SecondSonPC's, on this manager.
+        Run("NativeKernelMem(game)", [&](TestGroup& g) { TestKernelMemoryApi(g, cfg, game, rec); });
     }
     if (game.vm != nullptr) {
         game.gpu->SetListener(rec.next);

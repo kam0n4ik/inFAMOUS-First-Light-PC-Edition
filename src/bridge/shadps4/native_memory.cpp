@@ -9,6 +9,7 @@
 
 #include "base/log.h"
 #include "core/libraries/kernel/memory.h"
+#include "runtime/kernel/kernel_memory.h"
 
 namespace SecondSon::Bridge {
 
@@ -455,6 +456,11 @@ bool InstallNativeMemory(const App::Config& cfg, s32 sdk_version, u32 psf_attrib
         return false;
     }
     g_game = {manager, guest, gpu};
+    if (std::ranges::find(cfg.native_groups, "kernel-memory") != cfg.native_groups.end()) {
+        // P3.5.2: the game's memory imports are SecondSonPC's functions on this manager (the bridge's functions,
+        // which reach it through `guest`, stay for the bridge's own callers).
+        Kernel::MemoryApi::Install(*manager, static_cast<u32>(sdk_version));
+    }
     u64 total = 0;
     for (const auto& r : layout.ranges) {
         total += r.size;

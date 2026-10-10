@@ -29,7 +29,9 @@
 //                              bridge's, P2.3.4; threads: SecondSonPC's guest thread manager, P2.4;
 //                              cpu (= fs-patch): SecondSonPC's CPU patcher, P3.3/P3.4; exceptions:
 //                              SecondSonPC's exception dispatcher, P3.4; errno: SecondSonPC's guest errno,
-//                              the bridge's functions use it too, P3.5; --loader sspc only)
+//                              the bridge's functions use it too, P3.5; kernel-memory: libkernel's memory
+//                              functions on SecondSonPC's memory manager (needs memory), P3.5;
+//                              --loader sspc only)
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt
@@ -205,6 +207,10 @@ int main(int argc, char* argv[]) {
     if (native("memory") && native("kernel-dmem")) {
         return Fail("--native memory and --native kernel-dmem: SecondSonPC's memory manager keeps the direct memory "
                     "itself; kernel-dmem accounts it beside the bridge's manager");
+    }
+    if (native("kernel-memory") && !native("memory")) {
+        return Fail("--native kernel-memory is libkernel's memory API on SecondSonPC's memory manager: it needs "
+                    "--native memory (on the bridge's manager the bridge's functions are its API)");
     }
     if (native("threads")) {
         // The bridge's synchronisation objects take the waiting thread from its own Pthread
