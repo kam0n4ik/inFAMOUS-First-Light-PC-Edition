@@ -1,0 +1,328 @@
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index 21fdf037..029c6eaf 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -17,6 +17,11 @@
+ #include "video_core/amdgpu/pm4_cmds.h"
+ #include "video_core/renderdoc.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++// SecondSonPC patch 0027 (P4.1.2): --gpu-stats, SecondSonPC's PM4 statistics. Off: one load of a flag per packet.
++#include "runtime/gpu/pm4_stats.h"
++
++namespace GpuStats = SecondSon::Gpu::Pm4Stats;
++using GpuStatsEngine = SecondSon::Gpu::Pm4::Engine;
+ 
+ namespace AmdGpu {
+ 
+@@ -85,6 +90,12 @@ void Liverpool::ProcessCommands() {
+             command_queue.pop();
+             --num_commands;
+         }
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::OnSpan(GpuStats::Span::Commands, true);
++            callback();
++            GpuStats::OnSpan(GpuStats::Span::Commands, false);
++            continue;
++        }
+         callback();
+     }
+ }
+@@ -97,11 +108,17 @@ void Liverpool::Process(std::stop_token stoken) {
+ #endif
+ 
+     while (!stoken.stop_requested()) {
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::OnSpan(GpuStats::Span::Idle, true);
++        }
+         {
+             std::unique_lock lk{submit_mutex};
+             Common::CondvarWait(submit_cv, lk, stoken,
+                                 [this] { return num_commands || num_submits || submit_done; });
+         }
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::OnSpan(GpuStats::Span::Idle, false);
++        }
+         if (stoken.stop_requested()) {
+             break;
+         }
+@@ -140,12 +157,18 @@ void Liverpool::Process(std::stop_token stoken) {
+         }
+ 
+         if (submit_done) {
++            if (GpuStats::Enabled()) [[unlikely]] {
++                GpuStats::OnSpan(GpuStats::Span::Flush, true);
++            }
+             VideoCore::EndCapture();
+             if (rasterizer) {
+                 rasterizer->OnSubmit();
+                 rasterizer->Flush();
+             }
+             submit_done = false;
++            if (GpuStats::Enabled()) [[unlikely]] {
++                GpuStats::OnSpan(GpuStats::Span::Flush, false);
++            }
+         }
+ 
+         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+@@ -157,6 +180,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+ 
+     while (!ccb.empty()) {
+         ProcessCommands();
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::OnPacket(GpuStatsEngine::Constant, ccb.data(), ccb.size());
++        }
+ 
+         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
+         const u32 type = header->type;
+@@ -237,6 +263,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+     while (!dcb.empty()) {
+         ProcessCommands();
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::OnPacket(GpuStatsEngine::Draw, dcb.data(), dcb.size());
++        }
+ 
+         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+         const u32 type = header->type;
+@@ -787,7 +816,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                 if (vo_port->IsVoLabel(wait_addr) &&
+                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
++                    if (GpuStats::Enabled()) [[unlikely]] {
++                        GpuStats::OnSpan(GpuStats::Span::VoWait, true);
++                    }
+                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
++                    if (GpuStats::Enabled()) [[unlikely]] {
++                        GpuStats::OnSpan(GpuStats::Span::VoWait, false);
++                    }
+                     break;
+                 }
+                 while (!wait_reg_mem->Test(regs.reg_array)) {
+@@ -906,6 +941,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+             break;
+         }
+ 
++        if (GpuStats::Enabled()) [[unlikely]] {
++            // a packet split by the ring's end is whole in tmp_packet now
++            const bool buffered = header == reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
++            GpuStats::OnPacket(GpuStatsEngine::Compute, reinterpret_cast<const u32*>(header),
++                               buffered ? header->type3.NumWords() + 1 : acb.size());
++        }
++
+         if (header->type == 2) {
+             // Type-2 packet are used for padding purposes
+             next_dw_off = 1;
+@@ -1172,6 +1214,9 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
+ 
+ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+     auto& queue = mapped_queues[GfxQueueId];
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::OnSubmit(GpuStatsEngine::Draw, dcb.size(), ccb.size());
++    }
+ 
+     if (EmulatorSettings.IsCopyGpuBuffers()) {
+         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
+@@ -1191,6 +1236,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
+     auto& queue = mapped_queues[gnm_vqid];
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::OnSubmit(GpuStatsEngine::Compute, acb.size(), 0);
++    }
+ 
+     const auto vqid = gnm_vqid - 1;
+     const auto& task = ProcessCompute(acb, vqid);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 2084c8bf..ce0da934 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -19,6 +19,8 @@
+ #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
++// SecondSonPC patch 0027 (P4.1.2): --gpu-stats counts the pipelines created and the programs translated.
++#include "runtime/gpu/pm4_stats.h"
+ 
+ namespace Vulkan {
+ 
+@@ -369,6 +371,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
+         return nullptr;
+     }
+     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
++    if (is_new && SecondSon::Gpu::Pm4Stats::Enabled()) [[unlikely]] {
++        SecondSon::Gpu::Pm4Stats::Count(SecondSon::Gpu::Pm4Stats::Counter::PipelinesCreated);
++    }
+     if (is_new) {
+         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+@@ -425,6 +430,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
+         return nullptr;
+     }
+     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
++    if (is_new && SecondSon::Gpu::Pm4Stats::Enabled()) [[unlikely]] {
++        SecondSon::Gpu::Pm4Stats::Count(SecondSon::Gpu::Pm4Stats::Counter::PipelinesCreated);
++    }
+     if (is_new) {
+         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+@@ -714,6 +722,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
+         module = CompileSPV(spv, instance.GetDevice());
+     }
+     const u64 module_us = MicrosSince(t2);
++    if (SecondSon::Gpu::Pm4Stats::Enabled()) [[unlikely]] {
++        SecondSon::Gpu::Pm4Stats::Count(SecondSon::Gpu::Pm4Stats::Counter::ProgramsTranslated);
++    }
+     Bump(perm_idx != 0 ? stats.permutations : stats.modules);
+     Bump(stats.translate_us, translate_us);
+     Bump(stats.emit_us, emit_us);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index cb55d350..06b99b0d 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -19,6 +19,10 @@
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
+ #include "video_core/texture_cache/image_view.h"
+ #include "video_core/texture_cache/texture_cache.h"
++// SecondSonPC patch 0027 (P4.1.2): --gpu-stats counts the draws, dispatches and pipeline binds executed here.
++#include "runtime/gpu/pm4_stats.h"
++
++namespace GpuStats = SecondSon::Gpu::Pm4Stats;
+ 
+ namespace Vulkan {
+ 
+@@ -221,6 +225,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::OnPipelineBind(pipeline);
++    }
+ 
+     if (is_indexed) {
+         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+@@ -230,6 +237,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+                     instance_offset);
+     }
+     DebugState.IncDrawCall();
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::Count(GpuStats::Counter::RendererDraws);
++    }
+ 
+     ResetBindings(false);
+ }
+@@ -289,6 +299,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::OnPipelineBind(pipeline);
++    }
+ 
+     if (is_indexed) {
+         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
+@@ -300,6 +313,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+             cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
+         }
+         DebugState.IncDrawCall();
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::Count(GpuStats::Counter::RendererDraws);
++        }
+     } else {
+         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
+ 
+@@ -310,6 +326,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
+         }
+         DebugState.IncDrawCall();
++        if (GpuStats::Enabled()) [[unlikely]] {
++            GpuStats::Count(GpuStats::Counter::RendererDraws);
++        }
+     }
+ 
+     ResetBindings(false);
+@@ -344,8 +363,14 @@ void Rasterizer::DispatchDirect() {
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::OnPipelineBind(pipeline);
++    }
+     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+     DebugState.IncDispatch();
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::Count(GpuStats::Counter::RendererDispatches);
++    }
+ 
+     ResetBindings(true);
+ }
+@@ -378,8 +403,14 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::OnPipelineBind(pipeline);
++    }
+     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+     DebugState.IncDispatch();
++    if (GpuStats::Enabled()) [[unlikely]] {
++        GpuStats::Count(GpuStats::Counter::RendererDispatches);
++    }
+ 
+     ResetBindings(true);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 18b738d7..e19b505d 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -12,6 +12,8 @@
+ #include <vulkan/vulkan_format_traits.hpp>
+ 
+ #include "bridge/shadps4/perf_opts.h" // SecondSonPC P2.5 optimizations
++// SecondSonPC patch 0027 (P4.1.2): --gpu-stats counts the pipeline barriers recorded here.
++#include "runtime/gpu/pm4_stats.h"
+ 
+ namespace Vulkan {
+ 
+@@ -374,6 +376,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
+         .memoryBarrierCount = 1u,
+         .pMemoryBarriers = &post_copy_barrier,
+     });
++    if (SecondSon::Gpu::Pm4Stats::Enabled()) [[unlikely]] {
++        SecondSon::Gpu::Pm4Stats::Count(SecondSon::Gpu::Pm4Stats::Counter::Barriers);
++    }
+ 
+     buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
+@@ -753,6 +758,9 @@ void Runtime::FlushBarriers() {
+     scheduler.EndRendering();
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.pipelineBarrier2(dep_info);
++    if (SecondSon::Gpu::Pm4Stats::Enabled()) [[unlikely]] {
++        SecondSon::Gpu::Pm4Stats::Count(SecondSon::Gpu::Pm4Stats::Counter::Barriers);
++    }
+ 
+     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
+     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 0cade2bb..3983ce22 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -7,6 +7,8 @@
+ #include "imgui/renderer/texture_manager.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
++// SecondSonPC patch 0027 (P4.1.2): --gpu-stats counts the dynamic rendering scopes begun.
++#include "runtime/gpu/pm4_stats.h"
+ 
+ namespace Vulkan {
+ 
+@@ -81,6 +83,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
+     };
+ 
+     CommandBuffer().beginRendering(rendering_info);
++    if (SecondSon::Gpu::Pm4Stats::Enabled()) [[unlikely]] {
++        SecondSon::Gpu::Pm4Stats::Count(SecondSon::Gpu::Pm4Stats::Counter::RenderPassBegins);
++    }
+ }
+ 
+ void Scheduler::EndRendering() {

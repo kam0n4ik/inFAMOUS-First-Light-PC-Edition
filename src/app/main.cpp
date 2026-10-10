@@ -17,6 +17,15 @@
 //     --frame-log              presented frame times -> logs\frametimes.csv (tools\perf_runs.ps1)
 //     --track-stats            GPU write tracking statistics (access violations, protection changes,
 //                              uploads) every 10 s in SecondSonPC.log; per frame with --frame-log
+//     --gpu-stats              PM4 command statistics (P4.1.2): every packet of the game's command buffers
+//                              decoded and timed -> logs\gpu_stats.txt, gpu_frames.csv, gpu_stats_windows.csv;
+//                              a diagnostic capture, not for FPS comparisons
+//     --gpu-probe              SecondSonPC's own Vulkan foundation (P4.1.4) on its own: loader, instance, devices,
+//                              the chosen device and queues, a resource round trip -> logs\gpu_probe.txt, no game
+//     --gpu-probe-window <s>   the same and a test window cleared to a diagnostic colour for <s> seconds (not a
+//                              game frame); --gpu-device <index>: the probe's device instead of its own choice
+//     --gpu-backend bridge|sspc   the game's GPU backend (bridge, the default; sspc is refused for the game in
+//                              P4.1: it executes no GPU command of the game yet)
 //     --perf-opt <name>        P2.5 bridge performance change on / --no-perf-opt <name> off
 //                              (barrier-memo: on by default; docs\PHASE2_P25_PERFORMANCE.md)
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
@@ -57,6 +66,7 @@
 #include "bridge/shadps4/bootstrap.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
+#include "runtime/gpu/vulkan/vk_foundation.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
 
@@ -156,6 +166,34 @@ int main(int argc, char* argv[]) {
             config->frame_log = true; // diagnostics only
         } else if (arg == "--track-stats") {
             config->track_stats = true; // diagnostics only (P2.5)
+        } else if (arg == "--gpu-stats") {
+            config->gpu_stats = true; // diagnostics only (P4.1.2): not for FPS comparisons
+        } else if (arg == "--gpu-backend" && has_value) {
+            const std::string_view backend = argv[++i];
+            if (backend == "bridge") {
+                config->gpu_backend = App::Config::GpuBackend::Bridge;
+            } else if (backend == "sspc") {
+                config->gpu_backend = App::Config::GpuBackend::Sspc;
+            } else {
+                return Fail("--gpu-backend must be bridge|sspc");
+            }
+        } else if (arg == "--gpu-probe") {
+            config->gpu_probe = true;
+        } else if (arg == "--gpu-probe-window" && has_value) {
+            char* end = nullptr;
+            const unsigned long s = std::strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || s == 0 || s > 600) {
+                return Fail("--gpu-probe-window <seconds>: 1..600");
+            }
+            config->gpu_probe = true;
+            config->gpu_probe_window_s = static_cast<u32>(s);
+        } else if (arg == "--gpu-device" && has_value) {
+            char* end = nullptr;
+            const long d = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || d < 0 || d > 64) {
+                return Fail("--gpu-device <index>: a physical device index (0..64; --gpu-probe lists them)");
+            }
+            config->gpu_device = static_cast<s32>(d);
         } else if (arg == "--patch-race-test") {
             config->patch_race_test = true; // SSPC-002 regression test -> logs\patchrace.txt
         } else if ((arg == "--perf-opt" || arg == "--no-perf-opt") && has_value) {
@@ -233,6 +271,12 @@ int main(int argc, char* argv[]) {
     if (config->cpu_emulate_sse4a && !native("cpu") && !native("fs-patch")) {
         return Fail("--cpu-emulate sse4a is a mode of SecondSonPC's CPU patcher: it needs --native cpu");
     }
+    if (config->gpu_backend == App::Config::GpuBackend::Sspc && !config->gpu_probe && !config->selftest) {
+        // P4.1: no silent switch to the bridge either — the game runs on the backend asked for or not at all.
+        return Fail("--gpu-backend sspc: SecondSonPC's own GPU backend is a foundation in P4.1 (a Vulkan device and a "
+                    "test window, --gpu-probe); it executes none of the game's GPU commands yet. Run the game with the "
+                    "bridge's renderer (the default, --gpu-backend bridge).");
+    }
     if (native("exceptions") && config->fault_test) {
         return Fail("--fault-test checks the first-chance recorder's own handlers, which --native exceptions replaces; "
                     "run it without (the dispatcher has its own self-test: --selftest --native exceptions)");
@@ -246,6 +290,10 @@ int main(int argc, char* argv[]) {
                              (config->fault_recorder || config->fault_test) && !native("exceptions"));
     if (config->fault_test) {
         return Base::RunFaultSelfTest(config->logs_dir); // before any bridge code: no other handlers
+    }
+    if (config->gpu_probe) {
+        // P4.1.4: SecondSonPC's Vulkan foundation on its own (levels A/B); no game, no bridge renderer.
+        return Gpu::Vk::RunProbe(config->logs_dir, config->gpu_device, config->gpu_probe_window_s, false);
     }
     if (config->clear_shader_cache) {
         // <dir>\<game>\<generation>: only directories with the cache's own marker are removed.

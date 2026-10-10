@@ -61,6 +61,9 @@
 #include "runtime/cpu/exceptions.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/exports.h"
+#include "bridge/shadps4/gpu_memory_host.h"
+#include "runtime/gpu/backend.h"
+#include "runtime/gpu/pm4_stats.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/kernel/thread.h"
 #include "runtime/memory/virtual_memory.h"
@@ -668,6 +671,19 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     if (Listed(cfg.native_groups, "kernel-dmem") && !cfg.selftest && !InstallNativeDirectMemory(cfg)) {
         Fatal("--native kernel-dmem: the bridge's direct memory is already in use, see SecondSonPC.log");
     }
+    // P4.1.3: SecondSonPC's GPU memory contract over the selected manager; for the game, the bridge's renderer (its
+    // GnmDriver starts below) is recorded as the one owner of the guest GPU — no other backend may take a part of it.
+    InstallGpuGuestMemory();
+    if (!cfg.selftest) {
+        std::string gpu_error;
+        bool gpu_ok = Gpu::SelectBackend(Gpu::BackendKind::Bridge, &gpu_error);
+        for (u8 r = 0; gpu_ok && r < static_cast<u8>(Gpu::Resource::Count); ++r) {
+            gpu_ok = Gpu::Claim(static_cast<Gpu::Resource>(r), Gpu::BackendKind::Bridge, &gpu_error);
+        }
+        if (!gpu_ok) {
+            Fatal("the guest GPU's owner: " + gpu_error);
+        }
+    }
     StartBridgeLibraries(bindings, cfg.selftest);
     InstallKernelHost(cfg, psf_attributes);
     if (!HasBridgeImport(bindings, "libScePad")) {
@@ -1164,6 +1180,9 @@ void RunGame(const App::Config& cfg) {
              PerfOpts::stream_host ? "on" : "off", PerfOpts::stream_reads ? "on" : "off");
     if (cfg.track_stats) {
         TrackDiag::Enable(); // before the GPU (its page manager) and before the frame log
+    }
+    if (cfg.gpu_stats) {
+        Gpu::Pm4Stats::Enable({.dir = cfg.logs_dir}); // before the GPU command processor takes a packet
     }
     if (cfg.frame_log) {
         StartFrameLog(cfg.logs_dir / "frametimes.csv");

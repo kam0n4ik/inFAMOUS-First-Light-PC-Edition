@@ -93,6 +93,14 @@ struct Config {
     bool fault_recorder = true;              // --no-fault-recorder: no first-chance handler (A/B diagnostics)
     bool frame_log = false;                  // --frame-log: presented frame times -> logs\frametimes.csv
     bool track_stats = false;                // --track-stats: GPU write tracking statistics (P2.5 diagnostics)
+    bool gpu_stats = false;                  // --gpu-stats: PM4 command statistics, a diagnostic capture (P4.1.2)
+    // P4.1 (docs/PHASE4_P41_GPU_FOUNDATION.md): the game's GPU backend, chosen once at start. Only the bridge's
+    // (shadPS4's Vulkan renderer) runs the game; SecondSonPC's Vulkan foundation is checked on its own (--gpu-probe).
+    enum class GpuBackend : u8 { Bridge, Sspc };
+    GpuBackend gpu_backend = GpuBackend::Bridge; // --gpu-backend bridge|sspc (sspc: refused for the game in P4.1)
+    bool gpu_probe = false;                  // --gpu-probe: SecondSonPC's Vulkan foundation, no game -> logs\gpu_probe.txt
+    u32 gpu_probe_window_s = 0;              // --gpu-probe-window <s>: and a test window cleared to a diagnostic colour
+    s32 gpu_device = -1;                     // --gpu-device <index>: the probe's physical device (-1: its own choice)
     bool patch_race_test = false;            // --patch-race-test: SSPC-002 regression test, no game
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input

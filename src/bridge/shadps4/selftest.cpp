@@ -4885,6 +4885,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestLifecycle(cfg.logs_dir)) {
         native_groups.push_back(std::move(g));
     }
+    // P4.1: SecondSonPC's GPU interfaces (PM4 decoder and statistics, owners, memory contract, Vulkan foundation).
+    for (auto& g : TestGpu(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

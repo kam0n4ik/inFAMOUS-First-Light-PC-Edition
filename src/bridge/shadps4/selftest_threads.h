@@ -39,6 +39,10 @@ std::vector<TestGroup> TestEventQueues();
 /// <logs_dir>\selftest_lifecycle\<case>).
 std::vector<TestGroup> TestLifecycle(const std::filesystem::path& logs_dir);
 
+/// P4.1 (src/bridge/shadps4/selftest_gpu.cpp): the PM4 decoder and statistics, the guest GPU's owners, the GPU memory
+/// contract, the Vulkan foundation.
+std::vector<TestGroup> TestGpu(const App::Config& cfg);
+
 /// The executable segment of the game's eboot.bin copied into host memory (read/write; trampoline area after
 /// it) and its .eh_frame function ranges (selftest_fs.cpp). The game's files are only read.
 struct EbootCopy {

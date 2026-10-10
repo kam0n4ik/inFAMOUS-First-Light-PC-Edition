@@ -44,6 +44,10 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/file_system.cpp
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
+    src/runtime/gpu/backend.cpp
+    src/runtime/gpu/pm4.cpp
+    src/runtime/gpu/pm4_stats.cpp
+    src/runtime/gpu/vulkan/vk_foundation.cpp
     src/runtime/kernel/clock.cpp
     src/runtime/kernel/condvar.cpp
     src/runtime/kernel/event_flag.cpp
@@ -84,6 +88,9 @@ target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi SDL3::SDL
 # Zydis (x86 decoder, MIT): SecondSonPC's FS patcher (src/runtime/cpu, P3.3). An independent library that
 # comes from the bridge's externals until SecondSonPC vendors its own copy (Phase 5).
 target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
+# P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
+# (src/runtime/gpu/vulkan). No loader is linked: the system vulkan-1.dll is loaded at run time, as the bridge does.
+target_link_libraries(sspc_runtime PRIVATE Vulkan::Headers)
 # P3.4: the commit in fatal exception reports (as of the last configure; "-dirty" with local changes then).
 execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=10
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE SSPC_GIT_REV
