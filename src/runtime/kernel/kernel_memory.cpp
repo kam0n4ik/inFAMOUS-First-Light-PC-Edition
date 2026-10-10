@@ -6,7 +6,8 @@
 // (bridge/shadps4/native_memory.cpp) makes for it. Differences, each safer and each with a self-test:
 //  * a null `addr`/`addr_in_out` (MapDirectMemory, MapNamedFlexibleMemory): EINVAL; the oracle reads *addr first
 //    (an access violation in host code);
-//  * mprotect/mmap sizes that wrap when aligned up: EINVAL; the oracle wraps and would protect/map a small range.
+//  * mprotect/mmap sizes, and an mmap address hint, that wrap when aligned up: EINVAL; the oracle wraps and would
+//    protect/map a small range (or search from a small address).
 // AllocateDirectMemory reports any refusal of the manager as EAGAIN, as the oracle (its adapter returns -1 for every
 // error); the manager's own code (ENOMEM when the system refuses the commit, --memory-commit on-demand) goes to the
 // log. ReleaseDirectMemory answers 0 whatever the release did, as the oracle (the unchecked release).

@@ -12,7 +12,7 @@
 // (Libraries::Kernel::UseExternalClock): its TSC frequency, process time and process time counter.
 //
 // Units: ticks of the host TSC (invariant, the same on every core on the CPUs this runtime accepts; rdtsc is fenced
-// as the oracle's) and exact integer conversions (no fixed-point rounding, no overflow for any tick count). The TSC
+// as the oracle's) and exact integer conversions (no fixed-point rounding, no intermediate overflow). The TSC
 // frequency is the oracle's measurement (100 ms against the system time, rounded to 100 kHz): the value the game has
 // seen since P2.2. Monotonic: a later read on any thread never gives an earlier time (the TSC is synchronised; a read
 // before the epoch on a core whose TSC lags gives 0, never a wrapped value).
@@ -29,7 +29,8 @@ struct Export;
 
 namespace SecondSon::Kernel::Clock {
 
-/// Exact floor(ticks * units_per_second / frequency) without overflow for any u64 ticks (frequency > 0).
+/// Exact floor(ticks * units_per_second / frequency) without an intermediate overflow (frequency > 0); the result
+/// itself fits for any u64 ticks when frequency >= units_per_second (every TSC: >= 1 GHz against us or ns).
 u64 TicksTo(u64 ticks, u64 units_per_second, u64 frequency);
 
 /// A TSC-based clock: an epoch (a TSC value) and a frequency. The process has one (below); self-tests make their own.

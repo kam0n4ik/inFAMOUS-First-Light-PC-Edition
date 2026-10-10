@@ -93,6 +93,13 @@ $modeArgs = @{
     X = "--native exceptions"; FX = "--native cpu --native exceptions"
     FXE = "--native cpu --native exceptions --cpu-emulate sse4a"
     TMFX = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand"
+    # P3.5 (docs\PHASE3_P35_KERNEL_HLE.md): K = SecondSonPC's guest errno and process clock (the bridge's memory and
+    # threads), KM = + SecondSonPC's memory manager with libkernel's memory functions on it, KTM = KM + SecondSonPC's
+    # threads, TMFXK = everything native (P3.2-P3.5): TMFX + errno, clock and the memory functions.
+    K = "--native errno --native clock"
+    KM = "--native errno --native clock --native memory --memory-commit on-demand --native kernel-memory"
+    KTM = "--native errno --native clock --native memory --memory-commit on-demand --native kernel-memory --native threads"
+    TMFXK = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand --native errno --native clock --native kernel-memory"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
