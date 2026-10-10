@@ -18,6 +18,7 @@ src/bridge/shadps4/gpu_alloc_diag.cpp | diagnostics (SSPC-001) | Vulkan allocati
 src/bridge/shadps4/gpu_alloc_diag.h | diagnostics (SSPC-001) | included by the patched bridge (patch 0004) | video_core/renderer_vulkan/vk_common.h
 src/bridge/shadps4/gpu_memory_host.cpp | gpu (P4.1.3) | Gpu::GuestMemory (SecondSonPC's contract) over the bridge's GpuMemory, one listener slot never shared | core/address_space.h core/gpu_memory.h
 src/bridge/shadps4/selftest_gpu.cpp | tests | the GPU contract's notifications through the bridge's memory manager and its listener slot, the PM4 decoder against the bridge's header layout and opcode table | core/gpu_memory.h core/libraries/kernel/memory.h video_core/amdgpu/pm4_cmds.h
+src/bridge/shadps4/selftest_gpu_cp.cpp | tests | the command processor's packet fields, register indices and clear state against the bridge's layouts (the hardware's) | video_core/amdgpu/pm4_cmds.h video_core/amdgpu/regs.h
 src/bridge/shadps4/guest_stack.cpp | kernel (threads) | guest stacks in the selected guest memory manager | core/guest_memory.h
 src/bridge/shadps4/guest_stack.h | kernel (threads) | VAddr | common/types.h
 src/bridge/shadps4/input_host.cpp | input | Pad::Host over the bridge's SDL controllers, overlay, clock | common/elf_info.h common/singleton.h core/libraries/kernel/time.h imgui/renderer/imgui_core.h input/controller.h input/input_handler.h sdl_window.h
@@ -42,3 +43,5 @@ bridge -> bridge/shadps4/track_diag.h | diagnostics (P2.5) | GPU write tracking 
 bridge -> bridge/shadps4/gpu_alloc_diag.h | diagnostics (SSPC-001) | Vulkan allocation diagnostics (patch 0004)
 bridge -> bridge/shadps4/perf_opts.h | performance switches (P2.5) | barrier-memo, image-memo, stream-host, stream-reads (patches 0015, 0018-0020)
 bridge -> runtime/gpu/pm4_stats.h | diagnostics (P4.1.2) | PM4 command statistics hooks of the command processor and the renderer, --gpu-stats (patch 0027)
+bridge -> runtime/gpu/frame_pacing.h | diagnostics (P4.2, SSPC-015) | the flip timeline of GnmDriver, Liverpool and VideoOut, --frame-pacing (patch 0029)
+bridge -> runtime/gpu/cp_shadow.h | validation (P4.2) | SecondSonPC's command processor in the shadow of Liverpool: submissions and packets with Liverpool's state, --gpu-shadow and --gpu-trace (patch 0028)

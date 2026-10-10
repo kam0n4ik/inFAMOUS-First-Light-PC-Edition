@@ -102,6 +102,10 @@ $modeArgs = @{
     TMFXK = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand --native errno --native clock --native kernel-memory"
     # P3.6: TMFXKE = TMFXK + the guest's _exit through SecondSonPC's orderly exit (everything experimental).
     TMFXKE = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand --native errno --native clock --native kernel-memory --native exit"
+    # P4.2 (docs\PHASE4_P42_COMMAND_PROCESSOR.md): SH = SecondSonPC's command processor in the bridge's shadow
+    # (a diagnostic mode: not for FPS comparisons with plain runs); ST/ST2 = the shadow recording 3 frames from 40 s
+    # (the beach) / 75 s (the foliage) for --gpu-replay; FP = the flip timeline (SSPC-015).
+    SH = "--gpu-shadow"; ST = "--gpu-trace 40:3"; ST2 = "--gpu-trace 75:3"; FP = "--frame-pacing"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
@@ -194,7 +198,8 @@ foreach ($r in $runList) {
     $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\perf_sampler.ps1", "-Out", "$modeDir\samples.csv",
         "-MaxSeconds", "$([math]::Max(900, $Seconds + 120))")
-    Remove-Item "$logs\frametimes.csv", "$logs\memory_map.txt" -ErrorAction SilentlyContinue
+    Remove-Item "$logs\frametimes.csv", "$logs\memory_map.txt", "$logs\gpu_shadow.txt", "$logs\frame_pacing.csv",
+        "$logs\frame_pacing.txt" -ErrorAction SilentlyContinue
     $snap = $null
     if ($SnapshotAt -gt 0) {
         # Waits for the game (run_phase0 removes the previous calls.json before starting it).
@@ -211,6 +216,13 @@ foreach ($r in $runList) {
     Set-Content -Encoding UTF8 "$modeDir\run_phase0.txt" $text
     if (Test-Path "$logs\frametimes.csv") { Move-Item "$logs\frametimes.csv" "$modeDir\frametimes.csv" -Force }
     if (Test-Path "$logs\memory_map.txt") { Move-Item "$logs\memory_map.txt" "$modeDir\memory_map.txt" -Force } # --memory-map N
+    # P4.2: the shadow's report and traces, the flip timeline
+    foreach ($f in "gpu_shadow.txt", "frame_pacing.csv", "frame_pacing.txt") {
+        if (Test-Path "$logs\$f") { Move-Item "$logs\$f" "$modeDir\$f" -Force }
+    }
+    if (Test-Path "$logs\gpu_trace") {
+        Get-ChildItem "$logs\gpu_trace" -Filter *.sspctrace | Move-Item -Destination $modeDir -Force
+    }
 
     $runDir = "$logs\runs\$tag"
     if (-not (Test-Path "$runDir\run.json")) { "mode ${m}: run_phase0.ps1 wrote no run.json"; $text; exit 1 }

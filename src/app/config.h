@@ -101,6 +101,13 @@ struct Config {
     bool gpu_probe = false;                  // --gpu-probe: SecondSonPC's Vulkan foundation, no game -> logs\gpu_probe.txt
     u32 gpu_probe_window_s = 0;              // --gpu-probe-window <s>: and a test window cleared to a diagnostic colour
     s32 gpu_device = -1;                     // --gpu-device <index>: the probe's physical device (-1: its own choice)
+    // P4.2 (docs/PHASE4_P42_COMMAND_PROCESSOR.md): SecondSonPC's command processor beside the bridge's / offline.
+    bool gpu_shadow = false;                 // --gpu-shadow: in the bridge's shadow, compared -> logs\gpu_shadow.txt
+    s32 gpu_trace_start_s = -1;              // --gpu-trace <s>[:<frames>]: record frames for replay (with the shadow)
+    u32 gpu_trace_frames = 4;
+    std::filesystem::path gpu_replay;        // --gpu-replay <trace>: replay a trace offline, no game -> gpu_replay.txt
+    u32 gpu_replay_bench = 0;                // --gpu-replay-bench <n>: and time n passes (microbenchmarks)
+    bool frame_pacing = false;               // --frame-pacing: flip timeline -> logs\frame_pacing.csv (SSPC-015)
     bool patch_race_test = false;            // --patch-race-test: SSPC-002 regression test, no game
     std::filesystem::path reloc_snapshot;    // --reloc-snapshot <file>: at the first ParamGetInt
     std::string test_presses;                // --press key@sec[,key@sec...]: automated-run input

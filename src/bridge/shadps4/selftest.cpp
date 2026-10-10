@@ -4889,6 +4889,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestGpu(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    // P4.2: SecondSonPC's GPU command processor (registers, packets, sync, state, errors, rings, traces).
+    for (auto& g : TestGpuCommandProcessor(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

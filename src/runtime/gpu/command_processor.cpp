@@ -1,0 +1,1538 @@
+// SecondSonPC — SecondSonPC's GPU command processor (P4.2). See command_processor.h.
+#include "runtime/gpu/command_processor.h"
+
+#include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cstring>
+
+#include <fmt/format.h>
+
+// Descriptors and fence records are filled naming only the fields a packet sets.
+#pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
+
+namespace SecondSon::Gpu::Cp {
+
+namespace {
+
+constexpr u32 kMaxPending = 512;     ///< submissions waiting per queue
+constexpr u32 kMaxFences = 128;       ///< fences held per queue (Isolated)
+constexpr u32 kMaxFrames = 8;         ///< the submission, a carried packet, indirect buffers
+constexpr u32 kMaxPatches = 64;       ///< DMA/WRITE_DATA writes into packets not yet processed, per submission
+constexpr u32 kCarryDwords = 0x4001;  ///< the longest type-3 packet: header + 0x4000 body dwords
+constexpr u32 kNopHint = 0xC0001000u; ///< NOP with one payload dword: the driver's target size hint after a setup
+constexpr u32 kReadTags = 0x3022C;    ///< CP_DMA_READ_TAGS (register 0xC08B as a byte address): an L2 prefetch
+
+constexpr u32 FlatOf(u32 reg) {
+    for (u32 s = 0; s < static_cast<u32>(Space::Count); ++s) {
+        if (reg >= kSpaceBase[s] && reg - kSpaceBase[s] < kSpaceCount[s]) {
+            return kSpaceFirst[s] + (reg - kSpaceBase[s]);
+        }
+    }
+    return 0;
+}
+
+constexpr u32 kStageBase[] = {Reg::SpiShaderPgmLoPs, Reg::SpiShaderPgmLoVs, Reg::SpiShaderPgmLoGs,
+                              Reg::SpiShaderPgmLoEs, Reg::SpiShaderPgmLoHs, Reg::SpiShaderPgmLoLs};
+constexpr u32 kShBase = kSpaceBase[static_cast<u32>(Space::Sh)];
+constexpr u32 kComputeShFirst = kComputeBase - kShBase; ///< SH offset 0x200
+constexpr u32 kComputeShEnd = kComputeShFirst + kComputeCount;
+
+constexpr u32 kIdxNumIndices = FlatOf(Reg::VgtNumIndices);
+constexpr u32 kIdxNumInstances = FlatOf(Reg::VgtNumInstances);
+constexpr u32 kIdxDmaBaseHi = FlatOf(Reg::VgtDmaBaseHi);
+constexpr u32 kIdxDmaBase = FlatOf(Reg::VgtDmaBase);
+constexpr u32 kIdxIndexType = FlatOf(Reg::VgtDmaIndexType);
+constexpr u32 kIdxMaxSize = FlatOf(Reg::VgtDmaMaxSize);
+constexpr u32 kIdxDmaSize = FlatOf(Reg::VgtDmaSize);
+constexpr u32 kIdxIndxOffset = FlatOf(Reg::VgtIndxOffset);
+constexpr u32 kIdxInitiator = FlatOf(Reg::VgtDrawInitiator);
+constexpr u32 kIdxPrimType = FlatOf(Reg::VgtPrimitiveType);
+constexpr u32 kIdxStages = FlatOf(Reg::VgtShaderStagesEn);
+
+constexpr GroupMask kTargetGroups =
+    Bit(Group::ColorTarget) | Bit(Group::ColorFormat) | Bit(Group::DepthTarget) | Bit(Group::DepthFormat);
+
+u64 Mix(u64 h) {
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return h;
+}
+
+/// SET_*_REG of one register through its space (the draw packets' own register writes).
+bool SetOne(RegisterFile& regs, u32 reg, u32 value) {
+    return regs.WriteReg(reg, value);
+}
+
+} // namespace
+
+struct CommandProcessor::Frame {
+    u64 addr = 0;              ///< guest address of data[0]
+    const u32* data = nullptr; ///< the frame's dwords: the caller's copy or the processor's buffer
+    u32 size = 0;              ///< dwords
+    u32 pos = 0;               ///< the next packet
+    bool ring = false;         ///< a compute ring span: a packet cut by its end continues in the next span
+    bool owned = false;        ///< data is the processor's buffer of this depth
+    u32 ring_offset = 0;       ///< the span's start in the ring, dwords
+};
+
+struct CommandProcessor::Queue {
+    struct Pending {
+        u64 addr = 0;
+        u32 dwords = 0;
+        const u32* data = nullptr;
+        bool ring = false;
+        u32 ring_offset = 0;
+    };
+    struct Patch {
+        u64 dst = 0;
+        u32 bytes = 0;
+        u64 src = 0;          ///< the DMA's source address (0: GDS)
+        bool applied = false; ///< the processor's copy holds the written bytes
+    };
+
+    u32 id = 0;
+    bool compute = false;
+    bool mapped = false; ///< a compute ring known to the processor (MapComputeQueue)
+    u64 ring_addr = 0;
+    u32 ring_dw = 0;
+    u64 rptr_addr = 0;
+    u32 cursor_dw = 0; ///< DingDong: the next span's start
+    std::array<Pending, kMaxPending> pending{};
+    u32 head = 0;
+    u32 count = 0;
+    std::array<Frame, kMaxFrames> frames{};
+    u32 depth = 0;
+    std::array<std::vector<u32>, kMaxFrames> buffers;
+    std::vector<u32> spare; ///< a chained indirect buffer is read here first (the packet that chains stays readable)
+    u64 budget = 0;
+    std::vector<u32> carry; ///< a packet cut by the end of a ring span
+    u32 carry_have = 0;
+    u32 carry_need = 0;
+    u64 carry_addr = 0;
+    ComputeRegisters compute_regs;
+    u64 work_seq = 0;
+    u64 work_done = 0;
+    std::array<FenceOp, kMaxFences> fences{};
+    u32 fence_head = 0;
+    u32 fence_count = 0;
+    std::array<Patch, kMaxPatches> patches{};
+    u32 patch_count = 0;
+    bool patch_overflow = false;     ///< a write into unprocessed packets found no free patch entry
+    bool started_mid_packet = false; ///< the current submission began by completing a packet carried from the last
+    bool faulted = false;
+    bool blocked = false;
+};
+
+std::string_view DrawKindName(DrawKind kind) {
+    switch (kind) {
+    case DrawKind::Index2:
+        return "DRAW_INDEX_2";
+    case DrawKind::IndexOffset2:
+        return "DRAW_INDEX_OFFSET_2";
+    case DrawKind::IndexAuto:
+        return "DRAW_INDEX_AUTO";
+    case DrawKind::IndexIndirect:
+        return "DRAW_INDEX_INDIRECT";
+    case DrawKind::Indirect:
+        return "DRAW_INDIRECT";
+    }
+    return "?";
+}
+
+std::string_view DmaKindName(DmaKind kind) {
+    switch (kind) {
+    case DmaKind::MemoryToMemory:
+        return "memory->memory";
+    case DmaKind::DataToMemory:
+        return "data->memory";
+    case DmaKind::MemoryToGds:
+        return "memory->GDS";
+    case DmaKind::DataToGds:
+        return "data->GDS";
+    case DmaKind::GdsToMemory:
+        return "GDS->memory";
+    case DmaKind::ReadTagsPrefetch:
+        return "prefetch (CP_DMA_READ_TAGS)";
+    }
+    return "?";
+}
+
+std::string_view CpErrorName(CpErrorKind kind) {
+    static constexpr std::string_view kNames[] = {"none",
+                                                  "truncated packet",
+                                                  "reserved packet type 1",
+                                                  "type-0 packet",
+                                                  "unknown opcode",
+                                                  "unsupported opcode",
+                                                  "unsupported form",
+                                                  "packet shorter than its fields",
+                                                  "register outside the register windows",
+                                                  "unreadable command buffer",
+                                                  "indirect buffers nested too deep",
+                                                  "submission budget exceeded",
+                                                  "unreadable memory",
+                                                  "memory write failed",
+                                                  "GDS range",
+                                                  "too many fences held",
+                                                  "compute queue not mapped",
+                                                  "too many submissions queued"};
+    static_assert(std::size(kNames) == static_cast<size_t>(CpErrorKind::Count));
+    return kind < CpErrorKind::Count ? kNames[static_cast<size_t>(kind)] : "?";
+}
+
+std::string CpError::Text() const {
+    return fmt::format("{} on queue {} (depth {}) at {:#x}: opcode {:#04x} {} ({} dwords){}{}", CpErrorName(kind),
+                       queue, depth, address, opcode, Pm4::OpcodeName(opcode), dwords, detail.empty() ? "" : ": ",
+                       detail);
+}
+
+CommandProcessor::CommandProcessor(const Options& options) : options_(options) {
+    options_.max_ib_depth = std::min(options_.max_ib_depth, kMaxFrames - 2); // frames: submission, carry, IBs
+    queues_[kGraphicsQueue] = std::make_unique<Queue>();
+    queues_[kGraphicsQueue]->id = kGraphicsQueue;
+}
+
+CommandProcessor::~CommandProcessor() = default;
+
+CommandProcessor::Queue* CommandProcessor::Q(u32 queue) const {
+    return queue < kNumQueues ? queues_[queue].get() : nullptr;
+}
+
+const ComputeRegisters* CommandProcessor::Compute(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q ? &q->compute_regs : nullptr;
+}
+
+ComputeRegisters* CommandProcessor::MutableCompute(u32 queue) {
+    if (queue != kGraphicsQueue && queue < kNumQueues && !queues_[queue]) {
+        auto q = std::make_unique<Queue>(); // a compute queue known before its first submission (unmapped)
+        q->id = queue;
+        q->compute = true;
+        q->carry.resize(kCarryDwords);
+        queues_[queue] = std::move(q);
+    }
+    Queue* q = Q(queue);
+    return q ? &q->compute_regs : nullptr;
+}
+
+bool CommandProcessor::QueueFaulted(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q && q->faulted;
+}
+
+bool CommandProcessor::QueueBlocked(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q && q->blocked;
+}
+
+bool CommandProcessor::StartedMidPacket(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q && q->started_mid_packet;
+}
+
+u32 CommandProcessor::PendingSubmissions(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q ? q->count : 0;
+}
+
+u64 CommandProcessor::SubmittedWork(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q ? q->work_seq : 0;
+}
+
+u64 CommandProcessor::CompletedWork(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q ? q->work_done : 0;
+}
+
+// --- submissions ---
+
+bool CommandProcessor::SubmitGraphics(u64 addr, u32 dwords, const u32* data) {
+    Queue& q = *queues_[kGraphicsQueue];
+    if (q.count == kMaxPending) {
+        Fail(q, CpErrorKind::QueueFull, addr, 0, dwords, "graphics submission refused");
+        return false;
+    }
+    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, false, 0};
+    return true;
+}
+
+bool CommandProcessor::MapComputeQueue(u32 vqid, u64 ring_addr, u32 ring_dwords, u64 read_ptr_addr) {
+    if (vqid == 0 || vqid >= kNumQueues || ring_dwords == 0 || !std::has_single_bit(ring_dwords)) {
+        return false;
+    }
+    auto& slot = queues_[vqid];
+    if (slot) {
+        // mapped again: nothing of the previous ring survives (pending spans, frames, a carried packet, fences)
+        stats_.fences_dropped += slot->fence_count;
+        auto buffers = std::move(slot->buffers);
+        auto spare = std::move(slot->spare);
+        slot = std::make_unique<Queue>();
+        slot->buffers = std::move(buffers);
+        slot->spare = std::move(spare);
+    } else {
+        slot = std::make_unique<Queue>();
+    }
+    Queue& q = *slot;
+    q.id = vqid;
+    q.compute = true;
+    q.mapped = true;
+    q.ring_addr = ring_addr;
+    q.ring_dw = ring_dwords;
+    q.rptr_addr = read_ptr_addr;
+    q.cursor_dw = 0;
+    q.carry.resize(kCarryDwords);
+    if (options_.mode == Mode::Isolated && read_ptr_addr != 0) {
+        const u32 zero = 0;
+        options_.memory->Write(read_ptr_addr, &zero, sizeof(zero)); // as sceGnmMapComputeQueue: read pointer 0
+    }
+    return true;
+}
+
+void CommandProcessor::UnmapComputeQueue(u32 vqid) {
+    if (vqid == 0 || vqid >= kNumQueues || !queues_[vqid]) {
+        return;
+    }
+    stats_.fences_dropped += queues_[vqid]->fence_count;
+    queues_[vqid].reset();
+}
+
+bool CommandProcessor::SubmitCompute(u32 vqid, u64 addr, u32 dwords, const u32* data) {
+    if (vqid == 0 || vqid >= kNumQueues) {
+        return false;
+    }
+    auto& slot = queues_[vqid];
+    if (!slot) {
+        // a span of a ring the processor was not told about (Shadow: the bridge mapped it): no read pointer
+        slot = std::make_unique<Queue>();
+        slot->id = vqid;
+        slot->compute = true;
+        slot->carry.resize(kCarryDwords);
+    }
+    Queue& q = *slot;
+    if (q.count == kMaxPending) {
+        Fail(q, CpErrorKind::QueueFull, addr, 0, dwords, "compute submission refused");
+        return false;
+    }
+    const u32 offset = q.mapped ? static_cast<u32>((addr - q.ring_addr) / 4) : 0;
+    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, true, offset};
+    return true;
+}
+
+bool CommandProcessor::DingDong(u32 vqid, u32 next_offset_dw) {
+    Queue* q = Q(vqid);
+    if (q == nullptr || !q->mapped || next_offset_dw > q->ring_dw) {
+        if (q != nullptr) {
+            Fail(*q, CpErrorKind::QueueNotMapped, 0, 0, next_offset_dw, "DingDong past the ring or on no ring");
+        }
+        return false;
+    }
+    const u32 cur = q->cursor_dw;
+    const u32 next = next_offset_dw % q->ring_dw;
+    if (next_offset_dw == cur) {
+        return true;
+    }
+    bool ok = true;
+    if (next_offset_dw > cur) {
+        ok = SubmitCompute(vqid, q->ring_addr + u64{cur} * 4, next_offset_dw - cur);
+    } else {
+        ok = SubmitCompute(vqid, q->ring_addr + u64{cur} * 4, q->ring_dw - cur);
+        if (ok && next != 0) {
+            ok = SubmitCompute(vqid, q->ring_addr, next);
+        }
+    }
+    q->cursor_dw = next;
+    return ok;
+}
+
+// --- positioning ---
+
+bool CommandProcessor::Fetch(std::vector<u32>& buffer, u64 addr, u32 dwords) {
+    if (buffer.capacity() < dwords) {
+        ++stats_.buffer_growths;
+    }
+    if (buffer.size() < dwords) {
+        buffer.resize(dwords);
+    }
+    return options_.memory->Read(addr, buffer.data(), u64{dwords} * 4);
+}
+
+CommandProcessor::NextResult CommandProcessor::Next(Queue& q, u64& addr, std::span<const u32>& packet,
+                                                    Pm4::Packet& pk) {
+    for (;;) {
+        while (q.depth > 0 && q.frames[q.depth - 1].pos >= q.frames[q.depth - 1].size) {
+            --q.depth;
+        }
+        if (q.depth == 0) {
+            if (q.faulted && !options_.resume_after_fault) {
+                return NextResult::Fault;
+            }
+            if (q.count == 0) {
+                return NextResult::None;
+            }
+            const Queue::Pending s = q.pending[q.head];
+            q.head = (q.head + 1) % kMaxPending;
+            --q.count;
+            q.faulted = false;
+            q.budget = 0;
+            q.patch_count = 0;
+            q.patch_overflow = false;
+            q.started_mid_packet = false;
+            ++stats_.submissions;
+            Frame& f = q.frames[0];
+            f = Frame{.addr = s.addr, .data = s.data, .size = s.dwords, .ring = s.ring, .ring_offset = s.ring_offset};
+            if (f.data == nullptr) {
+                if (!Fetch(q.buffers[0], s.addr, s.dwords)) {
+                    Fail(q, CpErrorKind::IndirectUnreadable, s.addr, 0, s.dwords, "submission");
+                    continue;
+                }
+                f.data = q.buffers[0].data();
+                f.owned = true;
+            }
+            q.depth = 1;
+            if (f.ring && q.carry_need > 0) {
+                // the rest of the packet cut by the previous span's end
+                const u32 take = std::min(q.carry_need - q.carry_have, s.dwords);
+                q.started_mid_packet = true;
+                std::copy_n(f.data, take, q.carry.data() + q.carry_have);
+                q.carry_have += take;
+                f.pos = take;
+                if (q.carry_have == q.carry_need) {
+                    q.frames[1] = Frame{.addr = q.carry_addr, .data = q.carry.data(), .size = q.carry_need};
+                    q.depth = 2;
+                    q.carry_need = q.carry_have = 0;
+                }
+                UpdateReadPointer(q);
+            }
+            continue;
+        }
+        Frame& f = q.frames[q.depth - 1];
+        const std::span<const u32> rest(f.data + f.pos, f.size - f.pos);
+        Pm4::DecodeError e{};
+        addr = f.addr + u64{f.pos} * 4;
+        if (!Pm4::Decode(rest, pk, e)) {
+            if (e == Pm4::DecodeError::Truncated && f.ring && q.depth == 1) {
+                // continues in the next span of the ring (the hardware reads the ring as one stream)
+                q.carry_need = pk.dwords;
+                q.carry_have = static_cast<u32>(rest.size());
+                q.carry_addr = addr;
+                std::copy(rest.begin(), rest.end(), q.carry.begin());
+                f.pos = f.size;
+                ++stats_.ring_carries;
+                UpdateReadPointer(q);
+                continue;
+            }
+            Fail(q, e == Pm4::DecodeError::ReservedType ? CpErrorKind::ReservedType : CpErrorKind::Truncated, addr,
+                 static_cast<u8>(rest.empty() ? 0 : rest[0] >> 8), static_cast<u32>(rest.size()),
+                 fmt::format("{} dwords declared, {} left in the buffer", pk.dwords, rest.size()));
+            return NextResult::Fault;
+        }
+        packet = rest.first(pk.dwords);
+        return NextResult::Ok;
+    }
+}
+
+void CommandProcessor::UpdateReadPointer(Queue& q) {
+    if (options_.mode != Mode::Isolated || !q.mapped || q.rptr_addr == 0 || q.depth == 0 || !q.frames[0].ring) {
+        return;
+    }
+    const u32 rptr = (q.frames[0].ring_offset + q.frames[0].pos) % q.ring_dw;
+    options_.memory->Write(q.rptr_addr, &rptr, sizeof(rptr));
+}
+
+bool CommandProcessor::Peek(u32 queue, u64& addr, std::span<const u32>& packet) {
+    Queue* q = Q(queue);
+    Pm4::Packet pk;
+    return q != nullptr && Next(*q, addr, packet, pk) == NextResult::Ok;
+}
+
+StepStatus CommandProcessor::Fail(Queue& q, CpErrorKind kind, u64 addr, u8 opcode, u32 dwords, std::string detail) {
+    last_error_ = CpError{.kind = kind,
+                          .queue = q.id,
+                          .depth = q.depth > 0 ? q.depth - 1 : 0,
+                          .address = addr,
+                          .opcode = opcode,
+                          .dwords = dwords,
+                          .detail = std::move(detail)};
+    ++stats_.errors[static_cast<size_t>(kind)];
+    if (kind == CpErrorKind::QueueFull || kind == CpErrorKind::QueueNotMapped) {
+        return StepStatus::Faulted; // a refused submission: the queue itself goes on
+    }
+    q.depth = 0; // the submission is dropped
+    q.blocked = false;
+    q.faulted = true;
+    q.carry_need = q.carry_have = 0;
+    inline_marker_ = 0; // a marker of the dropped stream must not flag the next one's user data
+    return StepStatus::Faulted;
+}
+
+StepStatus CommandProcessor::Step(u32 queue) {
+    Queue* qp = Q(queue);
+    if (qp == nullptr) {
+        return StepStatus::Idle;
+    }
+    Queue& q = *qp;
+    u64 addr = 0;
+    std::span<const u32> p;
+    Pm4::Packet pk;
+    switch (Next(q, addr, p, pk)) {
+    case NextResult::None:
+        return StepStatus::Idle;
+    case NextResult::Fault:
+        return StepStatus::Faulted;
+    case NextResult::Ok:
+        break;
+    }
+    Frame& f = q.frames[q.depth - 1];
+    q.budget += pk.dwords;
+    if (q.budget > options_.max_dwords_per_submission) {
+        return Fail(q, CpErrorKind::BudgetExceeded, addr, pk.opcode, pk.dwords,
+                    fmt::format("more than {} dwords in one submission", options_.max_dwords_per_submission));
+    }
+    if (pk.type == 2) {
+        ++f.pos;
+        ++stats_.type2;
+        UpdateReadPointer(q);
+        return StepStatus::Packet;
+    }
+    if (pk.type == 0) {
+        return Fail(q, CpErrorKind::Type0, addr, 0, pk.dwords, fmt::format("base register {:#x}", pk.base));
+    }
+    if (pk.predicate) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, pk.opcode, pk.dwords, "predicated packet");
+    }
+    // Shadow: a packet an earlier DMA from memory wrote into — its bytes are what the GPU copied, unknown here; only
+    // a dispatch's group counts can be taken from the DMA's source (Dispatch). Anything else is refused, not guessed.
+    if (options_.mode == Mode::Shadow) {
+        const u64 end = addr + u64{pk.dwords} * 4;
+        for (u32 i = 0; i < q.patch_count; ++i) {
+            const auto& pt = q.patches[i];
+            if (pt.applied || pt.dst >= end || addr >= pt.dst + pt.bytes) {
+                continue;
+            }
+            const bool counts = pk.opcode == Pm4::Op::DispatchDirect && pt.dst <= addr + 4 &&
+                                addr + 16 <= pt.dst + pt.bytes;
+            if (!counts) {
+                return Fail(q, CpErrorKind::UnsupportedForm, addr, pk.opcode, pk.dwords,
+                            "a packet an earlier DMA from memory wrote into (its bytes are unknown to the shadow)");
+            }
+        }
+    }
+    const u32 saved = f.pos;
+    f.pos += pk.dwords;
+    if (observer_ != nullptr && !q.blocked) { // once per packet, not per retry of a blocked wait
+        observer_->BeforePacket(q.id, addr, p);
+    }
+    const StepStatus s = Execute(q, f, addr, p);
+    if (s == StepStatus::Blocked) {
+        f.pos = saved;
+        q.budget -= pk.dwords;
+        return s;
+    }
+    if (s != StepStatus::Packet) {
+        return s;
+    }
+    ++(q.compute ? stats_.compute_packets : stats_.graphics_packets)[pk.opcode];
+    if (observer_ != nullptr) {
+        observer_->AfterPacket(q.id, addr, p); // p stays readable: a chained buffer was read into another vector
+    }
+    UpdateReadPointer(q);
+    return StepStatus::Packet;
+}
+
+StepStatus CommandProcessor::Run(u32 queue, u64 max_packets) {
+    StepStatus s = StepStatus::Idle;
+    for (u64 n = 0; n < max_packets; ++n) {
+        s = Step(queue);
+        if (s != StepStatus::Packet) {
+            return s;
+        }
+    }
+    return s;
+}
+
+// --- packets ---
+
+StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<const u32> p) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    const auto body = p.subspan(1);
+    const u32 n = static_cast<u32>(p.size());
+    const auto short_packet = [&](u32 need) {
+        return Fail(q, CpErrorKind::ShortPacket, addr, op, n, fmt::format("{} body dwords, {} needed", body.size(), need));
+    };
+    const auto graphics_only = [&] {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n, "a graphics packet on a compute queue");
+    };
+    const auto unsupported = [&](std::string detail) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n, std::move(detail));
+    };
+    namespace O = Pm4::Op;
+    switch (op) {
+    case O::Nop: {
+        const Pm4::NopMarker m = Pm4::ClassifyNop(p);
+        if (m == Pm4::NopMarker::PatchedFlip) {
+            ++stats_.flips;
+            options_.work->Flip(FlipMarker{.queue = q.id, .packet_addr = addr, .after_seq = q.work_seq});
+        } else if (m == Pm4::NopMarker::SetVsharpInUdata || m == Pm4::NopMarker::SetTsharpInUdata ||
+                   m == Pm4::NopMarker::SetSsharpInUdata) {
+            inline_marker_ = body[0];
+        }
+        return StepStatus::Packet;
+    }
+    case O::SetShReg:
+        return SetRegs(q, f, addr, p, Space::Sh);
+    case O::SetContextReg:
+        return q.compute ? graphics_only() : SetRegs(q, f, addr, p, Space::Context);
+    case O::SetUconfigReg:
+        return q.compute ? graphics_only() : SetRegs(q, f, addr, p, Space::Uconfig);
+    case O::SetConfigReg:
+        return q.compute ? graphics_only() : SetRegs(q, f, addr, p, Space::Config);
+    case O::IndexType:
+    case O::NumInstances:
+    case O::IndexBufferSize: {
+        if (q.compute) {
+            return graphics_only();
+        }
+        if (body.empty()) {
+            return short_packet(1);
+        }
+        const u32 reg = op == O::IndexType      ? Reg::VgtDmaIndexType
+                        : op == O::NumInstances ? Reg::VgtNumInstances
+                                                : Reg::VgtDmaSize;
+        SetOne(regs_, reg, body[0]);
+        return StepStatus::Packet;
+    }
+    case O::IndexBase: {
+        if (q.compute) {
+            return graphics_only();
+        }
+        if (body.size() < 2) {
+            return short_packet(2);
+        }
+        SetOne(regs_, Reg::VgtDmaBase, body[0]);
+        SetOne(regs_, Reg::VgtDmaBaseHi, body[1] & 0xFF); // BASE_ADDR[39:32]
+        return StepStatus::Packet;
+    }
+    case O::SetBase: {
+        if (body.size() < 3) {
+            return short_packet(3);
+        }
+        const u32 index = body[0] & 0xF;
+        if (index > 3) {
+            return unsupported(fmt::format("base index {}", index));
+        }
+        set_base_[index] = body[1] | (u64{body[2] & 0xFFFF} << 32);
+        return StepStatus::Packet;
+    }
+    case O::DrawIndex2:
+        return Draw(q, addr, p, DrawKind::Index2);
+    case O::DrawIndexOffset2:
+        return Draw(q, addr, p, DrawKind::IndexOffset2);
+    case O::DrawIndexAuto:
+        return Draw(q, addr, p, DrawKind::IndexAuto);
+    case O::DrawIndexIndirect:
+        return Draw(q, addr, p, DrawKind::IndexIndirect);
+    case O::DrawIndirect:
+        return Draw(q, addr, p, DrawKind::Indirect);
+    case O::DispatchDirect:
+        return Dispatch(q, addr, p, false);
+    case O::DispatchIndirect:
+        return Dispatch(q, addr, p, true);
+    case O::DmaData:
+        return DmaData(q, addr, p);
+    case O::AcquireMem: {
+        if (body.size() < 6) {
+            return short_packet(6);
+        }
+        const CacheActionOp a{.queue = q.id,
+                              .packet_addr = addr,
+                              .coher_cntl = body[0],
+                              .base = (body[3] | (u64{body[4] & 0xFF} << 32)) << 8,
+                              .size = (body[1] | (u64{body[2] & 0xFF} << 32)) << 8,
+                              .after_seq = q.work_seq};
+        ++stats_.cache_actions;
+        options_.work->CacheAction(a);
+        return StepStatus::Packet;
+    }
+    case O::EventWrite: {
+        if (body.empty()) {
+            return short_packet(1);
+        }
+        const u32 index = (body[0] >> 8) & 0xF;
+        if (index != 0 && index != 4 && index != 7) {
+            // ZPASS_DONE, statistics samples: they write counters to memory (not implemented)
+            return unsupported(fmt::format("event index {} (type {})", index, body[0] & 0x3F));
+        }
+        ++stats_.cache_actions;
+        options_.work->CacheAction(
+            CacheActionOp{.queue = q.id, .packet_addr = addr, .event = body[0] & 0xFFF, .after_seq = q.work_seq});
+        return StepStatus::Packet;
+    }
+    case O::WaitRegMem:
+        return WaitRegMem(q, addr, p);
+    case O::EventWriteEop: {
+        if (q.compute) {
+            return graphics_only();
+        }
+        if (body.size() < 5) {
+            return short_packet(5);
+        }
+        FenceOp fence{.kind = FenceKind::EndOfPipe,
+                      .queue = q.id,
+                      .packet_addr = addr,
+                      .event_type = body[0] & 0x3F,
+                      .data_sel = (body[2] >> 29) & 7,
+                      .int_sel = (body[2] >> 24) & 3,
+                      .addr = body[1] | (u64{body[2] & 0xFFFF} << 32),
+                      .data = body[3] | (u64{body[4]} << 32)};
+        if (fence.data_sel > 4 || fence.int_sel == 3 || (fence.int_sel == 1 && fence.data_sel != 0)) {
+            return unsupported(fmt::format("data_sel {} int_sel {}", fence.data_sel, fence.int_sel));
+        }
+        return Fence(q, fence);
+    }
+    case O::EventWriteEos: {
+        if (q.compute) {
+            return graphics_only();
+        }
+        if (body.size() < 4) {
+            return short_packet(4);
+        }
+        FenceOp fence{.kind = FenceKind::EndOfShader,
+                      .queue = q.id,
+                      .packet_addr = addr,
+                      .event_type = body[0] & 0x3F,
+                      .eos_command = (body[2] >> 29) & 7,
+                      .addr = body[1] | (u64{body[2] & 0xFFFF} << 32),
+                      .data = body[3]};
+        if (fence.eos_command == 1) {
+            fence.gds_offset = body[3] & 0xFFFF; // bytes, as the bridge reads it (unverified: docs §3)
+            fence.gds_dwords = body[3] >> 16;
+            ++stats_.gds_fences;
+        } else if (fence.eos_command != 2) {
+            return unsupported(fmt::format("EOS command {}", fence.eos_command));
+        }
+        return Fence(q, fence);
+    }
+    case O::ReleaseMem: {
+        if (body.size() < 6) {
+            return short_packet(6);
+        }
+        FenceOp fence{.kind = FenceKind::Release,
+                      .queue = q.id,
+                      .packet_addr = addr,
+                      .event_type = body[0] & 0x3F,
+                      .data_sel = (body[1] >> 29) & 7,
+                      .int_sel = (body[1] >> 24) & 7,
+                      .addr = body[2] | (u64{body[3]} << 32),
+                      .data = body[4] | (u64{body[5]} << 32)};
+        if (fence.data_sel == 5) {
+            fence.gds_offset = body[4] & 0xFFFF; // bytes, as the bridge reads it (unverified: docs §3)
+            fence.gds_dwords = body[4] >> 16;
+            ++stats_.gds_fences;
+        } else if (fence.data_sel > 4) {
+            return unsupported(fmt::format("data_sel {}", fence.data_sel));
+        }
+        if (fence.int_sel > 3 || (fence.int_sel == 1 && fence.data_sel != 0)) { // as EOP: 1 = interrupt only
+            return unsupported(fmt::format("int_sel {} data_sel {}", fence.int_sel, fence.data_sel));
+        }
+        return Fence(q, fence);
+    }
+    case O::WriteData: {
+        if (body.size() < 3) {
+            return short_packet(3);
+        }
+        const u32 dst_sel = (body[0] >> 8) & 0xF;
+        if ((dst_sel != 2 && dst_sel != 5) || ((body[0] >> 16) & 1) != 0) {
+            return unsupported(fmt::format("dst_sel {}{}", dst_sel, ((body[0] >> 16) & 1) ? ", one address" : ""));
+        }
+        const u64 dst = body[1] | (u64{body[2]} << 32);
+        const auto data = body.subspan(3);
+        ++stats_.writes;
+        stats_.write_bytes += data.size_bytes();
+        DmaOp w{.kind = DmaKind::DataToMemory,
+                .queue = q.id,
+                .packet_addr = addr,
+                .dst = dst,
+                .bytes = static_cast<u32>(data.size_bytes())};
+        if (options_.mode == Mode::Isolated && !data.empty()) {
+            if (!options_.memory->Write(dst, data.data(), data.size_bytes())) {
+                return Fail(q, CpErrorKind::MemoryWriteFailed, addr, op, n,
+                            fmt::format("{} bytes at {:#x}", data.size_bytes(), dst));
+            }
+            w.executed = true;
+        }
+        // the data is in the packet: the processor's copy of later packets it lands in takes it in both modes
+        w.command_patch = PatchCommands(q, dst, reinterpret_cast<const u8*>(data.data()), w.bytes, 0) > 0;
+        options_.work->Dma(w);
+        return StepStatus::Packet;
+    }
+    case O::IndirectBuffer:
+        return IndirectBuffer(q, addr, p);
+    case O::ClearState:
+        if (q.compute) {
+            return graphics_only();
+        }
+        regs_.ClearContext();
+        return StepStatus::Packet;
+    case O::ContextControl:
+        // Register shadowing for context switches: the processor keeps every register itself, nothing to load.
+        if (body.size() < 2) {
+            return short_packet(2);
+        }
+        return StepStatus::Packet;
+    case O::PfpSyncMe:
+        return StepStatus::Packet; // the prefetch parser waits for the micro engine: one in-order engine here
+    default:
+        break;
+    }
+    return Fail(q, Pm4::OpcodeName(op).empty() ? CpErrorKind::UnknownOpcode : CpErrorKind::UnsupportedOpcode, addr, op,
+                n, {});
+}
+
+StepStatus CommandProcessor::SetRegs(Queue& q, Frame& f, u64 addr, std::span<const u32> p, Space space) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    if (p.size() < 2) {
+        return Fail(q, CpErrorKind::ShortPacket, addr, op, static_cast<u32>(p.size()), "no register offset");
+    }
+    const u32 offset = p[1] & 0xFFFF;
+    if ((p[1] >> 16) != 0) {
+        ++stats_.reg_index_nonzero; // CI's index field (SET_*_REG_INDEX forms): reserved here, ignored
+    }
+    const u32 count = static_cast<u32>(p.size() - 2);
+    const u32* values = p.data() + 2;
+    const auto out_of_range = [&] {
+        return Fail(q, CpErrorKind::RegisterRange, addr, op, static_cast<u32>(p.size()),
+                    fmt::format("{} registers from {} offset {:#x}", count, SpaceName(space), offset));
+    };
+    if (space != Space::Sh) {
+        if (!regs_.Write(space, offset, values, count)) {
+            return out_of_range();
+        }
+        if (space == Space::Context) {
+            ExtentHint(f, kSpaceBase[static_cast<u32>(Space::Context)] + offset, count);
+        }
+        return StepStatus::Packet;
+    }
+    // SH: the compute registers belong to the queue, the rest to the graphics register file. The whole range is
+    // checked first: a refused packet writes nothing.
+    if (offset > kSpaceCount[static_cast<u32>(Space::Sh)] || count > kSpaceCount[static_cast<u32>(Space::Sh)] - offset) {
+        return out_of_range();
+    }
+    if (q.compute && (offset < kComputeShFirst || offset + count > kComputeShEnd)) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, static_cast<u32>(p.size()),
+                    fmt::format("graphics SH registers set from a compute queue (offset {:#x}, {} registers)", offset,
+                                count));
+    }
+    const u32 marker = inline_marker_;
+    inline_marker_ = 0;
+    for (u32 i = 0; i < count;) {
+        const u32 o = offset + i;
+        if (o >= kComputeShFirst && o < kComputeShEnd) {
+            const u32 k = std::min(count - i, kComputeShEnd - o);
+            q.compute_regs.Write(o - kComputeShFirst, values + i, k);
+            i += k;
+            continue;
+        }
+        if (q.compute) {
+            return Fail(q, CpErrorKind::UnsupportedForm, addr, op, static_cast<u32>(p.size()),
+                        fmt::format("graphics SH register {:#x} set from a compute queue", kShBase + o));
+        }
+        const u32 k = o < kComputeShFirst ? std::min(count - i, kComputeShFirst - o) : count - i;
+        if (!regs_.Write(Space::Sh, o, values + i, k)) {
+            return out_of_range();
+        }
+        // user data slots: an inline V#/T#/S# right after its marker, or a plain value replacing one
+        for (u32 s = 0; s < static_cast<u32>(Stage::Count); ++s) {
+            const u32 ud = kStageBase[s] + 4 - kShBase;
+            const u32 lo = std::max(o, ud), hi = std::min(o + k, ud + 16);
+            for (u32 r = lo; r < hi; ++r) {
+                const u16 bit = static_cast<u16>(1u << (r - ud));
+                inline_sharps_[s] = marker != 0 ? static_cast<u16>(inline_sharps_[s] | bit)
+                                                : static_cast<u16>(inline_sharps_[s] & ~bit);
+            }
+        }
+        i += k;
+    }
+    return StepStatus::Packet;
+}
+
+void CommandProcessor::ExtentHint(const Frame& f, u32 reg, u32 count) {
+    // The PS4 driver follows a colour/depth target's setup with a one-dword NOP carrying the target's real size
+    // (the registers only give the tile-aligned pitch). The same sequences as the bridge's Liverpool reads them,
+    // bounded by the buffer: a missing hint is counted, never read past the buffer's end.
+    const auto hint = [&f, this](u32 after, u32& out) {
+        if (u64{f.pos} + after + 1 < f.size && f.data[f.pos + after] == kNopHint) {
+            out = f.data[f.pos + after + 1];
+            ++stats_.extent_hints;
+        } else {
+            out = 0;
+            ++stats_.extent_hints_missing;
+        }
+    };
+    if (reg >= Reg::CbColor0Base && reg < Reg::CbColor0Base + 8 * Reg::CbColorStride) {
+        const u32 t = (reg - Reg::CbColor0Base) / Reg::CbColorStride;
+        const u32 field = (reg - Reg::CbColor0Base) % Reg::CbColorStride;
+        if (field == 0) { // CB_COLORn_BASE
+            if (count == 0x0e || count == 0x0d || count == 0x0b) {
+                hint(0, cb_extent_[t]);
+            } else {
+                cb_extent_[t] = 0;
+            }
+        } else if (field == 7 && count == 4) { // CB_COLORn_CMASK
+            hint(0, cb_extent_[t]);
+        }
+    } else if (reg == Reg::DbZInfo) {
+        if (count == 8) {
+            hint(12, db_extent_); // 20 dwords after the registers' start: past one more setup packet
+        } else {
+            db_extent_ = 0;
+        }
+    }
+}
+
+StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, DrawKind kind) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    if (q.compute) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, static_cast<u32>(p.size()),
+                    "a draw on a compute queue");
+    }
+    const auto b = p.subspan(1);
+    static constexpr u32 kNeed[] = {5, 4, 2, 4, 4};
+    const u32 need = kNeed[static_cast<u32>(kind)];
+    if (b.size() < need) {
+        return Fail(q, CpErrorKind::ShortPacket, addr, op, static_cast<u32>(p.size()),
+                    fmt::format("{} body dwords, {} needed", b.size(), need));
+    }
+    DrawDescriptor d;
+    switch (kind) {
+    case DrawKind::Index2:
+        SetOne(regs_, Reg::VgtDmaMaxSize, b[0]);
+        SetOne(regs_, Reg::VgtDmaBase, b[1]);
+        SetOne(regs_, Reg::VgtDmaBaseHi, b[2] & 0xFF);
+        SetOne(regs_, Reg::VgtNumIndices, b[3]);
+        SetOne(regs_, Reg::VgtDrawInitiator, b[4]);
+        d.indexed = true;
+        break;
+    case DrawKind::IndexOffset2:
+        SetOne(regs_, Reg::VgtDmaMaxSize, b[0]);
+        SetOne(regs_, Reg::VgtNumIndices, b[2]);
+        SetOne(regs_, Reg::VgtDrawInitiator, b[3]);
+        d.index_offset = b[1];
+        d.indexed = true;
+        break;
+    case DrawKind::IndexAuto:
+        SetOne(regs_, Reg::VgtNumIndices, b[0]);
+        SetOne(regs_, Reg::VgtDrawInitiator, b[1]);
+        break;
+    case DrawKind::IndexIndirect:
+        // the index buffer's size (INDEX_BUFFER_SIZE) bounds the indices the GPU fetches
+        SetOne(regs_, Reg::VgtDmaMaxSize, regs_.At(kIdxDmaSize));
+        SetOne(regs_, Reg::VgtDrawInitiator, b[3]);
+        d.indexed = true;
+        d.indirect = true;
+        break;
+    case DrawKind::Indirect:
+        SetOne(regs_, Reg::VgtDrawInitiator, b[3]);
+        d.indirect = true;
+        break;
+    }
+    if (d.indirect) {
+        d.args_addr = set_base_[1] + b[0];
+        d.base_vtx_loc = static_cast<u16>(b[1] & 0xFFFF);
+        d.start_inst_loc = static_cast<u16>(b[2] & 0xFFFF);
+    }
+    d.kind = kind;
+    d.queue = q.id;
+    d.packet_addr = addr;
+    BuildDraw(d);
+    d.seq = ++q.work_seq;
+    ++stats_.draws;
+    options_.work->Draw(d);
+    return StepStatus::Packet;
+}
+
+void CommandProcessor::BuildDraw(DrawDescriptor& d) {
+    const GroupMask changed = regs_.Dirty();
+    regs_.ClearDirty(changed);
+    d.changed = changed;
+    if ((changed & kPipelineGroups) != 0) {
+        // the groups' hashes are kept by the register file at every change: no pass over their registers here
+        u64 key = 0x9e3779b97f4a7c15ull;
+        for (GroupMask m = kPipelineGroups; m != 0; m &= m - 1) {
+            key = Mix(key ^ regs_.GroupHash(static_cast<Group>(std::countr_zero(m))));
+        }
+        pipeline_key_ = key;
+        ++pipeline_version_;
+        ++stats_.pipeline_key_rebuilds;
+    }
+    if ((changed & kDynamicGroups) != 0) {
+        ++dynamic_version_;
+    }
+    if ((changed & kTargetGroups) != 0) {
+        ++targets_version_;
+    }
+    d.pipeline_key = pipeline_key_;
+    d.pipeline_version = pipeline_version_;
+    d.dynamic_version = dynamic_version_;
+    d.targets_version = targets_version_;
+
+    const RegisterFile& r = regs_;
+    d.index_count = r.At(kIdxNumIndices);
+    d.instance_count = r.At(kIdxNumInstances);
+    d.index_base = (u64{r.At(kIdxDmaBaseHi) & 0xFF} << 32) | (r.At(kIdxDmaBase) & ~1u);
+    d.index_type = r.At(kIdxIndexType);
+    d.max_index_size = r.At(kIdxMaxSize);
+    d.vgt_index_offset = r.At(kIdxIndxOffset);
+    d.draw_initiator = r.At(kIdxInitiator);
+    d.primitive_type = r.At(kIdxPrimType);
+    d.stages_enable = r.At(kIdxStages);
+    // VGT_SHADER_STAGES_EN: LS_EN [1:0], HS_EN [2], ES_EN [4:3], GS_EN [5]
+    u32 active = (1u << static_cast<u32>(Stage::Ps)) | (1u << static_cast<u32>(Stage::Vs));
+    if ((d.stages_enable & 0x3) != 0) {
+        active |= 1u << static_cast<u32>(Stage::Ls);
+    }
+    if ((d.stages_enable & 0x4) != 0) {
+        active |= 1u << static_cast<u32>(Stage::Hs);
+    }
+    if ((d.stages_enable & 0x18) != 0) {
+        active |= 1u << static_cast<u32>(Stage::Es);
+    }
+    if ((d.stages_enable & 0x20) != 0) {
+        active |= 1u << static_cast<u32>(Stage::Gs);
+    }
+    d.active_stages = static_cast<u8>(active);
+    const u32* values = r.Values().data();
+    for (u32 s = 0; s < static_cast<u32>(Stage::Count); ++s) {
+        const u32 i = FlatOf(kStageBase[s]);
+        d.shaders[s] = ShaderRef{.address = ((u64{values[i + 1] & 0xFF} << 32) | values[i]) << 8,
+                                 .rsrc1 = values[i + 2],
+                                 .rsrc2 = values[i + 3]};
+        if ((active & (1u << s)) != 0) {
+            std::copy_n(values + i + 4, 16, d.user_data[s].begin());
+        }
+    }
+    d.inline_sharps = inline_sharps_;
+    d.cb_extent = cb_extent_;
+    d.db_extent = db_extent_;
+}
+
+StepStatus CommandProcessor::Dispatch(Queue& q, u64 addr, std::span<const u32> p, bool indirect) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    const u32 n = static_cast<u32>(p.size());
+    const auto b = p.subspan(1);
+    ComputeRegisters& cr = q.compute_regs;
+    DispatchDescriptor d;
+    u32 initiator = 0;
+    if (!indirect) {
+        if (b.size() < 4) {
+            return Fail(q, CpErrorKind::ShortPacket, addr, op, n, "4 body dwords needed");
+        }
+        initiator = b[3];
+        // the group counts written into this packet by an earlier write of the submission (Gnm's indirect dispatch
+        // on a compute queue: a DMA from the counts' buffer into the packet)
+        const u64 counts = addr + 4;
+        for (u32 i = 0; i < q.patch_count; ++i) {
+            const auto& pt = q.patches[i];
+            const bool covers = pt.dst <= counts && counts + 12 <= pt.dst + pt.bytes;
+            const bool overlaps = pt.dst < counts + 12 && counts < pt.dst + pt.bytes;
+            if (covers) {
+                d.patched = true;
+                if (!pt.applied) { // Shadow: the GPU copies the counts when it gets there
+                    if (pt.src == 0) {
+                        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n,
+                                    "group counts written from GDS into the packet");
+                    }
+                    d.indirect = true;
+                    d.indirect_addr = pt.src + (counts - pt.dst);
+                } else {
+                    d.indirect = false; // the processor's copy holds them (a later write wins)
+                }
+            } else if (overlaps) {
+                return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n,
+                            "a write into part of this dispatch's group counts");
+            }
+        }
+        if (!d.indirect) {
+            cr.Write(Reg::ComputeDimX, b.data(), 3); // COMPUTE_DIM_X/Y/Z
+        }
+    } else {
+        if (q.compute) { // MEC form: the address in the packet
+            if (b.size() < 3) {
+                return Fail(q, CpErrorKind::ShortPacket, addr, op, n, "3 body dwords needed");
+            }
+            d.indirect_addr = b[0] | (u64{b[1] & 0xFFFF} << 32);
+            initiator = b[2];
+        } else { // graphics form: an offset from SET_BASE's base
+            if (b.size() < 2) {
+                return Fail(q, CpErrorKind::ShortPacket, addr, op, n, "2 body dwords needed");
+            }
+            d.indirect_addr = set_base_[1] + b[0];
+            initiator = b[1];
+        }
+        d.indirect = true;
+    }
+    cr.Write(Reg::ComputeDispatchInitiator, &initiator, 1);
+    if ((initiator & 1) == 0) { // COMPUTE_SHADER_EN off: nothing is launched
+        ++stats_.dispatches_disabled;
+        return StepStatus::Packet;
+    }
+    const auto& v = cr.values;
+    if (!d.indirect) {
+        d.groups = {v[Reg::ComputeDimX], v[Reg::ComputeDimX + 1], v[Reg::ComputeDimX + 2]};
+    }
+    d.initiator = initiator;
+    d.threads = {v[0x07] & 0xFFFF, v[0x08] & 0xFFFF, v[0x09] & 0xFFFF};
+    d.shader = ShaderRef{.address = ((u64{v[Reg::ComputePgmLo + 1] & 0xFF} << 32) | v[Reg::ComputePgmLo]) << 8,
+                         .rsrc1 = v[Reg::ComputePgmRsrc1],
+                         .rsrc2 = v[Reg::ComputePgmRsrc1 + 1]};
+    std::copy_n(v.begin() + Reg::ComputeUserData0, 16, d.user_data.begin());
+    d.program_version = cr.versions[static_cast<u32>(ComputeGroup::Program)];
+    d.user_data_version = cr.versions[static_cast<u32>(ComputeGroup::UserData)];
+    cr.dirty = 0;
+    d.queue = q.id;
+    d.packet_addr = addr;
+    d.seq = ++q.work_seq;
+    ++stats_.dispatches;
+    options_.work->Dispatch(d);
+    return StepStatus::Packet;
+}
+
+u32 CommandProcessor::PatchCommands(Queue& q, u64 dst, const u8* bytes_known, u32 bytes, u64 src_addr) {
+    // A write into packets of this queue not processed yet: the processor reads them later, so it must see it. With
+    // the bytes known (WRITE_DATA, a fill, Isolated's DMA) the processor's copy takes them; otherwise (Shadow's DMA from
+    // memory) the patch names the source the GPU will copy from.
+    u32 hits = 0;
+    for (u32 i = 0; i < q.depth; ++i) {
+        Frame& f = q.frames[i];
+        const u64 lo = f.addr + u64{f.pos} * 4;
+        const u64 hi = f.addr + u64{f.size} * 4;
+        const u64 a = std::max(dst, lo), e = std::min(dst + bytes, hi);
+        if (a >= e) {
+            continue;
+        }
+        ++hits;
+        ++stats_.dma_command_patches;
+        if (q.patch_count < kMaxPatches) {
+            q.patches[q.patch_count++] = {dst, bytes, src_addr, bytes_known != nullptr};
+        } else {
+            q.patch_overflow = true; // the caller refuses the packet when the bytes are not known (Shadow)
+        }
+        if (bytes_known == nullptr) {
+            continue;
+        }
+        if (!f.owned) { // the caller's copy is read-only: take one of our own
+            auto& buf = q.buffers[i];
+            if (buf.capacity() < f.size) {
+                ++stats_.buffer_growths;
+            }
+            buf.assign(f.data, f.data + f.size);
+            f.data = buf.data();
+            f.owned = true;
+        }
+        std::memcpy(reinterpret_cast<u8*>(const_cast<u32*>(f.data)) + (a - f.addr), bytes_known + (a - dst), e - a);
+    }
+    return hits;
+}
+
+StepStatus CommandProcessor::DmaData(Queue& q, u64 addr, std::span<const u32> p) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    const u32 n = static_cast<u32>(p.size());
+    const auto b = p.subspan(1);
+    if (b.size() < 6) {
+        return Fail(q, CpErrorKind::ShortPacket, addr, op, n, "6 body dwords needed");
+    }
+    const u32 src_sel = (b[0] >> 29) & 3, dst_sel = (b[0] >> 20) & 3;
+    const u32 bytes = b[5] & 0x1FFFFF;
+    const bool sas = (b[5] >> 26) & 1, das = (b[5] >> 27) & 1, saic = (b[5] >> 28) & 1, daic = (b[5] >> 29) & 1;
+    const u64 src = b[1] | (u64{b[2]} << 32);
+    const u64 dst = b[3] | (u64{b[4]} << 32);
+    DmaOp d{.queue = q.id, .packet_addr = addr, .src = src, .dst = dst, .bytes = bytes};
+    ++stats_.dma;
+    if (dst_sel != 1 && dst == kReadTags) {
+        // Gnm's prefetch: the source read into the L2 through a CP register; no memory changes
+        d.kind = DmaKind::ReadTagsPrefetch;
+        ++stats_.dma_prefetch;
+        options_.work->Dma(d);
+        return StepStatus::Packet;
+    }
+    if (sas || das || saic || daic) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n,
+                    fmt::format("address spaces/no-increment sas {} das {} saic {} daic {}", sas, das, saic, daic));
+    }
+    const bool src_mem = src_sel == 0 || src_sel == 3, dst_mem = dst_sel == 0 || dst_sel == 3;
+    if (src_mem && dst_mem) {
+        d.kind = DmaKind::MemoryToMemory;
+    } else if (src_sel == 2 && dst_mem) {
+        d.kind = DmaKind::DataToMemory;
+        d.src = b[1];
+    } else if (src_mem && dst_sel == 1) {
+        d.kind = DmaKind::MemoryToGds;
+    } else if (src_sel == 2 && dst_sel == 1) {
+        d.kind = DmaKind::DataToGds;
+        d.src = b[1];
+    } else if (src_sel == 1 && dst_mem) {
+        d.kind = DmaKind::GdsToMemory;
+    } else {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n, fmt::format("src_sel {} dst_sel {}", src_sel, dst_sel));
+    }
+    const bool gds = d.kind == DmaKind::MemoryToGds || d.kind == DmaKind::DataToGds || d.kind == DmaKind::GdsToMemory;
+    const u64 gds_off = d.kind == DmaKind::GdsToMemory ? (src & 0xFFFFFFFF) : (dst & 0xFFFFFFFF);
+    if (gds && (gds_off > kGdsBytes || bytes > kGdsBytes - gds_off)) {
+        return Fail(q, CpErrorKind::GdsRange, addr, op, n, fmt::format("{} bytes at GDS {:#x}", bytes, gds_off));
+    }
+    stats_.dma_bytes += bytes;
+    const bool to_memory =
+        d.kind == DmaKind::MemoryToMemory || d.kind == DmaKind::DataToMemory || d.kind == DmaKind::GdsToMemory;
+    const auto staging = [&] {
+        if (scratch_.capacity() < bytes) {
+            ++stats_.buffer_growths;
+        }
+        if (scratch_.size() < bytes) {
+            scratch_.resize(bytes);
+        }
+        return scratch_.data();
+    };
+    const auto fill = [&](u8* out) {
+        const u32 pattern = b[1];
+        for (u32 i = 0; i < bytes; ++i) {
+            out[i] = static_cast<u8>(pattern >> ((i % 4) * 8));
+        }
+    };
+    if (options_.mode != Mode::Isolated) {
+        if (to_memory) {
+            const u8* known = nullptr;
+            if (d.kind == DmaKind::DataToMemory) { // the fill's bytes are known: the processor's copy takes them
+                u8* tmp = staging();
+                fill(tmp);
+                known = tmp;
+            }
+            d.command_patch =
+                PatchCommands(q, dst, known, bytes, d.kind == DmaKind::MemoryToMemory ? src : 0) > 0;
+            if (q.patch_overflow && known == nullptr) {
+                return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n,
+                            fmt::format("more than {} writes into packets not yet processed", kMaxPatches));
+            }
+        }
+        options_.work->Dma(d); // not executed: the command processor beside it copies
+        return StepStatus::Packet;
+    }
+    u8* tmp = staging();
+    // Isolated: the CP's DMA engine copies now (stream order; the stream orders it against GPU work with fences).
+    switch (d.kind) {
+    case DmaKind::MemoryToMemory:
+    case DmaKind::MemoryToGds:
+        if (!options_.memory->Read(src, d.kind == DmaKind::MemoryToGds ? gds_.data() + gds_off : tmp, bytes)) {
+            return Fail(q, CpErrorKind::MemoryUnreadable, addr, op, n, fmt::format("{} bytes at {:#x}", bytes, src));
+        }
+        break;
+    case DmaKind::DataToMemory:
+        fill(tmp);
+        break;
+    case DmaKind::DataToGds:
+        fill(gds_.data() + gds_off);
+        break;
+    case DmaKind::GdsToMemory:
+        std::memcpy(tmp, gds_.data() + gds_off, bytes);
+        break;
+    case DmaKind::ReadTagsPrefetch:
+        break;
+    }
+    if (to_memory) {
+        if (!options_.memory->Write(dst, tmp, bytes)) {
+            return Fail(q, CpErrorKind::MemoryWriteFailed, addr, op, n, fmt::format("{} bytes at {:#x}", bytes, dst));
+        }
+        d.command_patch = PatchCommands(q, dst, tmp, bytes, d.kind == DmaKind::MemoryToMemory ? src : 0) > 0;
+    }
+    d.executed = true;
+    options_.work->Dma(d);
+    return StepStatus::Packet;
+}
+
+u64 CommandProcessor::ClockSample(u32 data_sel) {
+    if (options_.clock != nullptr) {
+        return options_.clock(options_.clock_ctx, data_sel);
+    }
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
+    u8 buf[8];
+    const u8* src = buf;
+    u64 bytes = 0;
+    bool from_gds = false;
+    if (op.kind == FenceKind::EndOfShader) {
+        if (op.eos_command == 2) {
+            const u32 v = static_cast<u32>(op.data);
+            std::memcpy(buf, &v, 4);
+            bytes = 4;
+        } else {
+            from_gds = true;
+        }
+    } else {
+        switch (op.data_sel) {
+        case 1: {
+            const u32 v = static_cast<u32>(op.data);
+            std::memcpy(buf, &v, 4);
+            bytes = 4;
+            break;
+        }
+        case 3:
+        case 4:
+            op.data = ClockSample(op.data_sel);
+            [[fallthrough]];
+        case 2:
+            std::memcpy(buf, &op.data, 8);
+            bytes = 8;
+            break;
+        case 5:
+            from_gds = true;
+            break;
+        default:
+            break;
+        }
+    }
+    if (from_gds) {
+        bytes = u64{op.gds_dwords} * 4;
+        if (op.gds_offset > kGdsBytes || bytes > kGdsBytes - op.gds_offset) {
+            Fail(q, CpErrorKind::GdsRange, op.packet_addr, 0, 0,
+                 fmt::format("fence of {} bytes from GDS {:#x}", bytes, op.gds_offset));
+            return false;
+        }
+        src = gds_.data() + op.gds_offset;
+    }
+    if (bytes != 0 && !options_.memory->Write(op.addr, src, bytes)) {
+        Fail(q, CpErrorKind::MemoryWriteFailed, op.packet_addr, 0, 0,
+             fmt::format("fence of {} bytes at {:#x}", bytes, op.addr));
+        return false;
+    }
+    op.written = true;
+    ++stats_.fences_written;
+    const bool irq = op.kind == FenceKind::EndOfPipe ? (op.int_sel == 1 || op.int_sel == 2)
+                                                     : (op.kind == FenceKind::Release && op.int_sel >= 1);
+    if (irq) {
+        options_.work->Interrupt(q.id, op.kind);
+    }
+    return true;
+}
+
+StepStatus CommandProcessor::Fence(Queue& q, FenceOp& op) {
+    ++stats_.fences;
+    op.after_seq = q.work_seq > q.work_done ? q.work_seq : 0;
+    if (options_.mode == Mode::Shadow) {
+        options_.work->Fence(op); // not written: the command processor beside it writes
+        return StepStatus::Packet;
+    }
+    if (op.after_seq != 0 || q.fence_count != 0) { // GPU work before it, or an earlier fence still held
+        if (q.fence_count == kMaxFences) {
+            return Fail(q, CpErrorKind::FenceQueueFull, op.packet_addr, 0, 0,
+                        fmt::format("{} fences held waiting for the GPU", kMaxFences));
+        }
+        op.after_seq = q.work_seq;
+        op.deferred = true;
+        q.fences[(q.fence_head + q.fence_count++) % kMaxFences] = op;
+        ++stats_.fences_deferred;
+        options_.work->Fence(op);
+        return StepStatus::Packet;
+    }
+    if (!WriteFence(q, op)) {
+        return StepStatus::Faulted;
+    }
+    options_.work->Fence(op);
+    return StepStatus::Packet;
+}
+
+void CommandProcessor::CompleteWork(u32 queue, u64 seq) {
+    Queue* qp = Q(queue);
+    if (qp == nullptr) {
+        return;
+    }
+    Queue& q = *qp;
+    q.work_done = std::max(q.work_done, std::min(seq, q.work_seq));
+    while (q.fence_count > 0 && q.fences[q.fence_head].after_seq <= q.work_done) {
+        FenceOp op = q.fences[q.fence_head];
+        q.fence_head = (q.fence_head + 1) % kMaxFences;
+        --q.fence_count;
+        if (WriteFence(q, op)) {
+            options_.work->Fence(op);
+        }
+    }
+}
+
+StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32> p) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    const u32 n = static_cast<u32>(p.size());
+    const auto b = p.subspan(1);
+    if (b.size() < 6) {
+        return Fail(q, CpErrorKind::ShortPacket, addr, op, n, "6 body dwords needed");
+    }
+    const u32 function = b[0] & 7;
+    const bool memory = (b[0] >> 4) & 1;
+    if (function == 7) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n, "function 7 (reserved)");
+    }
+    if (!q.blocked) {
+        ++stats_.waits;
+    }
+    if (options_.mode == Mode::Shadow) {
+        return StepStatus::Packet; // the command processor beside it waits
+    }
+    u32 value = 0;
+    if (memory) {
+        const u64 poll = (u64{b[2]} << 32) | (b[1] & ~3u);
+        if (!options_.memory->Read(poll, &value, sizeof(value))) {
+            return Fail(q, CpErrorKind::MemoryUnreadable, addr, op, n, fmt::format("poll address {:#x}", poll));
+        }
+    } else {
+        const u32 reg = b[1] & 0xFFFF;
+        u32 index = 0;
+        if (!FlatIndex(reg, index)) {
+            return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n,
+                        fmt::format("register {:#x} outside the register windows", reg));
+        }
+        value = regs_.At(index);
+    }
+    const u32 v = value & b[4], ref = b[3];
+    bool ok = false;
+    switch (function) {
+    case 0:
+        ok = true;
+        break;
+    case 1:
+        ok = v < ref;
+        break;
+    case 2:
+        ok = v <= ref;
+        break;
+    case 3:
+        ok = v == ref;
+        break;
+    case 4:
+        ok = v != ref;
+        break;
+    case 5:
+        ok = v >= ref;
+        break;
+    case 6:
+        ok = v > ref;
+        break;
+    default:
+        break;
+    }
+    if (!ok) {
+        if (!q.blocked) {
+            ++stats_.waits_blocked;
+        }
+        q.blocked = true;
+        return StepStatus::Blocked;
+    }
+    q.blocked = false;
+    return StepStatus::Packet;
+}
+
+StepStatus CommandProcessor::IndirectBuffer(Queue& q, u64 addr, std::span<const u32> p) {
+    const u8 op = static_cast<u8>(p[0] >> 8);
+    const u32 n = static_cast<u32>(p.size());
+    const auto b = p.subspan(1);
+    if (b.size() < 3) {
+        return Fail(q, CpErrorKind::ShortPacket, addr, op, n, "3 body dwords needed");
+    }
+    if ((b[0] & 3) != 0) {
+        return Fail(q, CpErrorKind::UnsupportedForm, addr, op, n, "unaligned base");
+    }
+    const u64 ib = b[0] | (u64{b[1] & 0xFFFF} << 32);
+    const u32 size = b[2] & 0xFFFFF;
+    const bool chain = (b[2] >> 20) & 1;
+    ++stats_.indirect_buffers;
+    if (size == 0) {
+        if (chain) { // a chain ends the current buffer even when it chains to nothing
+            q.frames[q.depth - 1].pos = q.frames[q.depth - 1].size;
+        }
+        return StepStatus::Packet;
+    }
+    const u32 slot = chain ? q.depth - 1 : q.depth;
+    // frames: [0] the submission, [1] a carried packet (ring queues) or the first indirect buffer, ...
+    const u32 limit = options_.max_ib_depth + (q.frames[0].ring ? 1u : 0u);
+    if (slot > limit || slot >= kMaxFrames) {
+        return Fail(q, CpErrorKind::IndirectTooDeep, addr, op, n, fmt::format("{} levels", slot));
+    }
+    if (q.budget + size > options_.max_dwords_per_submission) {
+        return Fail(q, CpErrorKind::BudgetExceeded, addr, op, n, fmt::format("indirect buffer of {} dwords", size));
+    }
+    // Read into a buffer nobody points at: for a chain the current frame's buffer still holds this packet.
+    std::vector<u32>& target = chain ? q.spare : q.buffers[slot];
+    if (!Fetch(target, ib, size)) {
+        return Fail(q, CpErrorKind::IndirectUnreadable, addr, op, n, fmt::format("{} dwords at {:#x}", size, ib));
+    }
+    if (chain) {
+        std::swap(q.spare, q.buffers[slot]);
+    }
+    q.frames[slot] = Frame{.addr = ib, .data = q.buffers[slot].data(), .size = size, .owned = true};
+    q.depth = slot + 1;
+    return StepStatus::Packet;
+}
+
+bool CommandProcessor::Resync(u32 queue, u64 addr) {
+    Queue* qp = Q(queue);
+    if (qp == nullptr) {
+        return false;
+    }
+    Queue& q = *qp;
+    inline_marker_ = 0;
+    const bool unstarted = q.depth == 1 && q.frames[0].pos == 0;
+    if (unstarted && q.frames[0].addr == addr) {
+        return true;
+    }
+    for (u32 i = 0; i < q.count; ++i) {
+        if (q.pending[(q.head + i) % kMaxPending].addr == addr) {
+            q.depth = 0;
+            q.carry_need = q.carry_have = 0;
+            q.head = (q.head + i) % kMaxPending;
+            q.count -= i;
+            stats_.submissions += i; // dropped unprocessed, counted as taken
+            return true;
+        }
+    }
+    if (!unstarted) {
+        q.depth = 0;
+        q.carry_need = q.carry_have = 0;
+    }
+    return false;
+}
+
+void CommandProcessor::Reset() {
+    for (u32 i = 0; i < kNumQueues; ++i) {
+        auto& slot = queues_[i];
+        if (!slot) {
+            continue;
+        }
+        stats_.fences_dropped += slot->fence_count;
+        // a fresh queue (unmapped) keeping the buffers' capacity: a reset does not cost allocations later
+        auto buffers = std::move(slot->buffers);
+        auto spare = std::move(slot->spare);
+        auto carry = std::move(slot->carry);
+        const bool compute = slot->compute;
+        slot = std::make_unique<Queue>();
+        slot->id = i;
+        slot->compute = compute;
+        slot->buffers = std::move(buffers);
+        slot->spare = std::move(spare);
+        slot->carry = std::move(carry);
+    }
+    regs_.Reset();
+    set_base_ = {};
+    cb_extent_ = {};
+    db_extent_ = 0;
+    gds_.fill(0);
+    pipeline_key_ = 0;
+    inline_marker_ = 0;
+    inline_sharps_ = {};
+    last_error_ = {};
+}
+
+} // namespace SecondSon::Gpu::Cp

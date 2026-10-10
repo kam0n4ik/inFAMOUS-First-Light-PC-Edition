@@ -24,6 +24,14 @@
 //                              the chosen device and queues, a resource round trip -> logs\gpu_probe.txt, no game
 //     --gpu-probe-window <s>   the same and a test window cleared to a diagnostic colour for <s> seconds (not a
 //                              game frame); --gpu-device <index>: the probe's device instead of its own choice
+//     --gpu-shadow             SecondSonPC's command processor (P4.2) beside the bridge's: every packet processed by
+//                              both, registers compared before each draw/dispatch -> logs\gpu_shadow.txt; nothing of it
+//                              reaches the game (no writes, no waits); a diagnostic mode, not for FPS comparisons
+//     --gpu-trace <s>[:<n>]    with the shadow: record <n> frames (4) from the first flip after <s> seconds
+//                              -> logs\gpu_trace\*.sspctrace
+//     --gpu-replay <trace>     the command processor on a recorded trace, compared with the bridge's recorded state
+//                              -> logs\gpu_replay.txt, no game; --gpu-replay-bench <n>: and n timed passes
+//     --frame-pacing           the flip timeline (submit, GPU thread, flip, vblank) -> logs\frame_pacing.csv
 //     --gpu-backend bridge|sspc   the game's GPU backend (bridge, the default; sspc is refused for the game in
 //                              P4.1: it executes no GPU command of the game yet)
 //     --perf-opt <name>        P2.5 bridge performance change on / --no-perf-opt <name> off
@@ -66,6 +74,7 @@
 #include "bridge/shadps4/bootstrap.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
+#include "runtime/gpu/cp_replay.h"
 #include "runtime/gpu/vulkan/vk_foundation.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
@@ -194,6 +203,36 @@ int main(int argc, char* argv[]) {
                 return Fail("--gpu-device <index>: a physical device index (0..64; --gpu-probe lists them)");
             }
             config->gpu_device = static_cast<s32>(d);
+        } else if (arg == "--gpu-shadow") {
+            config->gpu_shadow = true; // diagnostics only (P4.2): SecondSonPC's command processor beside the bridge's
+        } else if (arg == "--gpu-trace" && has_value) {
+            // <start seconds>[:<frames>]: the shadow records frames for --gpu-replay from the first flip after it
+            const std::string v = argv[++i];
+            char* end = nullptr;
+            const long s = std::strtol(v.c_str(), &end, 10);
+            long frames = 4;
+            if (end != v.c_str() && *end == ':') {
+                char* end2 = nullptr;
+                frames = std::strtol(end + 1, &end2, 10);
+                end = end2;
+            }
+            if (end == v.c_str() || *end != '\0' || s < 0 || s > 3600 || frames < 1 || frames > 120) {
+                return Fail("--gpu-trace <start seconds 0..3600>[:<frames 1..120>]");
+            }
+            config->gpu_shadow = true;
+            config->gpu_trace_start_s = static_cast<s32>(s);
+            config->gpu_trace_frames = static_cast<u32>(frames);
+        } else if (arg == "--gpu-replay" && has_value) {
+            config->gpu_replay = std::filesystem::absolute(argv[++i]);
+        } else if (arg == "--gpu-replay-bench" && has_value) {
+            char* end = nullptr;
+            const unsigned long n = std::strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || n == 0 || n > 1000) {
+                return Fail("--gpu-replay-bench <passes 1..1000>");
+            }
+            config->gpu_replay_bench = static_cast<u32>(n);
+        } else if (arg == "--frame-pacing") {
+            config->frame_pacing = true; // diagnostics only (P4.2, SSPC-015): the flip timeline
         } else if (arg == "--patch-race-test") {
             config->patch_race_test = true; // SSPC-002 regression test -> logs\patchrace.txt
         } else if ((arg == "--perf-opt" || arg == "--no-perf-opt") && has_value) {
@@ -294,6 +333,13 @@ int main(int argc, char* argv[]) {
     if (config->gpu_probe) {
         // P4.1.4: SecondSonPC's Vulkan foundation on its own (levels A/B); no game, no bridge renderer.
         return Gpu::Vk::RunProbe(config->logs_dir, config->gpu_device, config->gpu_probe_window_s, false);
+    }
+    if (!config->gpu_replay.empty()) {
+        // P4.2: SecondSonPC's command processor on a recorded trace; no game, no bridge.
+        return Gpu::Cp::RunReplay(config->gpu_replay, config->logs_dir, config->gpu_replay_bench);
+    }
+    if (config->gpu_replay_bench != 0) {
+        return Fail("--gpu-replay-bench times a replay: it needs --gpu-replay <trace>");
     }
     if (config->clear_shader_cache) {
         // <dir>\<game>\<generation>: only directories with the cache's own marker are removed.

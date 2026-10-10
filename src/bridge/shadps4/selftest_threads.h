@@ -43,6 +43,9 @@ std::vector<TestGroup> TestLifecycle(const std::filesystem::path& logs_dir);
 /// contract, the Vulkan foundation.
 std::vector<TestGroup> TestGpu(const App::Config& cfg);
 
+/// P4.2 (src/bridge/shadps4/selftest_gpu_cp.cpp): SecondSonPC's GPU command processor.
+std::vector<TestGroup> TestGpuCommandProcessor(const App::Config& cfg);
+
 /// The executable segment of the game's eboot.bin copied into host memory (read/write; trampoline area after
 /// it) and its .eh_frame function ranges (selftest_fs.cpp). The game's files are only read.
 struct EbootCopy {

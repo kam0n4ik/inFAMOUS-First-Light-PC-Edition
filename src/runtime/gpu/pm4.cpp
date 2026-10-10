@@ -126,7 +126,9 @@ bool Decode(std::span<const u32> stream, Packet& out, DecodeError& error) {
         out.predicate = (h & 1) != 0;
         out.compute = ((h >> 1) & 1) != 0;
         out.opcode = static_cast<u8>(h >> 8);
-        out.dwords = ((h >> 16) & 0x3FFF) + 2;
+        // count 0x3FFF: a header-only packet (the one-dword NOP filler, PKT3_NOP_PAD); the bridge's NumWords wraps
+        // to the same
+        out.dwords = ((h >> 16) & 0x3FFF) == 0x3FFF ? 1 : ((h >> 16) & 0x3FFF) + 2;
         break;
     default:
         error = DecodeError::ReservedType;

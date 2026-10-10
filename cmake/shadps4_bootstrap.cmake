@@ -110,6 +110,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/track_diag.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/gpu_memory_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_gpu.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_gpu_cp.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp
     )
     target_link_libraries(shadps4 PRIVATE ${runtime_target})

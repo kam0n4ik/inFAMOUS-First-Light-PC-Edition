@@ -75,6 +75,13 @@ void TestDecode(TestGroup& g) {
         g.Check("type-2 padding: 1 dword", Pm4::Decode(s, p, e) && p.type == 2 && p.dwords == 1, "");
     }
     {
+        // P4.2 regression: count 0x3FFF is the header-only form (the one-dword NOP filler), not 0x4001 dwords
+        const AmdGpu::PM4Type3Header bridge{AmdGpu::PM4ItOpcode::Nop, 0x3FFF};
+        const u32 s[] = {bridge.raw, H3(Pm4::Op::Nop, 1), 0};
+        g.Check("a header-only packet (count 0x3FFF): 1 dword, as the bridge's NumWords",
+                Pm4::Decode(s, p, e) && p.type == 3 && p.dwords == 1 && bridge.NumWords() + 1 == 1, "");
+    }
+    {
         const u32 s[] = {(1u << 16) | 0x1234u, 7, 8};
         g.Check("type-0: base register and 1 + count + 1 dwords",
                 Pm4::Decode(s, p, e) && p.type == 0 && p.base == 0x1234 && p.dwords == 3, "");

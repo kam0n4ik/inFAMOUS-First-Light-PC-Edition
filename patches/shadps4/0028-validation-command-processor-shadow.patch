@@ -1,0 +1,68 @@
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index 029c6eaf2f..a31c6c8dc9 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -22,6 +22,20 @@
+ 
+ namespace GpuStats = SecondSon::Gpu::Pm4Stats;
+ using GpuStatsEngine = SecondSon::Gpu::Pm4::Engine;
++// SecondSonPC patch 0028 (P4.2): --gpu-shadow / --gpu-trace, SecondSonPC's command processor in this one's shadow.
++// Off: one load of a flag per packet and per submission.
++#include "runtime/gpu/cp_shadow.h"
++
++namespace CpShadow = SecondSon::Gpu::CpShadow;
++
++// The state the shadow compares with, inside Liverpool's member functions (the current queue's compute registers).
++#define SSPC_SHADOW_VIEW()                                                                         \
++    SecondSon::Gpu::Cp::BridgeView {                                                               \
++        .regs = regs.reg_array.data(), .cs = reinterpret_cast<const u32*>(&GetCsRegs()),           \
++        .index_buffer_size = index_buffer_num_indices, .indirect_args = indirect_args_addr,        \
++        .cb_extent = reinterpret_cast<const u32*>(last_cb_extent.data()),                          \
++        .db_extent = last_db_extent.raw                                                            \
++    }
+ 
+ namespace AmdGpu {
+ 
+@@ -266,6 +280,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+         if (GpuStats::Enabled()) [[unlikely]] {
+             GpuStats::OnPacket(GpuStatsEngine::Draw, dcb.data(), dcb.size());
+         }
++        if (CpShadow::Enabled()) [[unlikely]] {
++            CpShadow::OnPacket(0, dcb.data(), dcb.size(), false, SSPC_SHADOW_VIEW());
++        }
+ 
+         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+         const u32 type = header->type;
+@@ -947,6 +964,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+             GpuStats::OnPacket(GpuStatsEngine::Compute, reinterpret_cast<const u32*>(header),
+                                buffered ? header->type3.NumWords() + 1 : acb.size());
+         }
++        if (CpShadow::Enabled()) [[unlikely]] {
++            const bool buffered = header == reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
++            CpShadow::OnPacket(vqid + 1, reinterpret_cast<const u32*>(header),
++                               buffered ? header->type3.NumWords() + 1 : acb.size(), buffered,
++                               SSPC_SHADOW_VIEW());
++        }
+ 
+         if (header->type == 2) {
+             // Type-2 packet are used for padding purposes
+@@ -1217,6 +1240,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+     if (GpuStats::Enabled()) [[unlikely]] {
+         GpuStats::OnSubmit(GpuStatsEngine::Draw, dcb.size(), ccb.size());
+     }
++    if (CpShadow::Enabled()) [[unlikely]] {
++        CpShadow::OnSubmit(0, dcb.data(), dcb.size()); // copied now; the constant engine's ccb is not shadowed
++    }
+ 
+     if (EmulatorSettings.IsCopyGpuBuffers()) {
+         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
+@@ -1239,6 +1265,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+     if (GpuStats::Enabled()) [[unlikely]] {
+         GpuStats::OnSubmit(GpuStatsEngine::Compute, acb.size(), 0);
+     }
++    if (CpShadow::Enabled()) [[unlikely]] {
++        CpShadow::OnSubmit(gnm_vqid, acb.data(), acb.size());
++    }
+ 
+     const auto vqid = gnm_vqid - 1;
+     const auto& task = ProcessCompute(acb, vqid);

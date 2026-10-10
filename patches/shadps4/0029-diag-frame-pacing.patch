@@ -1,0 +1,143 @@
+diff --git a/src/core/libraries/gnmdriver/gnmdriver.cpp b/src/core/libraries/gnmdriver/gnmdriver.cpp
+index 32c2c1b7d9..fcc24281c0 100644
+--- a/src/core/libraries/gnmdriver/gnmdriver.cpp
++++ b/src/core/libraries/gnmdriver/gnmdriver.cpp
+@@ -22,6 +22,10 @@
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/amdgpu/pm4_cmds.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
++// SecondSonPC patch 0029 (P4.2, SSPC-015): --frame-pacing, the flip timeline. Off: one load of a flag per call.
++#include "runtime/gpu/frame_pacing.h"
++
++namespace FramePacing = SecondSon::Gpu::FramePacing;
+ 
+ extern Frontend::WindowSDL* g_window;
+ std::unique_ptr<Vulkan::Presenter> presenter;
+@@ -2299,8 +2303,14 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
+     auto* cmdbuf = dcb_gpu_addrs[count - 1];
+     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
+ 
++    if (FramePacing::Enabled()) [[unlikely]] {
++        FramePacing::Mark(FramePacing::Event::SubmitEnter);
++    }
+     std::scoped_lock lk{m_submit_lock};
+     WaitGpuIdle();
++    if (FramePacing::Enabled()) [[unlikely]] {
++        FramePacing::Mark(FramePacing::Event::SubmitUnblocked);
++    }
+ 
+     const s32 patch_result =
+         PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
+@@ -2308,8 +2318,12 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
+         return patch_result;
+     }
+ 
+-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
++    const s32 submitted = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
++                                        const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
++    if (FramePacing::Enabled()) [[unlikely]] {
++        FramePacing::Mark(FramePacing::Event::Submitted);
++    }
++    return submitted;
+ }
+ 
+ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
+@@ -2359,6 +2373,9 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
+ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
+     HLE_TRACE;
+     LOG_DEBUG(Lib_GnmDriver, "called");
++    if (FramePacing::Enabled()) [[unlikely]] {
++        FramePacing::Mark(FramePacing::Event::SubmitDone);
++    }
+     std::scoped_lock lk{m_submit_lock};
+     WaitGpuIdle();
+     if (!liverpool->IsGpuIdle()) {
+diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
+index 978e937373..23893d8f51 100644
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -12,6 +12,10 @@
+ #include "imgui/renderer/imgui_core.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
++// SecondSonPC patch 0029 (P4.2, SSPC-015): --frame-pacing, the flip timeline. Off: one load of a flag per event.
++#include "runtime/gpu/frame_pacing.h"
++
++namespace FramePacing = SecondSon::Gpu::FramePacing;
+ 
+ extern std::unique_ptr<Vulkan::Presenter> presenter;
+ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+@@ -320,6 +324,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
+         const auto& group = port->groups[buffer.group_index];
+         frame = presenter->PrepareFrame(group, buffer.address_left);
+     }
++    if (FramePacing::Enabled()) [[unlikely]] {
++        FramePacing::Mark(FramePacing::Event::FlipQueued);
++    }
+ 
+     std::scoped_lock lock{mutex};
+     requests.push({
+@@ -352,6 +359,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+ 
+     while (!token.stop_requested()) {
+         timer.Start();
++        if (FramePacing::Enabled()) [[unlikely]] {
++            FramePacing::Mark(FramePacing::Event::Vblank);
++        }
+ 
+         if (DebugState.IsGuestThreadsPaused()) {
+             DrawLastFrame();
+@@ -372,7 +382,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+                     }
+                 }
+             } else {
++                if (FramePacing::Enabled()) [[unlikely]] {
++                    FramePacing::Mark(FramePacing::Event::FlipTaken);
++                }
+                 Flip(request);
++                if (FramePacing::Enabled()) [[unlikely]] {
++                    FramePacing::Mark(FramePacing::Event::Presented);
++                }
+                 FRAME_END;
+             }
+         }
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index a31c6c8dc9..ecf1e4a38e 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -27,6 +27,10 @@ using GpuStatsEngine = SecondSon::Gpu::Pm4::Engine;
+ #include "runtime/gpu/cp_shadow.h"
+ 
+ namespace CpShadow = SecondSon::Gpu::CpShadow;
++// SecondSonPC patch 0029 (P4.2, SSPC-015): --frame-pacing, the flip timeline (flip marker, VideoOut label waits).
++#include "runtime/gpu/frame_pacing.h"
++
++namespace FramePacing = SecondSon::Gpu::FramePacing;
+ 
+ // The state the shadow compares with, inside Liverpool's member functions (the current queue's compute registers).
+ #define SSPC_SHADOW_VIEW()                                                                         \
+@@ -313,6 +317,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                 case PM4CmdNop::PayloadType::PatchedFlip: {
+                     // There is no evidence that GPU CP drives flip events by parsing
+                     // special NOP packets. For convenience lets assume that it does.
++                    if (FramePacing::Enabled()) [[unlikely]] {
++                        FramePacing::Mark(FramePacing::Event::CpFlip);
++                    }
+                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                     break;
+                 }
+@@ -836,7 +843,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                     if (GpuStats::Enabled()) [[unlikely]] {
+                         GpuStats::OnSpan(GpuStats::Span::VoWait, true);
+                     }
++                    if (FramePacing::Enabled()) [[unlikely]] {
++                        FramePacing::Mark(FramePacing::Event::CpLabelWait);
++                    }
+                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
++                    if (FramePacing::Enabled()) [[unlikely]] {
++                        FramePacing::Mark(FramePacing::Event::CpLabelWaitEnd);
++                    }
+                     if (GpuStats::Enabled()) [[unlikely]] {
+                         GpuStats::OnSpan(GpuStats::Span::VoWait, false);
+                     }

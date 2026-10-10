@@ -45,6 +45,12 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/fs_observer.cpp
     src/runtime/filesystem/vfs.cpp
     src/runtime/gpu/backend.cpp
+    src/runtime/gpu/command_processor.cpp
+    src/runtime/gpu/cp_registers.cpp
+    src/runtime/gpu/cp_replay.cpp
+    src/runtime/gpu/cp_shadow.cpp
+    src/runtime/gpu/cp_validation.cpp
+    src/runtime/gpu/frame_pacing.cpp
     src/runtime/gpu/pm4.cpp
     src/runtime/gpu/pm4_stats.cpp
     src/runtime/gpu/vulkan/vk_foundation.cpp

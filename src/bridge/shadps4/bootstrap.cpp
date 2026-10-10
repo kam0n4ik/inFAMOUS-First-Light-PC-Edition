@@ -63,6 +63,8 @@
 #include "runtime/exports.h"
 #include "bridge/shadps4/gpu_memory_host.h"
 #include "runtime/gpu/backend.h"
+#include "runtime/gpu/cp_shadow.h"
+#include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/pm4_stats.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/kernel/thread.h"
@@ -1183,6 +1185,21 @@ void RunGame(const App::Config& cfg) {
     }
     if (cfg.gpu_stats) {
         Gpu::Pm4Stats::Enable({.dir = cfg.logs_dir}); // before the GPU command processor takes a packet
+    }
+    if (cfg.frame_pacing) {
+        Gpu::FramePacing::Enable(cfg.logs_dir); // P4.2, SSPC-015: before the first submit and the first vblank
+    }
+    if (cfg.gpu_shadow && EmulatorSettings.IsCopyGpuBuffers()) {
+        // the bridge would execute copies of the command buffers at other addresses: the shadow's lockstep (same
+        // packet, same address) cannot hold — refused rather than reporting every packet as a divergence
+        Fatal("--gpu-shadow / --gpu-trace need the bridge's copyGPUBuffers off (it is on in the bridge's settings)");
+    }
+    if (cfg.gpu_shadow) {
+        // P4.2: SecondSonPC's command processor beside the bridge's, before its first submission (reads command
+        // memory through the GPU memory contract installed above; claims nothing)
+        Gpu::CpShadow::Enable({.dir = cfg.logs_dir,
+                               .trace_start_s = cfg.gpu_trace_start_s,
+                               .trace_frames = cfg.gpu_trace_frames});
     }
     if (cfg.frame_log) {
         StartFrameLog(cfg.logs_dir / "frametimes.csv");
