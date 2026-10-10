@@ -66,6 +66,10 @@ void OnBarriers(std::uint32_t iterations, std::uint32_t emitted, std::uint32_t r
                 bool partially_transited);
 void OnFindImage();
 void OnStreamCopy(std::uint64_t bytes);
+// A stream-buffer copy of [addr, addr + bytes) whose content hashes to `content` in frame `frame`:
+// counts copies that repeat an earlier copy of the same range in the same frame (and with the
+// same content) - what a cache of stream copies could skip.
+void OnStreamCopyContent(std::uint64_t addr, std::uint64_t bytes, std::uint64_t content, std::uint32_t frame);
 
 /// Running totals (for --frame-log's per-frame deltas).
 struct Totals {

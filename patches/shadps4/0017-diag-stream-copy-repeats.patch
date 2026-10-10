@@ -1,0 +1,41 @@
+diff --git a/src/core/libraries/videoout/video_out.cpp b/src/core/libraries/videoout/video_out.cpp
+index 1cf6d2a8..1a4bb134 100644
+--- a/src/core/libraries/videoout/video_out.cpp
++++ b/src/core/libraries/videoout/video_out.cpp
+@@ -139,7 +139,8 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
+ }
+ 
+ s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
+-    LOG_TRACE(Lib_VideoOut, "called");
++    // SecondSonPC P2.5: the game's frame rate cap (0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz).
++    LOG_INFO(Lib_VideoOut, "handle {} rate {}", handle, rate);
+     driver->GetPort(handle)->flip_rate = rate;
+     return ORBIS_OK;
+ }
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index c6ae66b2..a620b5dd 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <algorithm>
+ #include <magic_enum/magic_enum.hpp>
++#include <xxhash.h>
+ 
+ #include "common/alignment.h"
+ #include "core/debug_state.h"
+@@ -187,6 +188,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+         stream_buffer.Commit();
+         if (SecondSon::TrackDiag::Enabled()) {
+             SecondSon::TrackDiag::OnStreamCopy(size); // SecondSonPC P2.5
++            // How many of these copies repeat the same range and content within a frame (diagnostics:
++            // the guest data is read again into a cached buffer, not from the write-combined stream).
++            thread_local std::vector<u8> sspc_content;
++            sspc_content.resize(size);
++            memory->CopySparseMemory(device_addr, sspc_content.data(), size);
++            SecondSon::TrackDiag::OnStreamCopyContent(device_addr, size,
++                                                      XXH3_64bits(sspc_content.data(), size),
++                                                      DebugState.GetFrameNum());
+         }
+         return {&stream_buffer, offset};
+     }

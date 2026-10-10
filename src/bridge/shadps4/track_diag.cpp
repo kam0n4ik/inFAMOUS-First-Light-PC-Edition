@@ -63,6 +63,15 @@ struct State {
     std::atomic<u64> barrier_calls{0}, barrier_iterations{0}, barriers{0}, barrier_partial_req{0},
         barrier_partial_state{0}, barrier_max_resources{0}, barrier_iter_big{0};
     std::atomic<u64> find_image{0}, stream_copies{0}, stream_bytes{0};
+    // Stream-buffer copies seen by range (OnStreamCopyContent; guarded by stream_lock).
+    struct StreamEntry {
+        u64 addr = 0, size = 0, content = 0;
+        u32 frame = ~0u;
+    };
+    std::vector<StreamEntry> stream_seen = std::vector<StreamEntry>(1u << 16);
+    std::atomic_flag stream_lock = ATOMIC_FLAG_INIT;
+    std::atomic<u64> stream_repeat_frame{0}, stream_repeat_frame_bytes{0}, stream_repeat_same{0},
+        stream_repeat_same_bytes{0}, stream_same_any{0}, stream_same_any_bytes{0};
     Histogram handler, chain;
     std::vector<Slot> pages = std::vector<Slot>(kPageSlots);
     std::vector<Slot> regions = std::vector<Slot>(kRegionSlots);
@@ -74,6 +83,7 @@ thread_local u32 t_fault_depth = 0;
 
 struct GpuThreadLast {
     u64 bc = 0, bi = 0, b = 0, bpr = 0, bps = 0, big = 0, fi = 0, sc = 0, sb = 0;
+    u64 rf = 0, rfb = 0, rs = 0, rsb = 0, sa = 0, sab = 0;
 };
 GpuThreadLast g_last; // LogLoop only
 
@@ -293,7 +303,16 @@ void LogLoop() {
                  bc - g_last.bc, bpr - g_last.bpr, bps - g_last.bps, bi - g_last.bi, big - g_last.big, b - g_last.b,
                  s.barrier_max_resources.load(), fi - g_last.fi, sc - g_last.sc,
                  double(sb - g_last.sb) / 1048576.0);
-        g_last = {bc, bi, b, bpr, bps, big, fi, sc, sb};
+        const u64 rf = s.stream_repeat_frame.load(), rfb = s.stream_repeat_frame_bytes.load();
+        const u64 rs = s.stream_repeat_same.load(), rsb = s.stream_repeat_same_bytes.load();
+        const u64 sa = s.stream_same_any.load(), sab = s.stream_same_any_bytes.load();
+        SSPC_LOG(App, Info,
+                 "track stats: stream-buffer copies repeating a range already copied in the same frame +{} "
+                 "({:.1f} MiB), of them with the same content +{} ({:.1f} MiB); same content as the range's "
+                 "previous copy (any frame) +{} ({:.1f} MiB)",
+                 rf - g_last.rf, double(rfb - g_last.rfb) / 1048576.0, rs - g_last.rs,
+                 double(rsb - g_last.rsb) / 1048576.0, sa - g_last.sa, double(sab - g_last.sab) / 1048576.0);
+        g_last = {bc, bi, b, bpr, bps, big, fi, sc, sb, rf, rfb, rs, rsb, sa, sab};
         last = now;
         last_handler = h;
         last_chain = c;
@@ -446,6 +465,30 @@ void OnFindImage() {
 void OnStreamCopy(u64 bytes) {
     Add(g_state->stream_copies, 1);
     Add(g_state->stream_bytes, bytes);
+}
+
+void OnStreamCopyContent(u64 addr, u64 bytes, u64 content, u32 frame) {
+    State& s = *g_state;
+    while (s.stream_lock.test_and_set(std::memory_order_acquire)) {
+        _mm_pause();
+    }
+    auto& e = s.stream_seen[((addr ^ (bytes << 40)) * 0x9E3779B97F4A7C15ull) >> 48];
+    if (e.addr == addr && e.size == bytes) {
+        if (e.content == content) {
+            Add(s.stream_same_any, 1);
+            Add(s.stream_same_any_bytes, bytes);
+        }
+        if (e.frame == frame) {
+            Add(s.stream_repeat_frame, 1);
+            Add(s.stream_repeat_frame_bytes, bytes);
+            if (e.content == content) {
+                Add(s.stream_repeat_same, 1);
+                Add(s.stream_repeat_same_bytes, bytes);
+            }
+        }
+    }
+    e = {addr, bytes, content, frame};
+    s.stream_lock.clear(std::memory_order_release);
 }
 
 Totals Take() {
