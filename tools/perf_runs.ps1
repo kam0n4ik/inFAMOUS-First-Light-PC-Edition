@@ -32,12 +32,17 @@ param(
     [int]$SnapshotAt = 0,                         # copy logs\calls.json this many s after start
                                                   # (the last periodic dump) -> <mode>\calls_<N>s.json
     [string]$Exes = "",                           # extra builds: "name=path[,name=path]" (see above)
+    [string]$Saves = "",                          # the saves to snapshot (a "home" folder); default the
+                                                  # real ones, userdata\home. P2.5 scenes: a frozen copy
+                                                  # (logs\p25\scene_*\home), so play in between does not
+                                                  # move the scene
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
 $logs = "$root\logs"
-$saves = "$root\userdata\home"
+$saves = if ($Saves) { $Saves.TrimEnd('\') } else { "$root\userdata\home" }
+if (-not (Test-Path "$saves\1000")) { "perf_runs: -Saves $saves is not a saves 'home' folder (no 1000\)"; exit 1 }
 $modeArgs = @{
     A = ""; B = "--bridge kernel-eventflag"; C = "--bridge kernel-sema"
     D = "--bridge kernel-sema --bridge kernel-eventflag"
@@ -59,8 +64,11 @@ $modeArgs = @{
     # these are the four combinations A-D of docs/PHASE2_P24_NATIVE_THREADS.md.
     T = "--native threads"; TM = "--native threads --native memory --memory-commit on-demand"
     # P2.5 bridge performance changes, one build: PO0 every change off, PO1 the defaults (all on that
-    # passed their A/B: barrier-memo). PO0 = PO1 of the build before P2.5.
-    PO0 = "--no-perf-opt barrier-memo"; PO1 = ""
+    # passed their A/B: barrier-memo, image-memo). PO0 = PO1 of the build before P2.5.
+    PO0 = "--no-perf-opt barrier-memo --no-perf-opt image-memo"; PO1 = ""
+    # One change under test against the defaults. PI = + image-memo (its A/B, p25_imemo_ab; now a
+    # default, so PI = PO1).
+    PI = "--perf-opt image-memo"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
@@ -127,6 +135,7 @@ $meta = [ordered]@{
     exe = $exe.FullName; exe_time = $exe.LastWriteTime.ToString("s"); exe_size = $exe.Length
     git_head = (& git -C $root rev-parse --short HEAD); git_dirty = [bool](& git -C $root status --porcelain -- src third_party patches CMakeLists.txt)
     free_commit_gib_at_start = $freeCommitGiB; commit_limit_gib = $limitGiB; modes = @($runList | ForEach-Object { $_.Label })
+    saves = $saves
     exes = [ordered]@{}
 }
 foreach ($name in @("") + @($exeMap.Keys | Sort-Object)) {
@@ -181,5 +190,5 @@ if (Test-Path "$out\profile") { Remove-Item "$out\profile" -Recurse -Force }
 
 $hashesAfter = Get-SaveHashes
 $changed = @(@($hashesBefore.Keys) + @($hashesAfter.Keys) | Sort-Object -Unique | Where-Object { $hashesBefore[$_] -ne $hashesAfter[$_] })
-"real saves unchanged: $(if ($changed.Count) { "NO - $($changed -join ', ')" } else { 'yes' })"
+"saves $saves unchanged: $(if ($changed.Count) { "NO - $($changed -join ', ')" } else { 'yes' })"
 if (Test-Path "$PSScriptRoot\perf_report.py") { & python -I "$PSScriptRoot\perf_report.py" $out }
