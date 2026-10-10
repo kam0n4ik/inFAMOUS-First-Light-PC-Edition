@@ -125,7 +125,7 @@ if (-not $modeList.Count -or @($modeList | Where-Object { -not $modeArgs.Contain
 }
 $maxSeconds = if ($Soak) { 2400 } else { 300 }
 if ($Seconds -lt 30 -or $Seconds -gt $maxSeconds) { Fail "-Seconds must be 30..$maxSeconds (-Soak for one long run)" }
-if ($Soak -and $runList.Count -ne 1) { Fail "-Soak takes one run" }
+if ($Soak -and @($runList).Count -ne 1) { Fail "-Soak takes one run" }
 if ($Press -match '\s') { Fail "-Press must not contain spaces" }
 if (-not (Test-Path $defaultExe)) { Fail "not built" }
 foreach ($r in $runList) {
