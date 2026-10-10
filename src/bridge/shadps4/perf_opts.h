@@ -14,4 +14,11 @@ namespace SecondSon::PerfOpts {
 // its A/B (Salmon Bay, 7 runs: 18.2 -> 24.3 FPS); --no-perf-opt barrier-memo turns it off.
 inline bool barrier_memo = true;
 
+// TextureCache::FindImage (patch 0018): while no image was registered or unregistered
+// (TextureCache::sspc_registry_gen), a request whose perfect match was found before - same address,
+// sizes, format, type, mips/layers - returns that image again without walking the page table (the
+// same image and the same LRU touch). On by default since its A/B (beach scene, 4 runs ABBA: open
+// view 55.6-58.0 -> 60 FPS, dense foliage 32.4-35.2 -> 38.5 FPS); --no-perf-opt image-memo turns it off.
+inline bool image_memo = true;
+
 } // namespace SecondSon::PerfOpts

@@ -147,8 +147,11 @@ int main(int argc, char* argv[]) {
             const bool on = arg == "--perf-opt";
             if (name == "barrier-memo") {
                 SecondSon::PerfOpts::barrier_memo = on;
+            } else if (name == "image-memo") {
+                SecondSon::PerfOpts::image_memo = on;
             } else {
-                return Fail(std::string(arg) + ": unknown change " + std::string(name) + " (barrier-memo)");
+                return Fail(std::string(arg) + ": unknown change " + std::string(name) +
+                            " (barrier-memo, image-memo)");
             }
         } else if (arg == "--selftest") {
             config->selftest = true;

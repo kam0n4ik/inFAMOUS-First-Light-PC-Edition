@@ -1,0 +1,105 @@
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index b867de41..a84ad22a 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -20,6 +20,7 @@
+ #include "video_core/texture_cache/texture_cache.h"
+ #include "video_core/texture_cache/tile_manager.h"
+ 
++#include "bridge/shadps4/perf_opts.h"  // SecondSonPC P2.5 optimizations
+ #include "bridge/shadps4/track_diag.h" // SecondSonPC P2.5 diagnostics
+ 
+ namespace VideoCore {
+@@ -526,6 +527,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+         SecondSon::TrackDiag::OnFindImage(); // SecondSonPC P2.5
+     }
+ 
++    // SecondSonPC P2.5 (--perf-opt image-memo): the same request with no image registered or
++    // unregistered since its perfect match was found finds that image again.
++    SspcFindMemo* sspc_memo = nullptr;
++    if (SecondSon::PerfOpts::image_memo) {
++        const u64 key = info.guest_address ^ (info.guest_size << 20) ^
++                        (u64(info.size.width) << 32) ^ (u64(info.size.height) << 44) ^
++                        (u64(info.size.depth) << 56) ^ u64(info.pixel_format) ^
++                        (u64(info.type) << 8) ^ (u64(info.resources.levels) << 12) ^
++                        (u64(info.resources.layers) << 24) ^ u64(exact_fmt);
++        sspc_memo = &sspc_find_memo[(key * 0x9E3779B97F4A7C15ull) >> 52];
++        if (sspc_memo->gen == sspc_registry_gen && sspc_memo->guest_address == info.guest_address &&
++            sspc_memo->guest_size == info.guest_size && sspc_memo->size == info.size &&
++            sspc_memo->format == info.pixel_format && sspc_memo->type == info.type &&
++            sspc_memo->resources == info.resources && sspc_memo->exact_fmt == exact_fmt) {
++            Image& image = slot_images[sspc_memo->id];
++            image.tick_accessed_last = scheduler.CurrentTick(); // as below
++            TouchImage(image);
++            return sspc_memo->id;
++        }
++    }
++
+     SmallVector<ImageId, 8> image_ids;
+     ForEachImageInRegion(info.guest_address, info.guest_size,
+                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+@@ -553,6 +575,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+         }
+         image_id = cache_id;
+     }
++    const ImageId sspc_perfect = image_id; // SecondSonPC P2.5 (image-memo)
++    const u64 sspc_gen = sspc_registry_gen;
+ 
+     // Try to resolve overlaps (if any)
+     int view_mip{-1};
+@@ -603,6 +627,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+         desc.view_info.range.base.layer = view_slice;
+     }
+ 
++    // SecondSonPC P2.5 (image-memo): only a perfect match kept as it was (no view adjustment, nothing
++    // registered or freed on the way) is remembered.
++    if (sspc_memo != nullptr && sspc_perfect && image_id == sspc_perfect && sspc_registry_gen == sspc_gen) {
++        *sspc_memo = {sspc_gen, info.guest_address, info.guest_size, info.size, info.pixel_format, info.type,
++                      info.resources, exact_fmt, image_id};
++    }
+     return image_id;
+ }
+ 
+@@ -817,6 +847,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
+     image.flags |= ImageFlagBits::Registered;
++    ++sspc_registry_gen; // SecondSonPC P2.5 (image-memo)
+     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+     image_lru_cache.Insert(image, gc_tick);
+     const auto& info = image.info;
+@@ -835,6 +866,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
+     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
+                "Trying to unregister an already unregistered image");
+     image.flags &= ~ImageFlagBits::Registered;
++    ++sspc_registry_gen; // SecondSonPC P2.5 (image-memo)
+     image_lru_cache.Free(image);
+     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index cee15ea4..3779fbe1 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -375,6 +375,22 @@ private:
+     u64 pressure_gc_samplers = 0;
+     u64 critical_gc_samplers = 0;
+     u64 gc_tick = 0;
++    // SecondSonPC P2.5 (--perf-opt image-memo): bumped by RegisterImage and UnregisterImage, the only
++    // changes of the set of images FindImage searches. While it is unchanged, a request whose perfect
++    // match was found before finds the same image again (FindImage).
++    u64 sspc_registry_gen = 1;
++    struct SspcFindMemo {
++        u64 gen = 0;
++        VAddr guest_address = 0;
++        u64 guest_size = 0;
++        Extent3D size{};
++        vk::Format format{};
++        AmdGpu::ImageType type{};
++        SubresourceExtent resources{};
++        bool exact_fmt = false;
++        ImageId id{};
++    };
++    std::array<SspcFindMemo, 4096> sspc_find_memo{};
+     Common::LRUCache<Image> image_lru_cache;
+     Common::LRUCache<Sampler> sampler_lru_cache;
+     const bool readback_linear_images;
