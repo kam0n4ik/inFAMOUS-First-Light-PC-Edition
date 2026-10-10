@@ -1,0 +1,77 @@
+diff --git a/src/core/libraries/kernel/kernel.cpp b/src/core/libraries/kernel/kernel.cpp
+index 6163b800..da7beee3 100644
+--- a/src/core/libraries/kernel/kernel.cpp
++++ b/src/core/libraries/kernel/kernel.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include <thread>
+ #include <boost/asio/io_context.hpp>
+ 
+@@ -84,13 +85,24 @@ static PS4_SYSV_ABI void stack_chk_fail() {
+ }
+ 
+ static thread_local s32 g_posix_errno = 0;
++// SecondSonPC P3.5.1 (patch 0023): when set, the guest errno is SecondSonPC's cell (UseExternalErrno). Set once
++// before any guest thread runs; every access below goes through __Error(), so there is one owner either way.
++static std::atomic<s32* (*)()> g_external_errno{nullptr};
+ 
+ s32* PS4_SYSV_ABI __Error() {
++    if (const auto location = g_external_errno.load(std::memory_order_relaxed)) {
++        return location();
++    }
+     return &g_posix_errno;
+ }
+ 
++bool UseExternalErrno(s32* (*location)()) {
++    s32* (*expected)() = nullptr;
++    return location != nullptr && g_external_errno.compare_exchange_strong(expected, location);
++}
++
+ void ErrSceToPosix(s32 error) {
+-    g_posix_errno = error - ORBIS_KERNEL_ERROR_UNKNOWN;
++    *__Error() = error - ORBIS_KERNEL_ERROR_UNKNOWN;
+ }
+ 
+ s32 ErrnoToSceKernelError(s32 error) {
+@@ -152,7 +164,7 @@ s32 NativeToPosixErrno(s32 const e) {
+ }
+ 
+ void SetPosixErrno(s32 e) {
+-    g_posix_errno = NativeToPosixErrno(e);
++    *__Error() = NativeToPosixErrno(e);
+ }
+ 
+ struct OrbisKernelUuid {
+@@ -187,12 +199,12 @@ s32 PS4_SYSV_ABI kernel_ioctl(s32 fd, u64 cmd, VA_ARGS) {
+     auto* file = h->GetFile(fd);
+     if (file == nullptr) {
+         LOG_INFO(Lib_Kernel, "ioctl: fd = {:X} cmd = {:X} file == nullptr", fd, cmd);
+-        g_posix_errno = POSIX_EBADF;
++        *__Error() = POSIX_EBADF;
+         return -1;
+     }
+     if (file->type != Core::FileSys::FileType::Device) {
+         LOG_WARNING(Lib_Kernel, "ioctl: fd = {:X} cmd = {:X} file->type != Device", fd, cmd);
+-        g_posix_errno = ENOTTY;
++        *__Error() = ENOTTY;
+         return -1;
+     }
+     VA_CTX(ctx);
+diff --git a/src/core/libraries/kernel/kernel.h b/src/core/libraries/kernel/kernel.h
+index e2c09fe9..7391371e 100644
+--- a/src/core/libraries/kernel/kernel.h
++++ b/src/core/libraries/kernel/kernel.h
+@@ -18,6 +18,10 @@ s32 ErrnoToSceKernelError(s32 e);
+ void SetPosixErrno(s32 e);
+ s32 NativeToPosixErrno(s32 const e);
+ s32* PS4_SYSV_ABI __Error();
++/// SecondSonPC P3.5.1 (patch 0023): the guest errno is SecondSonPC's — from now on __Error() (and so every
++/// function of the bridge that sets or reads errno) answers with location()'s cell of the calling thread.
++/// Once, at start-up, before any guest thread exists. false for nullptr or a second call.
++bool UseExternalErrno(s32* (*location)());
+ const char* PS4_SYSV_ABI sceKernelGetFsSandboxRandomWord();
+ 
+ extern Core::EntryParams entry_params;

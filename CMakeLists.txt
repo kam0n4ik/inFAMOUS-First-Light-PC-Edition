@@ -45,6 +45,7 @@ add_library(sspc_runtime STATIC
     src/runtime/filesystem/vfs.cpp
     src/runtime/kernel/condvar.cpp
     src/runtime/kernel/event_flag.cpp
+    src/runtime/kernel/guest_errno.cpp
     src/runtime/kernel/kernel_util.cpp
     src/runtime/kernel/memory.cpp
     src/runtime/kernel/mutex.cpp

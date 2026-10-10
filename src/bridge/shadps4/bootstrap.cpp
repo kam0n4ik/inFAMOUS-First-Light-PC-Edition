@@ -1053,6 +1053,11 @@ void RunGame(const App::Config& cfg) {
     if (std::string error; own_loader && !InstallGuestCpu(cfg, &error)) {
         Fatal(error);
     }
+    // P3.5: the guest errno (and the process clock) SecondSonPC's with --native errno / clock, before any bridge
+    // library starts (libkernel's RegisterLib starts the bridge's clock) and before any guest thread.
+    if (std::string error; own_loader && !InstallKernelRuntime(cfg, &error)) {
+        Fatal(error);
+    }
     if (cfg.patch_race_test) {
         // Before the game window exists: a window that pumps no messages for half a minute looks hung.
         std::quick_exit(RunPatchRaceTest(cfg));

@@ -28,7 +28,8 @@
 //                              memory, P2.3.1; memory: SecondSonPC's memory manager instead of the
 //                              bridge's, P2.3.4; threads: SecondSonPC's guest thread manager, P2.4;
 //                              cpu (= fs-patch): SecondSonPC's CPU patcher, P3.3/P3.4; exceptions:
-//                              SecondSonPC's exception dispatcher, P3.4; --loader sspc only)
+//                              SecondSonPC's exception dispatcher, P3.4; errno: SecondSonPC's guest errno,
+//                              the bridge's functions use it too, P3.5; --loader sspc only)
 //     --memory-commit upfront|on-demand   with --native memory: the physical memory's commit
 //                              charge at start (upfront, as the bridge) or when handed out
 //     --memory-map <seconds>   the guest's virtual and direct memory maps -> logs\memory_map.txt

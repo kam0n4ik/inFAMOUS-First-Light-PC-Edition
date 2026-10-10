@@ -1,12 +1,14 @@
 // SecondSonPC — TEMPORARY bridge for the native libkernel functions (Phase 2, P2.2): the guest
-// errno and the process clock are still shadPS4's (shared with BRIDGE functions and with the
-// VideoOut/AudioOut timestamps), and so are the guest threads whose priority orders waiters —
+// errno and the process clock are shadPS4's by default (shared with BRIDGE functions and with the
+// VideoOut/AudioOut timestamps) and SecondSonPC's with --native errno / --native clock (P3.5, the
+// bridge reads them through patches 0023/0024); so are the guest threads whose priority orders waiters —
 // unless --native threads (P2.4) runs them on SecondSonPC's thread manager, whose host is here too:
 // guest stacks from the selected guest memory manager, TCBs from SecondSonPC's loader, the FS base in
 // SecondSonPC's TCB slot (P3.3, runtime/cpu/tcb_slot.h), the bridge's debug thread list.
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <string>
 
 #include "app/config.h"
 #include "base/log.h"
@@ -20,6 +22,7 @@
 #include "core/tls.h"
 #include "loader/linker.h"
 #include "runtime/cpu/tcb_slot.h"
+#include "runtime/kernel/guest_errno.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/thread.h"
 
@@ -30,6 +33,8 @@ namespace {
 class KernelHostImpl final : public Kernel::Host {
 public:
     s32* Errno() override {
+        // The guest errno's one owner: the bridge's cell, or with --native errno SecondSonPC's, which the bridge's
+        // __Error() then returns (patch 0023).
         return Libraries::Kernel::__Error();
     }
     u64 ProcessTimeUs() override {
@@ -99,6 +104,22 @@ void InstallKernelHost(const App::Config& cfg, u32 psf_attributes) {
         Kernel::Threads::Enable();
         SSPC_LOG(Kernel, Warning, "EXPERIMENTAL: guest threads on SecondSonPC's thread manager");
     }
+}
+
+bool InstallKernelRuntime(const App::Config& cfg, std::string* error) {
+    const auto native = [&cfg](std::string_view g) { return std::ranges::find(cfg.native_groups, g) != cfg.native_groups.end(); };
+    if (native("errno")) {
+        // P3.5.1: one guest errno, SecondSonPC's: the game's __error is its export (group "errno"), the bridge's
+        // __Error() — every BRIDGE function, Kernel::Host::Errno, the file system's host — returns the same cell.
+        if (!Libraries::Kernel::UseExternalErrno(&Kernel::GuestErrno::OwnLocation)) {
+            *error = "--native errno: the bridge's errno is already redirected";
+            return false;
+        }
+        Kernel::GuestErrno::Enable();
+        SSPC_LOG(Kernel, Warning, "EXPERIMENTAL: the guest errno is SecondSonPC's (--native errno): __error and every "
+                                  "BRIDGE function use its per-thread cell");
+    }
+    return true;
 }
 
 } // namespace SecondSon::Bridge

@@ -58,6 +58,11 @@ void InstallNativeInput(const App::Config& cfg, SDL_Window* window, bool test_mo
 /// neoMode with the title's PS4 Pro attribute (src/bridge/shadps4/kernel_host.cpp).
 void InstallKernelHost(const App::Config& cfg, u32 psf_attributes);
 
+/// P3.5 (src/bridge/shadps4/kernel_host.cpp): --native errno makes the guest errno SecondSonPC's (the bridge's
+/// __Error() returns its cell, patch 0023). Once, at start-up, before any bridge library starts and before guest
+/// code. false: `error` says why (the caller stops).
+bool InstallKernelRuntime(const App::Config& cfg, std::string* error);
+
 /// --selftest (src/bridge/shadps4/selftest.cpp): exit code 0 = every check passed.
 int RunSelfTest(const App::Config& cfg);
 

@@ -29,6 +29,7 @@
 #include "bridge/shadps4/guest_stack.h"
 #include "core/guest_memory.h"
 #include "runtime/exports.h"
+#include "runtime/kernel/guest_errno.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/thread.h"
 
@@ -1367,6 +1368,90 @@ void TestSync(TestGroup& c) {
     c.Check("mutex/cond destroy", g.cond_destroy(&g_cond) == 0 && g.mutex_destroy(&g_mutex) == 0, "");
 }
 
+// ------------------------------------------------------------------------- P3.5.1: the guest errno
+
+using ErrorFn = s32*(SSPC_SYSV_ABI*)();
+ErrorFn g_error = nullptr; // SecondSonPC's __error (runtime/kernel/guest_errno.h), called as the game calls it
+constexpr int kErrnoThreads = 8;
+std::atomic<int> g_errno_written{0};
+s32* g_errno_cells[kErrnoThreads];
+
+/// arg: the thread's index. Result bits: 1 not 0 at the start, 2 another address later, 4 the value changed under it.
+SSPC_SYSV_ABI void* ErrnoWorker(void* arg) {
+    const auto index = static_cast<int>(reinterpret_cast<uintptr_t>(arg));
+    const s32 mine = 1000 + index;
+    s32* const cell = g_error();
+    g_errno_cells[index] = cell;
+    uintptr_t bad = *cell != 0 ? 1 : 0;
+    *cell = mine;
+    g_errno_written.fetch_add(1);
+    WaitFor(5000, [] { return g_errno_written.load() == kErrnoThreads; }); // every thread has written its own
+    for (int i = 0; i < 20000 && bad == 0; ++i) {
+        s32* const again = g_error();
+        if (again != cell) {
+            bad |= 2;
+        } else if (*again != mine) {
+            bad |= 4;
+        }
+        *again = mine;
+    }
+    *cell = 0x5A5A; // left behind at exit: no later thread may see it
+    return reinterpret_cast<void*>(bad);
+}
+
+/// 1: the thread's errno was 0 at its start.
+SSPC_SYSV_ABI void* ErrnoFresh(void*) {
+    s32* const cell = g_error();
+    const bool fresh = *cell == 0;
+    *cell = 0x5A5A;
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(fresh ? 1 : 0));
+}
+
+void TestGuestErrno(TestGroup& c) {
+    for (const auto& e : Kernel::GuestErrno::Exports()) {
+        if (std::string_view(e.name) == "__error") {
+            g_error = reinterpret_cast<ErrorFn>(e.function);
+        }
+    }
+    if (g_error == nullptr) {
+        c.Check("SecondSonPC's __error export", false, "missing");
+        return;
+    }
+    s32* const own = g_error();
+    const s32 own_before = *own;
+    g_errno_written = 0;
+    std::vector<Handle> hs(kErrnoThreads);
+    for (int i = 0; i < kErrnoThreads; ++i) {
+        g.create(&hs[i], nullptr, &ErrnoWorker, reinterpret_cast<void*>(static_cast<uintptr_t>(i)), "errno");
+    }
+    uintptr_t bad = 0;
+    for (auto h : hs) {
+        void* r = nullptr;
+        g.join(h, &r);
+        bad |= reinterpret_cast<uintptr_t>(r);
+    }
+    std::vector<s32*> cells(g_errno_cells, g_errno_cells + kErrnoThreads);
+    std::ranges::sort(cells);
+    const bool distinct = std::ranges::adjacent_find(cells) == cells.end() &&
+                          std::ranges::find(cells, own) == cells.end();
+    c.Check("8 manager threads at once: each starts at 0, keeps one cell (its own address) for its life and sees only "
+            "its own value through 20000 calls",
+            bad == 0 && distinct, fmt::format("result bits {:#x}, distinct cells {}", bad, distinct));
+
+    u32 fresh = 0;
+    for (int i = 0; i < 64; ++i) {
+        Handle h = nullptr;
+        void* r = nullptr;
+        g.create(&h, nullptr, &ErrnoFresh, nullptr, "errno-reuse");
+        g.join(h, &r);
+        fresh += r != nullptr ? 1 : 0;
+    }
+    c.Check("64 manager threads one after another, each after one that left 0x5A5A behind: each starts at 0",
+            fresh == 64, fmt::format("{}/64", fresh));
+    c.Check("the creating thread's errno is untouched by its threads", g_error() == own && *own == own_before,
+            fmt::format("{} -> {}", own_before, *own));
+}
+
 } // namespace
 
 std::vector<TestGroup> TestNativeThreads(bool guest_stacks) {
@@ -1417,6 +1502,10 @@ std::vector<TestGroup> TestNativeThreads(bool guest_stacks) {
     TestGroup stacks{.name = "NativeThreads(stacks)"};
     TestStacks(stacks);
     groups.push_back(std::move(stacks));
+
+    TestGroup err{.name = "NativeThreads(errno)"}; // P3.5.1
+    TestGuestErrno(err);
+    groups.push_back(std::move(err));
     Threads::Test::SetEventLog(event_log);
 
     TestGroup sync{.name = "NativeThreads(sync)"};

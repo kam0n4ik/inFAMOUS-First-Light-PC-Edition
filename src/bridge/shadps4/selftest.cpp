@@ -4873,6 +4873,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestNativeCpu(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    // P3.5: the guest errno (the bridge's in this run, or SecondSonPC's with --native errno).
+    for (auto& g : TestKernelHle(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;
