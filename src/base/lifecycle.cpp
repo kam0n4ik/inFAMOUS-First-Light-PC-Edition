@@ -29,6 +29,8 @@ std::atomic<State> g_state{State::Running};
 std::atomic<DWORD> g_exiting_thread{0};
 std::atomic<int> g_code{1}; // std::quick_exit does not tell its code: the watchdog then ends with 1
 std::atomic<bool> g_steps_started{false};
+std::atomic<bool> g_steps_done{false};
+std::atomic<const char*> g_current_step{nullptr}; // for the watchdog's line
 std::atomic<bool> g_installed{false};
 std::atomic<u32> g_watchdog_ms{30000};
 
@@ -40,14 +42,21 @@ std::atomic<u32> g_watchdog_ms{30000};
 
 DWORD WINAPI Watchdog(void*) {
     const u32 ms = g_watchdog_ms.load();
-    Sleep(ms);
+    for (u32 waited = 0; waited < ms; waited += 50) {
+        Sleep(50);
+        if (g_state.load() == State::Fatal) {
+            return 0; // the fatal path ends the process with its own code, after its report
+        }
+    }
     // The steps hang (a step waits for a thread that never answers): end anyway. No lock: the hung step may
     // hold the log's.
-    char line[200];
+    char line[256];
     const int code = g_code.load();
+    const char* step = g_current_step.load();
     const int n = std::snprintf(line, sizeof(line),
-                                "[EXIT] the exit steps did not finish in %u ms: ending the process with code %d\n",
-                                ms, code);
+                                "[EXIT] the exit steps did not finish in %u ms (step: %s): ending the process with "
+                                "code %d\n",
+                                ms, step != nullptr ? step : "?", code);
     if (n > 0) {
         Log::EmergencyWrite(line, static_cast<size_t>(n));
     }
@@ -78,10 +87,12 @@ void RunSteps(const char* reason) {
                 Park();
             }
             SSPC_LOG(App, Info, "exit step ({}): {}", kStageNames[stage], step.name);
+            g_current_step.store(step.name);
             step.fn();
         }
     }
     SSPC_LOG(App, Info, "exit steps done in {} ms", GetTickCount64() - t0);
+    g_steps_done.store(true);
 }
 
 void OnQuickExit() {
@@ -95,7 +106,16 @@ void OnQuickExit() {
         Park(); // ExitProcess now would end the fatal reporter in the middle of its report
     }
     if (g_exiting_thread.load() != GetCurrentThreadId()) {
-        Park(); // another thread is running the exit
+        // Another thread is running Exit's steps. The CRT runs at_quick_exit handlers under its exit lock, which
+        // that thread's own std::quick_exit then needs: parking here would hold it until the watchdog. Wait for
+        // the steps instead and let this std::quick_exit end the process (with its own code).
+        while (!g_steps_done.load() && g_state.load() != State::Fatal) {
+            Sleep(10);
+        }
+        if (g_state.load() == State::Fatal) {
+            Park();
+        }
+        return;
     }
     RunSteps("std::quick_exit"); // Exit's own std::quick_exit: the steps ran already
 }

@@ -100,6 +100,8 @@ $modeArgs = @{
     KM = "--native errno --native clock --native memory --memory-commit on-demand --native kernel-memory"
     KTM = "--native errno --native clock --native memory --memory-commit on-demand --native kernel-memory --native threads"
     TMFXK = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand --native errno --native clock --native kernel-memory"
+    # P3.6: TMFXKE = TMFXK + the guest's _exit through SecondSonPC's orderly exit (everything experimental).
+    TMFXKE = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand --native errno --native clock --native kernel-memory --native exit"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}

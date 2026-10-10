@@ -68,8 +68,9 @@ PREFIX = [
 def decision(name: str, cls: str) -> tuple[str, str, str]:
     if cls == "B":
         if name in EQUEUE:
-            return ("Phase 4 (explicit adapter in P3.6)", "no",
-                    "VideoOut flip and Gnm EOP events are delivered into the game's queues by the graphics bridge")
+            return ("adapted in P3.6 (patch 0025); owner: the bridge's libkernel", "yes",
+                    "the game's only queue is the trophy subsystem's; the graphics bridge may deliver flip/EOP events "
+                    "into queues (this game subscribes none) through the event queue contract")
         if name in EXACT:
             return EXACT[name]
         return ("Phase 4", "no", "graphics bridge")

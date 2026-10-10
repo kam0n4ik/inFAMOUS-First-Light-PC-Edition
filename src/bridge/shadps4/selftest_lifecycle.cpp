@@ -55,6 +55,10 @@ void StepServicesHangs() {
     SSPC_LOG(App, Info, "test step: services (hangs)");
     Sleep(INFINITE);
 }
+void StepServicesSlow() {
+    SSPC_LOG(App, Info, "test step: services (slow)");
+    Sleep(600);
+}
 void StepStorage() {
     SSPC_LOG(App, Info, "test step: storage");
 }
@@ -186,11 +190,28 @@ void TestCases(TestGroup& g, const std::filesystem::path& base) {
                 Brief(r));
     }
     {
-        const auto r = RunChild("step-hangs", base / "step-hangs");
-        g.Check("a step that never returns: the watchdog ends the process with the code (1.5 s limit)",
-                r.finished && r.exit_code == 7 && r.seconds < 15 &&
-                    r.log.find("[EXIT] the exit steps did not finish in 1500 ms") != std::string::npos,
+        // The CRT runs at_quick_exit handlers under its exit lock: a std::quick_exit while Exit's steps run must
+        // not hold it until the watchdog (20 s here).
+        const auto r = RunChild("quick-exit-during-exit", base / "quick-exit-during-exit");
+        g.Check("std::quick_exit(9) on another thread while Exit(7)'s steps run: the steps once, then the process ends "
+                "at once (code of either), not by the watchdog",
+                r.finished && (r.exit_code == 9 || r.exit_code == 7) && r.seconds < 10 &&
+                    Count(r.log, "test step: services (slow)") == 1 && Count(r.log, "exit steps done") == 1 &&
+                    r.log.find("[EXIT]") == std::string::npos,
                 Brief(r));
+    }
+    {
+        const auto r = RunChild("step-hangs", base / "step-hangs");
+        g.Check("a step that never returns: the watchdog ends the process with the code and names the step",
+                r.finished && r.exit_code == 7 && r.seconds < 15 &&
+                    r.log.find("[EXIT] the exit steps did not finish in 1500 ms (step: test services)") !=
+                        std::string::npos,
+                Brief(r));
+    }
+    {
+        const auto r = RunChild("fatal-during-steps", base / "fatal-during-steps");
+        g.Check("a fatal path while a step hangs: the watchdog stands down, the fatal path's code ends the process",
+                r.finished && r.exit_code == 0x43 && r.log.find("[EXIT]") == std::string::npos, Brief(r));
     }
     {
         const auto r = RunChild("fatal-first", base / "fatal-first");
@@ -269,9 +290,30 @@ int RunLifecycleChild(int argc, char** argv) {
         Lifecycle::Install(10000);
         Lifecycle::Exit(7, "test exit");
     }
+    if (name == "quick-exit-during-exit") {
+        Lifecycle::AddExitStep(Stage::Services, "test services (slow)", &StepServicesSlow);
+        Lifecycle::Install(20000);
+        std::thread([] {
+            Sleep(150); // inside the slow step
+            std::quick_exit(9);
+        }).detach();
+        Lifecycle::Exit(7, "test exit");
+    }
     if (name == "step-hangs") {
         AddSteps(&StepServicesHangs);
         Lifecycle::Install(1500);
+        Lifecycle::Exit(7, "test exit");
+    }
+    if (name == "fatal-during-steps") {
+        AddSteps(&StepServicesHangs);
+        Lifecycle::Install(1000);
+        std::thread([] {
+            Sleep(300); // inside the hanging step
+            Lifecycle::EnterFatal("test fatal");
+            Sleep(2000); // a fatal report that takes longer than the watchdog's limit
+            Log::Flush();
+            TerminateProcess(GetCurrentProcess(), 0x43);
+        }).detach();
         Lifecycle::Exit(7, "test exit");
     }
     if (name == "fatal-first") {
