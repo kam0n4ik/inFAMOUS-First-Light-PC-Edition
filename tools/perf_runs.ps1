@@ -87,6 +87,12 @@ $modeArgs = @{
     # B = MF (SecondSonPC's memory + FS patcher, the bridge's threads), C = TF (SecondSonPC's threads + FS
     # patcher, the bridge's memory), D = TMF; TM = SecondSonPC's memory + threads with the bridge's FS patcher.
     MF = "--native fs-patch --native memory --memory-commit on-demand"; TF = "--native fs-patch --native threads"
+    # P3.4 (docs\PHASE3_P34_EXCEPTIONS_CPU.md): X = SecondSonPC's exception dispatcher (the bridge's CPU patcher
+    # behind it), FX = dispatcher + SecondSonPC's CPU patcher, FXE = FX with SSE4a emulated on this AMD CPU (the
+    # Intel path: 23 trampolines, 73 sites through the illegal-instruction exception), TMFX = everything native.
+    X = "--native exceptions"; FX = "--native cpu --native exceptions"
+    FXE = "--native cpu --native exceptions --cpu-emulate sse4a"
+    TMFX = "--native cpu --native exceptions --native threads --native memory --memory-commit on-demand"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
