@@ -1,0 +1,686 @@
+diff --git a/src/core/libraries/gnmdriver/gnmdriver.cpp b/src/core/libraries/gnmdriver/gnmdriver.cpp
+index 3d6bfea3..32c2c1b7 100644
+--- a/src/core/libraries/gnmdriver/gnmdriver.cpp
++++ b/src/core/libraries/gnmdriver/gnmdriver.cpp
+@@ -123,11 +123,18 @@ static inline bool IsValidEventType(Platform::InterruptId id) {
+            static_cast<u32>(id) == static_cast<u32>(Platform::InterruptId::GfxEop);
+ }
+ 
++// SecondSonPC (P3.6, patch 0025): the interrupt handler names the queue by its identity, not by a pointer
++// to it: a queue deleted before sceGnmDeleteEqEvent (or a newer one reusing its handle) receives nothing,
++// and the handler's key is the queue's serial (unique per queue object, never reused).
++static void* IrqUid(const EqueueId& queue) {
++    return reinterpret_cast<void*>(static_cast<uintptr_t>(queue.serial));
++}
++
+ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
+     LOG_TRACE(Lib_GnmDriver, "called");
+ 
+-    auto equeue = GetEqueue(eq);
+-    if (!equeue) {
++    const auto queue = FindEqueueId(eq);
++    if (!queue) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+@@ -139,11 +146,13 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
+     kernel_event.event.data = id;
+     kernel_event.event.udata = udata;
+ 
+-    equeue->AddEvent(kernel_event);
++    if (!EqueueAddEvent(*queue, kernel_event)) {
++        return ORBIS_KERNEL_ERROR_EBADF; // deleted meanwhile
++    }
+ 
+     Platform::IrqC::Instance()->Register(
+         static_cast<Platform::InterruptId>(id),
+-        [=](Platform::InterruptId irq) {
++        [queue = *queue, id](Platform::InterruptId irq) {
+             ASSERT_MSG(irq == static_cast<Platform::InterruptId>(id), "An unexpected IRQ occured");
+ 
+             // We need to convert IRQ# to event id
+@@ -151,11 +160,10 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
+                 return;
+ 
+             // Event data is expected to be an event type as per sceGnmGetEqEventType.
+-            equeue->TriggerEvent(static_cast<GnmEventType>(id),
+-                                 OrbisKernelEvent::Filter::GraphicsCore,
+-                                 reinterpret_cast<void*>(id));
++            EqueueTriggerEvent(queue, static_cast<GnmEventType>(id),
++                               OrbisKernelEvent::Filter::GraphicsCore, reinterpret_cast<void*>(id));
+         },
+-        equeue);
++        IrqUid(*queue));
+     return ORBIS_OK;
+ }
+ 
+@@ -273,14 +281,14 @@ int PS4_SYSV_ABI sceGnmDebugHardwareStatus() {
+ s32 PS4_SYSV_ABI sceGnmDeleteEqEvent(OrbisKernelEqueue eq, u64 id) {
+     LOG_TRACE(Lib_GnmDriver, "called");
+ 
+-    auto equeue = GetEqueue(eq);
+-    if (!equeue) {
++    const auto queue = FindEqueueId(eq);
++    if (!queue) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+-    equeue->RemoveEvent(id, OrbisKernelEvent::Filter::GraphicsCore);
++    EqueueRemoveEvent(*queue, id, OrbisKernelEvent::Filter::GraphicsCore);
+ 
+-    Platform::IrqC::Instance()->Unregister(static_cast<Platform::InterruptId>(id), equeue);
++    Platform::IrqC::Instance()->Unregister(static_cast<Platform::InterruptId>(id), IrqUid(*queue));
+     return ORBIS_OK;
+ }
+ 
+diff --git a/src/core/libraries/kernel/equeue.cpp b/src/core/libraries/kernel/equeue.cpp
+index 29ab897f..6a6c482c 100644
+--- a/src/core/libraries/kernel/equeue.cpp
++++ b/src/core/libraries/kernel/equeue.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
++#include <memory>
++#include <shared_mutex>
+ #include <thread>
+ #include <magic_enum/magic_enum.hpp>
+ 
+@@ -21,28 +24,64 @@ namespace Libraries::Kernel {
+ extern boost::asio::io_context io_context;
+ extern void KernelSignalRequest();
+ 
+-static std::unordered_map<s32, EqueueInternal*> kqueues;
++// SecondSonPC (P3.6, patch 0025; docs/PHASE3_P36_BRIDGE_ISOLATION.md §3): the table of the game's queues.
++// Guest threads (create, delete, wait), the VideoOut present thread, GPU interrupts and timers all reach it,
++// so it is under a lock, keyed by the whole handle, and holds the queues by reference count: a queue deleted
++// while a thread waits on it or a producer delivers into it lives until they are done with it. Producers name
++// a queue by EqueueId: a newer queue that reuses a handle is not the one they registered with.
++static std::shared_mutex kqueues_mutex;
++static std::unordered_map<OrbisKernelEqueue, std::shared_ptr<EqueueInternal>> kqueues;
++static std::atomic<u64> kqueue_serial{1};
+ static constexpr auto HrTimerSpinlockThresholdNs = 1200000u;
+ 
+-EqueueInternal* GetEqueue(OrbisKernelEqueue eq) {
+-    if (!kqueues.contains(eq)) {
+-        return nullptr;
+-    }
+-    return kqueues[eq];
++static std::shared_ptr<EqueueInternal> FindEqueue(OrbisKernelEqueue eq) {
++    std::shared_lock lock{kqueues_mutex};
++    const auto it = kqueues.find(eq);
++    return it != kqueues.end() ? it->second : nullptr;
+ }
+ 
+-static void HrTimerCallback(OrbisKernelEqueue eq, const OrbisKernelEvent& kevent) {
+-    if (kqueues.contains(eq)) {
+-        kqueues[eq]->TriggerEvent(kevent.ident, OrbisKernelEvent::Filter::HrTimer, kevent.udata);
+-    }
++static std::shared_ptr<EqueueInternal> FindEqueue(EqueueId id) {
++    auto equeue = FindEqueue(id.handle);
++    return equeue != nullptr && equeue->GetId() == id ? equeue : nullptr;
++}
++
++static void InsertEqueue(OrbisKernelEqueue eq, std::string_view name) {
++    auto equeue = std::make_shared<EqueueInternal>(eq, name, kqueue_serial.fetch_add(1));
++    std::unique_lock lock{kqueues_mutex};
++    kqueues[eq] = std::move(equeue);
++}
++
++std::optional<EqueueId> FindEqueueId(OrbisKernelEqueue eq) {
++    const auto equeue = FindEqueue(eq);
++    return equeue != nullptr ? std::optional{equeue->GetId()} : std::nullopt;
++}
++
++bool EqueueAddEvent(EqueueId id, EqueueEvent& event) {
++    const auto equeue = FindEqueue(id);
++    return equeue != nullptr && equeue->AddEvent(event);
++}
++
++bool EqueueRemoveEvent(EqueueId id, u64 ident, s16 filter) {
++    const auto equeue = FindEqueue(id);
++    return equeue != nullptr && equeue->RemoveEvent(ident, filter);
+ }
+ 
+-static void TimerCallback(OrbisKernelEqueue eq, const OrbisKernelEvent& kevent) {
+-    if (kqueues.contains(eq) && kqueues[eq]->EventExists(kevent.ident, kevent.filter)) {
+-        kqueues[eq]->TriggerEvent(kevent.ident, OrbisKernelEvent::Filter::Timer, kevent.udata);
++bool EqueueTriggerEvent(EqueueId id, u64 ident, s16 filter, void* trigger_data) {
++    const auto equeue = FindEqueue(id);
++    return equeue != nullptr && equeue->TriggerEvent(ident, filter, trigger_data);
++}
++
++static void HrTimerCallback(EqueueId id, const OrbisKernelEvent& kevent) {
++    EqueueTriggerEvent(id, kevent.ident, OrbisKernelEvent::Filter::HrTimer, kevent.udata);
++}
++
++static void TimerCallback(EqueueId id, const OrbisKernelEvent& kevent) {
++    const auto equeue = FindEqueue(id);
++    if (equeue != nullptr && equeue->EventExists(kevent.ident, kevent.filter)) {
++        equeue->TriggerEvent(kevent.ident, OrbisKernelEvent::Filter::Timer, kevent.udata);
+         if (!(kevent.flags & OrbisKernelEvent::Flags::OneShot)) {
+             // Reschedule the event for its next period.
+-            kqueues[eq]->ScheduleEvent(kevent.ident, kevent.filter, TimerCallback);
++            equeue->ScheduleEvent(kevent.ident, kevent.filter, TimerCallback);
+         }
+     }
+ }
+@@ -118,7 +157,7 @@ bool EqueueInternal::AddEvent(EqueueEvent& event) {
+ }
+ 
+ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
+-                                   void (*callback)(OrbisKernelEqueue, const OrbisKernelEvent&)) {
++                                   void (*callback)(EqueueId, const OrbisKernelEvent&)) {
+     std::scoped_lock lock{m_mutex};
+ 
+     const auto& it = std::ranges::find_if(m_events, [id, filter](auto& ev) {
+@@ -140,8 +179,9 @@ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
+         it->timer->expires_at(it->timer->expiry() + event.timer_interval);
+     }
+ 
++    // SecondSonPC (patch 0025): the queue by its identity, not `this` — it may be deleted before the timer fires.
+     it->timer->async_wait(
+-        [this, event_data = event.event, callback](const boost::system::error_code& ec) {
++        [queue = GetId(), event_data = event.event, callback](const boost::system::error_code& ec) {
+             if (ec) {
+                 if (ec != boost::system::errc::operation_canceled) {
+                     LOG_ERROR(Kernel_Event, "Timer callback error: {}", ec.message());
+@@ -151,7 +191,7 @@ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
+                 }
+                 return;
+             }
+-            callback(this->m_handle, event_data);
++            callback(queue, event_data);
+         });
+     KernelSignalRequest();
+ 
+@@ -225,7 +265,9 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
+             }
+         }
+     }
+-    m_cond.notify_one();
++    // SecondSonPC (patch 0025): every waiter re-checks. With notify_one two waiters and a level-triggered
++    // event (or two events in a row) could leave one asleep while an event it can take is pending.
++    m_cond.notify_all();
+     return has_found;
+ }
+ 
+@@ -328,7 +370,7 @@ s32 PS4_SYSV_ABI posix_kqueue() {
+     snprintf(name, sizeof(name), "kqueue%i", kqueue_handle);
+ 
+     // Create the queue
+-    kqueues[kqueue_handle] = new EqueueInternal(kqueue_handle, name);
++    InsertEqueue(kqueue_handle, name);
+     LOG_INFO(Kernel_Event, "kqueue created with name {}", name);
+ 
+     // Return handle.
+@@ -351,11 +393,11 @@ s32 PS4_SYSV_ABI posix_kevent(s32 handle, OrbisKernelEvent* changelist, u64 ncha
+              nevents);
+ 
+     // Get the equeue
+-    if (!kqueues.contains(handle)) {
++    const auto equeue = FindEqueue(static_cast<OrbisKernelEqueue>(handle));
++    if (equeue == nullptr) {
+         *__Error() = POSIX_EBADF;
+         return ORBIS_FAIL;
+     }
+-    auto equeue = kqueues[handle];
+ 
+     // First step is to apply all changes in changelist.
+     for (u64 i = 0; i < nchanges; i++) {
+@@ -441,33 +483,39 @@ int PS4_SYSV_ABI sceKernelCreateEqueue(OrbisKernelEqueue* eq, const char* name)
+     kqueue_file->type = Core::FileSys::FileType::Equeue;
+ 
+     // Create the equeue
+-    kqueues[kqueue_handle] = new EqueueInternal(kqueue_handle, name);
++    InsertEqueue(kqueue_handle, name);
+     *eq = kqueue_handle;
+ 
+     return ORBIS_OK;
+ }
+ 
+ int PS4_SYSV_ABI sceKernelDeleteEqueue(OrbisKernelEqueue eq) {
+-    if (!kqueues.contains(eq)) {
+-        return ORBIS_KERNEL_ERROR_EBADF;
++    // SecondSonPC (patch 0025): out of the table first, then the descriptor (no new queue takes the handle
++    // before the old one is gone); the object goes when its last holder does — a thread still waiting on it
++    // keeps it (it wakes at its timeout or at an event already registered; producers no longer find it).
++    std::shared_ptr<EqueueInternal> equeue;
++    {
++        std::unique_lock lock{kqueues_mutex};
++        const auto it = kqueues.find(eq);
++        if (it == kqueues.end()) {
++            return ORBIS_KERNEL_ERROR_EBADF;
++        }
++        equeue = std::move(it->second);
++        kqueues.erase(it);
+     }
+-
+     auto* handles = Common::Singleton<Core::FileSys::HandleTable>::Instance();
+     handles->DeleteHandle(eq);
+-    delete kqueues[eq];
+-    kqueues.erase(eq);
+     return ORBIS_OK;
+ }
+ 
+ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev, int num, int* out,
+                                      OrbisKernelUseconds* timo) {
+     HLE_TRACE;
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+-    auto& equeue = kqueues[eq];
+-
+     TRACE_HINT(equeue->GetName());
+     LOG_TRACE(Kernel_Event, "equeue = {} num = {}", equeue->GetName(), num);
+ 
+@@ -491,7 +539,8 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
+ 
+ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKernelTimespec* ts,
+                                           void* udata) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+@@ -514,7 +563,6 @@ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKer
+     // `HrTimerSpinlockThresholdUs`) and fall back to boost asio timers if the time to tick is
+     // large. Even for large delays, we truncate a small portion to complete the wait
+     // using the spinlock, prioritizing precision.
+-    auto& equeue = kqueues[eq];
+     if (total_ns < HrTimerSpinlockThresholdNs) {
+         return equeue->AddSmallTimer(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+     }
+@@ -526,11 +574,11 @@ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKer
+ }
+ 
+ int PS4_SYSV_ABI sceKernelDeleteHRTimerEvent(OrbisKernelEqueue eq, int id) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+-    auto& equeue = kqueues[eq];
+     if (equeue->HasSmallTimer()) {
+         return equeue->RemoveSmallTimer(id) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOENT;
+     } else {
+@@ -542,7 +590,8 @@ int PS4_SYSV_ABI sceKernelDeleteHRTimerEvent(OrbisKernelEqueue eq, int id) {
+ 
+ int PS4_SYSV_ABI sceKernelAddTimerEvent(OrbisKernelEqueue eq, int id, OrbisKernelUseconds usec,
+                                         void* udata) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+@@ -554,7 +603,6 @@ int PS4_SYSV_ABI sceKernelAddTimerEvent(OrbisKernelEqueue eq, int id, OrbisKerne
+     event.event.data = usec / 1000;
+     event.event.udata = udata;
+ 
+-    auto& equeue = kqueues[eq];
+     if (!equeue->AddEvent(event)) {
+         return ORBIS_KERNEL_ERROR_ENOMEM;
+     }
+@@ -562,17 +610,18 @@ int PS4_SYSV_ABI sceKernelAddTimerEvent(OrbisKernelEqueue eq, int id, OrbisKerne
+ }
+ 
+ int PS4_SYSV_ABI sceKernelDeleteTimerEvent(OrbisKernelEqueue eq, int id) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+-    return kqueues[eq]->RemoveEvent(id, OrbisKernelEvent::Filter::Timer)
+-               ? ORBIS_OK
+-               : ORBIS_KERNEL_ERROR_ENOENT;
++    return equeue->RemoveEvent(id, OrbisKernelEvent::Filter::Timer) ? ORBIS_OK
++                                                                    : ORBIS_KERNEL_ERROR_ENOENT;
+ }
+ 
+ int PS4_SYSV_ABI sceKernelAddUserEvent(OrbisKernelEqueue eq, int id) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+@@ -584,11 +633,12 @@ int PS4_SYSV_ABI sceKernelAddUserEvent(OrbisKernelEqueue eq, int id) {
+     event.event.fflags = 0;
+     event.event.data = 0;
+ 
+-    return kqueues[eq]->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
++    return equeue->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+ }
+ 
+ int PS4_SYSV_ABI sceKernelAddUserEventEdge(OrbisKernelEqueue eq, int id) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+@@ -600,7 +650,7 @@ int PS4_SYSV_ABI sceKernelAddUserEventEdge(OrbisKernelEqueue eq, int id) {
+     event.event.fflags = 0;
+     event.event.data = 0;
+ 
+-    return kqueues[eq]->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
++    return equeue->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+ }
+ 
+ void* PS4_SYSV_ABI sceKernelGetEventUserData(const OrbisKernelEvent* ev) {
+@@ -613,22 +663,24 @@ u64 PS4_SYSV_ABI sceKernelGetEventId(const OrbisKernelEvent* ev) {
+ }
+ 
+ int PS4_SYSV_ABI sceKernelTriggerUserEvent(OrbisKernelEqueue eq, int id, void* udata) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+-    if (!kqueues[eq]->TriggerEvent(id, OrbisKernelEvent::Filter::User, udata)) {
++    if (!equeue->TriggerEvent(id, OrbisKernelEvent::Filter::User, udata)) {
+         return ORBIS_KERNEL_ERROR_ENOENT;
+     }
+     return ORBIS_OK;
+ }
+ 
+ int PS4_SYSV_ABI sceKernelDeleteUserEvent(OrbisKernelEqueue eq, int id) {
+-    if (!kqueues.contains(eq)) {
++    const auto equeue = FindEqueue(eq);
++    if (equeue == nullptr) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
+ 
+-    if (!kqueues[eq]->RemoveEvent(id, OrbisKernelEvent::Filter::User)) {
++    if (!equeue->RemoveEvent(id, OrbisKernelEvent::Filter::User)) {
+         return ORBIS_KERNEL_ERROR_ENOENT;
+     }
+     return ORBIS_OK;
+diff --git a/src/core/libraries/kernel/equeue.h b/src/core/libraries/kernel/equeue.h
+index 9b3c73c1..f348b3fd 100644
+--- a/src/core/libraries/kernel/equeue.h
++++ b/src/core/libraries/kernel/equeue.h
+@@ -5,6 +5,7 @@
+ 
+ #include <condition_variable>
+ #include <mutex>
++#include <optional>
+ #include <string>
+ #include <vector>
+ #include <boost/asio/steady_timer.hpp>
+@@ -140,6 +141,16 @@ private:
+     bool is_triggered = false;
+ };
+ 
++/// SecondSonPC (P3.6, patch 0025): one queue as a producer names it — the guest handle and the serial of the
++/// queue object the handle named when the producer looked it up. A later queue that reuses the handle has
++/// another serial and receives nothing meant for the deleted one.
++struct EqueueId {
++    OrbisKernelEqueue handle = 0;
++    u64 serial = 0;
++
++    bool operator==(const EqueueId&) const = default;
++};
++
+ class EqueueInternal {
+     struct SmallTimer {
+         OrbisKernelEvent event;
+@@ -148,16 +159,18 @@ class EqueueInternal {
+     };
+ 
+ public:
+-    explicit EqueueInternal(OrbisKernelEqueue handle, std::string_view name)
+-        : m_handle(handle), m_name(name) {}
++    explicit EqueueInternal(OrbisKernelEqueue handle, std::string_view name, u64 serial)
++        : m_handle(handle), m_serial(serial), m_name(name) {}
+ 
+     std::string_view GetName() const {
+         return m_name;
+     }
++    EqueueId GetId() const {
++        return {m_handle, m_serial};
++    }
+ 
+     bool AddEvent(EqueueEvent& event);
+-    bool ScheduleEvent(u64 id, s16 filter,
+-                       void (*callback)(OrbisKernelEqueue, const OrbisKernelEvent&));
++    bool ScheduleEvent(u64 id, s16 filter, void (*callback)(EqueueId, const OrbisKernelEvent&));
+     bool RemoveEvent(u64 id, s16 filter);
+     int WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo);
+     bool TriggerEvent(u64 ident, s16 filter, void* trigger_data);
+@@ -182,6 +195,7 @@ public:
+ 
+ private:
+     OrbisKernelEqueue m_handle;
++    u64 m_serial;
+     std::string m_name;
+     std::mutex m_mutex;
+     std::vector<EqueueEvent> m_events;
+@@ -189,7 +203,16 @@ private:
+     std::unordered_map<u64, SmallTimer> m_small_timers;
+ };
+ 
+-EqueueInternal* GetEqueue(OrbisKernelEqueue eq);
++/// SecondSonPC (P3.6, patch 0025): the only way producers (GnmDriver interrupts, VideoOut flips and vblanks,
++/// timers) reach the game's queues — by identity, never by a pointer to a queue object. Each call looks the
++/// queue up in the table (under its lock) and holds it for the call, from any thread; a queue that was
++/// deleted (or a handle a newer queue reuses) receives nothing. Return false: no such queue (or, for
++/// Remove/Trigger, no such event in it).
++std::optional<EqueueId> FindEqueueId(OrbisKernelEqueue eq);
++bool EqueueAddEvent(EqueueId id, EqueueEvent& event);
++bool EqueueRemoveEvent(EqueueId id, u64 ident, s16 filter);
++bool EqueueTriggerEvent(EqueueId id, u64 ident, s16 filter, void* trigger_data);
++
+ u64 PS4_SYSV_ABI sceKernelGetEventData(const OrbisKernelEvent* ev);
+ 
+ void RegisterEventQueue(Core::Loader::SymbolsResolver* sym);
+diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
+index 8d8d988a..978e9373 100644
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -80,20 +80,15 @@ void VideoOutDriver::Close(s32 handle) {
+     }
+ 
+     // Clear events
+-    for (auto event : main_port.flip_events) {
+-        auto equeue = Kernel::GetEqueue(event);
+-        if (equeue != nullptr) {
+-            equeue->RemoveEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
+-                                Kernel::OrbisKernelEvent::Filter::VideoOut);
+-        }
++    std::scoped_lock events_lock{main_port.vo_mutex}; // SecondSonPC (patch 0025)
++    for (const auto& queue : main_port.flip_events) {
++        Kernel::EqueueRemoveEvent(queue, static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
++                                  Kernel::OrbisKernelEvent::Filter::VideoOut);
+     }
+     main_port.flip_events.clear();
+-    for (auto event : main_port.vblank_events) {
+-        auto equeue = Kernel::GetEqueue(event);
+-        if (equeue != nullptr) {
+-            equeue->RemoveEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+-                                Kernel::OrbisKernelEvent::Filter::VideoOut);
+-        }
++    for (const auto& queue : main_port.vblank_events) {
++        Kernel::EqueueRemoveEvent(queue, static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
++                                  Kernel::OrbisKernelEvent::Filter::VideoOut);
+     }
+     main_port.vblank_events.clear();
+ }
+@@ -257,11 +252,11 @@ void VideoOutDriver::Flip(const Request& req) {
+     }
+ 
+     // Trigger flip events for the port.
+-    for (auto event : port->flip_events) {
+-        auto equeue = Kernel::GetEqueue(event);
+-        if (equeue != nullptr) {
+-            equeue->TriggerEvent(
+-                static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
++    {
++        std::scoped_lock events_lock{port->vo_mutex}; // SecondSonPC (patch 0025)
++        for (const auto& queue : port->flip_events) {
++            Kernel::EqueueTriggerEvent(
++                queue, static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
+                 Kernel::OrbisKernelEvent::Filter::VideoOut,
+                 reinterpret_cast<void*>(static_cast<u64>(OrbisVideoOutInternalEventId::Flip) |
+                                         (req.flip_arg << 16)));
+@@ -387,16 +382,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+             std::scoped_lock lock{main_port.vo_mutex};
+ 
+             // Trigger flip events for the port
+-            for (auto event : main_port.vblank_events) {
+-                auto equeue = Kernel::GetEqueue(event);
+-                if (equeue != nullptr) {
+-                    equeue->TriggerEvent(
+-                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+-                        Kernel::OrbisKernelEvent::Filter::VideoOut,
+-                        reinterpret_cast<void*>(
+-                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
+-                            (vblank_status.count << 16)));
+-                }
++            for (const auto& queue : main_port.vblank_events) {
++                Kernel::EqueueTriggerEvent(
++                    queue, static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
++                    Kernel::OrbisKernelEvent::Filter::VideoOut,
++                    reinterpret_cast<void*>(static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
++                                            (vblank_status.count << 16)));
+             }
+ 
+             // Update vblank status
+diff --git a/src/core/libraries/videoout/driver.h b/src/core/libraries/videoout/driver.h
+index ca2b6456..192c7525 100644
+--- a/src/core/libraries/videoout/driver.h
++++ b/src/core/libraries/videoout/driver.h
+@@ -25,8 +25,10 @@ struct VideoOutPort {
+     std::array<BufferAttributeGroup, MaxDisplayBufferGroups> groups;
+     FlipStatus flip_status;
+     SceVideoOutVblankStatus vblank_status;
+-    std::vector<Kernel::OrbisKernelEqueue> flip_events;
+-    std::vector<Kernel::OrbisKernelEqueue> vblank_events;
++    // SecondSonPC (P3.6, patch 0025): the queues by identity, under vo_mutex (guest threads add and delete,
++    // the present thread delivers).
++    std::vector<Kernel::EqueueId> flip_events;
++    std::vector<Kernel::EqueueId> vblank_events;
+     std::mutex vo_mutex;
+     std::mutex port_mutex;
+     std::condition_variable vo_cv;
+diff --git a/src/core/libraries/videoout/video_out.cpp b/src/core/libraries/videoout/video_out.cpp
+index 1a4bb134..d7f82bad 100644
+--- a/src/core/libraries/videoout/video_out.cpp
++++ b/src/core/libraries/videoout/video_out.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++
+ #include "common/assert.h"
+ #include "common/elf_info.h"
+ #include "common/logging/log.h"
+@@ -46,8 +48,9 @@ s32 PS4_SYSV_ABI sceVideoOutAddFlipEvent(Kernel::OrbisKernelEqueue eq, s32 handl
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+     }
+ 
+-    auto equeue = Kernel::GetEqueue(eq);
+-    if (equeue == nullptr) {
++    // SecondSonPC (P3.6, patch 0025): the queue by identity (the present thread delivers into it later).
++    const auto queue = Kernel::FindEqueueId(eq);
++    if (!queue) {
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+     }
+ 
+@@ -59,9 +62,14 @@ s32 PS4_SYSV_ABI sceVideoOutAddFlipEvent(Kernel::OrbisKernelEqueue eq, s32 handl
+     event.event.fflags = 0;
+     event.event.data = 0;
+     event.data = port;
+-    equeue->AddEvent(event);
++    if (!Kernel::EqueueAddEvent(*queue, event)) {
++        return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE; // deleted meanwhile
++    }
+ 
+-    port->flip_events.push_back(eq);
++    std::scoped_lock lock{port->vo_mutex};
++    if (std::ranges::find(port->flip_events, *queue) == port->flip_events.end()) {
++        port->flip_events.push_back(*queue); // once per queue: a second add only updates udata
++    }
+     return ORBIS_OK;
+ }
+ 
+@@ -71,12 +79,16 @@ s32 PS4_SYSV_ABI sceVideoOutDeleteFlipEvent(Kernel::OrbisKernelEqueue eq, s32 ha
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+     }
+ 
+-    auto equeue = Kernel::GetEqueue(eq);
+-    if (equeue == nullptr) {
++    const auto queue = Kernel::FindEqueueId(eq);
++    if (!queue) {
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+     }
+-    equeue->RemoveEvent(handle, Kernel::OrbisKernelEvent::Filter::VideoOut);
+-    port->flip_events.erase(find(port->flip_events.begin(), port->flip_events.end(), eq));
++    // SecondSonPC (patch 0025): the event added above (it was removed by the port's handle, which is not its
++    // ident), and the queue out of the list only if it is there.
++    Kernel::EqueueRemoveEvent(*queue, static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
++                              Kernel::OrbisKernelEvent::Filter::VideoOut);
++    std::scoped_lock lock{port->vo_mutex};
++    std::erase(port->flip_events, *queue);
+     return ORBIS_OK;
+ }
+ 
+@@ -88,8 +100,9 @@ s32 PS4_SYSV_ABI sceVideoOutAddVblankEvent(Kernel::OrbisKernelEqueue eq, s32 han
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+     }
+ 
+-    auto equeue = Kernel::GetEqueue(eq);
+-    if (equeue == nullptr) {
++    // SecondSonPC (P3.6, patch 0025): the queue by identity (the present thread delivers into it later).
++    const auto queue = Kernel::FindEqueueId(eq);
++    if (!queue) {
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+     }
+ 
+@@ -101,9 +114,14 @@ s32 PS4_SYSV_ABI sceVideoOutAddVblankEvent(Kernel::OrbisKernelEqueue eq, s32 han
+     event.event.fflags = 0;
+     event.event.data = 0;
+     event.data = port;
+-    equeue->AddEvent(event);
++    if (!Kernel::EqueueAddEvent(*queue, event)) {
++        return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE; // deleted meanwhile
++    }
+ 
+-    port->vblank_events.push_back(eq);
++    std::scoped_lock lock{port->vo_mutex};
++    if (std::ranges::find(port->vblank_events, *queue) == port->vblank_events.end()) {
++        port->vblank_events.push_back(*queue); // once per queue: a second add only updates udata
++    }
+     return ORBIS_OK;
+ }
+ 
+@@ -113,12 +131,15 @@ s32 PS4_SYSV_ABI sceVideoOutDeleteVblankEvent(Kernel::OrbisKernelEqueue eq, s32
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+     }
+ 
+-    auto equeue = Kernel::GetEqueue(eq);
+-    if (equeue == nullptr) {
++    const auto queue = Kernel::FindEqueueId(eq);
++    if (!queue) {
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+     }
+-    equeue->RemoveEvent(handle, Kernel::OrbisKernelEvent::Filter::VideoOut);
+-    port->vblank_events.erase(find(port->vblank_events.begin(), port->vblank_events.end(), eq));
++    // SecondSonPC (patch 0025): the event added above, not one with the port's handle as ident.
++    Kernel::EqueueRemoveEvent(*queue, static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
++                              Kernel::OrbisKernelEvent::Filter::VideoOut);
++    std::scoped_lock lock{port->vo_mutex};
++    std::erase(port->vblank_events, *queue);
+     return ORBIS_OK;
+ }
+ 

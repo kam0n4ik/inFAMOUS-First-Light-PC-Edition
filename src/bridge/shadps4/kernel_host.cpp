@@ -93,6 +93,7 @@ public:
 void InstallKernelHost(const App::Config& cfg, u32 psf_attributes) {
     static KernelHostImpl host;
     Kernel::SetHost(&host);
+    InstallEventQueueHost(); // P3.6: the event queue contract over the bridge's libkernel
     const bool title_neo = ((psf_attributes >> 23) & 1) != 0; // param.sfo ATTRIBUTE: supports PS4 Pro
     Kernel::Configure(cfg.neo_mode, title_neo);
     Kernel::Start();

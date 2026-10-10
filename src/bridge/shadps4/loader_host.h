@@ -63,6 +63,10 @@ void InstallKernelHost(const App::Config& cfg, u32 psf_attributes);
 /// code. false: `error` says why (the caller stops).
 bool InstallKernelRuntime(const App::Config& cfg, std::string* error);
 
+/// P3.6 (src/bridge/shadps4/event_queue_host.cpp): the contract of runtime/kernel/event_queues.h over the bridge's
+/// libkernel, the owner of the game's event queues (patch 0025). Called by InstallKernelHost.
+void InstallEventQueueHost();
+
 /// --selftest (src/bridge/shadps4/selftest.cpp): exit code 0 = every check passed.
 int RunSelfTest(const App::Config& cfg);
 

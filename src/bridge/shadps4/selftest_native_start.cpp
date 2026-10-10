@@ -806,6 +806,10 @@ int RunNativeMemorySelfTest(const App::Config& cfg) {
             groups.push_back(std::move(g));
         }
     }
+    // P3.6: the game's event queues (they do not depend on the memory manager; run in this configuration too).
+    for (auto& g : TestEventQueues()) {
+        groups.push_back(std::move(g));
+    }
     int checks = 0;
     int failures = 0;
     std::string text = fmt::format("SecondSonPC self-test --native memory (commit {}): SecondSonPC's memory manager "

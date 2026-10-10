@@ -4877,6 +4877,10 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestKernelHle(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    // P3.6: the game's event queues (the bridge's libkernel, patch 0025) and their contract.
+    for (auto& g : TestEventQueues()) {
+        native_groups.push_back(std::move(g));
+    }
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

@@ -31,6 +31,9 @@ std::vector<TestGroup> TestNativeCpu(const App::Config& cfg);
 /// P3.5 (src/bridge/shadps4/selftest_kernel_hle.cpp): the guest errno, libkernel's memory functions.
 std::vector<TestGroup> TestKernelHle(const App::Config& cfg);
 
+/// P3.6 (src/bridge/shadps4/selftest_equeue.cpp): the game's event queues, their guest API and contract.
+std::vector<TestGroup> TestEventQueues();
+
 /// The executable segment of the game's eboot.bin copied into host memory (read/write; trampoline area after
 /// it) and its .eh_frame function ranges (selftest_fs.cpp). The game's files are only read.
 struct EbootCopy {
