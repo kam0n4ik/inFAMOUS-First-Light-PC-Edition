@@ -1,0 +1,80 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index a6fb0203..2ec614e4 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -107,6 +107,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
+              (sspc_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0,
+              (sspc_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0,
+              (sspc_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0);
++    // SecondSonPC P2.5 (--perf-opt stream-reads): see Runtime::AccessBuffer.
++    runtime.SspcSetReadUntracked(&stream_buffer);
+ }
+ 
+ BufferCache::~BufferCache() = default;
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 4f6fd2bb..18b738d7 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <vulkan/vulkan_format_traits.hpp>
+ 
++#include "bridge/shadps4/perf_opts.h" // SecondSonPC P2.5 optimizations
++
+ namespace Vulkan {
+ 
+ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
+@@ -691,8 +693,6 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64
+ 
+ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+-    MakeCurrent(handle);
+-
+     const Interval range = {
+         .start = offset,
+         .end = offset + size,
+@@ -710,6 +710,19 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
+         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
+         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
+ 
++    // SecondSonPC P2.5 (--perf-opt stream-reads): read ranges are only ever checked for a write
++    // destination (IsBufferAccessed with check_read_access: CopyBuffer, FillBuffer, InlineData), and
++    // the stream buffer is never one (its ranges are written by the CPU; a GPU copy, fill or inline
++    // write goes to a buffer ObtainBuffer returned for writing, never the stream buffer). So a
++    // read-only access to it adds its stage to the pending barrier, as below, without the interval
++    // bookkeeping that the ~27 000 stream copies per frame otherwise pay for.
++    if (SecondSon::PerfOpts::stream_reads && handle == sspc_read_untracked &&
++        !(src_access & WRITE_MASK)) {
++        memory_barrier.srcStageMask |= src_stage;
++        return;
++    }
++
++    MakeCurrent(handle);
+     if (src_access & WRITE_MASK) {
+         resource->write_ranges.Add(range);
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.h b/src/video_core/renderer_vulkan/vk_runtime.h
+index 7dffced1..65ab7bcc 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.h
++++ b/src/video_core/renderer_vulkan/vk_runtime.h
+@@ -74,6 +74,12 @@ public:
+     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                           bool check_read_access = false);
+ 
++    /// SecondSonPC P2.5 (--perf-opt stream-reads): the buffer (the stream buffer) whose read-only
++    /// accesses are not recorded in read ranges (see AccessBuffer).
++    void SspcSetReadUntracked(const VideoCore::Buffer* handle) {
++        sspc_read_untracked = handle;
++    }
++
+     void FlushBarriers();
+ 
+ private:
+@@ -92,6 +98,7 @@ private:
+     };
+     BufferBarriers* resource{};
+     std::vector<BufferBarriers> resources;
++    const VideoCore::Buffer* sspc_read_untracked{}; // SecondSonPC P2.5 (stream-reads)
+     VideoCore::Image::Barriers image_barriers;
+     vk::MemoryBarrier2 memory_barrier{};
+ };

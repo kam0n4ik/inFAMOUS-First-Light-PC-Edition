@@ -1046,9 +1046,11 @@ void RunGame(const App::Config& cfg) {
     if (!cfg.test_presses.empty()) {
         StartTestInput(cfg.test_presses, cfg.logs_dir);
     }
-    SSPC_LOG(App, Info, "P2.5 bridge performance changes: barrier-memo {}, image-memo {}, stream-host {}",
+    SSPC_LOG(App, Info,
+             "P2.5 bridge performance changes: barrier-memo {}, image-memo {}, stream-host {}, "
+             "stream-reads {}",
              PerfOpts::barrier_memo ? "on" : "off", PerfOpts::image_memo ? "on" : "off",
-             PerfOpts::stream_host ? "on" : "off");
+             PerfOpts::stream_host ? "on" : "off", PerfOpts::stream_reads ? "on" : "off");
     if (cfg.track_stats) {
         TrackDiag::Enable(); // before the GPU (its page manager) and before the frame log
     }

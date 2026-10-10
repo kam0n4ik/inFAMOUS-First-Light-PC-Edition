@@ -30,4 +30,12 @@ inline bool image_memo = true;
 // 128 MiB moved from VRAM to shared memory); --no-perf-opt stream-host turns it off.
 inline bool stream_host = true;
 
+// Vulkan::Runtime::AccessBuffer (patch 0020): a read-only access to the stream buffer adds only its
+// pipeline stage to the pending barrier, without recording a read range - read ranges are checked only
+// for a write destination, which the stream buffer never is (~27 000 intervals per frame looking at
+// dense foliage). On by default since its A/B (beach scene, ABBA: dense foliage 41.2-41.5 -> 43.2-44.5
+// FPS); --no-perf-opt stream-reads turns it off. (Tried with it and rejected: the stream buffer in
+// cached system memory - 40.2-40.5 FPS, slower than write-combined memory, docs/PHASE2_P25_PERFORMANCE.md.)
+inline bool stream_reads = true;
+
 } // namespace SecondSon::PerfOpts

@@ -64,14 +64,20 @@ $modeArgs = @{
     # these are the four combinations A-D of docs/PHASE2_P24_NATIVE_THREADS.md.
     T = "--native threads"; TM = "--native threads --native memory --memory-commit on-demand"
     # P2.5 bridge performance changes, one build: PO0 every change off, PO1 the defaults (all on that
-    # passed their A/B: barrier-memo, image-memo, stream-host). PO0 = PO1 of the build before P2.5.
-    PO0 = "--no-perf-opt barrier-memo --no-perf-opt image-memo --no-perf-opt stream-host"; PO1 = ""
+    # passed their A/B: barrier-memo, image-memo, stream-host, stream-reads). PO0 = PO1 of the build
+    # before P2.5.
+    PO0 = "--no-perf-opt barrier-memo --no-perf-opt image-memo --no-perf-opt stream-host --no-perf-opt stream-reads"
+    PO1 = ""
     # One change under test against the defaults. PI = + image-memo (its A/B, p25_imemo_ab; now a
     # default, so PI = PO1).
     PI = "--perf-opt image-memo"
     # PS = + stream-host (the stream buffer in system memory, patch 0019; its A/B p25_shost_ab, now a
     # default, so PS = PO1).
     PS = "--perf-opt stream-host"
+    # PR = + stream-reads (no read ranges for the stream buffer, patch 0020; its A/B p25_stream2_ab, now
+    # a default, so PR = PO1). That session's PC (stream buffer in cached system memory) was rejected and
+    # removed.
+    PR = "--perf-opt stream-reads"
 }
 $defaultExe = "$root\build\bin\SecondSonPC.exe"
 $exeMap = @{}
