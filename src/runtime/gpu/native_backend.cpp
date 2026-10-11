@@ -994,6 +994,20 @@ std::string Backend::Report() {
                            buffers_->Ok() ? "on," : "OFF,", b.resident_bytes >> 20, b.binds, b.bind_calls, b.uploads,
                            b.upload_bytes >> 20, b.writebacks, b.writeback_bytes >> 20, b.invalidations, b.uncached, b.large_ranges, b.early_writebacks,
                            b.over_budget, b.first_error);
+        out += fmt::format("write-back ranges <=4 KiB {} ({} MiB), <=64 KiB {} ({} MiB), <=1 MiB {} ({} MiB), <=4 MiB {} "
+                           "({} MiB), larger {} ({} MiB); copy commands {}\n",
+                           b.wb_hist_count[0], b.wb_hist_bytes[0] >> 20, b.wb_hist_count[1], b.wb_hist_bytes[1] >> 20,
+                           b.wb_hist_count[2], b.wb_hist_bytes[2] >> 20, b.wb_hist_count[3], b.wb_hist_bytes[3] >> 20,
+                           b.wb_hist_count[4], b.wb_hist_bytes[4] >> 20, b.wb_commands);
+        out += fmt::format("write-backs of changed words only (large ranges): {} MiB compared in {} dispatches, shadows "
+                           "made from the host {}\n",
+                           b.wb_diff_bytes >> 20, b.wb_diff_dispatches, b.wb_shadow_inits);
+        if (b.wb_checked_bytes != 0) {
+            out += fmt::format("write-backs checked (SSPC_DIAG_WB_DIRTY): {} MiB, changed 256-byte chunks {} ({} MiB), "
+                               "changed words {} ({} KiB)\n",
+                               b.wb_checked_bytes >> 20, b.wb_dirty_chunks, (b.wb_dirty_chunks * 256) >> 20,
+                               b.wb_dirty_words, (b.wb_dirty_words * 4) >> 10);
+        }
     }
     if (pipelines_) {
         const auto& p = pipelines_->Stats();

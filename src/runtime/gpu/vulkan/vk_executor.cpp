@@ -466,6 +466,20 @@ void Executor::Flush() {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
     const u64 wb0 = buffers_.Stats().writeback_bytes;
+    // SSPC_DIAG_MEASURE=skip_wb: MEASUREMENT ONLY (the host never sees the GPU's buffer writes) - the write-backs'
+    // GPU cost without the profiler (never a configuration)
+    static const bool skip_wb = [] {
+        char v[32] = {};
+        const bool s = GetEnvironmentVariableA("SSPC_DIAG_MEASURE", v, sizeof(v)) > 0 && std::string_view(v) == "skip_wb";
+        if (s) {
+            SSPC_LOG(GPU, Warning, "MEASUREMENT ONLY: SSPC_DIAG_MEASURE=skip_wb - no write-backs (the host's copy is "
+                                   "wrong)");
+        }
+        return s;
+    }();
+    if (skip_wb) {
+        buffers_.DropWriteBack();
+    }
     buffers_.RecordWriteBack(cur_.cb, cur_.value);
     // (by the batch's end: 0 a fence/flip/sync/idle flush, 1 full with a fence or a timeline write, 2 full without)
     stats_.wb_bytes_by[!flush_full_ ? 0 : batch_fence_ ? 1 : 2] += buffers_.Stats().writeback_bytes - wb0;

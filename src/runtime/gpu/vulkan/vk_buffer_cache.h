@@ -16,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +42,11 @@ struct BufferCacheStats {
     u64 invalidations = 0, uncached = 0, over_budget = 0, large_ranges = 0, early_writebacks = 0;
     u64 t_large = 0, t_bound = 0, t_scan = 0, t_hook = 0, t_arm = 0, t_copy = 0; ///< TSC ticks inside Prepare
     u64 n_upload_calls = 0;
+    /// write-back ranges by size (<=4 KiB, <=64 KiB, <=1 MiB, <=4 MiB, larger): count, bytes; copy commands recorded
+    std::array<u64, 5> wb_hist_count{}, wb_hist_bytes{};
+    u64 wb_commands = 0;
+    u64 wb_diff_bytes = 0, wb_diff_dispatches = 0, wb_shadow_inits = 0; ///< write-backs by the changed-words shader
+    u64 wb_checked_bytes = 0, wb_dirty_chunks = 0, wb_dirty_words = 0; ///< SSPC_DIAG_WB_DIRTY (256-byte chunks, words)
     std::string first_error;
 };
 
@@ -104,6 +110,10 @@ public:
     void Collect(u64 completed);
     /// The end of a batch: the copies of its GPU writes back to the host (`cb` outside rendering).
     void RecordWriteBack(VkCommandBuffer cb, u64 seq);
+    /// SSPC_DIAG_MEASURE=skip_wb only: the batch's written ranges forgotten (no write-back).
+    void DropWriteBack() { written_.clear(); }
+    /// SSPC_DIAG_WB_DIRTY=1: the completed write-backs compared with the host's bytes before them (Collect calls it).
+    void CheckWriteBacks(u64 completed);
     /// Before the batch is submitted: binds the memory its commands need (vkQueueBindSparse, the queue's lock held by
     /// the caller); `wait_value` of `wait` is what the batch waits for (0: nothing to wait for).
     bool SubmitBinds(VkSemaphore& wait, u64& wait_value);
@@ -185,6 +195,35 @@ private:
         u64 seq;
     };
     std::vector<DeferredInval> deferred_inval_;
+    std::vector<std::pair<VkBuffer, VkBufferCopy>> wb_regions_; ///< RecordWriteBack's scratch
+    std::vector<VkBufferCopy> wb_copies_;
+    struct WbSnap {
+        u64 seq = 0, addr = 0;
+        std::vector<u8> before;
+    };
+    std::deque<WbSnap> wb_snaps_; ///< SSPC_DIAG_WB_DIRTY
+    /// The write-back of a large range (>= kDiffMin) by the shader wb_diff.comp: a device-local shadow per range holds
+    /// what the host has (made from the host once; every upload of pages under it copies the same host bytes into it;
+    /// a write the tracker does not see over it - an exact invalidation - makes it again); at the batch's end the
+    /// shader writes to the host (and the shadow) only the words where the video memory copy differs from it.
+    struct WbShadow {
+        u64 addr = 0, size = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        bool valid = false;
+    };
+    static constexpr u64 kDiffMin = 1ull << 20;
+    static constexpr size_t kMaxShadows = 32;
+    static constexpr u64 kShadowBudget = 256ull << 20;
+    std::vector<WbShadow> wb_shadows_; ///< (capacity reserved: pointers into it stay valid)
+    u64 shadow_bytes_ = 0;
+    VkDescriptorSetLayout diff_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout diff_layout_ = VK_NULL_HANDLE;
+    VkPipeline diff_pipeline_ = VK_NULL_HANDLE;
+    void InitDiff();
+    void CopyIntoShadows(u64 a, u64 size, VkCommandBuffer cb);
+    /// The shadow of exactly [b, e) (made, or its host bytes copied in when not in step: `inited`); nullptr: none.
+    WbShadow* ShadowFor(u64 b, u64 e, VkCommandBuffer cb, u64 seq, bool& inited);
     bool host_wait_binds_ = false; ///< the binds complete on the host (validation runs; SSPC_DIAG_BIND_HOST_WAIT=1)
     void (*before_upload_)(void*) = nullptr;
     void* before_upload_ctx_ = nullptr;

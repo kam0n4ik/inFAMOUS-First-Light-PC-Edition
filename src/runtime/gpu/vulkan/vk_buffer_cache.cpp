@@ -4,15 +4,18 @@
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 
 #include <algorithm>
+#include <cstring>
 #include <bit>
 
 #include <fmt/format.h>
 
 #include "base/log.h"
+#include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
+#include "runtime/gpu/vulkan/wb_diff_spv.h"
 
 #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
 
@@ -98,6 +101,7 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
                                        .initialValue = 0};
     const VkSemaphoreCreateInfo si{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
     f.vkCreateSemaphore(ctx_.Device(), &si, nullptr, &bind_timeline_);
+    InitDiff();
     SSPC_LOG(GPU, Info,
              "native backend: buffer cache on: the guest's GPU address space mirrored in video memory (sparse {} GiB, "
              "{} KiB blocks, budget {} MiB)",
@@ -106,6 +110,19 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
 
 BufferCache::~BufferCache() {
     const auto& f = Fn();
+    for (WbShadow& sh : wb_shadows_) {
+        f.vkDestroyBuffer(ctx_.Device(), sh.buffer, nullptr);
+        f.vkFreeMemory(ctx_.Device(), sh.memory, nullptr);
+    }
+    if (diff_pipeline_ != VK_NULL_HANDLE) {
+        f.vkDestroyPipeline(ctx_.Device(), diff_pipeline_, nullptr);
+    }
+    if (diff_layout_ != VK_NULL_HANDLE) {
+        f.vkDestroyPipelineLayout(ctx_.Device(), diff_layout_, nullptr);
+    }
+    if (diff_set_layout_ != VK_NULL_HANDLE) {
+        f.vkDestroyDescriptorSetLayout(ctx_.Device(), diff_set_layout_, nullptr);
+    }
     if (buffer_ != VK_NULL_HANDLE) {
         f.vkDestroyBuffer(ctx_.Device(), buffer_, nullptr);
     }
@@ -150,6 +167,8 @@ void BufferCache::ApplyInvalidations() {
         coarse.swap(pending_coarse_);
     }
     const size_t exact = ranges.size();
+    // (a write-back shadow under an exact report needs nothing: those pages are invalid now, and a GPU write there - the
+    // only thing compared with the shadow - uploads them first, which copies the same host bytes into the shadow)
     ranges.insert(ranges.end(), coarse.begin(), coarse.end());
     for (size_t r = 0; r < ranges.size(); ++r) {
         const u64 addr = ranges[r].first, size = ranges[r].second;
@@ -239,19 +258,162 @@ bool BufferCache::EnsureBound(u64 first_block, u64 last_block) {
 bool BufferCache::Upload(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) {
     const auto& f = Fn();
     for (u64 done = 0; done < size;) {
-        const u64 piece = std::min(kMaxCopy - ((addr + done) & (kMaxCopy - 1)), size - done);
+        const u64 a = addr + done;
+        const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), size - done);
         GuestBuffers::View v{};
         GuestBuffers::Failure fl{};
-        if (!guest_.Get(addr + done, piece, seq, v, fl)) {
+        if (!guest_.Get(a, piece, seq, v, fl)) {
             return false;
         }
-        const VkBufferCopy copy{.srcOffset = v.offset, .dstOffset = addr + done, .size = piece};
+        const VkBufferCopy copy{.srcOffset = v.offset, .dstOffset = a, .size = piece};
         f.vkCmdCopyBuffer(cb, v.buffer, buffer_, 1, &copy);
+        // a write-back shadow over these pages takes the same host bytes (it holds what the host has where the video
+        // memory copy is valid; the caller's barriers order both copies)
+        for (const WbShadow& sh : wb_shadows_) {
+            const u64 lo = std::max(a, sh.addr), hi = std::min(a + piece, sh.addr + sh.size);
+            if (sh.valid && lo < hi) {
+                const VkBufferCopy sc{.srcOffset = v.offset + (lo - a), .dstOffset = lo - sh.addr, .size = hi - lo};
+                f.vkCmdCopyBuffer(cb, v.buffer, sh.buffer, 1, &sc);
+            }
+        }
         stats_.upload_bytes += piece;
         done += piece;
     }
     ++stats_.uploads;
     return true;
+}
+
+void BufferCache::CopyIntoShadows(u64 a, u64 size, VkCommandBuffer cb) {
+    // a write-back by copy: the shadows over [a, a + size) take the video memory bytes too (else an older shadow word
+    // that equals the video memory copy again later - a counter reset - would hide the change from the comparison)
+    for (const WbShadow& sh : wb_shadows_) {
+        const u64 lo = std::max(a, sh.addr), hi = std::min(a + size, sh.addr + sh.size);
+        if (sh.valid && lo < hi) {
+            const VkBufferCopy c{.srcOffset = lo, .dstOffset = lo - sh.addr, .size = hi - lo};
+            Fn().vkCmdCopyBuffer(cb, buffer_, sh.buffer, 1, &c);
+        }
+    }
+}
+
+void BufferCache::InitDiff() {
+    // SSPC_DIAG_WB_DIFF=off: every write-back copies whole ranges (the P4.6 behaviour)
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_WB_DIFF", v, sizeof(v)) == 3 && std::string_view(v) == "off") {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_WB_DIFF=off - write-backs copy whole ranges");
+        return;
+    }
+    const auto& f = Fn();
+    const VkDevice dev = ctx_.Device();
+    if (ctx_.Caps().max_push_descriptors < 3) {
+        return;
+    }
+    VkDescriptorSetLayoutBinding b[3];
+    for (u32 i = 0; i < 3; ++i) {
+        b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    }
+    const VkDescriptorSetLayoutCreateInfo dci{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                              .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                              .bindingCount = 3,
+                                              .pBindings = b};
+    const VkPushConstantRange pr{.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 16};
+    VkShaderModule sm = VK_NULL_HANDLE;
+    const VkShaderModuleCreateInfo smi{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                       .codeSize = sizeof(kWbDiffSpirv),
+                                       .pCode = kWbDiffSpirv};
+    if (f.vkCreateDescriptorSetLayout(dev, &dci, nullptr, &diff_set_layout_) != VK_SUCCESS) {
+        diff_set_layout_ = VK_NULL_HANDLE;
+        return;
+    }
+    const VkPipelineLayoutCreateInfo pci{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                         .setLayoutCount = 1,
+                                         .pSetLayouts = &diff_set_layout_,
+                                         .pushConstantRangeCount = 1,
+                                         .pPushConstantRanges = &pr};
+    if (f.vkCreatePipelineLayout(dev, &pci, nullptr, &diff_layout_) != VK_SUCCESS ||
+        f.vkCreateShaderModule(dev, &smi, nullptr, &sm) != VK_SUCCESS) {
+        return;
+    }
+    const VkComputePipelineCreateInfo cpi{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = sm,
+                  .pName = "main"},
+        .layout = diff_layout_};
+    if (f.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &diff_pipeline_) != VK_SUCCESS) {
+        diff_pipeline_ = VK_NULL_HANDLE;
+    }
+    f.vkDestroyShaderModule(dev, sm, nullptr);
+    wb_shadows_.reserve(kMaxShadows);
+    if (diff_pipeline_ != VK_NULL_HANDLE) {
+        SSPC_LOG(GPU, Info, "native backend: buffer cache: write-backs of ranges >= {} KiB write only the words the GPU "
+                            "changed (a video memory shadow per range)",
+                 kDiffMin >> 10);
+    }
+}
+
+BufferCache::WbShadow* BufferCache::ShadowFor(u64 b, u64 e, VkCommandBuffer cb, u64 seq, bool& inited) {
+    inited = false;
+    WbShadow* match = nullptr;
+    for (WbShadow& sh : wb_shadows_) {
+        if (match == nullptr && sh.addr <= b && e <= sh.addr + sh.size) {
+            match = &sh; // a shadow holding the whole range
+        }
+    }
+    for (WbShadow& sh : wb_shadows_) {
+        if (&sh != match && sh.valid && sh.addr < e && b < sh.addr + sh.size) {
+            // another shadow over these bytes would not see this write-back: made again before its next use (an
+            // older shadow word equal to the video memory copy would hide a newer CPU write from the comparison)
+            sh.valid = false;
+        }
+    }
+    if (match == nullptr) {
+        if (wb_shadows_.size() >= kMaxShadows || shadow_bytes_ + (e - b) > kShadowBudget) {
+            return nullptr;
+        }
+        const auto& f = Fn();
+        WbShadow sh{.addr = b, .size = e - b};
+        const VkBufferCreateInfo bci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                     .size = sh.size,
+                                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        if (f.vkCreateBuffer(ctx_.Device(), &bci, nullptr, &sh.buffer) != VK_SUCCESS) {
+            return nullptr;
+        }
+        VkMemoryRequirements req{};
+        f.vkGetBufferMemoryRequirements(ctx_.Device(), sh.buffer, &req);
+        const VkMemoryAllocateInfo mai{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                       .allocationSize = req.size,
+                                       .memoryTypeIndex = memory_type_};
+        if ((req.memoryTypeBits & (1u << memory_type_)) == 0 ||
+            f.vkAllocateMemory(ctx_.Device(), &mai, nullptr, &sh.memory) != VK_SUCCESS) {
+            f.vkDestroyBuffer(ctx_.Device(), sh.buffer, nullptr);
+            return nullptr;
+        }
+        f.vkBindBufferMemory(ctx_.Device(), sh.buffer, sh.memory, 0);
+        shadow_bytes_ += sh.size;
+        wb_shadows_.push_back(sh);
+        match = &wb_shadows_.back();
+    }
+    if (!match->valid) {
+        // the host's bytes now (before this batch's write-back: what the host had since the last sync), all of it
+        const auto& f = Fn();
+        const u64 sb = match->addr, se = match->addr + match->size;
+        for (u64 a = sb; a < se;) {
+            const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), se - a);
+            GuestBuffers::View v{};
+            GuestBuffers::Failure fl{};
+            if (!guest_.Get(a, piece, seq, v, fl)) {
+                return nullptr;
+            }
+            const VkBufferCopy c{.srcOffset = v.offset, .dstOffset = a - sb, .size = piece};
+            f.vkCmdCopyBuffer(cb, v.buffer, match->buffer, 1, &c);
+            a += piece;
+        }
+        ++stats_.wb_shadow_inits;
+        inited = true;
+    }
+    return match;
 }
 
 bool BufferCache::Resident(u64 addr, u64 size, Range& out) {
@@ -494,6 +656,7 @@ void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) 
                 const VkBufferCopy copy{.srcOffset = a, .dstOffset = v.offset, .size = piece};
                 f.vkCmdCopyBuffer(cb, buffer_, v.buffer, 1, &copy);
                 stats_.writeback_bytes += piece;
+                CopyIntoShadows(a, piece, cb);
             }
             a += piece;
         }
@@ -561,6 +724,9 @@ bool BufferCache::HostWritePending(u64 addr, u64 size) const {
 }
 
 void BufferCache::Collect(u64 completed) {
+    if (!wb_snaps_.empty()) {
+        CheckWriteBacks(completed);
+    }
     completed_ = std::max(completed_, completed);
     if (!deferred_inval_.empty()) {
         // a coarse report's kept pages: invalid once the GPU's batch completed (written back) - unless the GPU wrote
@@ -608,29 +774,156 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
         }
     }
     written_.clear();
+    // the batch's writes before the copies and the write-back shader (it reads the video memory copy and the shadows)
     VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-                        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                        .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+                        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
     const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
                                .pMemoryBarriers = &mb};
     f.vkCmdPipelineBarrier2(cb, &dep);
+    // SSPC_DIAG_WB_DIRTY=1: the host's bytes of each range before its write-back, compared with them once the batch
+    // completed (Collect): how much of what is copied back did the GPU change (gpu_native.txt)
+    static const bool dirty_diag = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_WB_DIRTY", v, sizeof(v)) == 1 && v[0] == '1';
+    }();
+    // the regions by destination window: one copy command per window (P4.6 night: ~2100 ranges a frame in the
+    // village were 2100 copy commands)
+    wb_regions_.clear();
+    // large ranges: only the words the GPU changed reach the host (P4.6 night, SSPC_DIAG_WB_DIRTY in the village: of
+    // ~48 MiB a frame copied back, 87% in ~3 ranges of ~11 MiB a frame, 5% of the words changed)
+    ApplyInvalidations(); // (a shadow under a write the tracker did not see is made again first)
+    struct Diff {
+        u64 b, e;
+        WbShadow* sh;
+    };
+    std::vector<Diff> diffs;
+    bool any_init = false;
     for (const auto& [b, e] : merged) {
+        const u64 size = e - b;
+        const u32 bucket = size <= (4u << 10) ? 0 : size <= (64u << 10) ? 1 : size <= (1u << 20) ? 2 : size <= (4u << 20) ? 3 : 4;
+        ++stats_.wb_hist_count[bucket];
+        stats_.wb_hist_bytes[bucket] += size;
+        if (dirty_diag && size <= (16ull << 20)) {
+            WbSnap snap{seq, b, std::vector<u8>(size)};
+            if (GuestMemory* gm = GetGuestMemory()) {
+                gm->CopySparse(b, snap.before.data(), size);
+                wb_snaps_.push_back(std::move(snap));
+            }
+        }
+        if (diff_pipeline_ != VK_NULL_HANDLE && size >= kDiffMin && (b & 3) == 0 && (size & 3) == 0) {
+            bool inited = false;
+            if (WbShadow* sh = ShadowFor(b, e, cb, seq, inited)) {
+                any_init |= inited;
+                diffs.push_back({b, e, sh});
+                ++stats_.writebacks;
+                continue;
+            }
+        }
         for (u64 a = b; a < e;) {
             const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), e - a);
             GuestBuffers::View v{};
             GuestBuffers::Failure fl{};
             if (guest_.Get(a, piece, seq, v, fl)) {
-                const VkBufferCopy copy{.srcOffset = a, .dstOffset = v.offset, .size = piece};
-                f.vkCmdCopyBuffer(cb, buffer_, v.buffer, 1, &copy);
+                wb_regions_.push_back({v.buffer, VkBufferCopy{.srcOffset = a, .dstOffset = v.offset, .size = piece}});
                 stats_.writeback_bytes += piece;
+                CopyIntoShadows(a, piece, cb); // (a shadow over it takes the same bytes the host gets)
             } else if (stats_.first_error.empty()) {
                 stats_.first_error = fmt::format("write-back of [{:#x}, {:#x}): no host import", a, a + piece);
             }
             a += piece;
         }
         ++stats_.writebacks;
+    }
+    std::ranges::stable_sort(wb_regions_, [](const auto& x, const auto& y) { return x.first < y.first; });
+    wb_copies_.clear();
+    for (size_t i = 0; i < wb_regions_.size(); ++i) {
+        wb_copies_.push_back(wb_regions_[i].second);
+        if (i + 1 == wb_regions_.size() || wb_regions_[i + 1].first != wb_regions_[i].first) {
+            f.vkCmdCopyBuffer(cb, buffer_, wb_regions_[i].first, static_cast<u32>(wb_copies_.size()), wb_copies_.data());
+            ++stats_.wb_commands;
+            wb_copies_.clear();
+        }
+    }
+    if (diffs.empty()) {
+        return;
+    }
+    if (any_init) { // the shadows' host bytes before the shader compares with them
+        const VkMemoryBarrier2 ib{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
+        const VkDependencyInfo idep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                    .pMemoryBarriers = &ib};
+        f.vkCmdPipelineBarrier2(cb, &idep);
+    }
+    f.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_pipeline_);
+    const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
+    for (const Diff& d : diffs) {
+        bool in_step = true;
+        for (u64 a = d.b; a < d.e;) {
+            const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), d.e - a);
+            GuestBuffers::View v{};
+            GuestBuffers::Failure fl{};
+            if (!guest_.Get(a, piece, seq, v, fl) || (v.offset & 3) != 0) {
+                // (no host view: the shadow no longer matches the host)
+                in_step = false;
+                if (stats_.first_error.empty()) {
+                    stats_.first_error = fmt::format("write-back of [{:#x}, {:#x}): no host import", a, a + piece);
+                }
+                a += piece;
+                continue;
+            }
+            const u64 in_sh = a - d.sh->addr; // (the shadow may hold more than this range)
+            const u64 c_off = a & ~(align - 1), s_off = in_sh & ~(align - 1), h_off = v.offset & ~(align - 1);
+            const VkDescriptorBufferInfo bi[3] = {{buffer_, c_off, a + piece - c_off},
+                                                  {d.sh->buffer, s_off, in_sh + piece - s_off},
+                                                  {v.buffer, h_off, v.offset + piece - h_off}};
+            VkWriteDescriptorSet w[3];
+            for (u32 i = 0; i < 3; ++i) {
+                w[i] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        .dstBinding = i,
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        .pBufferInfo = &bi[i]};
+            }
+            f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_layout_, 0, 3, w);
+            const u32 pc[4] = {static_cast<u32>(piece / 4), static_cast<u32>((a - c_off) / 4),
+                               static_cast<u32>((in_sh - s_off) / 4), static_cast<u32>((v.offset - h_off) / 4)};
+            f.vkCmdPushConstants(cb, diff_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            f.vkCmdDispatch(cb, static_cast<u32>((piece / 4 + 255) / 256), 1, 1);
+            stats_.wb_diff_bytes += piece;
+            ++stats_.wb_diff_dispatches;
+            a += piece;
+        }
+        d.sh->valid = in_step; // the shadow now holds what the host has (where the GPU wrote: the GPU's words)
+    }
+}
+
+void BufferCache::CheckWriteBacks(u64 completed) {
+    // SSPC_DIAG_WB_DIRTY: the ranges written back by completed batches against the host's bytes before them
+    while (!wb_snaps_.empty() && wb_snaps_.front().seq <= completed) {
+        WbSnap& s = wb_snaps_.front();
+        std::vector<u8> now(s.before.size());
+        if (GuestMemory* gm = GetGuestMemory()) {
+            gm->CopySparse(s.addr, now.data(), now.size());
+            stats_.wb_checked_bytes += now.size();
+            for (u64 off = 0; off < now.size(); off += 256) {
+                const u64 n = std::min<u64>(256, now.size() - off);
+                if (std::memcmp(now.data() + off, s.before.data() + off, n) != 0) {
+                    ++stats_.wb_dirty_chunks;
+                    for (u64 w = off; w < off + n; w += 4) {
+                        const u64 m = std::min<u64>(4, off + n - w);
+                        stats_.wb_dirty_words += std::memcmp(now.data() + w, s.before.data() + w, m) != 0 ? 1 : 0;
+                    }
+                }
+            }
+        }
+        wb_snaps_.pop_front();
     }
 }
 
