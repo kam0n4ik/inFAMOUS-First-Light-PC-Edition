@@ -191,6 +191,8 @@ private:
     PageTracker* tracker_ = nullptr;
     std::mutex mutex_;
     std::multimap<u64, Window> windows_; ///< by base (a larger and a smaller window may share one - review MEDIUM 5)
+    Window* last_get_ = nullptr;          ///< the window Get found last (under mutex_; Drop clears it)
+    const Window* last_backing_ = nullptr; ///< the backing window BackingPointer found last (likewise)
     std::vector<Window> retired_;
     u64 max_window_ = 0;
     Stats stats_;

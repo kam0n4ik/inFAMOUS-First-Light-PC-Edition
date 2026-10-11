@@ -362,6 +362,12 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
     const u64 end = addr + size;
     std::scoped_lock lock{mutex_};
     ++stats_.lookups;
+    // the window found last (most lookups fall into it: one 32 MiB window covers a frame's small ranges)
+    if (Window* w = last_get_; w != nullptr && w->base <= addr && end <= w->base + w->size) {
+        w->last_seq = std::max(w->last_seq, seq);
+        out = {w->buffer, addr - w->base, w->base, w->size, w->backing};
+        return true;
+    }
     // windows starting at or below addr, nearest first, up to the longest window back
     auto it = windows_.upper_bound(addr);
     while (it != windows_.begin()) {
@@ -373,6 +379,7 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
         if (w.base <= addr && end <= w.base + w.size) {
             w.last_seq = std::max(w.last_seq, seq);
             out = {w.buffer, addr - w.base, w.base, w.size, w.backing};
+            last_get_ = &w;
             return true;
         }
     }
@@ -446,6 +453,9 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
 const u8* GuestBuffers::BackingPointer(u64 addr, u64 size) {
     const u64 end = addr + size;
     std::scoped_lock lock{mutex_};
+    if (const Window* w = last_backing_; w != nullptr && w->base <= addr && end <= w->base + w->size) {
+        return w->host + (addr - w->base);
+    }
     auto it = windows_.upper_bound(addr);
     while (it != windows_.begin()) {
         --it;
@@ -454,6 +464,7 @@ const u8* GuestBuffers::BackingPointer(u64 addr, u64 size) {
             break;
         }
         if (w.backing && w.base <= addr && end <= w.base + w.size) {
+            last_backing_ = &w;
             return w.host + (addr - w.base);
         }
     }
@@ -466,6 +477,8 @@ void GuestBuffers::Drop(u64 addr, u64 size) {
     }
     const u64 end = addr + size;
     std::scoped_lock lock{mutex_};
+    last_get_ = nullptr; // (they may be erased below)
+    last_backing_ = nullptr;
     auto it = windows_.lower_bound(addr > max_window_ ? addr - max_window_ : 0);
     while (it != windows_.end() && it->first < end) {
         Window& w = it->second;
