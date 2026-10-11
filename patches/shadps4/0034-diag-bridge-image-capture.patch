@@ -1,0 +1,165 @@
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index ecf1e4a38e..ab9b5b1e17 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -321,6 +321,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                         FramePacing::Mark(FramePacing::Event::CpFlip);
+                     }
+                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
++                    if (rasterizer) { // SecondSonPC P4.5 diagnostics (SSPC_DIAG_BRIDGE_CAPTURE)
++                        static u64 sspc_flips = 0;
++                        rasterizer->SspcDiagCapture(++sspc_flips);
++                    }
+                     break;
+                 }
+                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 06b99b0d96..752a6906bb 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++
+ #include "common/debug.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
+@@ -422,6 +426,93 @@ u64 Rasterizer::Flush() {
+     return current_tick;
+ }
+ 
++void Rasterizer::SspcDiagCapture(u64 flip) {
++    struct Want {
++        VAddr addr;
++        u64 flip;
++    };
++    static const std::vector<Want> wants = [] {
++        std::vector<Want> v;
++        const char* s = std::getenv("SSPC_DIAG_BRIDGE_CAPTURE");
++        if (s == nullptr) {
++            return v;
++        }
++        std::string str(s);
++        char* p = str.data();
++        while (*p != 0) {
++            Want w{std::strtoull(p, &p, 16), 0};
++            if (*p == ':') {
++                w.flip = std::strtoull(p + 1, &p, 10);
++            }
++            v.push_back(w);
++            while (*p == ',' || *p == ' ') {
++                ++p;
++            }
++        }
++        LOG_WARNING(Render_Vulkan, "SecondSonPC diagnostics: SSPC_DIAG_BRIDGE_CAPTURE - {} image captures", v.size());
++        std::filesystem::create_directories("logs/p45");
++        std::ofstream("logs/p45/bridge_capture_status.txt", std::ios::app)
++            << fmt::format("SSPC_DIAG_BRIDGE_CAPTURE: {} captures", v.size()) << '\n';
++        return v;
++    }();
++    for (const Want& w : wants) {
++        if (w.flip != flip) {
++            continue;
++        }
++        const VideoCore::ImageId id = texture_cache.SspcGpuModifiedAt(w.addr);
++        {
++            std::filesystem::create_directories("logs/p45");
++            std::ofstream status("logs/p45/bridge_capture_status.txt", std::ios::app);
++            status << fmt::format("flip {} address {:#x}: {}", flip, w.addr, id ? "found" : "no GPU-modified image") << '\n';
++        }
++        if (!id) {
++            LOG_WARNING(Render_Vulkan, "SecondSonPC diagnostics: no GPU-modified image at {:#x} at flip {}", w.addr,
++                        flip);
++            continue;
++        }
++        VideoCore::Image& image = texture_cache.GetImage(id);
++        const bool depth = image.info.props.is_depth;
++        const u32 texel = depth ? (image.info.num_bits == 16 ? 2u : 4u) : std::max(image.info.num_bits / 8, 1u);
++        const u32 w_px = image.info.size.width, h_px = image.info.size.height;
++        const u32 layers = std::min<u32>(image.info.resources.layers, 8);
++        const u64 layer_bytes = u64{w_px} * h_px * texel;
++        const auto staging =
++            runtime.GetStagingPool().Request(layer_bytes * layers, VideoCore::MemoryType::HostCached, 16, true);
++        std::vector<vk::BufferImageCopy> copies;
++        for (u32 l = 0; l < layers; ++l) {
++            copies.push_back(vk::BufferImageCopy{
++                .bufferOffset = staging.offset + l * layer_bytes,
++                .bufferRowLength = w_px,
++                .bufferImageHeight = h_px,
++                .imageSubresource = {.aspectMask = depth ? vk::ImageAspectFlagBits::eDepth
++                                                         : vk::ImageAspectFlagBits::eColor,
++                                     .mipLevel = 0,
++                                     .baseArrayLayer = l,
++                                     .layerCount = 1},
++                .imageOffset = {0, 0, 0},
++                .imageExtent = {w_px, h_px, 1},
++            });
++        }
++        runtime.DownloadImage(&image, staging.buffer, copies);
++        scheduler.Finish();
++        staging.Invalidate();
++        const int format = depth ? (texel == 2 ? 124 : 126) : static_cast<int>(image.info.pixel_format);
++        std::filesystem::create_directories("logs/p45");
++        for (u32 l = 0; l < layers; ++l) {
++            const std::string base = fmt::format("logs/p45/bridge_image_{:x}_{}_l{}", w.addr, flip, l);
++            std::ofstream raw(base + ".raw", std::ios::binary | std::ios::trunc);
++            raw.write(reinterpret_cast<const char*>(staging.mapped + l * layer_bytes),
++                      static_cast<std::streamsize>(layer_bytes));
++            std::ofstream meta(base + ".txt", std::ios::trunc);
++            meta << fmt::format("format={} width={} height={} row_bytes={} texel_bytes={}\n", format, w_px, h_px,
++                                u64{w_px} * texel, texel);
++        }
++        runtime.GetStagingPool().FreeDeferred(staging);
++        LOG_WARNING(Render_Vulkan, "SecondSonPC diagnostics: captured {:#x} ({}x{} format {} layers {}) at flip {}",
++                    w.addr, w_px, h_px, format, layers, flip);
++    }
++}
++
+ void Rasterizer::Finish() {
+     scheduler.Finish();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index c86bfce562..c3217b9f1f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -78,6 +78,10 @@ public:
+ 
+     u64 Flush();
+     void Finish();
++    /// SecondSonPC P4.5 diagnostics: SSPC_DIAG_BRIDGE_CAPTURE=<hex address>:<flip>[,...] - the GPU-modified image at that
++    /// address read back at that flip -> logs/p45/bridge_image_<address>_<flip>_l<layer>.raw/.txt (as the native
++    /// backend's SSPC_DIAG_CAPTURE_IMAGE: the same render target of both backends compared). Nothing without it.
++    void SspcDiagCapture(u64 flip);
+     void OnSubmit();
+     void OnFence();
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 3779fbe156..a957a47b0e 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -280,6 +280,21 @@ public:
+         });
+     }
+ 
++    /// SecondSonPC P4.5 diagnostics (SSPC_DIAG_BRIDGE_CAPTURE): the GPU-modified image starting at `address` that was
++    /// used last; {} when none.
++    ImageId SspcGpuModifiedAt(VAddr address) {
++        ImageId best{};
++        u64 tick = 0;
++        ForEachImageWithAddress(address, [&](ImageId id, Image& img) {
++            if (True(img.flags & ImageFlagBits::GpuModified) && img.info.guest_address == address &&
++                (!best || img.tick_accessed_last >= tick)) {
++                best = id;
++                tick = img.tick_accessed_last;
++            }
++        });
++        return best;
++    }
++
+     template <typename Func>
+     void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
+         const auto it = page_table.find(cpu_addr >> Traits::PAGE_BITS);

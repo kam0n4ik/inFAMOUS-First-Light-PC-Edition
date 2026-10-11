@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1695,6 +1696,10 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         return;
     }
     stage(stats_.t_pipe);
+    if (has_ps) { // SSPC_DIAG_DUMP_SHADER: a pixel shader too (P4.5)
+        DiagDumpShader(ps.address, ps.program != nullptr ? &ps.program->code : nullptr, ps.module->result.spirv);
+    }
+    DiagDumpShader(vs.address, vs.program != nullptr ? &vs.program->code : nullptr, vs.module->result.spirv);
     {
         // SSPC_DIAG_SKIP_PIPELINES=<id>,<id>...: those pipelines' draws not executed (which draws make what is seen; P4.5)
         static const std::vector<u64> skip = [] {
@@ -1843,6 +1848,26 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     target_cache_.depth_img = depth_img;
     }
     stage(stats_.t_targets);
+    if (histo_.active) {
+        // SSPC_DIAG_TARGET_WATCH=<hex address>: every draw rendering into that target (any MRT slot) with its export
+        // state (P4.5: a channel of a target lost)
+        static const u64 watch_rt = [] {
+            char v[32] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_TARGET_WATCH", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16)
+                                                                                       : 0ull;
+        }();
+        for (u32 i = 0; i < 8 && watch_rt != 0; ++i) {
+            if (color_img[i] != nullptr && color_img[i]->layout.guest_address == watch_rt) {
+                const auto& t = st->targets[i];
+                histo_.detail.push_back(fmt::format(
+                    "    target watch: draw {} pipeline {} vs {:#x} ps {:#x} slot {} img{} fmt {} | CB_COLOR_INFO {:#x} "
+                    "export {} write mask {:#x} blend {:#x} cb_shader_mask {:#x} mrt_mask {:#x} view fmt {}",
+                    stats_.draws, prep.pipeline, vs.address, has_ps ? ps.address : 0, i, color_img[i]->id,
+                    color_img[i]->layout.pixel_format, t.info, t.export_format, t.write_mask, t.blend,
+                    st->cb_shader_mask, st->mrt_mask, static_cast<int>(ColorTargetView(regs, i).format)));
+            }
+        }
+    }
     // resources
     PushData push{};
     const u32 vte = regs.Get(kPaClVteCntl);
@@ -2111,7 +2136,17 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
             pending_meta_clear_[target_cache_.htile] = false;
         }
     }
-    // the hardware's depth/stencil clear: DB_RENDER_CONTROL clear bits clear the drawn area (the scissor)
+    f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipeline);
+    if (!PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_GRAPHICS, writes)) {
+        Skipped(Skip::Pipeline, "descriptor set allocation");
+        return;
+    }
+    f.vkCmdPushConstants(cur_.cb, pipe->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
+    SetDynamicState(regs, *st, d.indexed);
+    // the hardware's depth/stencil clear (DB_RENDER_CONTROL clear bits): the pixels the draw covers take the clear
+    // value - the draw is the game's clear rectangle, so its viewport within its scissor. Not the whole target: a
+    // shadow atlas clears each cascade's part before drawing it, and a clear of everything wiped the cascades drawn
+    // before (surfaces lit by the sun came out shadowed; P4.5)
     const u32 rc = regs.Get(kDbRenderControl);
     if (depth_img != nullptr && (rc & 3) != 0 && !depth_clear) {
         VkClearAttachment ca{.aspectMask = 0};
@@ -2121,21 +2156,33 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         if ((rc & 2) && key.has_stencil) {
             ca.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
         }
-        if (ca.aspectMask != 0) {
+        const VkViewport& vp = dyn_.vps[0];
+        const VkRect2D& sc = dyn_.scs[0];
+        const float vx0 = std::min(vp.x, vp.x + vp.width), vx1 = std::max(vp.x, vp.x + vp.width);
+        const float vy0 = std::min(vp.y, vp.y + vp.height), vy1 = std::max(vp.y, vp.y + vp.height);
+        const s64 x0 = std::max<s64>({0, sc.offset.x, static_cast<s64>(std::floor(vx0))});
+        const s64 y0 = std::max<s64>({0, sc.offset.y, static_cast<s64>(std::floor(vy0))});
+        const s64 x1 = std::min<s64>({key.width, s64{sc.offset.x} + sc.extent.width, static_cast<s64>(std::ceil(vx1))});
+        const s64 y1 = std::min<s64>({key.height, s64{sc.offset.y} + sc.extent.height, static_cast<s64>(std::ceil(vy1))});
+        if (ca.aspectMask != 0 && x1 > x0 && y1 > y0) {
             ca.clearValue.depthStencil = {std::clamp(F(regs, kDbDepthClear), 0.0f, 1.0f),
                                           regs.Get(kDbStencilClear) & 0xFF};
-            const VkClearRect rect{{{0, 0}, {key.width, key.height}}, 0, key.layers};
+            const VkClearRect rect{{{static_cast<s32>(x0), static_cast<s32>(y0)},
+                                    {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}},
+                                   0,
+                                   key.layers};
             f.vkCmdClearAttachments(cur_.cb, 1, &ca, 1, &rect);
             ++stats_.depth_clears;
+            stats_.depth_clears_partial += (x1 - x0) < key.width || (y1 - y0) < key.height ? 1 : 0;
+            if (histo_.active) { // SSPC_DIAG_DRAW_HISTO: the frame's clears in order
+                histo_.detail.push_back(fmt::format(
+                    "    depth clear: draw {} pipeline {} packet {:#x} depth {:#x} aspects {:#x} rect {},{} {}x{} value {} "
+                    "| rc {:#x} dc {:#x} prim {} count {}",
+                    stats_.draws, prep.pipeline, d.packet_addr, depth_img->layout.guest_address, ca.aspectMask, x0, y0,
+                    x1 - x0, y1 - y0, ca.clearValue.depthStencil.depth, rc, dc, d.primitive_type, d.index_count));
+            }
         }
     }
-    f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipeline);
-    if (!PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_GRAPHICS, writes)) {
-        Skipped(Skip::Pipeline, "descriptor set allocation");
-        return;
-    }
-    f.vkCmdPushConstants(cur_.cb, pipe->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
-    SetDynamicState(regs, *st, d.indexed);
     const auto same_input = [](const auto& a, const auto& b) {
         return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
     };
@@ -2234,12 +2281,20 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         e.instances += d.indirect ? 0 : instances;
         e.verts += d.indirect ? 0 : d.index_count;
         // SSPC_DIAG_DRAW_HISTO_P=<pipeline>: that pipeline's draws in detail (textures, vertex buffers)
-        static const u64 detail = [] {
-            char v[16] = {};
-            return GetEnvironmentVariableA("SSPC_DIAG_DRAW_HISTO_P", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10)
-                                                                                    : ~0ull;
+        static const std::vector<u64> detail = [] {
+            std::vector<u64> v;
+            char s[256] = {};
+            if (GetEnvironmentVariableA("SSPC_DIAG_DRAW_HISTO_P", s, sizeof(s)) > 0) {
+                for (char* p = s; *p != 0;) {
+                    v.push_back(std::strtoull(p, &p, 10));
+                    while (*p == ',' || *p == ' ') {
+                        ++p;
+                    }
+                }
+            }
+            return v;
         }();
-        if (prep.pipeline == detail) {
+        if (std::ranges::find(detail, u64{prep.pipeline}) != detail.end()) {
             std::string line = fmt::format("    draw verts {} inst {} indirect {} args {:#x}", d.index_count, instances,
                                            d.indirect, d.indirect ? d.args_addr : 0);
             for (const auto* sv : {&vs, &ps}) {
@@ -2249,21 +2304,47 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
                     }
                 }
             }
+            line = fmt::format("    p{} ", prep.pipeline) + line.substr(4);
             for (const CachedImage* img : bound) {
-                line += fmt::format(" | img{} {:#x} fmt {} {}x{}{}{}", img->id, img->layout.guest_address,
-                                    img->layout.pixel_format, img->layout.size.width, img->layout.size.height,
+                line += fmt::format(" | img{} {:#x} fmt {} {}x{} lv {} ly {} type {}{}{}{}", img->id,
+                                    img->layout.guest_address, img->layout.pixel_format, img->layout.size.width,
+                                    img->layout.size.height, img->layout.levels, img->layout.layers,
+                                    static_cast<u32>(img->layout.type), img->layout.props.is_depth ? " depth" : "",
                                     img->gpu_written ? " gw" : "", img->alias_hits != 0 ? " alias" : "");
             }
+            for (const auto* sv : {&vs, &ps}) {
+                for (const auto& im : sv->plan.images) {
+                    line += fmt::format(" | T# {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} depth {} array {} "
+                                        "storage {}",
+                                        im.desc.raw[0], im.desc.raw[1], im.desc.raw[2], im.desc.raw[3], im.desc.raw[4],
+                                        im.desc.raw[5], im.desc.raw[6], im.desc.raw[7], im.depth, im.array, im.storage);
+                }
+                for (const auto& sm : sv->plan.samplers) {
+                    line += fmt::format(" | S# {:08x} {:08x} {:08x} {:08x}", sm.desc.raw[0], sm.desc.raw[1],
+                                        sm.desc.raw[2], sm.desc.raw[3]);
+                }
+            }
             for (const auto& v : vs.plan.vertices) {
-                line += fmt::format(" | vb {:#x}+{:#x}", v.address, v.size);
+                const u32 dfmt = v.fetch.data_format != 0 ? v.fetch.data_format : static_cast<u32>(v.desc.DataFormat());
+                const u32 raw_nfmt = v.fetch.data_format != 0 ? v.fetch.num_format : static_cast<u32>(v.desc.NumFormat());
+                const u32 nfmt = static_cast<u32>(
+                    RemapNumberFormat(static_cast<NumberFormat>(raw_nfmt), static_cast<DataFormat>(dfmt)));
+                line += fmt::format(" | vb {:#x}+{:#x} attr {} dfmt {} nfmt {}->{} vk {} stride {} V#dfmt {} V#nfmt {} "
+                                    "fetch dfmt {} nfmt {}",
+                                    v.address, v.size, v.attribute, dfmt, raw_nfmt, nfmt,
+                                    static_cast<int>(SurfaceFormat(dfmt, nfmt)), v.desc.Stride(),
+                                    static_cast<u32>(v.desc.DataFormat()), static_cast<u32>(v.desc.NumFormat()),
+                                    v.fetch.data_format, v.fetch.num_format);
             }
             histo_.detail.push_back(std::move(line));
         }
         if (e.legend.empty()) {
-            e.legend = fmt::format("vs {:#x} ps {:#x} prim {} rt0 fmt {} {}x{} depth {} blend0 {:#x}", vs.address,
-                                   has_ps ? ps.address : 0, d.primitive_type,
+            e.legend = fmt::format("vs {:#x} ps {:#x} prim {} rt0 fmt {} {}x{} depth {} blend0 {:#x} rt0 {:#x} db {:#x}",
+                                   vs.address, has_ps ? ps.address : 0, d.primitive_type,
                                    color_img[0] != nullptr ? color_img[0]->layout.pixel_format : 0, key.width, key.height,
-                                   depth_img != nullptr, regs.Get(0xA1E0));
+                                   depth_img != nullptr, regs.Get(0xA1E0),
+                                   color_img[0] != nullptr ? color_img[0]->layout.guest_address : 0,
+                                   depth_img != nullptr ? depth_img->layout.guest_address : 0);
         }
     }
     if (writes_memory) {
@@ -2567,6 +2648,25 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         ++e.count;
         e.indirect += d.indirect ? 1 : 0;
         e.instances += d.indirect ? 0 : u64{d.groups[0]} * std::max<u32>(d.groups[1], 1) * std::max<u32>(d.groups[2], 1);
+        // SSPC_DIAG_TARGET_WATCH: a dispatch binding the watched image (storage or sampled), with its other images
+        static const u64 watch_rt = [] {
+            char v[32] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_TARGET_WATCH", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16)
+                                                                                       : 0ull;
+        }();
+        if (watch_rt != 0 && std::ranges::any_of(bound, [](const CachedImage* i) { return i->layout.guest_address == watch_rt; })) {
+            std::string line = fmt::format("    dispatch watch: cs {:#x} groups {}x{}x{}", csv.address, d.groups[0],
+                                           d.groups[1], d.groups[2]);
+            for (const auto& im : csv.plan.images) {
+                line += fmt::format(" | T# {:08x} {:08x} storage {}", im.desc.raw[0], im.desc.raw[1], im.storage);
+            }
+            for (const CachedImage* img : bound) {
+                line += fmt::format(" | img{} {:#x} fmt {} {}x{}{}{}", img->id, img->layout.guest_address,
+                                    img->layout.pixel_format, img->layout.size.width, img->layout.size.height,
+                                    img->layout.props.is_depth ? " depth" : "", img->gpu_written ? " gw" : "");
+            }
+            histo_.detail.push_back(std::move(line));
+        }
     }
     if (writes_memory) {
         pending_writes_ = true;
@@ -2827,8 +2927,70 @@ void Executor::DrawHistogram() {
     histo_.active = id + 1 >= range[0] && id + 1 < range[0] + range[1];
 }
 
+void Executor::CaptureImageAt() {
+    // SSPC_DIAG_CAPTURE_IMAGE=<hex address>:<flip>[,<hex address>:<flip>...]: the GPU-written image at that address as it
+    // is at that flip's end -> logs\p45\image_<address>_<flip>.raw/.txt (+ .png for display formats); P4.5
+    struct Want {
+        u64 addr, flip;
+    };
+    static const std::vector<Want> wants = [] {
+        std::vector<Want> v;
+        char s[256] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_IMAGE", s, sizeof(s)) > 0) {
+            for (char* p = s; *p != 0;) {
+                Want w{std::strtoull(p, &p, 16), 0};
+                if (*p == ':') {
+                    w.flip = std::strtoull(p + 1, &p, 10);
+                }
+                v.push_back(w);
+                while (*p == ',' || *p == ' ') {
+                    ++p;
+                }
+            }
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_IMAGE - {} image captures", v.size());
+        }
+        return v;
+    }();
+    if (wants.empty() || !Begin()) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId();
+    for (const Want& w : wants) {
+        if (w.flip != id) {
+            continue;
+        }
+        CachedImage* img = images_.FindTargetAt(w.addr);
+        if (img == nullptr) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: no GPU-written image at {:#x} at flip {}", w.addr, id);
+            continue;
+        }
+        EndRendering();
+        if (pending_writes_) {
+            GlobalBarrier();
+        }
+        images_.Transition(cur_.cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT);
+        if (!readback_) {
+            readback_ = std::make_unique<ImageReadback>(ctx_);
+        }
+        const bool depth = img->layout.props.is_depth;
+        const VkFormat fmt = depth ? VK_FORMAT_D32_SFLOAT : img->format;
+        const u32 texel = depth ? 4u : std::max<u32>(img->layout.num_bits / 8, 1);
+        for (u32 layer = 0; layer < std::min<u32>(std::max<u32>(img->layout.layers, 1), 8); ++layer) {
+            readback_->Record(cur_.cb, cur_.value, img->image, fmt, depth ? VK_IMAGE_ASPECT_DEPTH_BIT : img->aspect,
+                              layer, img->layout.size.width, img->layout.size.height, texel,
+                              options_.capture_path.parent_path().parent_path() / "p45" /
+                                  fmt::format("image_{:x}_{}_l{}", w.addr, id, layer),
+                              true);
+        }
+        SSPC_LOG(GPU, Info, "DIAGNOSTIC: image capture img{} {:#x} fmt {} {}x{} layers {} at flip {}", img->id, w.addr,
+                 img->layout.pixel_format, img->layout.size.width, img->layout.size.height, img->layout.layers, id);
+    }
+}
+
 void Executor::Flip(const Cp::FlipMarker&) {
     images_.NewFrame();
+    CaptureImageAt();
     DrawHistogram();
     RaceCheck();
     ++stats_.flips;

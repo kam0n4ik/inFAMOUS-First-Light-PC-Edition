@@ -748,10 +748,12 @@ std::string Backend::Report() {
         const auto& s = executor_->Stats();
         out += fmt::format("draws {} (executed {}), dispatches {} (executed {}), batches {}, completed {}, flips {} "
                            "(blank {}), syncs {} ({} us waiting), render passes {}, global barriers {}, fast clears {}, "
-                           "depth clears {}, metadata writes {} (xor {}, reading metadata {}), cache actions {}\n",
+                           "depth clears {} (of part of the target {}), metadata writes {} (xor {}, reading metadata {}), "
+                           "cache actions {}\n",
                            s.draws, s.draws_executed, s.dispatches, s.dispatches_executed, s.batches,
                            s.completed_batches, s.flips, s.flips_blank, s.syncs, s.sync_wait_us, s.render_passes,
-                           s.global_barriers, s.fast_clears, s.depth_clears, s.meta_writes, s.meta_writes_xor, s.meta_writes_reading, s.cache_actions);
+                           s.global_barriers, s.fast_clears, s.depth_clears, s.depth_clears_partial, s.meta_writes,
+                           s.meta_writes_xor, s.meta_writes_reading, s.cache_actions);
         for (size_t i = 0; i < s.skipped.size(); ++i) {
             if (s.skipped[i] != 0) {
                 out += fmt::format("  not executed ({}): {} — first: {}\n", Vk::SkipName(static_cast<Vk::Skip>(i)),
@@ -767,10 +769,10 @@ std::string Backend::Report() {
         out += fmt::format("images evicted over the budget: {} ({} MiB)\n", i.evicted, i.evicted_bytes >> 20);
         out += fmt::format("GPU-written images whose memory was written since: {} (exact {}, buffer write at the base {}, "
                            "CPU {}, unmapped {}), targets uploaded first {}; expanded {}, block-compressed copies {}; "
-                           "superseded {}; retired {} ({} MiB); write-tracked {}, not trackable {}\n",
+                           "superseded {}; retired {} ({} MiB); write-tracked {}, not trackable {}; stencil views {}\n",
                            i.memory_newer, i.memory_newer_by[0], i.memory_newer_by[1], i.memory_newer_by[2],
                            i.memory_newer_by[3], i.target_uploads, i.expanded, i.block_copies, i.superseded, i.retired,
-                           i.retired_bytes >> 20, i.gpu_tracked, i.gpu_untracked);
+                           i.retired_bytes >> 20, i.gpu_tracked, i.gpu_untracked, i.stencil_views);
     }
     if (guest_) {
         const auto g = guest_->GetStats();

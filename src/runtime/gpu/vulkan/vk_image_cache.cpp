@@ -139,6 +139,7 @@ void ImageCache::Evict(u64 completed) {
             }
         }
         std::erase_if(meta_owner_, [&](const auto& e) { return e.second == img; });
+        std::erase_if(stencil_owner_, [&](const auto& e) { return e.second == img; });
         stats_.bytes -= img->bytes;
         --stats_.images;
         ++stats_.evicted;
@@ -185,6 +186,7 @@ void ImageCache::Retire(CachedImage* img) {
         }
     }
     std::erase_if(meta_owner_, [&](const auto& e) { return e.second == img; });
+    std::erase_if(stencil_owner_, [&](const auto& e) { return e.second == img; });
     const auto it = std::ranges::find_if(images_, [&](const std::unique_ptr<CachedImage>& p) { return p.get() == img; });
     if (it == images_.end()) {
         return;
@@ -620,6 +622,22 @@ void ImageCache::CopyImage(CachedImage& src, CachedImage& dst, VkCommandBuffer c
 
 CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffer cb, u64 seq, std::string& error) {
     ApplyInvalidations();
+    if (use == Use::Texture && !stencil_owner_.empty() && layout.num_bits == 8 && !layout.props.is_block) {
+        // a texture of a depth target's stencil plane (GCN: a surface of its own at DB_STENCIL_*_BASE; here the
+        // stencil aspect of the depth image the GPU rendered): the bridge's associated stencil image, copied from its
+        // depth image; a view of the aspect here. Guest memory never holds those texels - an upload read garbage, and
+        // the sun shadow mask (which reads the scene's stencil) came out shadowed where the bridge's is lit (P4.5).
+        if (const auto it = stencil_owner_.find(layout.guest_address); it != stencil_owner_.end()) {
+            CachedImage* depth = it->second;
+            if (depth->gpu_written && !depth->memory_newer && depth->layout.size.width == layout.size.width &&
+                depth->layout.size.height == layout.size.height && (depth->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+                depth->last_seq = seq;
+                depth->last_frame = frame_;
+                ++stats_.stencil_views;
+                return depth;
+            }
+        }
+    }
     CachedImage* match = nullptr;
     const auto [lo, hi] = by_address_.equal_range(layout.guest_address);
     for (auto it = lo; it != hi; ++it) {
@@ -645,7 +663,11 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
         // Only a sampled texture over an image the GPU wrote (a storage view needs the image's storage usage, a
         // sampled view the same sample count; CPU-written textures at a reused address are uploaded as themselves).
         const VkFormat want = static_cast<VkFormat>(layout.pixel_format);
-        for (auto it = lo; it != hi && match == nullptr && use == Use::Texture && alias_rule_; ++it) {
+        // P4.5: a storage image too (a compute pass writing a channel of a G-buffer target the draws rendered: one
+        // image of that memory, as the bridge's ResolveOverlap - two images split the texels, the shadow mask read a
+        // target whose red channel only the compute pass wrote, into an image of its own)
+        for (auto it = lo; it != hi && match == nullptr && (use == Use::Texture || use == Use::Storage) && alias_rule_;
+             ++it) {
             const ImageLayout& have = it->second->layout;
             // a compressed view of an uncompressed image is not a view in Vulkan (the bridge copies: ExpandImage)
             if (!it->second->gpu_written || have.BlockDim() != layout.BlockDim() || have.num_bits != layout.num_bits ||
@@ -655,6 +677,10 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
                 // fewer levels/layers: no view covers the request (the bridge copies the smaller image into a new one;
                 // the backend has no such copy yet, the texture is its own image)
                 continue;
+            }
+            if (use == Use::Storage &&
+                ((it->second->usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 || have.props.is_depth || layout.props.is_depth)) {
+                continue; // a storage view needs the image's storage usage (colour images only)
             }
             if (layout.props.is_depth && !have.props.is_depth) {
                 continue; // depth sampling of a colour image: a copy the backend does not make yet
@@ -747,6 +773,28 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
         }
     }
     if (match == nullptr) {
+        // diagnostics (P4.5): a second image of an address another image already has - each split of a memory's texels
+        // between two Vulkan images is logged once with both layouts (bounded)
+        for (auto it = lo; it != hi && dup_logged_ < 64; ++it) {
+            const ImageLayout& h = it->second->layout;
+            ++dup_logged_;
+            SSPC_LOG(GPU, Info,
+                     "native backend: another image at {:#x} for {}: want fmt {} {}x{}x{} type {} pitch {} lv {} ly {} s {} "
+                     "tile {} size {:#x} bits {} | have img{}{} fmt {} {}x{}x{} type {} pitch {} lv {} ly {} s {} tile {} "
+                     "size {:#x} bits {} usage {:#x}",
+                     layout.guest_address,
+                     use == Use::Texture   ? "texture"
+                     : use == Use::Storage ? "storage"
+                     : use == Use::ColorTarget ? "colour target"
+                     : use == Use::DepthTarget ? "depth target"
+                                               : "transfer",
+                     layout.pixel_format, layout.size.width, layout.size.height, layout.size.depth,
+                     static_cast<u32>(layout.type), layout.pitch, layout.levels, layout.layers, layout.num_samples,
+                     static_cast<u32>(layout.tile_mode), layout.guest_size, layout.num_bits, it->second->id,
+                     it->second->gpu_written ? " gw" : "", h.pixel_format, h.size.width, h.size.height, h.size.depth,
+                     static_cast<u32>(h.type), h.pitch, h.levels, h.layers, h.num_samples, static_cast<u32>(h.tile_mode),
+                     h.guest_size, h.num_bits, it->second->usage);
+        }
         match = Create(layout, error);
         if (match != nullptr && diag_ != nullptr && diag_->Enabled()) {
             diag_->Name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<u64>(match->image),
@@ -845,6 +893,9 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
             if (meta != 0) {
                 meta_owner_[meta] = match;
             }
+        }
+        if (use == Use::DepthTarget && layout.props.has_stencil && layout.stencil_addr != 0) {
+            stencil_owner_[layout.stencil_addr] = match;
         }
     }
     return match;

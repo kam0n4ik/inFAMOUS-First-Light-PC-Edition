@@ -659,6 +659,11 @@ void DeviceContext::QueryProfile(Gpu::Shader::DeviceProfile& out) const {
     out.supports_fragment_shader_barycentric = Has(exts, "VK_KHR_fragment_shader_barycentric");
     out.supports_shader_subgroup_clock = Has(exts, "VK_KHR_shader_clock");
     out.needs_manual_interpolation = out.supports_fragment_shader_barycentric && nvidia;
+    // SSPC_DIAG_NO_MANUAL_INTERP=1: fixed-function interpolation instead of the per-vertex inputs (an experiment, P4.5)
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_NO_MANUAL_INTERP", v, sizeof(v)) == 1 && v[0] == '1') {
+        out.needs_manual_interpolation = false;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_NO_MANUAL_INTERP=1 - no manual interpolation");
+    }
     out.needs_lds_barriers = nvidia;
     out.needs_buffer_offsets = lim.minStorageBufferOffsetAlignment > 4;
     out.needs_clip_distance_emulation = nvidia;

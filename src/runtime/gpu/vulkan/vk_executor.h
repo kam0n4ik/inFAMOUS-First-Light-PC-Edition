@@ -65,6 +65,7 @@ struct ExecutorStats {
     u64 batches = 0, flushes_fence = 0, flushes_flip = 0, flushes_sync = 0, flushes_full = 0, flushes_idle = 0;
     u64 syncs = 0, sync_wait_us = 0, flips = 0, flips_blank = 0, render_passes = 0, global_barriers = 0;
     u64 completed_batches = 0, cache_actions = 0, dma = 0, fast_clears = 0, depth_clears = 0;
+    u64 depth_clears_partial = 0; ///< DB_RENDER_CONTROL clears of part of the target (the draw's viewport/scissor)
     u64 indexed = 0, indirect = 0, vertex_bindings = 0, descriptor_sets = 0;
     u64 record_ns = 0; ///< CPU time recording draws/dispatches (TSC)
     u64 timeline_writes = 0, timeline_read_syncs = 0, uploads_ended_rendering = 0;
@@ -272,6 +273,8 @@ private:
     /// SSPC_DIAG_CAPTURE_FRAMES: the displayed image of this flip read back (recorded after its copy; P4.5).
     void CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h);
     std::unique_ptr<ImageReadback> readback_;
+    /// SSPC_DIAG_CAPTURE_IMAGE: a GPU-written image read back at a flip (P4.5)
+    void CaptureImageAt();
     /// SSPC_DIAG_DRAW_HISTO: the frame's draws by pipeline / dispatches by program, written at the flip (P4.5)
     void DrawHistogram();
     struct HistoEntry {

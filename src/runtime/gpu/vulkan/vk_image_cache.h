@@ -83,6 +83,7 @@ struct ImageCacheStats {
     u64 retired = 0, retired_bytes = 0; ///< images taken out (unmapped, superseded, expanded) and destroyed when unused
     u64 superseded = 0;
     u64 gpu_tracked = 0, gpu_untracked = 0; ///< GPU-written images whose pages could / could not be write-protected
+    u64 stencil_views = 0; ///< textures of a depth target's stencil plane: the depth image's stencil aspect
     std::string first_unsupported;
 };
 
@@ -186,7 +187,11 @@ private:
     PageTracker* tracker_ = nullptr;
     BufferCache* buffers_ = nullptr;
     std::unordered_map<u64, CachedImage*> meta_owner_; ///< CMASK/FMASK/HTILE address -> its target
+    /// A depth target's stencil plane address -> the depth image (the GCN stencil is a separate surface; the Vulkan
+    /// image holds both aspects: a texture of that address is the image's stencil aspect; P4.5)
+    std::unordered_map<u64, CachedImage*> stencil_owner_;
     u64 overlap_misses_logged_ = 0;
+    u64 dup_logged_ = 0; ///< second images of an address logged (P4.5 diagnostics)
     Diagnostics* diag_ = nullptr;
     bool alias_rule_ = true; ///< SSPC_DIAG_ALIAS_RULE=off: a diagnostic control run without the equal-address rule
     void (*before_upload_)(void*) = nullptr;
