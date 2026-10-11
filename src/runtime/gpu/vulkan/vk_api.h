@@ -160,6 +160,8 @@ namespace SecondSon::Gpu::Vk {
     X(vkAcquireNextImageKHR)                                                                                           \
     X(vkQueuePresentKHR)                                                                                               \
     X(vkSetDebugUtilsObjectNameEXT)                                                                                    \
+    X(vkCmdBeginDebugUtilsLabelEXT)                                                                                    \
+    X(vkCmdEndDebugUtilsLabelEXT)                                                                                      \
     X(vkCmdSetCheckpointNV)                                                                                            \
     X(vkGetQueueCheckpointDataNV)                                                                                      \
     X(vkCmdWriteBufferMarkerAMD)                                                                                       \

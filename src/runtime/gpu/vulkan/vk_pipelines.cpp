@@ -392,6 +392,10 @@ const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::Grap
         return fail(fmt::format("vkCreateGraphicsPipelines failed ({})", static_cast<int>(r)));
     }
     ++stats_.graphics;
+    if (ctx_.Caps().debug_utils) { // the id the executor's labels and SSPC_DIAG_* name (P4.6-G6)
+        ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(obj->pipeline),
+                  fmt::format("gfx p{}", pipeline_id).c_str());
+    }
     const PipelineObjects* raw = obj.get();
     pipelines_.emplace(key, std::move(obj));
     return raw;
@@ -431,6 +435,10 @@ const PipelineObjects* PipelineFactory::Compute(const GS::Module& cs, const GS::
         return nullptr;
     }
     ++stats_.compute;
+    if (ctx_.Caps().debug_utils) {
+        ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(obj->pipeline),
+                  fmt::format("cs module {}", cs.id).c_str());
+    }
     const PipelineObjects* raw = obj.get();
     pipelines_.emplace(key, std::move(obj));
     return raw;

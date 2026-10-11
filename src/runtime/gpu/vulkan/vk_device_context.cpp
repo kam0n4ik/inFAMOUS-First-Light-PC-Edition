@@ -155,8 +155,17 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
                      "--gpu-native-validate: VK_LAYER_KHRONOS_validation is not installed (validation SKIPPED)");
         }
     }
-    // debug utils: the validation messenger, and the object names of --gpu-native-diag
-    const bool debug_utils = (validation || options.diagnostics) && Has(iexts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // debug utils: the validation messenger, the object names of --gpu-native-diag, the profiler labels of
+    // SSPC_GPU_MARKERS=1 (P4.6-G6; under Nsight Graphics its layer provides the extension)
+    const bool markers = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_GPU_MARKERS", v, sizeof(v)) == 1 && v[0] == '1';
+    }();
+    const bool debug_utils =
+        (validation || options.diagnostics || markers) && Has(iexts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (markers && !debug_utils) {
+        SSPC_LOG(GPU, Warning, "SSPC_GPU_MARKERS=1: VK_EXT_debug_utils is not available - no labels or names");
+    }
     if (debug_utils) {
         ienable.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
@@ -203,6 +212,10 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     }
     ctx->caps_.validation = validation;
     ctx->caps_.debug_utils = debug_utils;
+    ctx->caps_.markers = markers && debug_utils;
+    if (ctx->caps_.markers) {
+        SSPC_LOG(GPU, Warning, "SSPC_GPU_MARKERS=1: debug labels and object names for a GPU profiler (diagnostic)");
+    }
 
     // --- the physical device
     f.vkEnumeratePhysicalDevices(ctx->instance_, &n, nullptr);

@@ -50,6 +50,9 @@ struct DeviceCaps {
     bool image_view_min_lod = false;
     bool maintenance5 = false;
     bool debug_utils = false;
+    /// SSPC_GPU_MARKERS=1 (P4.6-G6, diagnostic): debug labels around the recorded commands and object names, for a
+    /// GPU profiler's capture (NVIDIA Nsight Graphics GPU Trace) to be read by pass/pipeline; needs VK_EXT_debug_utils
+    bool markers = false;
     bool device_fault = false;      ///< VK_EXT_device_fault
     bool sparse_buffer = false;     ///< sparseBinding + sparseResidencyBuffer on the queue (the buffer cache)
     bool checkpoints = false;       ///< VK_NV_device_diagnostic_checkpoints (diagnostics)

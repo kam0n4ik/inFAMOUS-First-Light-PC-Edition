@@ -116,7 +116,7 @@ void WriteValidationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 }
 
 Diagnostics::Diagnostics(DeviceContext& ctx, bool enabled, const std::filesystem::path& logs_dir)
-    : ctx_(ctx), enabled_(enabled), dir_(logs_dir) {
+    : ctx_(ctx), enabled_(enabled), naming_(enabled || ctx.Caps().markers), dir_(logs_dir) {
     if (!enabled_) {
         return;
     }
@@ -208,7 +208,7 @@ void Diagnostics::Submitted(u64 batch, u64 first_cmd, u64 last_cmd) {
 
 void Diagnostics::Name(VkObjectType type, u64 handle, const std::string& name) {
     const auto& f = Fn();
-    if (!enabled_ || handle == 0 || f.vkSetDebugUtilsObjectNameEXT == nullptr) {
+    if (!naming_ || handle == 0 || f.vkSetDebugUtilsObjectNameEXT == nullptr) {
         return;
     }
     const VkDebugUtilsObjectNameInfoEXT ni{.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,

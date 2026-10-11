@@ -107,9 +107,13 @@ VkFormat DisplayFormat(u32 pixel_format, VkFormat image_format) {
 
 // SSPC_DIAG_WATCH=<hex address>: the CPU writes of that guest page, caught by write protection (P4.5 race diagnosis)
 std::atomic<u64> g_watch_page{0};
+// SSPC_DIAG_WATCH_READS=1 (P4.6-G7, SSPC-020): the page no-access - the CPU's reads are caught too (who reads the GPU
+// clock fences)
+DWORD g_watch_prot = PAGE_READONLY;
 struct WatchHit {
     u64 tsc, rip, addr;
     u32 tid;
+    u32 write; ///< the access: 1 write, 0 read
 };
 std::array<WatchHit, 512> g_watch_hits;
 std::atomic<u32> g_watch_n{0};
@@ -124,11 +128,12 @@ LONG CALLBACK WatchFilter(EXCEPTION_POINTERS* e) {
         e->ContextRecord->EFlags &= ~0x100u;
         DWORD old = 0;
         if (const u64 page = g_watch_page.load(std::memory_order_acquire); page != 0) {
-            VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &old);
+            VirtualProtect(reinterpret_cast<void*>(page), 4096, g_watch_prot, &old);
         }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1) {
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 ||
+        (r->ExceptionInformation[0] != 1 && !(g_watch_prot == PAGE_NOACCESS && r->ExceptionInformation[0] == 0))) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const u64 page = g_watch_page.load(std::memory_order_acquire);
@@ -138,7 +143,8 @@ LONG CALLBACK WatchFilter(EXCEPTION_POINTERS* e) {
     }
     const u32 n = g_watch_n.fetch_add(1, std::memory_order_acq_rel);
     if (n < g_watch_hits.size()) {
-        g_watch_hits[n] = {__rdtsc(), e->ContextRecord->Rip, a, GetCurrentThreadId()};
+        g_watch_hits[n] = {__rdtsc(), e->ContextRecord->Rip, a, GetCurrentThreadId(),
+                           static_cast<u32>(r->ExceptionInformation[0])};
     }
     DWORD old = 0;
     VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
@@ -175,6 +181,12 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         } else {
             SSPC_LOG(GPU, Warning, "SSPC_GPU_PROFILE=1: GPU time per command (a timestamp after every command; slower)");
         }
+    }
+    markers_ = ctx_.Caps().markers && Fn().vkCmdBeginDebugUtilsLabelEXT != nullptr &&
+               Fn().vkCmdEndDebugUtilsLabelEXT != nullptr;
+    if (markers_) {
+        legend_.open(options_.capture_path.parent_path().parent_path() / "gpu_markers.txt", std::ios::trunc);
+        legend_ << "# SSPC_GPU_MARKERS legend: label (D p<pipeline> vs<addr> ps<addr> @<PM4 packet>) | its targets\n";
     }
     if (ctx_.Caps().timestamp_period > 0.0f) {
         const VkQueryPoolCreateInfo qi{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -300,6 +312,7 @@ bool Executor::Begin() {
     open_ = true;
     commands_ = 0;
     rendering_ = false;
+    label_open_ = false; // labels never span command buffers (Flush ends the open one)
     // a new command buffer: no dynamic state set yet - also what a draw sets only conditionally (the depth bias values
     // with bias on, the colour write masks with colour targets): not "already set" from the last buffer (validation f3)
     dyn_.valid = false;
@@ -325,6 +338,22 @@ void Executor::EndRendering() {
         Fn().vkCmdEndRendering(cur_.cb);
         rendering_ = false;
         render_ = RenderKey{};
+    }
+}
+
+void Executor::Label(u64 key, std::string text) {
+    EndLabel();
+    const VkDebugUtilsLabelEXT l{.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = text.c_str()};
+    Fn().vkCmdBeginDebugUtilsLabelEXT(cur_.cb, &l);
+    label_open_ = true;
+    label_key_ = key;
+    label_text_ = std::move(text);
+}
+
+void Executor::EndLabel() {
+    if (label_open_) {
+        Fn().vkCmdEndDebugUtilsLabelEXT(cur_.cb);
+        label_open_ = false;
     }
 }
 
@@ -361,6 +390,9 @@ void Executor::Flush() {
         return;
     }
     EndRendering();
+    if (LabelChanges(kLabelOther | 5)) {
+        Label(kLabelOther | 5, "W batch end: write-backs, host barrier");
+    }
     // the GPU's writes of guest buffers (video memory) copied back to the host before the batch's fences
     if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
@@ -380,6 +412,7 @@ void Executor::Flush() {
                                .pMemoryBarriers = &mb};
     f.vkCmdPipelineBarrier2(cur_.cb, &dep);
     pending_writes_ = false;
+    EndLabel();
     if (cur_.query_slot != ~0u) {
         f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries_, cur_.query_slot * 2 + 1);
     }
@@ -787,6 +820,26 @@ void Executor::ProfReport() {
     std::ranges::sort(v, [](const auto& x, const auto& y) { return x.second->ns > y.second->ns; });
     std::string out = fmt::format("GPU profile over {} frames: {:.2f} ms GPU per frame in commands; the top:\n", prof_frames_,
                                   static_cast<double>(prof_total_ns_) / 1e6 / static_cast<double>(prof_frames_));
+    {
+        // by kind (P4.6-G3): draws (key low bits 0), dispatches (1, of them single-workgroup ones), the rest (small keys)
+        double ns[3] = {}, ns_1x1 = 0;
+        u64 n[3] = {}, n_1x1 = 0;
+        for (const auto& [k, a] : prof_acc_) {
+            const bool other = (k < 8 && (k & 3) != 1) || (k >> 32) == 0xD1A6; // ProfMark's 2..5 and the DIAG keys
+            const u32 kind = other ? 2 : (k & 3) == 0 ? 0 : (k & 3) == 1 ? 1 : 2;
+            ns[kind] += static_cast<double>(a.ns);
+            n[kind] += a.count;
+            if (kind == 1 && a.label.ends_with("groups 1x1x1")) {
+                ns_1x1 += static_cast<double>(a.ns);
+                n_1x1 += a.count;
+            }
+        }
+        const double fr = static_cast<double>(prof_frames_);
+        out += fmt::format("  by kind (ms/frame, commands/frame): draws {:.2f} ({:.0f}), dispatches {:.2f} ({:.0f}; "
+                           "keys first seen as 1x1x1: {:.2f} ({:.0f})), other {:.2f} ({:.0f})\n",
+                           ns[0] / 1e6 / fr, n[0] / fr, ns[1] / 1e6 / fr, n[1] / fr, ns_1x1 / 1e6 / fr, n_1x1 / fr,
+                           ns[2] / 1e6 / fr, n[2] / fr);
+    }
     for (size_t i = 0; i < v.size() && i < 30; ++i) {
         const ProfAcc& a = *v[i].second;
         out += fmt::format("  {:5.2f} ms/frame {:4.1f}% x{:6} ({:7.1f} us each)  {}\n",
@@ -804,6 +857,18 @@ void Executor::ProfReport() {
         }
     }
     SSPC_LOG(GPU, Info, "{}", out);
+    {
+        // every key of this report (P4.6-G3: totals by queue / workgroup count offline), appended per report
+        static std::ofstream full(options_.capture_path.parent_path().parent_path() / "gpu_profile_full.txt",
+                                  std::ios::trunc);
+        full << fmt::format("report frames {} total_ms_per_frame {:.3f}\n", prof_frames_,
+                            static_cast<double>(prof_total_ns_) / 1e6 / static_cast<double>(prof_frames_));
+        for (const auto& [k, a] : v) {
+            full << fmt::format("{:#x}\t{:.4f}\t{}\t{}\n", k,
+                                static_cast<double>(a->ns) / 1e6 / static_cast<double>(prof_frames_), a->count, a->label);
+        }
+        full.flush();
+    }
     prof_acc_.clear();
     prof_frames_ = 0;
     prof_total_ns_ = 0;
@@ -964,6 +1029,9 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     }
     Note(queue, seq);
     ++commands_;
+    if (LabelChanges(kLabelOther | 1)) {
+        Label(kLabelOther | 1, "T WRITE_DATA on the timeline");
+    }
     // after the earlier work's accesses of this memory, before the later work's: one barrier for a run of writes to
     // different ranges (the next draw's barrier follows through pending_writes_)
     const bool overlap = std::ranges::any_of(run_ranges_, [&](const std::pair<u64, u64>& r) {
@@ -1002,6 +1070,9 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
         return false;
     }
     write_run_ = false;
+    if (LabelChanges(kLabelOther | 2)) {
+        Label(kLabelOther | 2, "T DMA copy on the timeline");
+    }
     // a copy: outside rendering, after the earlier writes (of its source too)
     EndRendering();
     if (pending_writes_) {
@@ -1057,6 +1128,9 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
         return false;
     }
     write_run_ = false;
+    if (LabelChanges(kLabelOther | 3)) {
+        Label(kLabelOther | 3, "T GDS DMA on the timeline");
+    }
     // after every earlier access (the shaders' GDS atomics are storage writes; a fill/copy over GDS must also wait for
     // their reads): one full barrier
     GlobalBarrier(5);
@@ -1809,6 +1883,17 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         return;
     }
     stage(stats_.t_pipe);
+    if (markers_) {
+        // a new label at a new pipeline or a change of the target registers (before this draw's uploads and barriers:
+        // they count to it)
+        const u64 tv = ((u64{regs.Version(Cp::Group::ColorFormat)} * 31 + regs.Version(Cp::Group::ColorTarget)) * 31 +
+                        regs.Version(Cp::Group::DepthFormat)) * 31 + regs.Version(Cp::Group::DepthTarget);
+        const u64 lkey = ((u64{prep.pipeline} & 0x3FFFFFFF) << 32) | (tv & 0xFFFFFFFF);
+        if (LabelChanges(lkey)) {
+            Label(lkey, fmt::format("D p{} vs{:x} ps{:x} @{:x}", prep.pipeline, vs.address, has_ps ? ps.address : 0,
+                                    d.packet_addr));
+        }
+    }
     if (has_ps) { // SSPC_DIAG_DUMP_SHADER: a pixel shader too (P4.5)
         DiagDumpShader(ps.address, ps.program != nullptr ? &ps.program->code : nullptr, ps.module->result.spirv,
                        ps.runtime, prep.pipeline);
@@ -2116,6 +2201,24 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
                 args_rb_.push_back({cur_.value, VideoOut::NextFlipId(), d.args_addr, rb});
             }
         }
+    }
+    // once per pipeline and target images (the register versions in the label's key change almost every draw:
+    // g2_village_markers wrote 141 MB keyed by them)
+    if (markers_ && label_open_ &&
+        legend_done_
+            .insert((u64{prep.pipeline} << 40) ^ (u64{color_img[0] != nullptr ? color_img[0]->id : 0} << 20) ^
+                    (color_img[1] != nullptr ? u64{color_img[1]->id} << 10 : 0) ^ (depth_img != nullptr ? depth_img->id : 0))
+            .second) {
+        std::string line = label_text_ + " |";
+        for (u32 i = 0; i < 8; ++i) {
+            if (color_img[i] != nullptr) {
+                line += fmt::format(" c{} {};", i, DescribeImage(*color_img[i]));
+            }
+        }
+        if (depth_img != nullptr) {
+            line += fmt::format(" depth {};", DescribeImage(*depth_img));
+        }
+        legend_ << line << " | " << key.width << "x" << key.height << " layers " << key.layers << "\n";
     }
     DiagCaptureBefore(prep.pipeline, color_img);
     DiagCaptureDraw(prep.pipeline, color_img, false);
@@ -2503,6 +2606,11 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         return;
     }
     const GS::StageView& csv = frontend_.Stage(GS::HwStage::Cs);
+    if (LabelChanges((1ull << 62) | csv.address)) {
+        Label((1ull << 62) | csv.address,
+              fmt::format("X cs{:x} {}x{}x{}{} @{:x}", csv.address, d.groups[0], d.groups[1], d.groups[2],
+                          d.indirect ? " indirect" : "", d.packet_addr));
+    }
     lds_groups_ = std::max<u64>(1, u64{cs->values[Cp::Reg::ComputeDimX]} * cs->values[Cp::Reg::ComputeDimX + 1] *
                                        cs->values[Cp::Reg::ComputeDimX + 2]);
     lds_group_bytes_ = ((d.shader.rsrc2 >> 15) & 0x1FFu) * 512u; // COMPUTE_PGM_RSRC2.LDS_SIZE, 128-dword units
@@ -2653,8 +2761,8 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     }
     DiagEnd(cid);
     if (prof_) {
-        ProfMark((csv.address << 2) | 1, fmt::format("dispatch cs {:#x} groups {}x{}x{}{}", csv.address, d.groups[0],
-                                                     d.groups[1], d.groups[2], d.indirect ? " indirect" : ""));
+        ProfMark((csv.address << 2) | 1, fmt::format("dispatch q{} cs {:#x} groups {}x{}x{}{}", d.queue, csv.address,
+                                                     d.groups[0], d.groups[1], d.groups[2], d.indirect ? " indirect" : ""));
         ProfDescribe((csv.address << 2) | 1, "dispatch", &csv, bound);
         // SSPC_DIAG_DUP_DISPATCH=<hex cs address> (with SSPC_GPU_PROFILE): the dispatch once more right after itself
         // (same inputs, same outputs) and an empty interval - whether its time is its own execution or a stall
@@ -2856,8 +2964,13 @@ void Executor::RaceCheck() {
         char v[32] = {};
         const u64 w = GetEnvironmentVariableA("SSPC_DIAG_WATCH", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16) : 0ull;
         if (w != 0) {
+            char rd[4] = {};
+            if (GetEnvironmentVariableA("SSPC_DIAG_WATCH_READS", rd, sizeof(rd)) == 1 && rd[0] == '1') {
+                g_watch_prot = PAGE_NOACCESS;
+            }
             AddVectoredExceptionHandler(1, &WatchFilter);
-            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_WATCH={:#x} - CPU writes of its page logged per flip", w);
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_WATCH={:#x} - CPU {} of its page logged per flip", w,
+                     g_watch_prot == PAGE_NOACCESS ? "reads and writes" : "writes");
         }
         return w;
     }();
@@ -2883,6 +2996,17 @@ void Executor::RaceCheck() {
                                           "now {:.1f}, copy {:.1f} (after {} writes)",
                                           VideoOut::NextFlipId(), value[0], value[1], n, rel(now),
                                           rel(race_.watch_copy_tsc), race_.watch_copy_hits);
+            if (g_watch_prot == PAGE_NOACCESS) {
+                // SSPC-020: the four 64-bit timer pairs from the watched address (start, end) as the game computes
+                // them (low 32 bits, 800 MHz GPU counter -> ms; the game's timer 0x196ef0 in eboot)
+                u64 slots[8] = {};
+                GS::GameMemory().Read(watch & ~0xFull, slots, sizeof(slots));
+                out += " | pairs ms:";
+                for (u32 p = 0; p < 4; ++p) {
+                    const u32 d = static_cast<u32>(slots[2 * p + 1]) - static_cast<u32>(slots[2 * p]);
+                    out += fmt::format(" {:.3f}", static_cast<double>(d) / 800000.0);
+                }
+            }
             race_.watch_copy_tsc = 0;
             // the writes' times, coalesced into bursts (writes within 0.2 ms), with their code addresses
             for (u32 i = 0; i < n;) {
@@ -2890,12 +3014,14 @@ void Executor::RaceCheck() {
                 while (j < n && rel(g_watch_hits[j].tsc) - rel(g_watch_hits[j - 1].tsc) < 0.2) {
                     ++j;
                 }
-                out += fmt::format(" | {} writes at {:.1f}..{:.1f} rip {:#x} [{:#x}..]", j - i, rel(g_watch_hits[i].tsc),
-                                   rel(g_watch_hits[j - 1].tsc), g_watch_hits[i].rip, g_watch_hits[i].addr);
-                if (j - i <= 32) { // a short burst: every address
+                out += fmt::format(" | {} accesses at {:.1f}..{:.1f} rip {:#x} [{:#x}..]", j - i,
+                                   rel(g_watch_hits[i].tsc), rel(g_watch_hits[j - 1].tsc), g_watch_hits[i].rip,
+                                   g_watch_hits[i].addr);
+                if (j - i <= 32) { // a short burst: every address (r read, w write) and its code address
                     out += " at";
                     for (u32 k = i; k < j; ++k) {
-                        out += fmt::format(" {:x}", g_watch_hits[k].addr & 0xFFF);
+                        out += fmt::format(" {}{:x}@{:x}", g_watch_hits[k].write != 0 ? 'w' : 'r',
+                                           g_watch_hits[k].addr & 0xFFF, g_watch_hits[k].rip);
                     }
                 }
                 i = j;
@@ -2923,7 +3049,7 @@ void Executor::RaceCheck() {
         }
         const u64 page = watch & ~0xFFFull;
         DWORD old = 0;
-        if (VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &old)) {
+        if (VirtualProtect(reinterpret_cast<void*>(page), 4096, g_watch_prot, &old)) {
             g_watch_page.store(page, std::memory_order_release);
         }
     }
@@ -3283,6 +3409,9 @@ void Executor::Flip(const Cp::FlipMarker&) {
     const bool has = VideoOut::NextFlipBuffer(buf, index);
     if (has && presenter_ != nullptr && Begin()) {
         EndRendering();
+        if (LabelChanges(kLabelOther | 4)) {
+            Label(kLabelOther | 4, "F flip: frame copy to the presenter");
+        }
         CachedImage* img = images_.FindTargetAt(buf.address);
         if (img != nullptr) {
             images_.Touch(*img, cur_.value); // the flip copy reads it in this batch (review M2)

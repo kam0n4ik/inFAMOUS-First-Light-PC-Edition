@@ -779,7 +779,7 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
                      h.guest_size, h.num_bits, it->second->usage);
         }
         match = Create(layout, error);
-        if (match != nullptr && diag_ != nullptr && diag_->Enabled()) {
+        if (match != nullptr && diag_ != nullptr && diag_->Naming()) {
             diag_->Name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<u64>(match->image),
                         fmt::format("img{}@{:#x}+{:#x} fmt {} {}x{}x{} lv {} ly {} s {} tile {}", match->id,
                                     layout.guest_address, layout.guest_size, layout.pixel_format, layout.size.width,

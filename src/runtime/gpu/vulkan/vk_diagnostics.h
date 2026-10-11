@@ -38,6 +38,8 @@ public:
     ~Diagnostics();
 
     bool Enabled() const { return enabled_; }
+    /// Objects are named: --gpu-native-diag or SSPC_GPU_MARKERS=1 (a profiler's capture reads the names, P4.6-G6).
+    bool Naming() const { return naming_; }
 
     /// A command recorded into `cb` for submission `batch`: its id (0 when off), with a checkpoint and a "started" marker.
     u64 Begin(VkCommandBuffer cb, u64 batch, std::string text);
@@ -65,6 +67,7 @@ private:
 
     DeviceContext& ctx_;
     bool enabled_ = false;
+    bool naming_ = false;
     std::filesystem::path dir_;
     std::mutex mutex_;
     std::vector<Record> ring_; ///< by id % size

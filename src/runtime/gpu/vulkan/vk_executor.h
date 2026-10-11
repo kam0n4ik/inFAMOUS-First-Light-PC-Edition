@@ -437,6 +437,20 @@ private:
     void* flip_ctx_ = nullptr;
     u64 last_unblock_tsc_ = 0;
     u64 batch_first_cmd_ = 0, batch_last_cmd_ = 0;
+
+    // SSPC_GPU_MARKERS=1 (P4.6-G6, diagnostic): a debug label around each run of commands of one graphics pipeline with
+    // the same target registers / one compute shader / one kind of transfer (a GPU profiler's capture gives time and
+    // counters per label); the draw labels' targets once each in logs\gpu_markers.txt. Off: one branch per command.
+    bool markers_ = false;
+    bool label_open_ = false;
+    u64 label_key_ = 0;
+    std::string label_text_;
+    std::unordered_set<u64> legend_done_;
+    std::ofstream legend_;
+    bool LabelChanges(u64 key) const { return markers_ && open_ && (!label_open_ || key != label_key_); }
+    void Label(u64 key, std::string text); ///< ends the open label, begins this one
+    void EndLabel();
+    static constexpr u64 kLabelOther = 2ull << 62; ///< | kind: transfers and frame copies (draws 0, dispatches 1 << 62)
 };
 
 } // namespace SecondSon::Gpu::Vk
