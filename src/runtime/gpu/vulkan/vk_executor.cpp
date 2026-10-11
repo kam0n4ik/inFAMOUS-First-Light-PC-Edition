@@ -3099,8 +3099,46 @@ void Executor::DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>
     }
 }
 
+void Executor::EvictGpuImages() {
+    // over the image budget after the uploaded images went (P4.5, R7): the GPU-written ones the cache gives back are
+    // copied to their guest memory in this batch - through GuestRange's write path, as a DMA copy on the timeline (the
+    // buffer cache's copy of the range stays coherent) - and retired; textures there are uploaded again after it
+    if (!images_.OverBudget()) {
+        return;
+    }
+    const std::vector<CachedImage*> back = images_.EvictGpuWritten(timeline_.Completed(), 16);
+    if (back.empty() || !Begin()) {
+        return;
+    }
+    EndRendering();
+    if (pending_writes_) {
+        GlobalBarrier();
+    }
+    for (CachedImage* img : back) {
+        const u64 addr = img->layout.guest_address, bytes = img->layout.guest_size;
+        VkBuffer buf = VK_NULL_HANDLE;
+        u64 off = 0, avail = 0;
+        if (!GuestRange(addr, bytes, true, 4, buf, off, avail) || avail < bytes) {
+            continue; // kept (no write path to its memory now; a later call tries again)
+        }
+        EndRendering(); // GuestRange may have uploaded
+        std::string err;
+        if (!images_.WriteBackAndRetire(img, cur_.cb, cur_.value, buf, off, err)) {
+            SSPC_LOG(GPU, Warning, "native backend: GPU-written image at {:#x} kept: {}", addr, err);
+            continue;
+        }
+        pending_writes_ = true; // a later read of the memory waits for the copy
+        // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
+        timeline_writes_.push_back({addr, addr + bytes, cur_.value});
+        tw_lo_ = std::min(tw_lo_, addr);
+        tw_hi_ = std::max(tw_hi_, addr + bytes);
+        images_.Invalidate(addr, bytes); // textures there are uploaded again, after the copy
+    }
+}
+
 void Executor::Flip(const Cp::FlipMarker&) {
     images_.NewFrame();
+    EvictGpuImages();
     CaptureImageAt();
     DrawHistogram();
     RaceCheck();

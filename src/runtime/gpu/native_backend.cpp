@@ -766,7 +766,10 @@ std::string Backend::Report() {
         out += fmt::format("images {} ({} MiB), uploads {} (detiled {}, linear {}, {} MiB), overlap hits {}, target misses {}, overlap misses {}, unsupported {} {}\n",
                            i.images, i.bytes >> 20, i.uploads, i.detiles, i.linear_uploads, i.upload_bytes >> 20,
                            i.overlap_hits, i.target_misses, i.overlap_misses, i.unsupported, i.first_unsupported);
-        out += fmt::format("images evicted over the budget: {} ({} MiB)\n", i.evicted, i.evicted_bytes >> 20);
+        out += fmt::format("images evicted over the budget: {} ({} MiB); GPU-written: dropped (memory newer) {}, written "
+                           "back and freed {} ({} MiB), old but kept (no write-back path) {}\n",
+                           i.evicted, i.evicted_bytes >> 20, i.gpu_dropped, i.gpu_written_back,
+                           i.gpu_written_back_bytes >> 20, i.gpu_kept_no_path);
         out += fmt::format("GPU-written images whose memory was written since: {} (exact {}, buffer write at the base {}, "
                            "CPU {}, unmapped {}), targets uploaded first {}; expanded {}, block-compressed copies {}; "
                            "superseded {}; retired {} ({} MiB); write-tracked {}, not trackable {}; stencil views {}\n",

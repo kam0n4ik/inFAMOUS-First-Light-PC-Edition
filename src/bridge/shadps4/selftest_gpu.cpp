@@ -31,6 +31,7 @@
 #include "runtime/gpu/pm4.h"
 #include "runtime/gpu/pm4_stats.h"
 #include "runtime/gpu/vulkan/vk_foundation.h"
+#include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 
 // Options structures are filled naming only the fields a case changes.
@@ -506,15 +507,127 @@ void TestVulkan(TestGroup& g) {
     }
 }
 
+/// The native backend's image cache rules (P4.5; vk_image_cache.h), without a device.
+void TestImageCacheRules(TestGroup& g) {
+    namespace V = Gpu::Vk;
+    using V::InvalKind;
+    constexpr u64 K = 64 * 1024;
+    // invalidation: an image over [base, base + size)
+    const auto inval = [](InvalKind kind, u64 base, u64 size, bool gpu, bool uploaded, u64 a, u64 n) {
+        return V::ClassifyInvalidation(kind, base, size, gpu, uploaded, a, a + n);
+    };
+    const auto none = [](const V::InvalidationEffect& e) {
+        return !e.retire && !e.dirty && !e.memory_newer && !e.maybe_newer;
+    };
+    g.Check("invalidation: a write beside the image changes nothing",
+            none(inval(InvalKind::Exact, 0x100000, 0x40000, true, false, 0x140000, 0x1000)) &&
+                none(inval(InvalKind::Unmap, 0x100000, 0x40000, true, false, 0x0, 0x100000)),
+            "");
+    g.Check("invalidation: an unmap/remap over it retires it, texture or GPU-written (R4)",
+            inval(InvalKind::Unmap, 0x100000, 0x40000, true, false, 0x13F000, 0x2000).retire &&
+                inval(InvalKind::Unmap, 0x100000, 0x40000, false, true, 0x100000, 0x1000).retire,
+            "");
+    g.Check("invalidation: an uploaded texture is uploaded again after any write over it; never-uploaded: nothing",
+            inval(InvalKind::Coarse, 0x100000, 0x40000, false, true, 0x100000, K).dirty &&
+                inval(InvalKind::BufferWrite, 0x100000, 0x40000, false, true, 0x120000, 16).dirty &&
+                none(inval(InvalKind::Exact, 0x100000, 0x40000, false, false, 0x100000, 16)),
+            "");
+    g.Check("invalidation: a GPU-written image whose memory is written exactly (CPU write seen at a met wait, DMA) "
+            "takes memory's texels (address reuse, R3)",
+            inval(InvalKind::Exact, 0x100000, 0x40000, true, false, 0x120010, 4).memory_newer, "");
+    g.Check("invalidation: a shader's buffer write marks a GPU-written image only at its base (the bridge's "
+            "InvalidateMemoryFromGPU)",
+            inval(InvalKind::BufferWrite, 0x100000, 0x40000, true, false, 0x100000, 256).memory_newer &&
+                none(inval(InvalKind::BufferWrite, 0x100000, 0x40000, true, false, 0x110000, 256)),
+            "");
+    const auto inner = inval(InvalKind::Coarse, 0x100000, 0x40000, true, false, 0x110000, K);
+    const auto shared = inval(InvalKind::Coarse, 0x108000, 0x10000, true, false, 0x100000, K);
+    g.Check("invalidation: the tracker's 64 KiB block wholly inside a GPU-written image -> memory newer; a block it "
+            "shares with a neighbour -> maybe newer only (its texels kept)",
+            inner.memory_newer && !inner.maybe_newer && !shared.memory_newer && shared.maybe_newer, "");
+
+    // ExpandImage sources
+    V::CachedImage have;
+    have.gpu_written = true;
+    have.layout.supported = true;
+    have.layout.pixel_format = 97; // R16G16B16A16_SFLOAT
+    have.layout.num_bits = 64;
+    have.layout.size = {256, 256, 1};
+    have.layout.pitch = 256;
+    have.layout.tile_mode = static_cast<Gpu::TileMode>(14);
+    Gpu::ImageLayout want = have.layout;
+    want.levels = 9;
+    g.Check("ExpandImage: a GPU-written image serves a request for more levels of the same texels (R5)",
+            V::CanExpandFrom(have, want), "");
+    want.levels = 1;
+    want.layers = 1;
+    g.Check("ExpandImage: nothing more asked for: not an expansion", !V::CanExpandFrom(have, want), "");
+    want.levels = 9;
+    V::CachedImage stale = have;
+    stale.memory_newer = true;
+    V::CachedImage maybe = have;
+    maybe.maybe_newer = true;
+    V::CachedImage uploaded = have;
+    uploaded.gpu_written = false;
+    g.Check("ExpandImage: not from an image whose memory is (maybe) newer, nor from an uploaded texture",
+            !V::CanExpandFrom(stale, want) && !V::CanExpandFrom(maybe, want) && !V::CanExpandFrom(uploaded, want), "");
+    Gpu::ImageLayout other = want;
+    other.size = {128, 256, 1};
+    Gpu::ImageLayout msaa = want;
+    msaa.num_samples = 4;
+    g.Check("ExpandImage: another size or MSAA: no source", !V::CanExpandFrom(have, other) && !V::CanExpandFrom(have, msaa),
+            "");
+    Gpu::ImageLayout bc = have.layout;
+    bc.pixel_format = 131; // BC1_RGB_UNORM: 64-bit blocks
+    bc.props.is_block = true;
+    bc.size = {1024, 1024, 1};
+    bc.pitch = 1024;
+    g.Check("ExpandImage: a block-compressed view of uncompressed texels (one 64-bit texel per BC1 block, R6)",
+            V::CanExpandFrom(have, bc), fmt::format("{}x{} vs {}x{}", have.layout.BlockDim()[0], have.layout.BlockDim()[1],
+                                                    bc.BlockDim()[0], bc.BlockDim()[1]));
+
+    // the equal-address rule
+    Gpu::ImageLayout rgba = have.layout;
+    rgba.pixel_format = 37; // R8G8B8A8_UNORM
+    rgba.num_bits = 32;
+    Gpu::ImageLayout srgb = rgba;
+    srgb.pixel_format = 43; // R8G8B8A8_SRGB
+    Gpu::ImageLayout more = rgba;
+    more.levels = 4;
+    g.Check("equal-address rule: an image serves a view of a compatible format; not a larger request",
+            V::ImageServes(rgba, srgb) && !V::ImageServes(rgba, more) && V::ImageServes(more, rgba), "");
+
+    // eviction of GPU-written images (R7)
+    using E = V::GpuEviction;
+    const auto ev = [](V::GpuEvictionCandidate c) { return V::ClassifyGpuEviction(c); };
+    g.Check("GPU eviction: in flight -> kept, even when stale",
+            ev({.in_flight = true, .memory_newer = true, .age_frames = 1000}) == E::Keep, "");
+    g.Check("GPU eviction: memory newer / superseded -> dropped once unused for kGpuEvictStaleFrames (nothing lost)",
+            ev({.memory_newer = true, .age_frames = V::kGpuEvictStaleFrames - 1}) == E::Keep &&
+                ev({.memory_newer = true, .age_frames = V::kGpuEvictStaleFrames}) == E::Drop &&
+                ev({.superseded = true, .age_frames = 500}) == E::Drop,
+            "");
+    g.Check("GPU eviction: clean -> written back once unused for kGpuEvictCleanFrames, never dropped with its texels",
+            ev({.age_frames = V::kGpuEvictCleanFrames - 1}) == E::Keep &&
+                ev({.age_frames = V::kGpuEvictCleanFrames}) == E::WriteBack,
+            "");
+    g.Check("GPU eviction: maybe newer in memory, or no write-back path -> kept (no old texels over the CPU's bytes)",
+            ev({.maybe_newer = true, .age_frames = 1000}) == E::Keep &&
+                ev({.no_write_path = true, .age_frames = 1000}) == E::Keep,
+            "");
+}
+
 } // namespace
 
 std::vector<TestGroup> TestGpu(const App::Config& cfg) {
-    std::vector<TestGroup> out(5);
+    std::vector<TestGroup> out(6);
     out[0].name = "Pm4Decode";
     out[1].name = "Pm4Stats";
     out[2].name = "GpuOwners";
     out[3].name = "GpuMemory(contract)";
     out[4].name = "GpuVulkan";
+    out[5].name = "GpuImageCache(rules)";
+    TestImageCacheRules(out[5]);
     TestDecode(out[0]);
     TestStats(out[1], cfg.logs_dir / "selftest_gpu");
     TestStatsThreaded(out[1], cfg.logs_dir / "selftest_gpu" / "threaded");

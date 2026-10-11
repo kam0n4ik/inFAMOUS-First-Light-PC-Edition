@@ -84,8 +84,50 @@ struct ImageCacheStats {
     u64 superseded = 0;
     u64 gpu_tracked = 0, gpu_untracked = 0; ///< GPU-written images whose pages could / could not be write-protected
     u64 stencil_views = 0; ///< textures of a depth target's stencil plane: the depth image's stencil aspect
+    /// GPU-written images over the budget: dropped (memory newer), written back and freed, kept (no write-back path)
+    u64 gpu_dropped = 0, gpu_written_back = 0, gpu_written_back_bytes = 0, gpu_kept_no_path = 0;
     std::string first_unsupported;
 };
+
+/// A GPU-written image over the budget (P4.5; the bridge's GarbageCollectImages): what becomes of it.
+enum class GpuEviction : u8 {
+    Keep,      ///< used lately, in flight, maybe newer in memory, or no write-back path (see no_write_path)
+    Drop,      ///< memory holds newer texels (the CPU/DMA or another image wrote it since): freed, nothing written
+    WriteBack, ///< its texels copied (tiled: through the tiler) to its guest memory, then freed (re-uploaded at its
+               ///< next use)
+};
+struct GpuEvictionCandidate {
+    bool in_flight = false;    ///< its last use has not completed
+    bool memory_newer = false; ///< CachedImage::memory_newer
+    bool superseded = false;   ///< CachedImage::superseded
+    bool maybe_newer = false;  ///< CachedImage::maybe_newer (a write-back could put old texels over the CPU's bytes)
+    /// No copy back to its memory: MSAA, a volume, block-compressed, depth with stencil or not D32/D16, a tiling
+    /// the tiler has no variant for (the bridge keeps every tiled one: "can't handle non-linear image downloads")
+    bool no_write_path = false;
+    u64 age_frames = 0;        ///< presented frames since its last use
+};
+inline constexpr u64 kGpuEvictStaleFrames = 120; ///< a GPU-written image whose memory is newer: dropped this old
+inline constexpr u64 kGpuEvictCleanFrames = 300; ///< a clean one (its texels exist only in video memory): written back
+GpuEviction ClassifyGpuEviction(const GpuEvictionCandidate& c);
+
+/// Who wrote guest memory behind the images (P4.5): a DMA/WRITE_DATA or an exactly reported guest write; a shader's
+/// buffer write; the write tracker's report (whole 64 KiB blocks); an unmap/remap.
+enum class InvalKind : u8 { Exact, BufferWrite, Coarse, Unmap };
+/// What a write of [addr, end) does to an image over [begin, begin + size) (ImageCache::ApplyInvalidations' rule).
+struct InvalidationEffect {
+    bool retire = false;       ///< unmapped: taken out
+    bool dirty = false;        ///< an uploaded texture: uploaded again at its next use
+    bool memory_newer = false; ///< a GPU-written image: memory holds its texels now (surely written into it)
+    bool maybe_newer = false;  ///< a GPU-written image sharing a reported block: maybe written, maybe its neighbour
+};
+InvalidationEffect ClassifyInvalidation(InvalKind kind, u64 begin, u64 size, bool gpu_written, bool uploaded, u64 addr,
+                                        u64 end);
+/// An image with layout `have` at the same address serves a request for `want` through a view (the same texels: size,
+/// tiling, samples; a format of the same class; at least the levels/layers asked for) - the equal-address rule.
+bool ImageServes(const ImageLayout& have, const ImageLayout& want);
+/// `have` (an image the GPU wrote) can be copied into a new image for `want` (the bridge's ExpandImage: more levels or
+/// layers of the same texels, or a block-compressed view of its uncompressed texels).
+bool CanExpandFrom(const CachedImage& have, const ImageLayout& want);
 
 class ImageCache {
 public:
@@ -147,6 +189,16 @@ public:
     void SetTracker(PageTracker* tracker) { tracker_ = tracker; }
     /// Releases what completed submissions no longer need (temporary detile buffers).
     void Collect(u64 completed);
+    /// Still over the budget once the uploaded images went (Collect): GPU-written images by ClassifyGpuEviction,
+    /// least recently used first, at most `max` per call. Drop: retired here. WriteBack: returned - the caller records
+    /// the copy of each to its guest memory (WriteBackAndRetire; P4.5).
+    std::vector<CachedImage*> EvictGpuWritten(u64 completed, u32 max);
+    /// Records into `cb` (outside rendering) the copy of `img`'s texels to its guest memory at (`dst`, `dst_offset`)
+    /// (guest_size bytes; tiled: through a linear temporary and the tiler), then retires it (destroyed once `seq`
+    /// completed). false with `error`: nothing recorded, the image stays.
+    bool WriteBackAndRetire(CachedImage* img, VkCommandBuffer cb, u64 seq, VkBuffer dst, u64 dst_offset,
+                            std::string& error);
+    bool OverBudget() const { return stats_.bytes > budget_ || force_gpu_evict_; }
 
     /// The target whose CMASK/FMASK/HTILE metadata starts at `address` (registered when bound as a target), nullptr: none.
     CachedImage* MetaOwner(u64 address) const {
@@ -168,7 +220,6 @@ private:
     bool Upload(CachedImage& image, VkCommandBuffer cb, u64 seq, std::string& error);
     bool DetilePipeline(const TilingParams& p, VkPipeline& out, std::string& error);
     void ApplyInvalidations();
-    enum class InvalKind : u8 { Exact, BufferWrite, Coarse, Unmap };
     void Queue(u64 addr, u64 size, InvalKind kind);
     /// Takes `img` out of the lookups (its views stay valid until destroyed with it once `last_seq` completed).
     void Retire(CachedImage* img);
@@ -180,6 +231,10 @@ private:
                               std::multimap<u64, CachedImage*>::iterator hi);
     /// Write tracking of a GPU-written image (its pages protected: the CPU's writes there are seen).
     void TrackGpuWritten(CachedImage& img);
+    /// No way to copy `l`'s texels back to its memory (ClassifyGpuEviction's no_write_path).
+    static bool NoWritePath(const ImageLayout& l, VkImageAspectFlags aspect, VkFormat format);
+    /// A device-local temporary of `bytes` (destroyed once `seq` completed). VK_NULL_HANDLE: no memory.
+    VkBuffer TempBuffer(u64 bytes, u64 seq);
     std::vector<std::unique_ptr<CachedImage>> retired_; ///< taken out, destroyed once their last use completed
     u64 frame_ = 0, last_retire_scan_ = ~0ull;
 
@@ -193,6 +248,8 @@ private:
     u64 overlap_misses_logged_ = 0;
     u64 dup_logged_ = 0; ///< second images of an address logged (P4.5 diagnostics)
     Diagnostics* diag_ = nullptr;
+    bool force_gpu_evict_ = false; ///< SSPC_DIAG_GPU_EVICT_ALL: the write-back stress test
+    u64 force_age_scale_ = 1;      ///< ... =<frames>: ages counted that much faster
     bool alias_rule_ = true; ///< SSPC_DIAG_ALIAS_RULE=off: a diagnostic control run without the equal-address rule
     void (*before_upload_)(void*) = nullptr;
     void* before_upload_ctx_ = nullptr;

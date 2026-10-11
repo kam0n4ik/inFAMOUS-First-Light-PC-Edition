@@ -36,14 +36,6 @@ bool SameImage(const ImageLayout& a, const ImageLayout& b) {
            a.pitch == b.pitch && a.guest_size == b.guest_size;
 }
 
-/// Another image at the same address that can serve as this one through a view (the same texels: size, tiling,
-/// samples; a format of the same class; at least the levels/layers asked for).
-bool Serves(const ImageLayout& have, const ImageLayout& want) {
-    return have.size == want.size && have.num_samples == want.num_samples && have.tile_mode == want.tile_mode &&
-           have.levels >= want.levels && have.layers >= want.layers &&
-           IsVulkanFormatCompatible(static_cast<VkFormat>(have.pixel_format), static_cast<VkFormat>(want.pixel_format));
-}
-
 constexpr VkAccessFlags2 kWriteAccess = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
                                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
@@ -58,6 +50,14 @@ ImageCache::ImageCache(DeviceContext& ctx, GuestBuffers& guest) : ctx_(ctx), gue
         alias_rule_ = false;
         SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_ALIAS_RULE=off - the image cache's equal-address "
                                "aliasing rule is disabled for this run (a control run, not a configuration)");
+    }
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_GPU_EVICT_ALL", v, sizeof(v)) > 0) {
+        // =1: the standard ages; =<frames> (> 1): a clean image counts as old after that many frames
+        const u64 n = std::strtoull(v, nullptr, 10);
+        force_gpu_evict_ = n != 0;
+        force_age_scale_ = n > 1 ? std::max<u64>(kGpuEvictCleanFrames / n, 1) : 1;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_GPU_EVICT_ALL={} - every GPU-written image old enough is "
+                               "evicted (written back) whatever the budget (a stress test of the write-back, P4.5)", n);
     }
     const VkDescriptorSetLayoutBinding b[3] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -226,7 +226,6 @@ void ImageCache::ApplyInvalidations() {
     }
     // only the images that can overlap each range (by address; it walked every image for every range: 7.8% of the GPU
     // thread's samples, f1)
-    constexpr u64 kBlock = 64 * 1024; // the tracker's report granularity
     std::vector<CachedImage*> unmapped;
     for (const auto& [addr, size, kind] : ranges) {
         const u64 end = addr + size;
@@ -237,37 +236,18 @@ void ImageCache::ApplyInvalidations() {
             if (!(b < end && addr < e)) {
                 continue;
             }
-            if (kind == InvalKind::Unmap) {
+            const InvalidationEffect fx =
+                ClassifyInvalidation(kind, b, img->layout.guest_size, img->gpu_written, img->uploaded, addr, end);
+            if (fx.retire) {
                 unmapped.push_back(img);
                 continue;
             }
-            if (!img->gpu_written) {
-                if (img->uploaded) {
-                    img->dirty = true;
-                    ++stats_.invalidations;
-                }
-                continue;
+            if (fx.dirty) {
+                img->dirty = true;
+                ++stats_.invalidations;
             }
-            // a GPU-written image: memory holds its texels again only if this write was surely into it (P4.5)
-            bool hit = false;
-            switch (kind) {
-            case InvalKind::Exact:
-                hit = true;
-                break;
-            case InvalKind::BufferWrite:
-                hit = b == addr;
-                break;
-            case InvalKind::Coarse: {
-                const u64 ib = (b + kBlock - 1) & ~(kBlock - 1), ie = e & ~(kBlock - 1); // blocks wholly inside
-                hit = ib < ie && addr < ie && ib < end;
-                if (!hit) {
-                    img->maybe_newer = true; // a block it shares: the write may be its neighbour's
-                }
-                break;
-            }
-            default:
-                break;
-            }
+            img->maybe_newer |= fx.maybe_newer;
+            const bool hit = fx.memory_newer;
             if (hit && !img->memory_newer) {
                 img->memory_newer = true;
                 ++stats_.memory_newer;
@@ -557,29 +537,28 @@ CachedImage* ImageCache::ExpandSource(const ImageLayout& want, std::multimap<u64
     // wrote), the GPU-written texels copied over it (vkCmdCopyImage: size-compatible formats, the extent in the
     // source's texels). An image whose memory was written since (memory_newer: the address reused) is not a source.
     for (auto it = lo; it != hi; ++it) {
-        CachedImage* have_img = it->second;
-        const ImageLayout& have = have_img->layout;
-        if (!have_img->gpu_written || have_img->memory_newer || have_img->maybe_newer || have.num_samples != 1 ||
-            want.num_samples != 1 ||
-            have.num_bits != want.num_bits || have.props.is_depth != want.props.is_depth ||
-            (have.type == ImageType::Color3D) != (want.type == ImageType::Color3D)) {
-            continue;
-        }
-        if (want.props.is_block && !have.props.is_block) {
-            // texels of the uncompressed image = blocks of the compressed one
-            if (have.BlockDim() == want.BlockDim() && have.layers <= want.layers && have.size.depth == want.size.depth) {
-                return have_img;
-            }
-            continue;
-        }
-        if (want.props.is_block != have.props.is_block || have.size != want.size || have.tile_mode != want.tile_mode) {
-            continue;
-        }
-        if (have.levels < want.levels || have.layers < want.layers) {
-            return have_img;
+        if (CanExpandFrom(*it->second, want)) {
+            return it->second;
         }
     }
     return nullptr;
+}
+
+bool CanExpandFrom(const CachedImage& have_img, const ImageLayout& want) {
+    const ImageLayout& have = have_img.layout;
+    if (!have_img.gpu_written || have_img.memory_newer || have_img.maybe_newer || have.num_samples != 1 ||
+        want.num_samples != 1 || have.num_bits != want.num_bits || have.props.is_depth != want.props.is_depth ||
+        (have.type == ImageType::Color3D) != (want.type == ImageType::Color3D)) {
+        return false;
+    }
+    if (want.props.is_block && !have.props.is_block) {
+        // texels of the uncompressed image = blocks of the compressed one
+        return have.BlockDim() == want.BlockDim() && have.layers <= want.layers && have.size.depth == want.size.depth;
+    }
+    if (want.props.is_block != have.props.is_block || have.size != want.size || have.tile_mode != want.tile_mode) {
+        return false;
+    }
+    return have.levels < want.levels || have.layers < want.layers;
 }
 
 void ImageCache::CopyImage(CachedImage& src, CachedImage& dst, VkCommandBuffer cb) {
@@ -648,7 +627,7 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
     }
     if (match == nullptr) {
         for (auto it = lo; it != hi; ++it) {
-            if (Serves(it->second->layout, layout)) {
+            if (ImageServes(it->second->layout, layout)) {
                 match = it->second;
                 ++stats_.alias_hits;
                 break;
@@ -1088,6 +1067,232 @@ void ImageCache::Collect(u64 completed) {
         }
     }
     Evict(completed);
+}
+
+bool ImageServes(const ImageLayout& have, const ImageLayout& want) {
+    return have.size == want.size && have.num_samples == want.num_samples && have.tile_mode == want.tile_mode &&
+           have.levels >= want.levels && have.layers >= want.layers &&
+           IsVulkanFormatCompatible(static_cast<VkFormat>(have.pixel_format), static_cast<VkFormat>(want.pixel_format));
+}
+
+InvalidationEffect ClassifyInvalidation(InvalKind kind, u64 b, u64 size, bool gpu_written, bool uploaded, u64 addr,
+                                        u64 end) {
+    InvalidationEffect fx;
+    const u64 e = b + size;
+    if (!(b < end && addr < e)) {
+        return fx; // not over it
+    }
+    if (kind == InvalKind::Unmap) {
+        fx.retire = true;
+        return fx;
+    }
+    if (!gpu_written) {
+        fx.dirty = uploaded;
+        return fx;
+    }
+    // a GPU-written image: memory holds its texels again only if this write was surely into it (P4.5)
+    constexpr u64 kBlock = 64 * 1024; // the tracker's report granularity
+    switch (kind) {
+    case InvalKind::Exact:
+        fx.memory_newer = true;
+        break;
+    case InvalKind::BufferWrite:
+        fx.memory_newer = b == addr; // the bridge's InvalidateMemoryFromGPU: a pool overlapping it is not a write of it
+        break;
+    case InvalKind::Coarse: {
+        const u64 ib = (b + kBlock - 1) & ~(kBlock - 1), ie = e & ~(kBlock - 1); // blocks wholly inside
+        fx.memory_newer = ib < ie && addr < ie && ib < end;
+        fx.maybe_newer = !fx.memory_newer; // a block it shares: the write may be its neighbour's
+        break;
+    }
+    default:
+        break;
+    }
+    return fx;
+}
+
+GpuEviction ClassifyGpuEviction(const GpuEvictionCandidate& c) {
+    if (c.in_flight) {
+        return GpuEviction::Keep;
+    }
+    if (c.memory_newer || c.superseded) {
+        // memory (or another image) holds the newer texels: nothing of this one is lost (the bridge frees a dirty
+        // image without a download)
+        return c.age_frames >= kGpuEvictStaleFrames ? GpuEviction::Drop : GpuEviction::Keep;
+    }
+    // its texels exist only in video memory: written back where a copy can, else kept - never freed with its texels
+    // lost; nor written over memory the CPU may have written since (maybe_newer)
+    if (c.age_frames < kGpuEvictCleanFrames || c.maybe_newer || c.no_write_path) {
+        return GpuEviction::Keep;
+    }
+    return GpuEviction::WriteBack;
+}
+
+std::vector<CachedImage*> ImageCache::EvictGpuWritten(u64 completed, u32 max) {
+    std::vector<CachedImage*> out;
+    if (stats_.bytes <= budget_ && !force_gpu_evict_) {
+        return out;
+    }
+    std::vector<std::pair<CachedImage*, GpuEviction>> cand;
+    u64 no_path = 0;
+    for (const auto& img : images_) {
+        if (!img->gpu_written) {
+            continue;
+        }
+        const ImageLayout& l = img->layout;
+        const GpuEviction a = ClassifyGpuEviction({.in_flight = img->last_seq > completed,
+                                                   .memory_newer = img->memory_newer,
+                                                   .superseded = img->superseded,
+                                                   .maybe_newer = img->maybe_newer,
+                                                   .no_write_path = NoWritePath(l, img->aspect, img->format),
+                                                   .age_frames = (frame_ - std::min(frame_, img->last_frame)) *
+                                                                 force_age_scale_});
+        if (a != GpuEviction::Keep) {
+            cand.emplace_back(img.get(), a);
+        } else if (img->last_seq <= completed && frame_ - std::min(frame_, img->last_frame) >= kGpuEvictCleanFrames) {
+            ++no_path; // old enough, but no safe way to free it
+        }
+    }
+    stats_.gpu_kept_no_path = no_path;
+    std::ranges::sort(cand, [](const auto& a, const auto& b) { return a.first->last_seq < b.first->last_seq; });
+    const u64 target = force_gpu_evict_ ? 0 : budget_ / 10 * 9;
+    u64 bytes = stats_.bytes;
+    for (const auto& [img, a] : cand) {
+        if (bytes <= target || out.size() >= max) {
+            break;
+        }
+        bytes -= img->bytes;
+        if (a == GpuEviction::Drop) {
+            ++stats_.gpu_dropped;
+            Retire(img);
+        } else {
+            out.push_back(img);
+        }
+    }
+    return out;
+}
+
+bool ImageCache::NoWritePath(const ImageLayout& l, VkImageAspectFlags aspect, VkFormat format) {
+    if (l.num_samples > 1 || l.props.is_volume || l.props.is_block || l.guest_size == 0) {
+        return true;
+    }
+    if (l.props.is_depth &&
+        ((aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 || (format != VK_FORMAT_D32_SFLOAT && format != VK_FORMAT_D16_UNORM))) {
+        return true; // the stencil plane is a surface of its own; other depth formats' bytes differ from the guest's
+    }
+    return l.IsTiled() && !BuildTilingParams(l, true).supported;
+}
+
+VkBuffer ImageCache::TempBuffer(u64 bytes, u64 seq) {
+    const auto& f = Fn();
+    Temp t;
+    t.seq = seq;
+    const VkBufferCreateInfo bci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                 .size = bytes,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (f.vkCreateBuffer(ctx_.Device(), &bci, nullptr, &t.buffer) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    VkMemoryRequirements req{};
+    f.vkGetBufferMemoryRequirements(ctx_.Device(), t.buffer, &req);
+    const s32 mt = ctx_.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryAllocateInfo mai{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                   .allocationSize = req.size,
+                                   .memoryTypeIndex = static_cast<u32>(std::max(mt, 0))};
+    if (mt < 0 || f.vkAllocateMemory(ctx_.Device(), &mai, nullptr, &t.memory) != VK_SUCCESS) {
+        f.vkDestroyBuffer(ctx_.Device(), t.buffer, nullptr);
+        return VK_NULL_HANDLE;
+    }
+    f.vkBindBufferMemory(ctx_.Device(), t.buffer, t.memory, 0);
+    temps_.push_back(t);
+    return t.buffer;
+}
+
+bool ImageCache::WriteBackAndRetire(CachedImage* img, VkCommandBuffer cb, u64 seq, VkBuffer dst, u64 dst_offset,
+                                    std::string& error) {
+    // Upload in reverse: the image's levels/layers copied out in the guest's linear arrangement (each level at its
+    // offset, its pitch and height), tiled ones then tiled into the guest's memory by the tiler (IS_TILER)
+    const auto& f = Fn();
+    const ImageLayout& l = img->layout;
+    TilingParams p;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkBuffer linear = dst;
+    u64 linear_base = dst_offset;
+    u64 uoff = 0;
+    if (l.IsTiled()) {
+        p = BuildTilingParams(l, true);
+        if (!p.supported || !DetilePipeline(p, pipe, error)) {
+            if (error.empty()) {
+                error = fmt::format("no tiler ({})", p.reason);
+            }
+            return false;
+        }
+        uoff = (static_cast<u64>(l.guest_size) + 255) & ~255ull;
+        linear = TempBuffer(uoff + 256, seq);
+        if (linear == VK_NULL_HANDLE) {
+            error = "write-back temporary: no video memory";
+            return false;
+        }
+        linear_base = 0;
+    }
+    const u64 cid = diag_ != nullptr && diag_->Enabled()
+                        ? diag_->Begin(cb, seq,
+                                       fmt::format("write-back img{}@{:#x}+{:#x} fmt {} {}x{} lv {} ly {} tile {}", img->id,
+                                                   l.guest_address, l.guest_size, l.pixel_format, l.size.width,
+                                                   l.size.height, l.levels, l.layers, static_cast<u32>(l.tile_mode)))
+                        : 0;
+    Transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_READ_BIT);
+    std::vector<VkBufferImageCopy> copies;
+    const VkImageAspectFlags aspect = l.props.is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : img->aspect;
+    for (u32 m = 0; m < l.levels && m < kMaxMips; ++m) {
+        const MipInfo& mip = l.mips[m];
+        copies.push_back(VkBufferImageCopy{
+            .bufferOffset = linear_base + mip.offset,
+            .bufferRowLength = mip.pitch,
+            .bufferImageHeight = mip.height,
+            .imageSubresource = {aspect, m, 0, std::max<u32>(l.layers, 1)},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {std::max(l.size.width >> m, 1u), std::max(l.size.height >> m, 1u), 1u}});
+    }
+    f.vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear,
+                             static_cast<u32>(copies.size()), copies.data());
+    if (l.IsTiled()) {
+        f.vkCmdUpdateBuffer(cb, linear, uoff, sizeof(TilingInfo), &p.info);
+        VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                                             VK_ACCESS_2_UNIFORM_READ_BIT};
+        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                   .pMemoryBarriers = &mb};
+        f.vkCmdPipelineBarrier2(cb, &dep);
+        f.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        const VkDescriptorBufferInfo tiled{dst, dst_offset, l.guest_size};
+        const VkDescriptorBufferInfo lin{linear, 0, l.guest_size};
+        const VkDescriptorBufferInfo uni{linear, uoff, sizeof(TilingInfo)};
+        const VkWriteDescriptorSet w[3] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &tiled},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lin},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &uni},
+        };
+        f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, detile_layout_, 0, 3, w);
+        f.vkCmdDispatch(cb, std::max(p.dispatch_x, 1u), 1, 1);
+    }
+    if (cid != 0) {
+        diag_->End(cb, cid);
+    }
+    img->last_seq = std::max(img->last_seq, seq); // destroyed after the copy completed
+    ++stats_.gpu_written_back;
+    stats_.gpu_written_back_bytes += l.guest_size;
+    Retire(img);
+    return true;
 }
 
 } // namespace SecondSon::Gpu::Vk
