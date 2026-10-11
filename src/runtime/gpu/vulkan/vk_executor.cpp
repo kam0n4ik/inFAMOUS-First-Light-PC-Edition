@@ -2048,6 +2048,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
     }
     DiagCaptureBefore(prep.pipeline, color_img);
+    DiagCaptureDraw(prep.pipeline, color_img, false);
     // barriers and layouts (outside rendering)
     if (pending_writes_) {
         GlobalBarrier(7);
@@ -2308,6 +2309,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
     }
     DiagEnd(cid);
+    DiagCaptureDraw(prep.pipeline, color_img, true);
     stage(stats_.t_emit);
     if (prof_) {
         ProfMark((u64{prep.pipeline} << 2) | 0,
@@ -3034,6 +3036,62 @@ void Executor::CaptureImageAt() {
         SSPC_LOG(GPU, Info, "DIAGNOSTIC: image capture img{} {:#x} fmt {} {}x{} layers {} at flip {}", img->id, w.addr,
                  img->layout.pixel_format, img->layout.size.width, img->layout.size.height, img->layout.layers, id);
     }
+}
+
+void Executor::DiagCaptureDraw(u32 pipeline, const std::array<CachedImage*, 8>& color_img, bool after) {
+    // SSPC_DIAG_CAPTURE_DRAW=<hex address>:<first flip>:<count>:<pipeline>: in each of those flips, the render target at
+    // that address before and after the first draw of that pipeline, downsampled 4x -> logs\p45\draw\<before|after>_
+    // <flip> (P4.5: what one draw adds, frame after frame - the smoke's own flicker against its background's)
+    struct Range {
+        u64 addr = 0, first = 0, count = 0;
+        u32 pipeline = 0;
+    };
+    static const Range r = [] {
+        Range v;
+        char s[128] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_DRAW", s, sizeof(s)) > 0) {
+            char* p = s;
+            v.addr = std::strtoull(p, &p, 16);
+            v.first = *p == ':' ? std::strtoull(p + 1, &p, 10) : 0;
+            v.count = *p == ':' ? std::strtoull(p + 1, &p, 10) : 0;
+            v.pipeline = *p == ':' ? static_cast<u32>(std::strtoul(p + 1, &p, 10)) : 0;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_DRAW - {:#x} around pipeline {} in flips {} .. {}",
+                     v.addr, v.pipeline, v.first, v.first + v.count);
+        }
+        return v;
+    }();
+    static u64 done[2] = {~0ull, ~0ull};
+    if (r.count == 0 || pipeline != r.pipeline) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId();
+    if (id < r.first || id >= r.first + r.count || done[after ? 1 : 0] == id) {
+        return;
+    }
+    CachedImage* img = nullptr;
+    for (CachedImage* c : color_img) {
+        if (c != nullptr && c->layout.guest_address == r.addr) {
+            img = c;
+        }
+    }
+    if (img == nullptr) {
+        return;
+    }
+    done[after ? 1 : 0] = id;
+    EndRendering();
+    if (pending_writes_ || after) {
+        GlobalBarrier();
+    }
+    images_.Transition(cur_.cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT);
+    if (!readback_) {
+        readback_ = std::make_unique<ImageReadback>(ctx_);
+    }
+    const auto dir = options_.capture_path.parent_path().parent_path() / "p45" / "draw";
+    std::filesystem::create_directories(dir);
+    readback_->Record(cur_.cb, cur_.value, img->image, img->format, img->aspect, 0, img->layout.size.width,
+                      img->layout.size.height, std::max<u32>(img->layout.num_bits / 8, 1),
+                      dir / fmt::format("{}_{}", after ? "after" : "before", id), false, 4);
 }
 
 void Executor::DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>& color_img) {

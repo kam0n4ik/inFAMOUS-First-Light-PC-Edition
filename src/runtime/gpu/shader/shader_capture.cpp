@@ -435,6 +435,19 @@ int RunShaderVerify(const std::filesystem::path& capture, const std::filesystem:
         req.fetch_code = m.fetch_code;
         req.vertex_sharps = m.vertex_sharps;
         req.footer_hash = m.footer_hash;
+        static const bool trace = [] {
+            char* v = nullptr;
+            size_t n = 0;
+            const bool on = _dupenv_s(&v, &n, "SSPC_DIAG_VERIFY_TRACE") == 0 && v != nullptr;
+            std::free(v);
+            return on;
+        }();
+        if (trace) { // SSPC_DIAG_VERIFY_TRACE: each module named before the translator's own messages about it (P4.5)
+            std::fflush(stdout);
+            std::fprintf(stdout, "verify-trace module %zu %s %#llx threads %u x %u x %u\n", i, HwStageName(m.hw),
+                         static_cast<unsigned long long>(m.address), rp.threads[0], rp.threads[1], rp.threads[2]);
+            std::fflush(stdout);
+        }
         const TranslationResult res = translator->Translate(req);
         if (!res.Ok()) {
             translate_fail.Add(fmt::format("module {} ({} {:#018x}): {}: {}", i, HwStageName(m.hw), m.footer_hash,

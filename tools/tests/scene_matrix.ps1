@@ -5,6 +5,7 @@
 #   beach    logs\performance\p43_ab\snapshot          the P4.3/P4.4 reference route (beach, foliage)
 #   user1022 logs\p32\scene_user_1022                  the user's autosave of 2026-10-10 10:22 (P3.2's second scene)
 #   usercur  userdata\home (copied)                    the user's current progress (a copy; userdata is not touched)
+#   early    userdata\savedata_backups\2026-10-10_03-44-58_before_manual_sspc   the user's earliest backed-up progress
 # Per scene: tools\run_phase0.ps1 (title -> Continue -> three camera turns at 56..60 s, WM_CLOSE at the end), then
 # logs\p45\scenes\<Tag>\<scene>\: SecondSonPC.log, gpu_native.txt, vk_validation.log, screen.png, run.json and a line in
 # logs\p45\scenes\<Tag>\summary.txt: device lost lines, validation messages, [Error] lines, flips, 10-s FPS windows,
@@ -19,10 +20,11 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
-$sources = @{
-    beach    = "$root\logs\performance\p43_ab\snapshot"
-    user1022 = "$root\logs\p32\scene_user_1022"
-    usercur  = "$root\userdata"
+$sources = @{ # each scene's home directory (the save)
+    beach    = "$root\logs\performance\p43_ab\snapshot\home"
+    user1022 = "$root\logs\p32\scene_user_1022\home"
+    usercur  = "$root\userdata\home"
+    early    = "$root\userdata\savedata_backups\2026-10-10_03-44-58_before_manual_sspc"
 }
 $outRoot = "$root\logs\p45\scenes\$Tag"
 New-Item -ItemType Directory -Force $outRoot | Out-Null
@@ -35,7 +37,7 @@ foreach ($scene in ($Scenes -split ',' | Where-Object { $_ })) {
     if (Test-Path $profileDir) { Remove-Item $profileDir -Recurse -Force }
     New-Item -ItemType Directory -Force $profileDir | Out-Null
     # only the save (home\...) is copied: the profile holds nothing else
-    Copy-Item "$($sources[$scene])\home" "$profileDir\home" -Recurse
+    Copy-Item $sources[$scene] "$profileDir\home" -Recurse
     foreach ($f in "gpu_device_lost.txt", "vk_validation.log", "gpu_native.txt") {
         Remove-Item "$root\logs\$f" -ErrorAction SilentlyContinue
     }

@@ -333,6 +333,7 @@ private:
                         const GS::RuntimeParams& runtime, u32 pipeline);
     std::unordered_set<u64> dumped_shaders_; ///< SSPC_DIAG_DUMP_SHADER: the variants written
     void DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>& color_img);
+    void DiagCaptureDraw(u32 pipeline, const std::array<CachedImage*, 8>& color_img, bool after);
     /// Over the image budget: GPU-written images written back to their memory and freed (P4.5, R7).
     void EvictGpuImages();
     OwnedBuffer diag_scratch_; ///< SSPC_DIAG_DUP_DISPATCH: a dense copy of the dispatch's buffers
