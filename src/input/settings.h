@@ -42,13 +42,15 @@ enum class Action : u8 {
     MotionMode,   // toggles "controller held sideways": the mouse moves the controller (gyro)
     Shake,        // shakes the controller while held
     TouchDrag,    // while held the mouse drags a finger on the touch pad
+    TouchTwoFingers, // while held: two fingers on the touch pad and its click (the game's two-finger click)
     Count
 };
 constexpr size_t kActionCount = static_cast<size_t>(Action::Count);
 
-/// A physical input: an SDL scancode or a mouse button (SDL button number, 1 = left).
+/// A physical input: an SDL scancode, a mouse button (SDL button number, 1 = left) or a mouse wheel direction
+/// (MouseWheel: 0 up, 1 down, 2 left, 3 right; a notch counts as a press of one controller reading).
 struct InputCode {
-    enum class Kind : u8 { Key, MouseButton };
+    enum class Kind : u8 { Key, MouseButton, MouseWheel };
     Kind kind = Kind::Key;
     u16 code = 0;
     bool operator==(const InputCode&) const = default;
@@ -69,7 +71,8 @@ std::string_view ActionName(Action action);
 /// Default layout (docs/INPUT_MAPPING.md).
 Settings DefaultSettings();
 
-/// "Space", "W", "Left Shift", "Return"/"Enter", "Escape"/"Esc", "Mouse Left", ... Case-insensitive.
+/// "Space", "W", "Left Shift", "Return"/"Enter", "Escape"/"Esc", "Mouse Left", "Mouse X1", "Wheel Up", ...
+/// Case-insensitive.
 bool ParseInput(std::string_view name, InputCode& out);
 std::string InputName(InputCode input);
 

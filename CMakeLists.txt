@@ -153,3 +153,41 @@ add_custom_command(
     VERBATIM)
 add_custom_target(sspc_boundary_check DEPENDS ${CMAKE_BINARY_DIR}/sspc_boundary.stamp)
 add_dependencies(sspc_runtime sspc_boundary_check)
+
+# PC settings and the in-game settings menu (docs/PC_SETTINGS_IMPLEMENTATION.md): SecondSonPC's own code in one block,
+# apart from the runtime's list above. The menu overlay draws with Direct2D/DirectWrite in software (no GPU device).
+set(SSPC_PC_SETTINGS_SOURCES
+    src/input/binding_rules.cpp
+    src/input/device_tracker.cpp
+    src/input/gamepad_tuning.cpp
+    src/settings/registry.cpp
+    src/settings/settings_checks.cpp
+    src/settings/settings_service.cpp
+    src/settings/user_store.cpp
+    src/ui/overlay_win32.cpp
+    src/ui/settings_menu.cpp
+)
+# Settings and draw commands are written with designated initializers that leave the other fields at their defaults.
+set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp tools/settings_tests/main.cpp
+                            PROPERTIES COMPILE_OPTIONS "-Wno-missing-designated-field-initializers")
+target_sources(sspc_runtime PRIVATE ${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp)
+target_link_libraries(sspc_runtime PUBLIC d2d1 dwrite)
+target_sources(shadps4 PRIVATE ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/settings_host.cpp) # the bridge's live settings
+
+# Standalone tests of the PC settings and screenshots of the menu: SecondSonPC's sources only, no bridge, no game
+# (cmake --build <dir> --target sspc_settings_tests; tools/settings_tests/main.cpp).
+add_executable(sspc_settings_tests EXCLUDE_FROM_ALL
+    tools/settings_tests/main.cpp
+    ${SSPC_PC_SETTINGS_SOURCES}
+    src/app/config.cpp
+    src/base/log.cpp
+    src/runtime/language.cpp
+    src/input/settings.cpp
+    src/input/keyboard_mouse.cpp
+    src/input/motion.cpp
+)
+target_include_directories(sspc_settings_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(sspc_settings_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(sspc_settings_tests PRIVATE /utf-8 /W4)
+target_link_libraries(sspc_settings_tests PRIVATE fmt::fmt toml11::toml11 SDL3::SDL3 d2d1 dwrite windowscodecs ole32 uuid)
+set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

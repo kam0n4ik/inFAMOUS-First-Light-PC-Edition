@@ -9,6 +9,8 @@
 #include <toml.hpp>
 
 #include "runtime/language.h"
+#include "settings/registry.h"
+#include "settings/toml_value.h"
 
 namespace SecondSon::App {
 
@@ -287,6 +289,24 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
 
     r.Bool("Trace", "importCounter", c.import_counter);
     r.UInt("Trace", "dumpIntervalSeconds", c.dump_interval_s, 1, 3600);
+
+    // PC settings added with the in-game settings menu: parsed through the settings registry, by the same rules as
+    // the user settings file (docs/PC_SETTINGS_IMPLEMENTATION.md); here a wrong value is an error, as above.
+    for (const auto& d : Settings::All()) {
+        if (d.legacy_parse || d.table.empty() || d.set == nullptr) {
+            continue;
+        }
+        const std::string table(d.table), key(d.key);
+        if (const auto* v = r.Find(table.c_str(), key.c_str())) {
+            Settings::Value value;
+            std::string error;
+            if (Settings::FromToml(d, *v, value, error)) {
+                d.set(c, d, value);
+            } else {
+                r.Error(fmt::format("[{}] {}: {}", table, key, error));
+            }
+        }
+    }
 
     r.ReportUnknown();
     if (!errors.empty()) {

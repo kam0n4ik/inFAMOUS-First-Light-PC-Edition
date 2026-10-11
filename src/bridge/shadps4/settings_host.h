@@ -1,0 +1,19 @@
+// SecondSonPC — TEMPORARY bridge side of the PC settings (Phase 4): what only the bridge can apply while it owns the
+// presenter and the audio output (FSR/RCAS of the final frame, the FPS counter overlay, the master volume), and the
+// capabilities of this run. The settings, the menu and its overlay are SecondSonPC's (src/settings, src/ui).
+#pragma once
+
+#include "app/config.h"
+
+struct SDL_Window;
+
+namespace SecondSon::Bridge {
+
+/// [Graphics] into the bridge's settings before its presenter is created (it reads them once, at creation).
+void ApplyPcBridgeSettings(const App::Config& cfg);
+
+/// After the native input: capabilities, the bridge's appliers, the menu host. `native_gpu`: --gpu-backend sspc
+/// (the bridge's presenter is not started: FSR/RCAS and its FPS counter are unavailable).
+void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_mode, bool native_gpu);
+
+} // namespace SecondSon::Bridge

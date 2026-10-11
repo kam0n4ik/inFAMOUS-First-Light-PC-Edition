@@ -18,7 +18,7 @@ constexpr std::array<std::string_view, kActionCount> kActionNames{
     "l2",          "r2",         "l3",       "r3",        "options",   "touchPad",
     "dpadUp",      "dpadDown",   "dpadLeft", "dpadRight", "moveForward", "moveBack",
     "moveLeft",    "moveRight",  "walk",     "releaseMouse", "motionMode", "shake",
-    "touchDrag",
+    "touchDrag",   "touchTwoFingers",
 };
 
 struct MouseName {
@@ -30,6 +30,20 @@ constexpr MouseName kMouseNames[] = {
     {"mouse middle", SDL_BUTTON_MIDDLE}, {"mouse x1", SDL_BUTTON_X1},
     {"mouse x2", SDL_BUTTON_X2},
 };
+
+/// MouseWheel codes 0..3.
+constexpr std::string_view kWheelNames[] = {"wheel up", "wheel down", "wheel left", "wheel right"};
+
+/// "mouse left" -> "Mouse Left".
+std::string TitleCase(std::string_view lower) {
+    std::string s(lower);
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (i == 0 || s[i - 1] == ' ') {
+            s[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[i])));
+        }
+    }
+    return s;
+}
 
 /// Short names people type for keys whose SDL name is longer.
 constexpr std::pair<std::string_view, std::string_view> kAliases[] = {
@@ -89,6 +103,7 @@ Settings DefaultSettings() {
     bind(Action::MotionMode, {Key(SDL_SCANCODE_G)});
     bind(Action::Shake, {Key(SDL_SCANCODE_X)});
     bind(Action::TouchDrag, {Key(SDL_SCANCODE_T)});
+    bind(Action::TouchTwoFingers, {Key(SDL_SCANCODE_C)});
     return s;
 }
 
@@ -106,6 +121,12 @@ bool ParseInput(std::string_view name, InputCode& out) {
     for (const auto& m : kMouseNames) {
         if (lower == m.name) {
             out = Mouse(m.button);
+            return true;
+        }
+    }
+    for (size_t w = 0; w < std::size(kWheelNames); ++w) {
+        if (lower == kWheelNames[w]) {
+            out = {InputCode::Kind::MouseWheel, static_cast<u16>(w)};
             return true;
         }
     }
@@ -128,16 +149,14 @@ std::string InputName(InputCode input) {
     if (input.kind == InputCode::Kind::MouseButton) {
         for (const auto& m : kMouseNames) {
             if (m.button == input.code) {
-                std::string s(m.name); // "mouse left" -> "Mouse Left"
-                for (size_t i = 0; i < s.size(); ++i) {
-                    if (i == 0 || s[i - 1] == ' ') {
-                        s[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[i])));
-                    }
-                }
-                return s;
+                return TitleCase(m.name);
             }
         }
         return "Mouse " + std::to_string(input.code);
+    }
+    if (input.kind == InputCode::Kind::MouseWheel) {
+        return input.code < std::size(kWheelNames) ? TitleCase(kWheelNames[input.code])
+                                                   : "Wheel " + std::to_string(input.code);
     }
     const char* n = SDL_GetScancodeName(static_cast<SDL_Scancode>(input.code));
     return (n != nullptr && *n != '\0') ? n : "Scancode " + std::to_string(input.code);

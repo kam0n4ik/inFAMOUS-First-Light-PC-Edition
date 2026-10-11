@@ -84,15 +84,52 @@ void KeyboardMouse::Configure(const Settings& settings) {
     settings_ = settings;
     key_actions_.fill(0);
     mouse_actions_.fill(0);
+    wheel_actions_.fill(0);
     for (size_t a = 0; a < kActionCount; ++a) {
         for (const auto& in : settings_.bindings[a]) {
             if (in.kind == InputCode::Kind::Key && in.code < key_actions_.size()) {
                 key_actions_[in.code] |= 1u << a;
             } else if (in.kind == InputCode::Kind::MouseButton && in.code < mouse_actions_.size()) {
                 mouse_actions_[in.code] |= 1u << a;
+            } else if (in.kind == InputCode::Kind::MouseWheel && in.code < wheel_actions_.size()) {
+                wheel_actions_[in.code] |= 1u << a;
             }
         }
     }
+}
+
+void KeyboardMouse::ApplySettings(const Settings& settings) {
+    Configure(settings);
+    bool release;
+    {
+        std::scoped_lock lock{mutex_};
+        release = captured_ && !settings_.capture_mouse && !test_mode_;
+    }
+    if (release) {
+        SetCapture(false);
+    }
+}
+
+bool KeyboardMouse::WindowHasFocus() const {
+    SDL_Window* window = window_; // set before the first event, on this (main) thread
+    return window != nullptr && (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+
+void KeyboardMouse::SetMenuOpen(bool open) {
+    bool capture = false;
+    {
+        std::scoped_lock lock{mutex_};
+        ClearInputs();
+        menu_open_ = open;
+        capture = !open && !test_mode_ && want_capture_ && settings_.capture_mouse;
+    }
+    if (open) {
+        SetCapture(false);
+    } else if (capture && WindowHasFocus()) {
+        SetCapture(true);
+    }
+    SSPC_LOG(Input, Info, "settings menu {}: keyboard/mouse {}", open ? "open" : "closed",
+             open ? "go to the menu" : "back to the game");
 }
 
 void KeyboardMouse::AttachWindow(SDL_Window* window, bool test_mode) {
@@ -120,6 +157,10 @@ bool KeyboardMouse::Pressed(Action a) const {
             if (in.code < key_down_.size() && key_down_[in.code]) {
                 return true;
             }
+        } else if (in.kind == InputCode::Kind::MouseWheel) {
+            if (in.code < 32 && (wheel_latched_ & (1u << in.code)) != 0) {
+                return true;
+            }
         } else if (in.code < 32 && (mouse_down_ & (1u << in.code)) != 0) {
             return true;
         }
@@ -130,6 +171,7 @@ bool KeyboardMouse::Pressed(Action a) const {
 void KeyboardMouse::ClearInputs() {
     key_down_.fill(false);
     mouse_down_ = 0;
+    wheel_pending_ = wheel_latched_ = 0;
     swallowed_button_ = 0;
     mouse_dx_ = mouse_dy_ = 0.0;
 }
@@ -308,9 +350,33 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         }
         break;
     }
-    case SDL_EVENT_MOUSE_WHEEL:
+    case SDL_EVENT_MOUSE_WHEEL: {
+        // A notch is a press of the bound action for one controller reading (never lost between readings).
         result.consumed = true;
+        std::scoped_lock lock{mutex_};
+        if (!captured_ && settings_.capture_mouse) {
+            break; // the cursor is free (pause, another window's turn): the wheel is not the game's
+        }
+        const float flip = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f;
+        const float wy = e.wheel.y * flip, wx = e.wheel.x * flip;
+        u32 dirs = 0;
+        dirs |= wy > 0.0f ? 1u << 0 : 0u;
+        dirs |= wy < 0.0f ? 1u << 1 : 0u;
+        dirs |= wx < 0.0f ? 1u << 2 : 0u;
+        dirs |= wx > 0.0f ? 1u << 3 : 0u;
+        wheel_pending_ |= dirs;
+        for (size_t w = 0; w < wheel_actions_.size(); ++w) {
+            if ((dirs & (1u << w)) == 0) {
+                continue;
+            }
+            for (size_t a = 0; a < kActionCount; ++a) {
+                if ((wheel_actions_[w] & (1u << a)) != 0) {
+                    action_seq_[a] = ++seq_;
+                }
+            }
+        }
         break;
+    }
     case SDL_EVENT_WINDOW_FOCUS_GAINED: {
         // Back in the game (start, Alt+Tab back): the mouse is captured again unless Esc gave it
         // back on purpose.
@@ -333,6 +399,12 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
             test = test_mode_;
             if (!test) {
                 ClearInputs();
+                // The controller is not left held sideways (graffiti): back in the game the mouse turns the camera.
+                if (motion_mode_) {
+                    motion_mode_ = false;
+                    motion_.SetSideways(false, settings_.sideways_right_up);
+                    SSPC_LOG(Input, Info, "motion mode off: the window lost focus");
+                }
             }
         }
         if (!test) {
@@ -357,6 +429,9 @@ PadState KeyboardMouse::Read(u64 now_us) {
     }
     const double dt =
         has_last_ ? std::clamp((now_us - last_read_us_) / 1e6, 0.002, 0.1) : 1.0 / 60.0;
+    // Wheel notches since the previous reading press their actions for this reading only.
+    wheel_latched_ = wheel_pending_;
+    wheel_pending_ = 0;
 
     PadState s;
     for (const auto& b : kButtons) {
@@ -408,6 +483,14 @@ PadState KeyboardMouse::Read(u64 now_us) {
         finger_id_ = NextTouchId();
     }
     tap_ = tap;
+    // TouchTwoFingers: two fingers and the click while held - the game's "two-finger click" (logical 0x20000:
+    // absorbing with two fingers, pushing a car; docs/PHASE4_PC_INPUT_UI_RESEARCH.md §4.1).
+    const bool two = Pressed(Action::TouchTwoFingers);
+    if (two && !two_fingers_) {
+        two_finger_ids_[0] = NextTouchId();
+        two_finger_ids_[1] = NextTouchId();
+    }
+    two_fingers_ = two;
 
     if (motion_mode_) {
         const double k = kMotionRadiansPerCount * settings_.motion_sensitivity;
@@ -436,7 +519,12 @@ PadState KeyboardMouse::Read(u64 now_us) {
     motion_.SetShake(Pressed(Action::Shake));
     s.motion = motion_.Step(now_us / 1e6);
 
-    if (drag_) {
+    if (two_fingers_) {
+        s.buttons |= Button::TouchPad;
+        s.touch_active = true;
+        s.touch[0] = {true, kTwoFingersLeftX, kTouchHeight / 2, two_finger_ids_[0]};
+        s.touch[1] = {true, kTwoFingersRightX, kTouchHeight / 2, two_finger_ids_[1]};
+    } else if (drag_) {
         s.touch_active = true;
         s.touch[0] = {true, static_cast<u16>(drag_x_), static_cast<u16>(drag_y_), finger_id_};
     } else if (tap_) {

@@ -71,6 +71,13 @@ public:
     };
 
     void Configure(const Settings& settings);
+    /// Main thread: new settings while playing (the settings menu). Configure, then the cursor follows
+    /// capture_mouse (released at once when it is turned off).
+    void ApplySettings(const Settings& settings);
+    /// Main thread: SecondSonPC's settings menu opened/closed. Open: nothing stays pressed, the cursor is given back
+    /// (the menu takes every keyboard/mouse event meanwhile). Closed: nothing pressed, the cursor is captured again
+    /// if it was before and the window has focus.
+    void SetMenuOpen(bool open);
     /// The window the mouse is captured in: captured (hidden, kept inside the window, raw
     /// movement) whenever the window gets focus; Esc gives it back (pause menu) and takes it again,
     /// a click takes it too; focus loss (Alt+Tab) gives it back until the window has focus again.
@@ -97,6 +104,9 @@ public:
     static constexpr double kMotionRadiansPerCount = 0.0015;
     /// Touch drag: touch pad units per mouse count.
     static constexpr double kTouchUnitsPerCount = 2.0;
+    /// TouchTwoFingers: where the two fingers rest (a quarter of the width from each side, half the height).
+    static constexpr u16 kTwoFingersLeftX = kTouchWidth / 4;
+    static constexpr u16 kTwoFingersRightX = kTouchWidth * 3 / 4;
     /// `which` of the keyboard/mouse events --press pushes (no real device has this id).
     static constexpr u32 kScriptedInputId = 0x53535043; // "SSPC"
 
@@ -104,14 +114,19 @@ private:
     bool Pressed(Action a) const;
     void ClearInputs();             // mutex held
     void SetCapture(bool captured); // main thread, mutex not held
+    bool WindowHasFocus() const;    // main thread
     u8 NextTouchId();
 
     mutable std::mutex mutex_;
     Settings settings_ = DefaultSettings();
     std::array<u32, 512> key_actions_{}; // scancode -> action bits
     std::array<u32, 8> mouse_actions_{}; // SDL mouse button -> action bits
+    std::array<u32, 4> wheel_actions_{}; // wheel up/down/left/right -> action bits
     std::array<bool, 512> key_down_{};
     u32 mouse_down_ = 0; // bit = SDL mouse button
+    u32 wheel_pending_ = 0; // bit = wheel direction: notches since the last reading
+    u32 wheel_latched_ = 0; // the notches this reading presses (one reading each)
+    bool menu_open_ = false;
     std::array<u64, kActionCount> action_seq_{}; // order of presses (last of opposite keys wins)
     u64 seq_ = 0;
 
@@ -132,6 +147,8 @@ private:
     bool tap_ = false;
     double drag_x_ = 0.0, drag_y_ = 0.0;
     u8 finger_id_ = 0;
+    bool two_fingers_ = false;
+    std::array<u8, 2> two_finger_ids_{};
     u8 next_touch_id_ = 1;
 
     bool has_last_ = false;

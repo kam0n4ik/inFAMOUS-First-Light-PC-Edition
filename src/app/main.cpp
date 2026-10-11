@@ -65,6 +65,11 @@
 //     --clear-shader-cache     deletes the cache generations under [ShaderCache] dir and exits
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
+//   PC settings (docs/PC_SETTINGS_IMPLEMENTATION.md): the in-game menu (F1) saves changes to
+//   %LOCALAPPDATA%\SecondSonPC\settings.toml, which overrides SecondSonPC.toml;
+//     --settings <file>        that file instead (also for automated runs)
+//     --no-user-settings       SecondSonPC.toml alone, changes not saved (the default of --press, --selftest
+//                              and the other no-game modes: their runs stay reproducible)
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -76,6 +81,7 @@
 #include "app/config.h"
 #include "app/paths.h"
 #include "base/crash.h"
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "base/vram_monitor.h"
 #include "bridge/shadps4/bootstrap.h"
@@ -85,6 +91,8 @@
 #include "runtime/gpu/vulkan/vk_foundation.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
+#include "settings/settings_service.h"
+#include "settings/user_store.h"
 
 namespace {
 
@@ -115,12 +123,39 @@ int main(int argc, char* argv[]) {
         }
         return Fail(message);
     }
+    // PC settings: SecondSonPC.toml is the defaults; the user settings file (the in-game menu's) overrides them,
+    // then the command line overrides both for this run. Automated and no-game runs use SecondSonPC.toml alone.
+    const App::Config toml_defaults = *config;
+    std::filesystem::path user_settings_file = Settings::DefaultUserFile();
+    bool user_settings = true, explicit_settings = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--settings" && i + 1 < argc) {
+            user_settings_file = std::filesystem::absolute(argv[++i]);
+            explicit_settings = true;
+        } else if (a == "--no-user-settings" || a == "--press" || a == "--selftest" || a == "--fault-test" ||
+                   a == "--patch-race-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
+                   a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache") {
+            user_settings = false;
+        }
+    }
+    user_settings = (user_settings || explicit_settings) && !user_settings_file.empty();
+    Settings::Overrides user_overrides;
+    Settings::LoadReport user_report;
+    if (user_settings) {
+        user_report = Settings::LoadUserFile(user_settings_file, user_overrides);
+        Settings::ApplyOverrides(*config, user_overrides);
+    }
     bool stock_bootstrap = false;
     u32 vram_log_seconds = 0; // --vram-log <seconds>: video memory budget/usage samples (SSPC-001)
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         const bool has_value = i + 1 < argc;
-        if (arg == "--no-counter") {
+        if (arg == "--settings" && has_value) {
+            ++i; // read above, before the command line (it is the defaults the command line overrides)
+        } else if (arg == "--no-user-settings") {
+            // read above
+        } else if (arg == "--no-counter") {
             config->import_counter = false;
         } else if (arg == "--stock-bootstrap") {
             stock_bootstrap = true; // diagnostics only
@@ -365,6 +400,38 @@ int main(int argc, char* argv[]) {
     if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
         return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
     }
+    // PC settings: what the user file gave, then the owner of the settings for the menu (capabilities: bootstrap).
+    if (user_settings) {
+        using Status = Settings::LoadReport::Status;
+        switch (user_report.status) {
+        case Status::Missing:
+            SSPC_LOG(App, Info, "user settings {}: none yet (SecondSonPC.toml alone)", user_settings_file.string());
+            break;
+        case Status::Loaded:
+            SSPC_LOG(App, Info, "user settings {}: {} override(s)", user_settings_file.string(), user_overrides.size());
+            break;
+        case Status::Corrupt:
+            SSPC_LOG(App, Warning, "user settings {} do not parse ({}): moved to {}, SecondSonPC.toml alone",
+                     user_settings_file.string(), user_report.error, user_report.moved_to.string());
+            break;
+        case Status::Unreadable:
+            SSPC_LOG(App, Warning, "user settings {}: {} - SecondSonPC.toml alone", user_settings_file.string(),
+                     user_report.error);
+            break;
+        }
+        for (const auto& w : user_report.warnings) {
+            SSPC_LOG(App, Warning, "user settings: {}", w);
+        }
+    } else {
+        SSPC_LOG(App, Info, "user settings: not used in this run (SecondSonPC.toml alone, changes not saved)");
+    }
+    Settings::Instance().Init(toml_defaults, user_overrides, *config,
+                              user_settings ? user_settings_file : std::filesystem::path{}, 0);
+    Lifecycle::AddExitStep(Lifecycle::Stage::Storage, "user settings", [] {
+        if (!Settings::Instance().Flush(3000)) {
+            SSPC_LOG(App, Warning, "user settings: the last change was not written in 3 s");
+        }
+    });
     // P3.4: SecondSonPC's exception dispatcher records execute faults itself; the first-chance recorder's
     // vectored handlers are then not added (the unhandled exception filter is).
     Base::InstallCrashLogger(config->logs_dir / "crash", config->crash_dump,

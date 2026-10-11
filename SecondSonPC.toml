@@ -37,6 +37,7 @@ fullscreenMode = "borderless"      # "borderless" | "exclusive"
 vblankFrequency = 60               # FPS unlock is a later stage (game timing must be checked first)
 presentMode = "mailbox"            # "mailbox" | "fifo" (vsync) | "immediate"
 showFps = true                   # FPS counter overlay at start-up (F10 toggles)
+monitor = ""                       # display name the window opens on; "" = the primary display
 
 [Audio]
 volume = 100                       # 0..100, on top of the game's own volume settings
@@ -78,9 +79,32 @@ motionMode = "G"                   # controller held sideways, the mouse moves i
                                    # a movement key also ends it (the mouse turns the camera again)
 shake = "X"                        # shakes the controller while held (spray can)
 touchDrag = "T"                    # while held the mouse drags a finger on the touch pad
+touchTwoFingers = "C"              # while held: two fingers on the touch pad + its click (two-finger actions)
+                                   # Mouse X1/X2 and "Wheel Up"/"Wheel Down" (a notch = one press) can be bound too;
+                                   # F1 (settings menu), F10 and F11 are SecondSonPC's and cannot be.
+
+[Graphics]                         # the bridge's presenter (with --gpu-backend sspc: P4.6)
+fsr = false                        # FSR 1.0 scaling of the game's 1920x1080 frame to a larger window
+sharpening = true                  # RCAS after FSR
+sharpness = 88                     # 0..100 %
+
+[Gamepad]                          # real controllers (DualShock 4 and others)
+vibration = 100                    # % of the rumble the game asks for; 0 = off
+cameraSensitivity = 1.0            # right stick multiplier (0.25..2.0), on top of the game's own option
+invertCameraX = false
+invertCameraY = false
+menuButton = "guide"               # opens the settings menu: "guide" (PS button) | "l3r3" (held 1 s) | "off"
+
+[Interface]                        # SecondSonPC's settings menu (F1)
+language = "auto"                  # "auto" (as [Language] system) | "ru" | "en"
+scale = 100                        # 75..200 %, relative to the window height / 1080
+prompts = "auto"                   # button hints: "auto" | "playstation" | "xbox" | "keyboard"
+
+# The in-game menu (F1) saves the user's changes to %LOCALAPPDATA%\SecondSonPC\settings.toml, which overrides this
+# file; delete a line there (or the file) to come back to the values here (docs\PC_SETTINGS_IMPLEMENTATION.md).
 
 [Log]
-level = "info"                     # trace | debug | info | warning | error | critical
+level = "info"                    # trace | debug | info | warning | error | critical
 bridgeFilter = "*:info"            # temporary shadPS4 core log (logs\bridge_shadps4.log)
 
 [Debug]                            # diagnostics of the temporary Vulkan bridge and of the input

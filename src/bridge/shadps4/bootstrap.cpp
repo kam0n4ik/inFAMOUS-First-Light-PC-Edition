@@ -53,6 +53,7 @@
 #include "bridge/shadps4/memory_host.h"
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/perf_opts.h"
+#include "bridge/shadps4/settings_host.h"
 #include "bridge/shadps4/track_diag.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
@@ -342,6 +343,7 @@ void ApplyBridgeSettings(const App::Config& cfg) {
     s.SetVblankFrequency(cfg.vblank_hz);
     s.SetPresentMode(cfg.present_mode);
     s.SetShowFpsCounter(cfg.show_fps);
+    ApplyPcBridgeSettings(cfg); // [Graphics]: FSR/RCAS of the bridge's presenter (read when it is created)
     // P4.4 diagnostics: SSPC_DIAG_BRIDGE_READBACKS=1 (relaxed) / 2 (precise) - the bridge's GPU readbacks (shadPS4's
     // default: none; the native backend writes every GPU write back) for a comparison of the two backends' images
     if (char rb[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_BRIDGE_READBACKS", rb, sizeof(rb)) > 0 &&
@@ -709,6 +711,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     if (!HasBridgeImport(bindings, "libScePad")) {
         // Automated runs (--press) inject input; the system cursor must not be grabbed by them.
         InstallNativeInput(cfg, g_window->GetSDLWindow(), !cfg.test_presses.empty());
+        // PC settings menu (F1) and the bridge's live settings; off in automated runs and self-tests
+        InstallSettingsHost(cfg, g_window->GetSDLWindow(), !cfg.test_presses.empty() || cfg.selftest, native_gpu);
     } else {
         SSPC_LOG(Bridge, Warning, "libScePad is BRIDGE: shadPS4's keyboard layout and controllers");
     }
