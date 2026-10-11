@@ -1187,7 +1187,7 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     Fn().vkCmdUpdateBuffer(cur_.cb, v.buffer, v.offset, bytes, data);
     DiagEnd(cid);
     buffers_.Invalidate(dst, bytes); // the host's copy is newer: uploaded again (after this write) at the next use
-    MarkWrites();
+    MarkWrites(3);
     write_run_ = true;
     run_ranges_.emplace_back(dst, dst + bytes);
     timeline_writes_.push_back({dst, dst + bytes, cur_.value});
@@ -1313,7 +1313,7 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
     }
     }
     DiagEnd(cid);
-    MarkWrites(); // a later access of either side waits for it
+    MarkWrites(4); // a later access of either side waits for it
     ++stats_.timeline_gds;
     return true;
 }
@@ -1347,7 +1347,7 @@ void Executor::WaitMetByHeldFence(u32) {
     // the guest's GPU waits for its earlier work here (EVENT_WRITE_EOS + WAIT_REG_MEM): everything recorded after it
     // waits for everything before it - the next command's global barrier (the batch-end barrier covers later batches)
     ++stats_.waits_by_held;
-    MarkWrites();
+    MarkWrites(2);
 }
 
 void Executor::BeforeUpload() {
@@ -2713,7 +2713,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
     }
     if (writes_memory) {
-        MarkWrites();
+        MarkWrites(0);
     }
     stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
     if (commands_ >= options_.max_draws_per_batch) {
@@ -2856,13 +2856,15 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
             if (b.status == GS::ResourceStatus::Ok && b.size != 0 && b.address != 0) {
                 (b.written ? acc_writes_ : acc_reads_).emplace_back(b.address, b.address + b.size);
             }
+        } else if (b.kind == GS::BufferKind::GdsBuffer) {
+            // GDS (gds_): a range of its own, above the guest's 40-bit addresses
+            (b.written ? acc_writes_ : acc_reads_).emplace_back(kGdsRangeBase, kGdsRangeBase + gds_.size);
         } else if (b.kind != GS::BufferKind::Flatbuf && b.kind != GS::BufferKind::ClipPlanes) {
-            acc_unknown = true; // GDS, the emulated LDS (shared by every dispatch), ...
+            acc_unknown = true; // the emulated LDS (shared by every dispatch), BDA, ...
         }
     }
-    for (const auto& im : csv.plan.images) {
-        acc_unknown |= im.storage;
-    }
+    // storage images need nothing here: ImageCache::Transition orders each image's accesses with its own barrier (a
+    // write before or after it -> an image barrier from the image's last stage/access)
     if (d.indirect) {
         acc_reads_.emplace_back(d.indirect_addr, d.indirect_addr + 12);
     }
@@ -2902,7 +2904,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
     if (!PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_COMPUTE, writes)) {
         FinishShadows();
-        MarkWrites();
+        MarkWrites(6);
         Skipped(Skip::Pipeline, "descriptor set allocation");
         return;
     }
@@ -3061,7 +3063,11 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
             histo_.detail.push_back(std::move(line));
         }
     }
-    NoteAccesses(acc_reads_, acc_writes_, acc_unknown || (writes_memory && acc_writes_.empty()));
+    // (a storage image write alone is ordered by the image's own barriers: not an unknown write)
+    if (acc_unknown) {
+        ++stats_.unknown_by[1];
+    }
+    NoteAccesses(acc_reads_, acc_writes_, acc_unknown);
     stats_.t_dispatch += GS::Ticks() - t0;
     stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
 }
@@ -3547,7 +3553,7 @@ void Executor::EvictGpuImages() {
             SSPC_LOG(GPU, Warning, "native backend: GPU-written image at {:#x} kept: {}", addr, err);
             continue;
         }
-        MarkWrites(); // a later read of the memory waits for the copy
+        MarkWrites(5); // a later read of the memory waits for the copy
         // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
         timeline_writes_.push_back({addr, addr + bytes, cur_.value});
         tw_lo_ = std::min(tw_lo_, addr);

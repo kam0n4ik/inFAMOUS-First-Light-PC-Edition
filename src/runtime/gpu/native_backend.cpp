@@ -948,6 +948,10 @@ std::string Backend::Report() {
                            "ranges {}, read-after-write {}, write-after-write {}, write-after-read {}\n",
                            s.barrier_why[0], s.barrier_why[1], s.barrier_why[2], s.barrier_why[3], s.barrier_why[4],
                            s.barrier_why[5], s.barrier_why[6]);
+        out += fmt::format("writes of unknown extent: draws {}, dispatches {}, met waits {}, WRITE_DATA {}, GDS DMA {}, "
+                           "evictions {}, other {}\n",
+                           s.unknown_by[0], s.unknown_by[1], s.unknown_by[2], s.unknown_by[3], s.unknown_by[4],
+                           s.unknown_by[5], s.unknown_by[6]);
         if (s.stream_kinds[0] != 0) {
             out += fmt::format("streamed ranges (SSPC_DIAG_STREAM_STATS): new {} ({} MiB), again in the frame unchanged {} "
                                "({} MiB), again changed {} ({} MiB), unchanged since an earlier frame {} ({} MiB), "

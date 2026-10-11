@@ -102,6 +102,7 @@ struct ExecutorStats {
     /// barriers kept by NeedsBarrier, why: off, an unknown write pending, the command's own unknown accesses, too many
     /// ranges, read-after-write, write-after-write, write-after-read
     std::array<u64, 7> barrier_why{};
+    std::array<u64, 7> unknown_by{}; ///< writes of unknown extent by source (Executor::MarkWrites)
     std::array<u64, 3> wb_bytes_by{}; ///< write-back bytes by batch end: fence/flip/sync/idle, full+fence, full only
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
@@ -424,8 +425,11 @@ private:
         }
     };
     PendingRanges pend_;
+    static constexpr u64 kGdsRangeBase = 1ull << 48; ///< GDS in the range checks: above every guest address
     /// A write of unknown extent since the last barrier: the next command barriers.
-    void MarkWrites() {
+    /// `site` (counted): 0 a draw, 1 a dispatch, 2 a met wait, 3 WRITE_DATA, 4 GDS DMA, 5 an eviction, 6 other
+    void MarkWrites(u32 site) {
+        ++stats_.unknown_by[site < stats_.unknown_by.size() ? site : 6];
         pending_writes_ = true;
         pend_.unknown = true;
     }
