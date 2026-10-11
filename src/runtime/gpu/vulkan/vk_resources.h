@@ -64,15 +64,22 @@ struct OwnedBuffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     u8* mapped = nullptr;
     u64 size = 0;
+    u32 memory_type = 0;
 };
+/// Where a host-visible buffer lives: chosen by size (the BAR for small ones), cached system memory, or the BAR (video
+/// memory the CPU writes through PCIe; the GPU reads it at video memory speed) whatever the size.
+enum class HostPlacement : u8 { Auto, Cached, Bar, Device /* video memory the CPU never maps */ };
 bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool host_visible, OwnedBuffer& out,
-                  std::string& error, bool host_cached = false);
+                  std::string& error, bool host_cached = false, HostPlacement placement = HostPlacement::Auto);
 void DestroyBuffer(DeviceContext& ctx, OwnedBuffer& buffer);
 
 class StreamRing {
 public:
-    /// `host_cached`: in cached system memory (the CPU's many small copies at memory speed; the GPU reads over PCIe)
-    StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, bool host_cached = false);
+    /// `placement`: Cached - cached system memory (the CPU's small copies at memory speed; the GPU reads over PCIe);
+    /// Bar - video memory the CPU writes through the BAR (the GPU reads at video memory speed, as the bridge's stream
+    /// buffer); Auto - by size.
+    StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, HostPlacement placement);
+    u32 MemoryType() const { return buf_.memory_type; }
     ~StreamRing();
     bool Ok() const { return buf_.buffer != VK_NULL_HANDLE; }
 

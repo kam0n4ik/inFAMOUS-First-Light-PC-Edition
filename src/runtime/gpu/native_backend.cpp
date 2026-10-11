@@ -193,6 +193,7 @@ private:
     std::unique_ptr<Vk::Diagnostics> diag_; ///< destroyed after everything recording into the device
     std::unique_ptr<Vk::Timeline> timeline_;
     std::unique_ptr<Vk::StreamRing> ring_;
+    std::unique_ptr<Vk::StreamRing> shadow_ring_; ///< dense video memory dispatches write (Executor::PrepareShadows)
     std::unique_ptr<Vk::GuestBuffers> guest_;
     std::unique_ptr<Vk::BufferCache> buffers_; ///< the guest's buffers in video memory
     std::unique_ptr<Vk::ImageCache> images_;
@@ -242,10 +243,34 @@ bool Backend::Start(const Options& o, std::string& error) {
     timeline_ = std::make_unique<Vk::Timeline>(*ctx_);
     // the stream ring: small read-only ranges and user data each command (~35 MiB a frame measured): room for 4 frames
     // in the BAR heap, so recording never waits for the GPU to free it
-    ring_ = std::make_unique<Vk::StreamRing>(*ctx_, *timeline_, 160ull << 20, true);
+    Vk::HostPlacement ring_place = Vk::HostPlacement::Cached;
+    u64 ring_size = 160ull << 20;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_RING", v, sizeof(v)) > 0 && std::string_view(v) == "bar") {
+        ring_place = Vk::HostPlacement::Bar;
+        ring_size = 128ull << 20;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_RING=bar - the stream ring ({} MiB) in device-local "
+                               "host-visible memory (BAR) instead of cached system memory",
+                 ring_size >> 20);
+    }
+    ring_ = std::make_unique<Vk::StreamRing>(*ctx_, *timeline_, ring_size, ring_place);
     if (!timeline_->Ok() || !ring_->Ok()) {
         error = "the timeline or the stream ring could not be created";
         return false;
+    }
+    // written buffers of dispatches: ~10 MiB a frame measured (the skinning's 21 x 420 KiB first)
+    shadow_ring_ = std::make_unique<Vk::StreamRing>(*ctx_, *timeline_, 128ull << 20, Vk::HostPlacement::Device);
+    if (!shadow_ring_->Ok()) {
+        SSPC_LOG(GPU, Warning, "native backend: no write shadow ring: dispatches write the buffer cache in place");
+        shadow_ring_.reset();
+    }
+    {
+        const auto& mem = ctx_->Memory();
+        const u32 t = ring_->MemoryType();
+        const VkMemoryType& mt = mem.memoryTypes[t];
+        SSPC_LOG(GPU, Info, "native backend: the stream ring: {} MiB, memory type {} (flags {:#x}), heap {} ({} MiB, "
+                 "flags {:#x})",
+                 ring_size >> 20, t, static_cast<u32>(mt.propertyFlags), mt.heapIndex,
+                 mem.memoryHeaps[mt.heapIndex].size >> 20, static_cast<u32>(mem.memoryHeaps[mt.heapIndex].flags));
     }
     if (!Vk::CreateBuffer(*ctx_, Cp::kGdsBytes,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -280,6 +305,7 @@ bool Backend::Start(const Options& o, std::string& error) {
     cpo.gds = gds_.mapped;
     cp_ = std::make_unique<Cp::CommandProcessor>(cpo);
     executor_->Attach(cp_.get());
+    executor_->SetWriteShadowRing(shadow_ring_.get());
     diag_ = std::make_unique<Vk::Diagnostics>(*ctx_, o.diagnostics, o.logs_dir);
     executor_->SetDiagnostics(diag_.get());
     images_->SetDiagnostics(diag_.get());
@@ -592,6 +618,11 @@ std::string Backend::Report() {
     if (cp_ && executor_) {
         const auto& c = cp_->Stats();
         const auto& s = executor_->Stats();
+        out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
+                           "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
+                           s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,
+                           s.shadow_sizes[0], s.shadow_sizes[1], s.shadow_sizes[2], s.shadow_sizes[3],
+                           s.shadow_sizes[4], s.shadow_sizes[5]);
         out += fmt::format("timeline copies {} ({} MiB, refused {})\n", s.timeline_copies, s.timeline_copy_bytes >> 20,
                            s.tc_refused);
         out += fmt::format("waits that waited: processor packets {} ({} ms), frontend reads {} ({} ms), processor memory "

@@ -89,6 +89,7 @@ public:
     bool SubmitBinds(VkSemaphore& wait, u64& wait_value);
 
     const BufferCacheStats& Stats() const { return stats_; }
+    VkBuffer Buffer() const { return buffer_; }
 
 private:
     static constexpr u64 kBlockBits = 16; ///< 64 KiB residency blocks

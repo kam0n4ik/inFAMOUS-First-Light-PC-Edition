@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -148,6 +150,7 @@ Executor::~Executor() {
         f.vkDestroyQueryPool(dev, prof_pool_, nullptr);
     }
     DestroyBuffer(ctx_, lds_);
+    DestroyBuffer(ctx_, diag_scratch_);
     for (auto& [value, b] : lds_retired_) {
         DestroyBuffer(ctx_, b);
     }
@@ -306,7 +309,13 @@ void Executor::Flush() {
     }
     EndRendering();
     // the GPU's writes of guest buffers (video memory) copied back to the host before the batch's fences
+    if (prof_) {
+        ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+    }
     buffers_.RecordWriteBack(cur_.cb, cur_.value);
+    if (prof_) {
+        ProfMark(5, "batch end: write-backs of the GPU's writes to the host");
+    }
     // the batch's writes made available to the host (guest memory the CPU reads after the fence)
     const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -402,6 +411,9 @@ void Executor::Poll() {
         free_.push_back(std::move(b));
     }
     ring_.Collect(completed);
+    if (shadow_ring_ != nullptr) {
+        shadow_ring_->Collect(completed);
+    }
     guest_.Collect(completed);
     images_.Collect(completed);
     buffers_.Collect(completed);
@@ -485,6 +497,139 @@ void Executor::ProfCollect(Batch& b) {
     b.prof_keys.clear();
 }
 
+void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBufferInfo>& infos) {
+    // Measured (logs\p44\diag c17-c20): a shader's stores into the sparse mirror are ~150x slower than into a dense
+    // buffer on NVIDIA (the skinning dispatch 1196 us vs 7.7 us with only its outputs dense), its loads are not; a copy
+    // into the mirror costs 12 us for its 420 KiB. So a dispatch writes dense shadows, copied back after it.
+    static const bool off = [] {
+        char v[8] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_DIAG_WRITE_SHADOW", v, sizeof(v)) == 3 && std::string_view(v) == "off";
+        if (o) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_WRITE_SHADOW=off - dispatches write the mirror in place");
+        }
+        return o;
+    }();
+    shadows_.clear();
+    if (shadow_ring_ == nullptr || off) {
+        return;
+    }
+    const auto& plan = *static_cast<const GS::ResourceBindingPlan*>(plan_ptr);
+    const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
+    // the whole binding is copied in and out: a large one a shader writes a little of costs more than it saves.
+    // Measured on the reference route (d1-d3): no limit 33.9 ms GPU a frame (149 MiB copied each way a frame), 1 MiB
+    // 35.6 ms (the 1x1x1 dispatches' 1 MiB bindings copied), 256 KiB 29.6 ms (2 MiB a frame) - written bindings are
+    // <=64 KiB, ~140 KiB (the skinning), ~1 MiB or ~16 MiB, nothing between.
+    static const u64 kShadowMax = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_SHADOW_MAX_KIB", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) << 10
+                                                                                     : (256ull << 10);
+    }();
+    const size_t n = std::min(plan.buffers.size(), infos.size());
+    for (size_t k = 0; k < n; ++k) {
+        const auto& b = plan.buffers[k];
+        VkDescriptorBufferInfo& info = infos[k];
+        if (b.kind != GS::BufferKind::Guest || !b.written || b.size == 0 || info.buffer == VK_NULL_HANDLE ||
+            info.range == VK_WHOLE_SIZE || info.range == 0) {
+            continue;
+        }
+        ++stats_.shadow_sizes[info.range <= (64u << 10)    ? 0
+                              : info.range <= (256u << 10) ? 1
+                              : info.range <= (1u << 20)   ? 2
+                              : info.range <= (4u << 20)   ? 3
+                              : info.range <= (16u << 20)  ? 4
+                                                           : 5];
+        if (info.range > kShadowMax) {
+            ++stats_.shadow_too_large;
+            continue;
+        }
+        // another binding of the same memory would see the other copy: those stay in place
+        bool overlap = false;
+        for (size_t j = 0; j < plan.buffers.size() && !overlap; ++j) {
+            const auto& o = plan.buffers[j];
+            overlap = j != k && o.kind == GS::BufferKind::Guest && o.size != 0 && o.address < b.address + b.size &&
+                      b.address < o.address + o.size;
+        }
+        if (overlap) {
+            ++stats_.shadow_overlaps;
+            continue;
+        }
+        StreamRing::Slice sl{};
+        if (shadow_ring_->Allocate(info.range, align, cur_.value, sl) != StreamRing::Status::Ok) {
+            ++stats_.shadow_no_room;
+            continue;
+        }
+        // only the binding's own bytes are copied: the descriptor starts up to `align` - 1 bytes before them (aligned
+        // down), bytes that may be another binding's - adjacent outputs (the skinning's three) copied back whole would
+        // put their stale copy over the other's result (synchronization validation d4/d6: WRITE_AFTER_WRITE)
+        const u64 adjust = k < buf_adjust_.size() ? buf_adjust_[k] : 0;
+        if (adjust >= info.range) {
+            continue;
+        }
+        shadows_.push_back({info.buffer, sl.buffer, info.offset + adjust, sl.offset + adjust,
+                            std::min<u64>(b.size, info.range - adjust)});
+        info.buffer = sl.buffer;
+        info.offset = sl.offset; // aligned as the original: the shader's offset within it is the same
+    }
+    if (shadows_.empty()) {
+        return;
+    }
+    // the current contents in (the shader may read what it does not overwrite); the caller ordered the earlier writes
+    EndRendering();
+    if (pending_writes_) {
+        GlobalBarrier();
+    }
+    for (const Shadow& s : shadows_) {
+        const VkBufferCopy c{.srcOffset = s.home_offset, .dstOffset = s.shadow_offset, .size = s.size};
+        Fn().vkCmdCopyBuffer(cur_.cb, s.home, s.shadow, 1, &c);
+        ++stats_.shadows;
+        stats_.shadow_bytes += s.size;
+    }
+    GlobalBarrier();
+}
+
+void Executor::FinishShadows() {
+    if (shadows_.empty()) {
+        return;
+    }
+    GlobalBarrier(); // the dispatch's writes before the copies
+    for (const Shadow& s : shadows_) {
+        const VkBufferCopy c{.srcOffset = s.shadow_offset, .dstOffset = s.home_offset, .size = s.size};
+        Fn().vkCmdCopyBuffer(cur_.cb, s.shadow, s.home, 1, &c);
+    }
+    shadows_.clear();
+    pending_writes_ = true; // a later access of the memory waits for the copies
+}
+
+void Executor::DiagDumpShader(u64 address, const std::vector<u32>* code, const std::vector<u32>& spirv) {
+    // SSPC_DIAG_DUMP_SHADER=<hex address>: that program's GCN code and SPIR-V -> logs\p44\shader_<address>.{gcn,spv}
+    static const u64 wanted = [] {
+        char v[32] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_DUMP_SHADER", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    if (wanted == 0 || address != wanted || dumped_shader_) {
+        return;
+    }
+    dumped_shader_ = true;
+    const auto write = [](const std::filesystem::path& path, const void* data, size_t bytes) {
+        std::FILE* fp = _wfopen(path.c_str(), L"wb");
+        if (fp == nullptr) {
+            return false;
+        }
+        const bool ok = std::fwrite(data, 1, bytes, fp) == bytes;
+        std::fclose(fp);
+        return ok;
+    };
+    // next to the frame capture (logs\p44)
+    const std::filesystem::path base = options_.capture_path.parent_path() / fmt::format("shader_{:x}", address);
+    bool ok = true;
+    if (code != nullptr) {
+        ok &= write(std::filesystem::path(base).replace_extension(".gcn"), code->data(), code->size() * 4);
+    }
+    ok &= write(std::filesystem::path(base).replace_extension(".spv"), spirv.data(), spirv.size() * 4);
+    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: shader {:#x} dumped to {}.gcn/.spv ({} GCN words, {} SPIR-V words): {}", address,
+             base.string(), code != nullptr ? code->size() : 0, spirv.size(), ok ? "written" : "NOT written");
+}
+
 void Executor::ProfDescribe(u64 key, const char* what, const void* stage_view, const std::vector<CachedImage*>& bound) {
     if (!prof_described_.insert(key).second) {
         return;
@@ -493,7 +638,14 @@ void Executor::ProfDescribe(u64 key, const char* what, const void* stage_view, c
     std::string out = fmt::format("profile key {:#x} ({}) bindings:", key, what);
     for (const auto& b : s.plan.buffers) {
         if (b.kind == GS::BufferKind::Guest) {
-            out += fmt::format(" | buf {:#x}+{:#x}{}", b.address, b.size, b.written ? " WRITTEN" : "");
+            // where the GPU reads it: video memory (the cache's mirror), the stream ring or the host import (PCIe)
+            BufferCache::Range r{};
+            const BufferCache::Residency res = buffers_.Classify(b.address, b.size, r);
+            const char* where = res == BufferCache::Residency::All ? "vram"
+                                : !b.written && b.size <= 16 * 1024 ? "ring"
+                                                                     : (res == BufferCache::Residency::Partial ? "partial"
+                                                                                                                : "HOST");
+            out += fmt::format(" | buf {:#x}+{:#x}{} [{}]", b.address, b.size, b.written ? " WRITTEN" : "", where);
         } else {
             out += fmt::format(" | special kind {}", static_cast<int>(b.kind));
         }
@@ -529,6 +681,15 @@ void Executor::ProfReport() {
                            static_cast<double>(a.ns) / 1e6 / static_cast<double>(prof_frames_),
                            100.0 * static_cast<double>(a.ns) / static_cast<double>(prof_total_ns_), a.count,
                            static_cast<double>(a.ns) / 1e3 / static_cast<double>(std::max<u64>(a.count, 1)), a.label);
+    }
+    // the diagnostic experiments' intervals whatever their rank (SSPC_DIAG_DUP_DISPATCH)
+    for (u64 k = 6; k <= 13; ++k) {
+        if (const auto it = prof_acc_.find(DiagKey(k)); it != prof_acc_.end()) {
+            const ProfAcc& a = it->second;
+            out += fmt::format("  (diag) {:5.3f} ms/frame x{:6} ({:7.1f} us each)  {}\n",
+                               static_cast<double>(a.ns) / 1e6 / static_cast<double>(prof_frames_), a.count,
+                               static_cast<double>(a.ns) / 1e3 / static_cast<double>(std::max<u64>(a.count, 1)), a.label);
+        }
     }
     SSPC_LOG(GPU, Info, "{}", out);
     prof_acc_.clear();
@@ -710,9 +871,15 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
                         ? DiagBegin(fmt::format("timeline copy q{} seq {} {:#x} -> {:#x} ({} bytes)", queue, seq, src, dst,
                                                 bytes))
                         : 0;
+    if (prof_) {
+        ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+    }
     const VkBufferCopy region{.srcOffset = soff, .dstOffset = doff, .size = bytes};
     Fn().vkCmdCopyBuffer(cur_.cb, sbuf, dbuf, 1, &region);
     DiagEnd(cid);
+    if (prof_) {
+        ProfMark(4, "DMA copy on the timeline");
+    }
     pending_writes_ = true; // a later read of the destination waits for the copy
     // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
     timeline_writes_.push_back({dst, dst + bytes, cur_.value});
@@ -843,6 +1010,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     const GS::ShaderReflection& refl = s.module->result.reflection;
     const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
     const Cp::RegisterFile& regs = cp_->Registers();
+    buf_adjust_.assign(plan.buffers.size(), 0);
     // buffers
     for (size_t i = 0; i < plan.buffers.size(); ++i) {
         const auto& b = plan.buffers[i];
@@ -864,6 +1032,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             if (index < push.buf_offsets.size()) {
                 push.buf_offsets[index] = static_cast<u8>(adjust);
             }
+            buf_adjust_[i] = static_cast<u32>(adjust);
             info = {vb, aligned, std::min<u64>(b.size + adjust, vavail + adjust)};
             if (b.written) {
                 writes_memory = true;
@@ -1610,6 +1779,9 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
         cid = DiagBegin(std::move(text));
     }
+    if (prof_) {
+        ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+    }
     if (d.indexed) {
         if (ibuf != VK_NULL_HANDLE) {
             f.vkCmdBindIndexBuffer(cur_.cb, ibuf, ioff, idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
@@ -1738,6 +1910,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     }
     std::string err;
     const PipelineObjects* pipe = pipelines_.Compute(*csv.module, csv.plan, err);
+    DiagDumpShader(csv.address, csv.program != nullptr ? &csv.program->code : nullptr, csv.module->result.spirv);
     if (pipe == nullptr) {
         Skipped(Skip::Pipeline, err);
         return;
@@ -1796,8 +1969,10 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
             img_infos[i].imageLayout = info_images_[i]->current;
         }
     }
+    PrepareShadows(&csv.plan, buf_infos);
     f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
     if (!PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_COMPUTE, writes)) {
+        FinishShadows();
         Skipped(Skip::Pipeline, "descriptor set allocation");
         return;
     }
@@ -1812,6 +1987,9 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         }
         cid = DiagBegin(std::move(text));
     }
+    if (prof_) {
+        ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+    }
     if (d.indirect) {
         f.vkCmdDispatchIndirect(cur_.cb, argbuf, argoff);
     } else {
@@ -1822,7 +2000,111 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         ProfMark((csv.address << 2) | 1, fmt::format("dispatch cs {:#x} groups {}x{}x{}{}", csv.address, d.groups[0],
                                                      d.groups[1], d.groups[2], d.indirect ? " indirect" : ""));
         ProfDescribe((csv.address << 2) | 1, "dispatch", &csv, bound);
+        // SSPC_DIAG_DUP_DISPATCH=<hex cs address> (with SSPC_GPU_PROFILE): the dispatch once more right after itself
+        // (same inputs, same outputs) and an empty interval - whether its time is its own execution or a stall
+        static const u64 dup = [] {
+            char v[32] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_DUP_DISPATCH", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16)
+                                                                                      : 0ull;
+        }();
+        if (dup != 0 && csv.address == dup && !d.indirect) {
+            GlobalBarrier();
+            ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+            ProfMark(DiagKey(6), "DIAG: an empty interval (timestamp to timestamp)");
+            f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
+            ProfMark(DiagKey(7), "DIAG: the same dispatch again, right after itself");
+            f.vkCmdDispatch(cur_.cb, 1, 1, 1);
+            ProfMark(DiagKey(8), "DIAG: the same program, one workgroup");
+            // its buffers copied into one dense device-local buffer (not the sparse mirror, not the ring): the same
+            // dispatch reading and writing there (the guest's data untouched)
+            std::string serr;
+            if (diag_scratch_.buffer == VK_NULL_HANDLE) {
+                CreateBuffer(ctx_, 16ull << 20,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             false, diag_scratch_, serr);
+            }
+            if (diag_scratch_.buffer == VK_NULL_HANDLE && dense_logged_++ == 0) {
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC: no dense scratch buffer: {}", serr);
+            }
+            // 9: every buffer dense; 10: only the read ones (the written stay in the mirror); 11: only the written
+            for (u32 variant = 9; variant <= 11 && diag_scratch_.buffer != VK_NULL_HANDLE; ++variant) {
+                GlobalBarrier(); // the copies after the dispatches above
+                std::vector<VkDescriptorBufferInfo> dup_infos = buf_infos;
+                u64 at = 0;
+                bool fits = true;
+                for (size_t k = 0; k < dup_infos.size(); ++k) {
+                    auto& bi = dup_infos[k];
+                    if (bi.buffer == VK_NULL_HANDLE || bi.range == VK_WHOLE_SIZE || bi.range == 0) {
+                        continue;
+                    }
+                    const bool written = k < csv.plan.buffers.size() && csv.plan.buffers[k].written;
+                    if ((variant == 10 && written) || (variant == 11 && !written)) {
+                        continue;
+                    }
+                    at = (at + 255) & ~255ull;
+                    if (at + bi.range > diag_scratch_.size) {
+                        fits = false;
+                        break;
+                    }
+                    const VkBufferCopy c{.srcOffset = bi.offset, .dstOffset = at, .size = bi.range};
+                    f.vkCmdCopyBuffer(cur_.cb, bi.buffer, diag_scratch_.buffer, 1, &c);
+                    bi.buffer = diag_scratch_.buffer;
+                    bi.offset = at;
+                    at += bi.range;
+                }
+                if (dense_logged_++ == 0) {
+                    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: dense copy of the dispatch's {} buffers: {} bytes, fits {}",
+                             dup_infos.size(), at, fits);
+                }
+                if (fits) {
+                    GlobalBarrier();
+                    std::vector<VkWriteDescriptorSet> dup_writes = writes;
+                    for (auto& w : dup_writes) {
+                        if (w.pBufferInfo != nullptr) {
+                            w.pBufferInfo = dup_infos.data() + (w.pBufferInfo - buf_infos.data());
+                        }
+                    }
+                    if (PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_COMPUTE, dup_writes)) {
+                        ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+                        f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
+                        ProfMark(DiagKey(variant), variant == 9    ? "DIAG: the same dispatch, all its buffers in a dense copy"
+                                          : variant == 10 ? "DIAG: the same dispatch, read buffers dense, written in the mirror"
+                                                          : "DIAG: the same dispatch, written buffers dense, read in the mirror");
+                        if (variant == 11) {
+                            // the dense outputs copied back over the mirror's (the same values): a copy's writes
+                            GlobalBarrier();
+                            ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+                            u32 copies = 0;
+                            for (size_t k = 0; k < dup_infos.size() && k < csv.plan.buffers.size(); ++k) {
+                                if (csv.plan.buffers[k].written && dup_infos[k].buffer == diag_scratch_.buffer) {
+                                    const VkBufferCopy c{.srcOffset = dup_infos[k].offset,
+                                                         .dstOffset = buf_infos[k].offset,
+                                                         .size = dup_infos[k].range};
+                                    f.vkCmdCopyBuffer(cur_.cb, diag_scratch_.buffer, buf_infos[k].buffer, 1, &c);
+                                    ++copies;
+                                }
+                            }
+                            ProfMark(DiagKey(12), "DIAG: the written buffers copied from the dense copy into the mirror");
+                            // the same bytes through a shader-free fill-free path: dense -> dense
+                            ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+                            for (size_t k = 0; k < dup_infos.size() && k < csv.plan.buffers.size(); ++k) {
+                                if (csv.plan.buffers[k].written && dup_infos[k].buffer == diag_scratch_.buffer) {
+                                    const VkBufferCopy c{.srcOffset = dup_infos[k].offset,
+                                                         .dstOffset = (8ull << 20) + dup_infos[k].offset,
+                                                         .size = dup_infos[k].range};
+                                    f.vkCmdCopyBuffer(cur_.cb, diag_scratch_.buffer, diag_scratch_.buffer, 1, &c);
+                                }
+                            }
+                            ProfMark(DiagKey(13), "DIAG: the same copies dense -> dense");
+                            (void)copies;
+                        }
+                    }
+                }
+            }
+        }
     }
+    FinishShadows();
     ++stats_.dispatches_executed;
     if (writes_memory) {
         pending_writes_ = true;

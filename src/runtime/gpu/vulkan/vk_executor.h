@@ -75,6 +75,8 @@ struct ExecutorStats {
     u64 n_prepare = 0;
     u64 tw_fail_shape = 0, tw_fail_import = 0; ///< WriteOnTimeline refusals: size/alignment/address, no import
     u64 timeline_copies = 0, timeline_copy_bytes = 0, tc_refused = 0;
+    u64 shadows = 0, shadow_bytes = 0, shadow_overlaps = 0, shadow_no_room = 0, shadow_too_large = 0;
+    std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
     std::string first_skip[static_cast<size_t>(Skip::Count)];
 };
@@ -113,6 +115,8 @@ public:
     void Synchronize(u32 queue) override;
     bool WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) override;
     bool CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) override;
+    /// Dense video memory for the written buffers of dispatches (see PrepareShadows); null: they write in place.
+    void SetWriteShadowRing(StreamRing* ring) { shadow_ring_ = ring; }
     /// Synchronize for a CPU read of guest memory by the command processor (its own memory reads).
     void SyncFromMemoryRead() { SyncFrom(2); }
 
@@ -171,6 +175,22 @@ private:
     void BeforeUpload();
     void OnDeviceLost(const char* where, u64 value);
     void SyncFrom(u32 source);
+    /// A dispatch's written guest buffers moved to dense shadows: their contents copied in (recorded now, outside
+    /// rendering, after the earlier writes); `infos` point at the shadows. FinishShadows copies them back after it.
+    void PrepareShadows(const void* plan, std::vector<VkDescriptorBufferInfo>& infos);
+    void FinishShadows();
+    struct Shadow {
+        VkBuffer home, shadow;
+        u64 home_offset, shadow_offset, size;
+    };
+    std::vector<Shadow> shadows_;
+    std::vector<u32> buf_adjust_; ///< BindStage: each guest buffer's offset from its aligned descriptor offset
+    StreamRing* shadow_ring_ = nullptr;
+    void DiagDumpShader(u64 address, const std::vector<u32>* code, const std::vector<u32>& spirv);
+    bool dumped_shader_ = false;
+    OwnedBuffer diag_scratch_; ///< SSPC_DIAG_DUP_DISPATCH: a dense copy of the dispatch's buffers
+    u32 dense_logged_ = 0;
+    static constexpr u64 DiagKey(u64 n) { return (0xD1A6ull << 32) | (n << 2) | 2; }
     /// The buffer a command accesses guest [addr, addr + size) through: video memory (the buffer cache), a stream copy
     /// for a small read-only range the CPU rewrote, or the host import. `avail`: bytes usable from `offset`.
     bool GuestRange(u64 addr, u64 size, bool write, u64 align, VkBuffer& buffer, u64& offset, u64& avail);

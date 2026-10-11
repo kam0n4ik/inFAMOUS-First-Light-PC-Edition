@@ -86,7 +86,8 @@ bool Timeline::Wait(u64 value, u64 timeout_ns) {
 // ------------------------------------------------------------------------------------------------ OwnedBuffer
 
 bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool host_visible, OwnedBuffer& out,
-                  std::string& error, bool host_cached) {
+                  std::string& error, bool host_cached, HostPlacement placement) {
+    host_cached |= placement == HostPlacement::Cached;
     out = {};
     const VkBufferCreateInfo bci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                  .size = size,
@@ -108,7 +109,7 @@ bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool h
     if (type >= 0) {
     } else if (host_visible) {
         // device-local + host-visible (the BAR) first for small buffers, then plain host memory
-        if (size <= (64ull << 20)) {
+        if (size <= (64ull << 20) || placement == HostPlacement::Bar) {
             type = ctx.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -135,6 +136,7 @@ bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool h
         return false;
     }
     Fn().vkBindBufferMemory(ctx.Device(), out.buffer, out.memory, 0);
+    out.memory_type = static_cast<u32>(type);
     if (host_visible) {
         void* p = nullptr;
         if (Fn().vkMapMemory(ctx.Device(), out.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
@@ -160,7 +162,7 @@ void DestroyBuffer(DeviceContext& ctx, OwnedBuffer& buffer) {
 
 // ------------------------------------------------------------------------------------------------ StreamRing
 
-StreamRing::StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, bool host_cached)
+StreamRing::StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, HostPlacement placement)
     : ctx_(ctx), timeline_(timeline) {
     std::string error;
     if (!CreateBuffer(ctx_, size,
@@ -168,7 +170,7 @@ StreamRing::StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, bool ho
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                      true, buf_, error, host_cached)) {
+                      placement != HostPlacement::Device, buf_, error, false, placement)) {
         SSPC_LOG(GPU, Error, "native backend: the stream ring ({} MiB): {}", size >> 20, error);
     }
 }
@@ -200,7 +202,7 @@ StreamRing::Status StreamRing::Allocate(u64 bytes, u64 align, u64 seq, Slice& ou
             allocated_ += bytes;
             out.buffer = buf_.buffer;
             out.offset = start % size;
-            out.data = buf_.mapped + out.offset;
+            out.data = buf_.mapped != nullptr ? buf_.mapped + out.offset : nullptr;
             return Status::Ok;
         }
         // full: the oldest submission's regions must be released
