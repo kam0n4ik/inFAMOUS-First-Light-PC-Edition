@@ -893,9 +893,9 @@ void Executor::DiagEnd(u64 id) {
 }
 
 bool Executor::GuestRange(u64 addr, u64 size, bool write, u64 align, VkBuffer& buffer, u64& offset, u64& avail) {
-    const u64 t0 = GS::Ticks();
+    const u64 t0 = GS::FineTicks();
     const bool ok = GuestRangeImpl(addr, size, write, align, buffer, offset, avail);
-    stats_.t_range += GS::Ticks() - t0;
+    stats_.t_range += GS::FineTicks() - t0;
     return ok;
 }
 
@@ -903,9 +903,9 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
     constexpr u64 kStreamMax = 16 * 1024; // the bridge's STREAM_THRESHOLD (16 KiB)
     if (!write && size <= kStreamMax) {
         BufferCache::Range r;
-        u64 tt = GS::Ticks();
+        u64 tt = GS::FineTicks();
         const BufferCache::Residency res = buffers_.Classify(addr, size, r);
-        stats_.t_classify += GS::Ticks() - tt;
+        stats_.t_classify += GS::FineTicks() - tt;
         if (res == BufferCache::Residency::All) {
             buffer = r.buffer;
             offset = r.offset;
@@ -918,7 +918,7 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
         if (res == BufferCache::Residency::None && !buffers_.HostWritePending(addr, size) &&
             !TimelineWritePending(addr, size)) {
             StreamRing::Slice sl{};
-            tt = GS::Ticks();
+            tt = GS::FineTicks();
             const u8* host = guest_.BackingPointer(addr, size);
             if (host == nullptr) { // no window there yet: imported once (32 MiB), then the copies read its host view
                 GuestBuffers::View gv{};
@@ -927,15 +927,15 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                     host = guest_.BackingPointer(addr, size);
                 }
             }
-            stats_.t_hostptr += GS::Ticks() - tt;
-            tt = GS::Ticks();
+            stats_.t_hostptr += GS::FineTicks() - tt;
+            tt = GS::FineTicks();
             const bool allocated = ring_.Allocate(size, std::max<u64>(align, 4), cur_.value, sl) == StreamRing::Status::Ok;
-            stats_.t_alloc += GS::Ticks() - tt;
-            tt = GS::Ticks();
+            stats_.t_alloc += GS::FineTicks() - tt;
+            tt = GS::FineTicks();
             const bool copied =
                 allocated &&
                 (host != nullptr ? (std::memcpy(sl.data, host, size), true) : GS::GameMemory().Read(addr, sl.data, size));
-            stats_.t_copy += GS::Ticks() - tt;
+            stats_.t_copy += GS::FineTicks() - tt;
             if (copied) {
                 buffer = sl.buffer;
                 offset = sl.offset;
@@ -978,9 +978,9 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
         }
     }
     BufferCache::Range r;
-    const u64 tp = GS::Ticks();
+    const u64 tp = GS::FineTicks();
     const bool prepared = buffers_.Prepare(addr, size, write, cur_.cb, cur_.value, r);
-    stats_.t_prepare += GS::Ticks() - tp;
+    stats_.t_prepare += GS::FineTicks() - tp;
     ++stats_.n_prepare;
     if (!prepared) {
         return false;
@@ -1504,10 +1504,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         if (!null_image) {
             const ImageLayout layout = LayoutFromTSharp(im.desc, im.depth);
             std::string err;
-            const u64 ti0 = GS::Ticks();
+            const u64 ti0 = GS::FineTicks();
             img = images_.Find(layout, im.storage ? ImageCache::Use::Storage : ImageCache::Use::Texture, cur_.cb,
                                cur_.value, err);
-            stats_.t_image += GS::Ticks() - ti0;
+            stats_.t_image += GS::FineTicks() - ti0;
             if (img == nullptr) {
                 Skipped(Skip::Image, err);
                 return false;
@@ -1842,9 +1842,9 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     const bool filtered = mode == 2 || mode == 5 || d.primitive_type == 0; // EliminateFastClear, FmaskDecompress, None
     // the frontend reads the guest's descriptors now (a write still on the GPU's timeline lands first: before this draw
     // is noted, so that flush completes only the earlier work)
-    const u64 tf0 = GS::Ticks();
+    const u64 tf0 = GS::FineTicks();
     const GS::DrawPreparation* prepared = filtered ? nullptr : &frontend_.PrepareDraw(d, regs, reader_);
-    stats_.t_front += GS::Ticks() - tf0;
+    stats_.t_front += GS::FineTicks() - tf0;
     if (!Begin()) {
         return;
     }
@@ -1863,9 +1863,9 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
                             GS::StageStatusName(frontend_.Stage(GS::HwStage::Ps).status)));
         return;
     }
-    u64 ts = GS::Ticks();
+    u64 ts = GS::FineTicks();
     const auto stage = [&](u64& acc) {
-        const u64 now = GS::Ticks();
+        const u64 now = GS::FineTicks();
         acc += now - ts;
         ts = now;
     };
@@ -2087,15 +2087,15 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     bound.clear();
     bool writes_memory = false;
     info_images_.clear();
-    const u64 tb0 = GS::Ticks();
+    const u64 tb0 = GS::FineTicks();
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets)) {
         return;
     }
     if (!BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets)) {
         return;
     }
-    stats_.t_bind += GS::Ticks() - tb0;
-    ts = GS::Ticks();
+    stats_.t_bind += GS::FineTicks() - tb0;
+    ts = GS::FineTicks();
     // vertex inputs
     std::vector<VkVertexInputBindingDescription2EXT>& vbind = scratch_.vbind;
     std::vector<VkVertexInputAttributeDescription2EXT>& vattr = scratch_.vattr;
@@ -2583,11 +2583,11 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     ++stats_.dispatches;
     const auto& f = Fn();
     const Cp::ComputeRegisters* cs = cp_->Compute(d.queue);
-    const u64 tf0 = GS::Ticks();
+    const u64 tf0 = GS::FineTicks();
     const GS::DrawPreparation* prepared =
         cs == nullptr ? nullptr
                       : &frontend_.PrepareDispatch(d, std::span<const u32, Cp::kComputeCount>(cs->values), reader_);
-    stats_.t_front += GS::Ticks() - tf0;
+    stats_.t_front += GS::FineTicks() - tf0;
     if (!Begin()) {
         return;
     }
@@ -2686,11 +2686,11 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     bool writes_memory = false;
     info_images_.clear();
     const std::vector<CachedImage*> none;
-    const u64 tb0 = GS::Ticks();
+    const u64 tb0 = GS::FineTicks();
     if (!BindStage(&csv, true, push, writes, buf_infos, img_infos, bound, writes_memory, none)) {
         return;
     }
-    stats_.t_bind += GS::Ticks() - tb0;
+    stats_.t_bind += GS::FineTicks() - tb0;
     VkBuffer argbuf = VK_NULL_HANDLE;
     u64 argoff = 0;
     if (d.indirect) {

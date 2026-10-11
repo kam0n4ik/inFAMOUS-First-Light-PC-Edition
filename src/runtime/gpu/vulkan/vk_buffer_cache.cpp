@@ -326,7 +326,7 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         return fallback();
     }
     ApplyInvalidations();
-    u64 t0 = Gpu::Shader::Ticks();
+    u64 t0 = Gpu::Shader::FineTicks();
     // (a large range is checked first: its tracking test would walk the whole range for nothing)
     if (size > kMaxCached || stats_.resident_bytes >= budget_ || !tracker_->CanArm(addr, size)) {
         // a range larger than the cache takes (a whole pool bound for a part of it) - or the budget is spent: the host
@@ -339,13 +339,13 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
             NoteHostWrite(addr, size, seq);
         }
         const bool ok = fallback();
-        stats_.t_large += Gpu::Shader::Ticks() - t0;
+        stats_.t_large += Gpu::Shader::FineTicks() - t0;
         return ok;
     }
     const u64 first_block = addr >> kBlockBits, last_block = (addr + size - 1) >> kBlockBits;
-    t0 = Gpu::Shader::Ticks();
+    t0 = Gpu::Shader::FineTicks();
     const bool bound = EnsureBound(first_block, last_block);
-    stats_.t_bound += Gpu::Shader::Ticks() - t0;
+    stats_.t_bound += Gpu::Shader::FineTicks() - t0;
     if (!bound) {
         FlushWritten(addr, size, cb, seq);
         if (write) {
@@ -355,7 +355,7 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         return fallback();
     }
     // the pages not valid in video memory, as runs
-    t0 = Gpu::Shader::Ticks();
+    t0 = Gpu::Shader::FineTicks();
     uploads_.clear();
     const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
     for (u64 b = first_block; b <= last_block; ++b) {
@@ -378,15 +378,15 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
             }
         }
     }
-    stats_.t_scan += Gpu::Shader::Ticks() - t0;
+    stats_.t_scan += Gpu::Shader::FineTicks() - t0;
     if (!uploads_.empty()) {
         const auto& f = Fn();
         ++stats_.n_upload_calls;
-        t0 = Gpu::Shader::Ticks();
+        t0 = Gpu::Shader::FineTicks();
         if (before_upload_ != nullptr) {
             before_upload_(before_upload_ctx_); // outside rendering, after the batch's earlier writes
         }
-        stats_.t_hook += Gpu::Shader::Ticks() - t0;
+        stats_.t_hook += Gpu::Shader::FineTicks() - t0;
         // earlier accesses of these pages (reads of their old copy) -> the copies -> later accesses
         VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                             .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -398,12 +398,12 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         f.vkCmdPipelineBarrier2(cb, &dep);
         for (const auto& [b, e] : uploads_) {
             // write-protect first: a CPU write from now on invalidates the pages again (the copy may still read it)
-            t0 = Gpu::Shader::Ticks();
+            t0 = Gpu::Shader::FineTicks();
             tracker_->Arm(b, e - b);
-            stats_.t_arm += Gpu::Shader::Ticks() - t0;
-            t0 = Gpu::Shader::Ticks();
+            stats_.t_arm += Gpu::Shader::FineTicks() - t0;
+            t0 = Gpu::Shader::FineTicks();
             const bool uploaded = Upload(b, e - b, cb, seq);
-            stats_.t_copy += Gpu::Shader::Ticks() - t0;
+            stats_.t_copy += Gpu::Shader::FineTicks() - t0;
             if (!uploaded) {
                 // not current: the pages stay invalid (they were marked valid above, before the copy - review MEDIUM 7)
                 const u64 fp = b >> kPageBits, lp = (e - 1) >> kPageBits;

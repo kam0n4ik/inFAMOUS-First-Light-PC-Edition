@@ -19,6 +19,8 @@
 // work, writes guest memory or tracks pages.
 #pragma once
 
+#include <intrin.h>
+
 #include <array>
 #include <condition_variable>
 #include <deque>
@@ -53,8 +55,17 @@ private:
 };
 
 /// The TSC as a clock (calibrated once): cheap timestamps around the frontend's steps.
-u64 Ticks();
+inline u64 Ticks() {
+    return __rdtsc();
+}
 u64 TicksToNs(u64 ticks);
+/// The per-stage timers of the hot path (frontend steps, binding, buffer classification, ...): on with
+/// SSPC_GPU_TIMINGS=1 only - tens of TSC reads a draw were a measurable share of the recording (P4.6). Off: FineTicks()
+/// is 0 (the stage sums stay 0); the coarse timers (recording, submission, waits) always count.
+extern const bool g_fine_timing;
+inline u64 FineTicks() {
+    return g_fine_timing ? __rdtsc() : 0;
+}
 
 enum class StageStatus : u8 {
     Ready,       ///< module ready, resources resolved

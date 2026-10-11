@@ -1,4 +1,6 @@
 // SecondSonPC — the shader frontend (P4.3). See shader_frontend.h.
+#include <windows.h>
+
 #include "runtime/gpu/shader/shader_frontend.h"
 
 #include <algorithm>
@@ -50,9 +52,10 @@ u64 BucketUpper(u32 b) {
 
 } // namespace
 
-u64 Ticks() {
-    return __rdtsc();
-}
+const bool g_fine_timing = [] {
+    char v[4] = {};
+    return GetEnvironmentVariableA("SSPC_GPU_TIMINGS", v, sizeof(v)) == 1 && v[0] == '1';
+}();
 
 u64 TicksToNs(u64 ticks) {
     return static_cast<u64>(static_cast<double>(ticks) / TicksPerNs());
@@ -335,7 +338,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     s.end = start;
     s.module = nullptr;
     // the program
-    const u64 tp = Ticks();
+    const u64 tp = FineTicks();
     const bool keep = options_.validation == Validation::PerFrame && s.program != nullptr && s.address == addr &&
                       stage_epoch_[si] == programs_.Epoch();
     if (keep) {
@@ -348,7 +351,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         s.program_error = l.error;
         stage_epoch_[si] = programs_.Epoch();
     }
-    times_.program.Add(TicksToNs(Ticks() - tp));
+    if (g_fine_timing) {
+        times_.program.Add(TicksToNs(Ticks() - tp));
+    }
     if (s.program == nullptr) {
         stage_epoch_[si] = 0;
         return StageStatus::NoProgram;
@@ -403,7 +408,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     }
 
     // resources and the key
-    const u64 tr = Ticks();
+    const u64 tr = FineTicks();
     if (!ResolveResources(r, first.srt, start, fetch, user_data, addr, memory, s.plan)) {
         ++stats_.srt_walk_failures;
     }
@@ -417,10 +422,14 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     for (size_t i = 0; i < s.plan.status_counts.size(); ++i) {
         stats_.resources[i] += s.plan.status_counts[i];
     }
-    const u64 tk = Ticks();
-    times_.resources.Add(TicksToNs(tk - tr));
+    const u64 tk = FineTicks();
+    if (g_fine_timing) {
+        times_.resources.Add(TicksToNs(tk - tr));
+    }
     BuildSpecializationKey(s.runtime, start, r, fetch, s.plan, s.key);
-    times_.key.Add(TicksToNs(Ticks() - tk));
+    if (g_fine_timing) {
+        times_.key.Add(TicksToNs(Ticks() - tk));
+    }
     s.end = EndOf(start, s.plan);
 
     // the module
@@ -467,13 +476,15 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
 
 const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, const Cp::RegisterFile& regs,
                                                    GuestReader& memory) {
-    const u64 t0 = Ticks();
+    const u64 t0 = FineTicks();
     ++stats_.draws;
     prep_ = {};
     if (DecodeStages(regs.Get(Reg::VgtShaderStagesEn)) != StageConfig::Vs) {
         ++stats_.unsupported;
         prep_.unsupported = true;
-        times_.draw.Add(TicksToNs(Ticks() - t0));
+        if (g_fine_timing) {
+            times_.draw.Add(TicksToNs(Ticks() - t0));
+        }
         return prep_;
     }
     BindingStart start{};
@@ -501,7 +512,7 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         start = s.end;
     }
     if (ready) {
-        const u64 tp = Ticks();
+        const u64 tp = FineTicks();
         const StageView& ps = stages_[static_cast<size_t>(HwStage::Ps)];
         const StageView& vs = stages_[static_cast<size_t>(HwStage::Vs)];
         const u32 ps_id = ps.module->id, vs_id = vs.module->id;
@@ -519,21 +530,25 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
             last_ps_ = ps_id;
             last_vs_ = vs_id;
         }
-        times_.pipeline.Add(TicksToNs(Ticks() - tp));
+        if (g_fine_timing) {
+            times_.pipeline.Add(TicksToNs(Ticks() - tp));
+        }
         prep_.ready = true;
         ++stats_.ready;
     } else {
         ++stats_.waiting;
         last_pipeline_ = 0;
     }
-    times_.draw.Add(TicksToNs(Ticks() - t0));
+    if (g_fine_timing) {
+        times_.draw.Add(TicksToNs(Ticks() - t0));
+    }
     return prep_;
 }
 
 const DrawPreparation& ShaderFrontend::PrepareDispatch(const Cp::DispatchDescriptor& d,
                                                        std::span<const u32, Cp::kComputeCount> cs,
                                                        GuestReader& memory) {
-    const u64 t0 = Ticks();
+    const u64 t0 = FineTicks();
     ++stats_.dispatches;
     prep_ = {};
     StageView& s = stages_[static_cast<size_t>(HwStage::Cs)];
@@ -550,7 +565,9 @@ const DrawPreparation& ShaderFrontend::PrepareDispatch(const Cp::DispatchDescrip
     } else {
         ++stats_.waiting;
     }
-    times_.dispatch.Add(TicksToNs(Ticks() - t0));
+    if (g_fine_timing) {
+        times_.dispatch.Add(TicksToNs(Ticks() - t0));
+    }
     return prep_;
 }
 
