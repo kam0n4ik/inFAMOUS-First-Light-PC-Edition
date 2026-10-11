@@ -203,6 +203,7 @@ CachedImage* ImageCache::Create(const ImageLayout& layout, std::string& error) {
     stats_.bytes += req.size;
     CachedImage* raw = img.get();
     by_address_.emplace(layout.guest_address, raw);
+    ++epoch_;
     images_.push_back(std::move(img));
     return raw;
 }

@@ -14,7 +14,9 @@
 // One thread records (the GPU thread).
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -103,6 +105,25 @@ private:
         u16 valid = 0; ///< pages whose video memory copy is current
         bool bound = false;
     };
+    /// The block table: leaves of 4096 blocks (256 MiB of addresses) made when first touched - a lookup is two array
+    /// indexings (it was a hash map: binding checks and scans 5.6 ms a frame for ~6200 ranges, e1).
+    static constexpr u64 kLeafBits = 12;
+    static constexpr u64 kLeafMask = (1ull << kLeafBits) - 1;
+    struct Leaf {
+        std::array<Block, 1ull << kLeafBits> blocks{};
+    };
+    std::vector<std::unique_ptr<Leaf>> leaves_;
+    Block* FindBlock(u64 b) {
+        const u64 l = b >> kLeafBits;
+        return l < leaves_.size() && leaves_[l] ? &leaves_[l]->blocks[b & kLeafMask] : nullptr;
+    }
+    Block& GetBlock(u64 b) {
+        auto& leaf = leaves_[b >> kLeafBits];
+        if (!leaf) {
+            leaf = std::make_unique<Leaf>();
+        }
+        return leaf->blocks[b & kLeafMask];
+    }
     void ApplyInvalidations();
     bool EnsureBound(u64 first_block, u64 last_block);
     bool Upload(u64 addr, u64 size, VkCommandBuffer cb, u64 seq);
@@ -118,7 +139,6 @@ private:
     u32 memory_type_ = 0;
     std::vector<VkDeviceMemory> chunks_;
     u64 chunk_used_ = kChunkBytes; ///< bytes of the last chunk given out
-    std::unordered_map<u64, Block> blocks_;
     std::vector<VkSparseMemoryBind> pending_binds_;
     VkSemaphore bind_timeline_ = VK_NULL_HANDLE;
     u64 bind_value_ = 0;

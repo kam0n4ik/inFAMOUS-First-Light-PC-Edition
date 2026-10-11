@@ -68,6 +68,7 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
         cr = f.vkCreateBuffer(ctx_.Device(), &bci, nullptr, &buffer_);
         if (cr == VK_SUCCESS) {
             space_ = size;
+            leaves_.resize(size >> (kBlockBits + kLeafBits));
             break;
         }
         SSPC_LOG(GPU, Info, "native backend: buffer cache: a sparse buffer of {} GiB was refused ({})", size >> 30,
@@ -145,29 +146,22 @@ void BufferCache::ApplyInvalidations() {
         }
         const u64 first_page = addr >> kPageBits, last_page = (end - 1) >> kPageBits;
         const u64 first_block = first_page / kPagesPerBlock, last_block = last_page / kPagesPerBlock;
-        if (last_block - first_block + 1 > blocks_.size()) {
-            // a range wider than what is resident (a whole pool written): the resident blocks, not the range's
-            for (auto& [b, blk] : blocks_) {
-                if (b < first_block || b > last_block || blk.valid == 0) {
+        // leaf by leaf: a range wider than what is resident (a whole pool written) skips the leaves never touched
+        for (u64 leaf = first_block >> kLeafBits; leaf <= (last_block >> kLeafBits) && leaf < leaves_.size(); ++leaf) {
+            Leaf* lp = leaves_[leaf].get();
+            if (lp == nullptr) {
+                continue;
+            }
+            const u64 b0 = std::max(first_block, leaf << kLeafBits);
+            const u64 b1 = std::min(last_block, ((leaf + 1) << kLeafBits) - 1);
+            for (u64 b = b0; b <= b1; ++b) {
+                Block& blk = lp->blocks[b & kLeafMask];
+                if (blk.valid == 0) {
                     continue;
                 }
                 blk.valid &= static_cast<u16>(~PageMask(b, first_page, last_page));
                 ++stats_.invalidations;
             }
-            continue;
-        }
-        for (u64 page = first_page; page <= last_page;) {
-            const u64 block = page / kPagesPerBlock;
-            const u64 block_last = std::min(last_page, (block + 1) * kPagesPerBlock - 1);
-            if (auto it = blocks_.find(block); it != blocks_.end() && it->second.valid != 0) {
-                u16 mask = 0;
-                for (u64 p = page; p <= block_last; ++p) {
-                    mask |= static_cast<u16>(1u << (p % kPagesPerBlock));
-                }
-                it->second.valid &= static_cast<u16>(~mask);
-                ++stats_.invalidations;
-            }
-            page = block_last + 1;
         }
     }
 }
@@ -177,15 +171,15 @@ bool BufferCache::EnsureBound(u64 first_block, u64 last_block) {
     const u64 bytes = 1ull << kBlockBits;
     u64 needed = 0;
     for (u64 b = first_block; b <= last_block; ++b) {
-        const auto it = blocks_.find(b);
-        needed += (it == blocks_.end() || !it->second.bound) ? bytes : 0;
+        const Block* blk = FindBlock(b);
+        needed += (blk == nullptr || !blk->bound) ? bytes : 0;
     }
     if (stats_.resident_bytes + needed > budget_) {
         ++stats_.over_budget;
         return false;
     }
     for (u64 b = first_block; b <= last_block; ++b) {
-        Block& blk = blocks_[b];
+        Block& blk = GetBlock(b);
         if (blk.bound) {
             continue;
         }
@@ -241,9 +235,9 @@ bool BufferCache::Resident(u64 addr, u64 size, Range& out) {
     ApplyInvalidations();
     const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
     for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
-        const auto it = blocks_.find(b);
+        const Block* blk = FindBlock(b);
         const u16 mask = PageMask(b, first_page, last_page);
-        if (it == blocks_.end() || !it->second.bound || (it->second.valid & mask) != mask) {
+        if (blk == nullptr || !blk->bound || (blk->valid & mask) != mask) {
             return false;
         }
     }
@@ -259,9 +253,9 @@ BufferCache::Residency BufferCache::Classify(u64 addr, u64 size, Range& out) {
     const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
     bool all = true, any = false;
     for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
-        const auto it = blocks_.find(b);
+        const Block* blk = FindBlock(b);
         const u16 mask = PageMask(b, first_page, last_page);
-        const u16 v = it != blocks_.end() && it->second.bound ? static_cast<u16>(it->second.valid & mask) : u16{0};
+        const u16 v = blk != nullptr && blk->bound ? static_cast<u16>(blk->valid & mask) : u16{0};
         all &= v == mask;
         any |= v != 0;
     }
@@ -278,11 +272,20 @@ bool BufferCache::AnyValid(u64 addr, u64 size) {
     }
     ApplyInvalidations();
     const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
-    for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
-        const auto it = blocks_.find(b);
-        if (it != blocks_.end() && (it->second.valid & PageMask(b, first_page, last_page)) != 0) {
+    const u64 first_block = first_page / kPagesPerBlock, last_block = last_page / kPagesPerBlock;
+    for (u64 b = first_block; b <= last_block;) {
+        const u64 leaf = b >> kLeafBits;
+        if (leaf >= leaves_.size()) {
+            break;
+        }
+        if (!leaves_[leaf]) {
+            b = (leaf + 1) << kLeafBits; // never touched: none of its blocks is valid
+            continue;
+        }
+        if ((leaves_[leaf]->blocks[b & kLeafMask].valid & PageMask(b, first_page, last_page)) != 0) {
             return true;
         }
+        ++b;
     }
     return false;
 }
@@ -335,7 +338,7 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
     uploads_.clear();
     const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
     for (u64 b = first_block; b <= last_block; ++b) {
-        Block& blk = blocks_[b];
+        Block& blk = GetBlock(b);
         const u16 mask = PageMask(b, first_page, last_page);
         u16 missing = static_cast<u16>(mask & ~blk.valid);
         blk.valid |= mask;

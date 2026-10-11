@@ -295,6 +295,11 @@ bool Backend::Start(const Options& o, std::string& error) {
     Vk::ExecutorOptions eo;
     eo.capture_flip = o.capture_flip;
     eo.capture_path = o.logs_dir / "p44" / "native_frame.png";
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_BATCH_DRAWS", v, sizeof(v)) > 0) {
+        eo.max_draws_per_batch = std::max<u32>(16, static_cast<u32>(std::strtoul(v, nullptr, 10)));
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BATCH_DRAWS={} - a batch is submitted after that many "
+                               "commands", eo.max_draws_per_batch);
+    }
     images_->SetBufferCache(buffers_.get());
     executor_ = std::make_unique<Vk::Executor>(*ctx_, *timeline_, *ring_, *guest_, *buffers_, *images_, *pipelines_,
                                                *frontend_, presenter_.get(), gds_, eo);
@@ -385,6 +390,7 @@ void Backend::Loop() {
     auto rate_t0 = std::chrono::steady_clock::now();
     u64 rate_flips = 0, rate_draws = 0, rate_record = 0, rate_wait = 0, rate_tw = 0, rate_gpu = 0, rate_submit = 0;
     u64 rate_front = 0, rate_bind = 0, rate_range = 0, rate_image = 0, rate_streamed = 0, rate_streamed_bytes = 0;
+    u64 rate_pipe = 0, rate_targets = 0, rate_vertex = 0, rate_layout = 0, rate_emit = 0, rate_dispatch = 0;
     u64 rate_ring_waits = 0, rate_classify = 0, rate_hostptr = 0, rate_alloc = 0, rate_copy = 0, rate_prepare = 0;
     u64 rate_nprep = 0, rate_tl = 0, rate_tb = 0, rate_ts = 0, rate_th = 0, rate_ta = 0, rate_tc = 0, rate_nu = 0;
     u64 prof_cp = 0, prof_poll = 0, prof_flush = 0, prof_idle = 0; // ns since the last rate line
@@ -485,6 +491,21 @@ void Backend::Loop() {
                      static_cast<double>(s.streamed_bytes - rate_streamed_bytes) / 1048576.0 / frames,
                      ring_->Waits() - rate_ring_waits);
             rate_ring_waits = ring_->Waits();
+            SSPC_LOG(GPU, Info,
+                     "native backend: draw stages per frame (ms): pipeline {:.1f}, targets {:.1f}, vertex/index {:.1f}, "
+                     "barriers/layouts {:.1f}, commands {:.1f}; dispatches whole {:.1f}",
+                     per_frame(static_cast<double>(GS::TicksToNs(s.t_pipe - rate_pipe))),
+                     per_frame(static_cast<double>(GS::TicksToNs(s.t_targets - rate_targets))),
+                     per_frame(static_cast<double>(GS::TicksToNs(s.t_vertex - rate_vertex))),
+                     per_frame(static_cast<double>(GS::TicksToNs(s.t_layout - rate_layout))),
+                     per_frame(static_cast<double>(GS::TicksToNs(s.t_emit - rate_emit))),
+                     per_frame(static_cast<double>(GS::TicksToNs(s.t_dispatch - rate_dispatch))));
+            rate_pipe = s.t_pipe;
+            rate_targets = s.t_targets;
+            rate_vertex = s.t_vertex;
+            rate_layout = s.t_layout;
+            rate_emit = s.t_emit;
+            rate_dispatch = s.t_dispatch;
             SSPC_LOG(GPU, Info,
                      "native backend: buffers per frame (ms): classify {:.1f}, host pointer {:.1f}, ring {:.1f}, copy {:.1f}, "
                      "cache prepare {:.1f} ({:.0f} calls)",
@@ -618,6 +639,7 @@ std::string Backend::Report() {
     if (cp_ && executor_) {
         const auto& c = cp_->Stats();
         const auto& s = executor_->Stats();
+        out += fmt::format("target cache: hits {}, misses {}\n", s.target_cache_hits, s.target_cache_misses);
         out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
                            "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
                            s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,

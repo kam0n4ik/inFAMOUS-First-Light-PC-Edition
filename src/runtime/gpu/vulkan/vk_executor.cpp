@@ -1408,6 +1408,12 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
                             GS::StageStatusName(frontend_.Stage(GS::HwStage::Ps).status)));
         return;
     }
+    u64 ts = GS::Ticks();
+    const auto stage = [&](u64& acc) {
+        const u64 now = GS::Ticks();
+        acc += now - ts;
+        ts = now;
+    };
     const GS::GraphicsPipelineState* st = frontend_.Pipelines().Graphics(prep.pipeline);
     const GS::StageView& vs = frontend_.Stage(GS::HwStage::Vs);
     const GS::StageView& ps = frontend_.Stage(GS::HwStage::Ps);
@@ -1421,17 +1427,61 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         Skipped(Skip::Pipeline, err.empty() ? "no pipeline state" : err);
         return;
     }
+    stage(stats_.t_pipe);
 
     // targets
     std::vector<CachedImage*> targets;
     RenderKey key;
+    std::array<CachedImage*, 8> color_img{};
+    const u32 target_mask = regs.Get(kCbTargetMask);
+    std::array<bool, 8> color_clear{};
+    CachedImage* depth_img = nullptr;
+    const u32 dc = regs.Get(kDbDepthControl);
+    bool depth_clear = false;
+    // the last draw's targets when nothing they are built from changed (e1: 9.9 ms a frame, ~1.8 us a draw, rebuilding
+    // the same targets draw after draw)
+    TargetInputs tin{};
+    tin.versions = {regs.Version(Cp::Group::ColorFormat), regs.Version(Cp::Group::ColorTarget),
+                    regs.Version(Cp::Group::DepthFormat), regs.Version(Cp::Group::DepthTarget)};
+    tin.mode = mode;
+    tin.target_mask = target_mask;
+    tin.depth_control = dc & 7; // stencil, depth test, depth write (the depth view)
+    tin.mrt_mask = st->mrt_mask;
+    tin.cb_extent = d.cb_extent;
+    tin.db_extent = d.db_extent;
+    tin.epoch = images_.Epoch();
+    if (target_cache_.valid && target_cache_.in == tin) {
+        ++stats_.target_cache_hits;
+        targets = target_cache_.targets;
+        key = target_cache_.key;
+        color_img = target_cache_.color_img;
+        depth_img = target_cache_.depth_img;
+        for (CachedImage* img : targets) {
+            img->last_seq = cur_.value; // what Find records for a target
+        }
+        if (!pending_meta_clear_.empty()) {
+            const auto take = [&](u64 meta) {
+                auto it = meta != 0 ? pending_meta_clear_.find(meta) : pending_meta_clear_.end();
+                if (it == pending_meta_clear_.end() || !it->second) {
+                    return false;
+                }
+                it->second = false;
+                return true;
+            };
+            for (u32 i = 0; i < 8; ++i) {
+                color_clear[i] = color_img[i] != nullptr && take(target_cache_.cmask[i]);
+            }
+            depth_clear = depth_img != nullptr && take(target_cache_.htile);
+        }
+    } else {
+    ++stats_.target_cache_misses;
+    target_cache_.valid = false;
+    target_cache_.cmask.fill(0);
+    target_cache_.htile = 0;
     key.width = ctx_.Caps().max_framebuffer_width;
     key.height = ctx_.Caps().max_framebuffer_height;
     key.layers = 0xFFFF;
-    std::array<CachedImage*, 8> color_img{};
     const u32 num_color = static_cast<u32>(std::bit_width(st->mrt_mask & 0xFFu));
-    const u32 target_mask = regs.Get(kCbTargetMask);
-    std::array<bool, 8> color_clear{};
     for (u32 i = 0; i < num_color; ++i) {
         const u32 base = Cp::Reg::CbColor0Base + i * Cp::Reg::CbColorStride;
         const u32 info = regs.Get(base + 4);
@@ -1457,6 +1507,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         color_img[i] = img;
         targets.push_back(img);
         const u64 cmask = u64{regs.Get(base + 7)} << 8;
+        target_cache_.cmask[i] = cmask;
         if (cmask != 0) {
             if (auto it = pending_meta_clear_.find(cmask); it != pending_meta_clear_.end() && it->second) {
                 color_clear[i] = true;
@@ -1465,10 +1516,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
     }
     key.color_count = num_color;
-    CachedImage* depth_img = nullptr;
-    const u32 dc = regs.Get(kDbDepthControl);
     const bool depth_valid = (regs.Get(kDbZInfo) & 3) != 0, stencil_valid = (regs.Get(kDbStencilInfo) & 1) != 0;
-    bool depth_clear = false;
     if ((((dc >> 1) & 1) && depth_valid) || ((dc & 1) && stencil_valid)) {
         const ImageLayout layout = LayoutFromDepthTarget(regs, d.db_extent);
         depth_img = images_.Find(layout, ImageCache::Use::DepthTarget, cur_.cb, cur_.value, err);
@@ -1483,6 +1531,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         key.height = std::min(key.height, std::max(depth_img->layout.size.height, 1u));
         targets.push_back(depth_img);
         const u64 htile = u64{regs.Get(kDbHtileBase)} << 8;
+        target_cache_.htile = htile;
         if (htile != 0) {
             if (auto it = pending_meta_clear_.find(htile); it != pending_meta_clear_.end() && it->second) {
                 depth_clear = true;
@@ -1497,7 +1546,15 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         key.width = std::max<u32>(1, std::min<u32>(key.width, 16384));
         key.height = std::max<u32>(1, std::min<u32>(key.height, 16384));
     }
-
+    target_cache_.valid = true;
+    target_cache_.in = tin;
+    target_cache_.in.epoch = images_.Epoch(); // a target just created bumped it: the next draw's inputs carry the new one
+    target_cache_.targets = targets;
+    target_cache_.key = key;
+    target_cache_.color_img = color_img;
+    target_cache_.depth_img = depth_img;
+    }
+    stage(stats_.t_targets);
     // resources
     PushData push{};
     const u32 vte = regs.Get(kPaClVteCntl);
@@ -1520,6 +1577,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         return;
     }
     stats_.t_bind += GS::Ticks() - tb0;
+    ts = GS::Ticks();
     // vertex inputs
     std::vector<VkVertexInputBindingDescription2EXT> vbind;
     std::vector<VkVertexInputAttributeDescription2EXT> vattr;
@@ -1592,6 +1650,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
     }
 
+    stage(stats_.t_vertex);
     // barriers and layouts (outside rendering)
     if (pending_writes_) {
         GlobalBarrier();
@@ -1678,6 +1737,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
             }
         }
     }
+    stage(stats_.t_layout);
     if (!rendering_) {
         std::array<VkRenderingAttachmentInfo, 8> colors{};
         for (u32 i = 0; i < key.color_count; ++i) {
@@ -1806,6 +1866,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
     }
     DiagEnd(cid);
+    stage(stats_.t_emit);
     if (prof_) {
         ProfMark((u64{prep.pipeline} << 2) | 0,
                  fmt::format("draw pipeline {} vs {:#x} ps {:#x} prim {} target {}x{} rt0 fmt {} depth {}", prep.pipeline,
@@ -2109,6 +2170,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     if (writes_memory) {
         pending_writes_ = true;
     }
+    stats_.t_dispatch += GS::Ticks() - t0;
     stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
 }
 

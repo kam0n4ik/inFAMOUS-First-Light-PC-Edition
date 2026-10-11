@@ -71,11 +71,15 @@ struct ExecutorStats {
     u64 lds_dispatches = 0, lds_max_bytes = 0;  ///< dispatches with the emulated LDS buffer
     u64 streamed = 0, streamed_bytes = 0; ///< small read-only ranges the CPU rewrote, copied into the stream ring
     u64 t_front = 0, t_bind = 0, t_range = 0, t_image = 0; ///< TSC ticks: frontend, resource binding (of it buffers, images)
+    /// TSC ticks of a draw's other stages: pipeline lookup, targets, vertex/index/indirect ranges, barriers and layouts,
+    /// the commands (rendering, state, descriptors, the draw); the dispatches' whole recording
+    u64 t_pipe = 0, t_targets = 0, t_vertex = 0, t_layout = 0, t_emit = 0, t_dispatch = 0;
     u64 t_classify = 0, t_hostptr = 0, t_alloc = 0, t_copy = 0, t_prepare = 0; ///< TSC ticks inside GuestRange
     u64 n_prepare = 0;
     u64 tw_fail_shape = 0, tw_fail_import = 0; ///< WriteOnTimeline refusals: size/alignment/address, no import
     u64 timeline_copies = 0, timeline_copy_bytes = 0, tc_refused = 0;
     u64 shadows = 0, shadow_bytes = 0, shadow_overlaps = 0, shadow_no_room = 0, shadow_too_large = 0;
+    u64 target_cache_hits = 0, target_cache_misses = 0;
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
     std::string first_skip[static_cast<size_t>(Skip::Count)];
@@ -84,7 +88,10 @@ struct ExecutorStats {
 struct ExecutorOptions {
     u64 capture_flip = 0;                 ///< --gpu-capture-native-frame N: the presented frame of flip N to PNG
     std::filesystem::path capture_path;   ///< where (native_frame.png)
-    u32 max_draws_per_batch = 4000;
+    /// A batch is submitted after this many draws: the GPU works on a frame while the rest is recorded (e3-e5: 4000 -
+    /// the frame's last batch ran on the GPU after recording, 19 ms idle a frame; 500 - 12 ms, 11.5 -> 12.6 FPS; 150 -
+    /// no better, submissions cost more)
+    u32 max_draws_per_batch = 500;
 };
 
 class Executor final : public Cp::GpuWork {
@@ -160,6 +167,27 @@ private:
         u32 width = 0, height = 0, layers = 1;
         bool operator==(const RenderKey&) const = default;
     };
+    /// A draw's render targets are built from these alone (the registers' group versions, the values of the groups
+    /// that change per draw for other reasons, the pipeline's MRT mask, the driver's size hints, the images' epoch).
+    struct TargetInputs {
+        std::array<u32, 4> versions{}; ///< ColorFormat, ColorTarget, DepthFormat, DepthTarget
+        u32 mode = 0, target_mask = 0, depth_control = 0, mrt_mask = 0;
+        std::array<u32, 8> cb_extent{};
+        u32 db_extent = 0;
+        u64 epoch = 0;
+        bool operator==(const TargetInputs&) const = default;
+    };
+    struct TargetCache {
+        bool valid = false;
+        TargetInputs in;
+        std::vector<CachedImage*> targets;
+        RenderKey key;
+        std::array<CachedImage*, 8> color_img{};
+        CachedImage* depth_img = nullptr;
+        std::array<u64, 8> cmask{}; ///< each colour target's CMASK address (a pending fast clear is checked per draw)
+        u64 htile = 0;
+    };
+    TargetCache target_cache_;
 
     bool Begin();
     void Note(u32 queue, u64 seq);

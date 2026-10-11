@@ -137,6 +137,14 @@ private:
     GuestBuffers& guest_;
     std::vector<std::unique_ptr<CachedImage>> images_;
     std::multimap<u64, CachedImage*> by_address_;
+    u64 epoch_ = 0;
+
+public:
+    /// Bumped whenever the set of images changes (a new image; an eviction must bump it too): what Find returned for
+    /// the same layout before is still what it returns while the epoch is the same (the executor's target cache).
+    u64 Epoch() const { return epoch_; }
+
+private:
     u32 next_id_ = 1;
     std::unordered_map<u64, VkSampler> samplers_;
     std::deque<Temp> temps_;
