@@ -24,6 +24,7 @@
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/cpu_sampler.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
@@ -214,6 +215,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> device_lost_{false};
     std::thread thread_;
+    CpuSampler sampler_; ///< SSPC_DIAG_SAMPLE=1: where the GPU thread's CPU time goes (logs\gpu_cpu_profile.txt)
     bool submit_done_ = false;
     std::array<bool, Cp::kNumQueues> mapped_{};
     std::mutex inval_mutex_;
@@ -351,6 +353,16 @@ bool Backend::Start(const Options& o, std::string& error) {
     VideoOut::Start(this);
     stop_.store(false);
     thread_ = std::thread([this] { Loop(); });
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_SAMPLE", v, sizeof(v)) > 0 && v[0] == '1') {
+        char delay[16] = {};
+        const u32 after = GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_AFTER", delay, sizeof(delay)) > 0
+                              ? static_cast<u32>(std::strtoul(delay, nullptr, 10))
+                              : 30;
+        if (sampler_.Start(reinterpret_cast<HANDLE>(thread_.native_handle()), 1000, after)) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SAMPLE=1 - the GPU thread is sampled every 1 ms from {} s "
+                                   "(logs\\gpu_cpu_profile.txt at the end)", after);
+        }
+    }
     SSPC_LOG(GPU, Info, "native backend started on {} (the game's GPU work runs on SecondSonPC's Vulkan backend)",
              ctx_->Name());
     return true;
@@ -585,6 +597,7 @@ void Backend::Loop() {
 }
 
 void Backend::Stop() {
+    sampler_.Stop(); // while the sampled thread still exists
     stop_.store(true, std::memory_order_release);
     cv_.notify_all();
     if (thread_.joinable()) {
@@ -602,6 +615,9 @@ void Backend::Stop() {
     std::error_code ec;
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
+    if (sampler_.Running()) {
+        std::ofstream(options_.logs_dir / "gpu_cpu_profile.txt", std::ios::trunc) << sampler_.Report(60);
+    }
 }
 
 std::string Backend::Report() {

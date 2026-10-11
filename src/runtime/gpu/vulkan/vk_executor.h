@@ -188,6 +188,17 @@ private:
         u64 htile = 0;
     };
     TargetCache target_cache_;
+    struct Scratch {
+        std::vector<VkWriteDescriptorSet> writes;
+        std::vector<VkDescriptorBufferInfo> buf_infos;
+        std::vector<VkDescriptorImageInfo> img_infos;
+        std::vector<CachedImage*> bound, targets;
+        std::vector<VkVertexInputBindingDescription2EXT> vbind;
+        std::vector<VkVertexInputAttributeDescription2EXT> vattr;
+        std::vector<VkBuffer> vbufs;
+        std::vector<VkDeviceSize> voffs;
+    };
+    Scratch scratch_; ///< one command's lists (Draw/Dispatch do not nest)
 
     bool Begin();
     void Note(u32 queue, u64 seq);

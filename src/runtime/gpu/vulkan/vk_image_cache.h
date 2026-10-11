@@ -137,6 +137,7 @@ private:
     GuestBuffers& guest_;
     std::vector<std::unique_ptr<CachedImage>> images_;
     std::multimap<u64, CachedImage*> by_address_;
+    u64 max_image_size_ = 0; ///< the largest image's guest size: how far before a range an overlapping image may start
     u64 epoch_ = 0;
 
 public:

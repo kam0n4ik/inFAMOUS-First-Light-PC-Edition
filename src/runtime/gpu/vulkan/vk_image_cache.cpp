@@ -117,10 +117,15 @@ void ImageCache::ApplyInvalidations() {
         }
         ranges.swap(pending_inval_);
     }
+    // only the images that can overlap each range (by address; it walked every image for every range: 7.8% of the GPU
+    // thread's samples, f1)
     for (const auto& [addr, size] : ranges) {
-        for (auto& img : images_) {
+        const u64 end = addr + size;
+        auto it = by_address_.lower_bound(addr > max_image_size_ ? addr - max_image_size_ : 0);
+        for (; it != by_address_.end() && it->first < end; ++it) {
+            CachedImage* img = it->second;
             const u64 b = img->layout.guest_address, e = b + img->layout.guest_size;
-            if (b < addr + size && addr < e && img->uploaded && !img->gpu_written) {
+            if (b < end && addr < e && img->uploaded && !img->gpu_written) {
                 img->dirty = true;
                 ++stats_.invalidations;
             }
@@ -203,6 +208,7 @@ CachedImage* ImageCache::Create(const ImageLayout& layout, std::string& error) {
     stats_.bytes += req.size;
     CachedImage* raw = img.get();
     by_address_.emplace(layout.guest_address, raw);
+    max_image_size_ = std::max<u64>(max_image_size_, layout.guest_size);
     ++epoch_;
     images_.push_back(std::move(img));
     return raw;

@@ -1430,7 +1430,8 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     stage(stats_.t_pipe);
 
     // targets
-    std::vector<CachedImage*> targets;
+    std::vector<CachedImage*>& targets = scratch_.targets;
+    targets.clear();
     RenderKey key;
     std::array<CachedImage*, 8> color_img{};
     const u32 target_mask = regs.Get(kCbTargetMask);
@@ -1562,12 +1563,17 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     push.xoffset = (vte >> 1) & 1 ? F(regs, kViewport0 + 1) : 0.0f;
     push.yscale = (vte >> 2) & 1 ? F(regs, kViewport0 + 2) : 1.0f;
     push.yoffset = (vte >> 3) & 1 ? F(regs, kViewport0 + 3) : 0.0f;
-    std::vector<VkWriteDescriptorSet> writes;
-    std::vector<VkDescriptorBufferInfo> buf_infos;
-    std::vector<VkDescriptorImageInfo> img_infos;
-    std::vector<CachedImage*> bound;
+    // the command's descriptor lists: reused (their capacity kept) - per-command vectors were 14% of the GPU thread's
+    // samples in the heap (f1)
+    std::vector<VkWriteDescriptorSet>& writes = scratch_.writes;
+    std::vector<VkDescriptorBufferInfo>& buf_infos = scratch_.buf_infos;
+    std::vector<VkDescriptorImageInfo>& img_infos = scratch_.img_infos;
+    std::vector<CachedImage*>& bound = scratch_.bound;
+    writes.clear();
+    buf_infos.clear();
+    img_infos.clear();
+    bound.clear();
     bool writes_memory = false;
-    buf_infos.reserve(64);
     info_images_.clear();
     const u64 tb0 = GS::Ticks();
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets)) {
@@ -1579,10 +1585,14 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     stats_.t_bind += GS::Ticks() - tb0;
     ts = GS::Ticks();
     // vertex inputs
-    std::vector<VkVertexInputBindingDescription2EXT> vbind;
-    std::vector<VkVertexInputAttributeDescription2EXT> vattr;
-    std::vector<VkBuffer> vbufs;
-    std::vector<VkDeviceSize> voffs;
+    std::vector<VkVertexInputBindingDescription2EXT>& vbind = scratch_.vbind;
+    std::vector<VkVertexInputAttributeDescription2EXT>& vattr = scratch_.vattr;
+    std::vector<VkBuffer>& vbufs = scratch_.vbufs;
+    std::vector<VkDeviceSize>& voffs = scratch_.voffs;
+    vbind.clear();
+    vattr.clear();
+    vbufs.clear();
+    voffs.clear();
     for (const auto& v : vs.plan.vertices) {
         const u32 slot = static_cast<u32>(vattr.size());
         // the format the fetch shader loads with: a typed load's (MTBUF) own format overrides the V#'s, as the
@@ -1977,12 +1987,17 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         return;
     }
     PushData push{};
-    std::vector<VkWriteDescriptorSet> writes;
-    std::vector<VkDescriptorBufferInfo> buf_infos;
-    std::vector<VkDescriptorImageInfo> img_infos;
-    std::vector<CachedImage*> bound;
+    // the command's descriptor lists: reused (their capacity kept) - per-command vectors were 14% of the GPU thread's
+    // samples in the heap (f1)
+    std::vector<VkWriteDescriptorSet>& writes = scratch_.writes;
+    std::vector<VkDescriptorBufferInfo>& buf_infos = scratch_.buf_infos;
+    std::vector<VkDescriptorImageInfo>& img_infos = scratch_.img_infos;
+    std::vector<CachedImage*>& bound = scratch_.bound;
+    writes.clear();
+    buf_infos.clear();
+    img_infos.clear();
+    bound.clear();
     bool writes_memory = false;
-    buf_infos.reserve(64);
     info_images_.clear();
     const std::vector<CachedImage*> none;
     const u64 tb0 = GS::Ticks();
