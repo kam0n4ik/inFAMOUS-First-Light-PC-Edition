@@ -76,6 +76,7 @@ struct ExecutorStats {
     u64 streamed = 0, streamed_bytes = 0; ///< small read-only ranges the CPU rewrote, copied into the stream ring
     u64 ring_mirror_copies = 0;           ///< hybrid ring: host -> video memory copies at the head of submissions
     u64 stream_promotions = 0;            ///< small read-only ranges cached instead of streamed (BufferCache::Promotable)
+    u64 binds_skipped = 0, push_constants_skipped = 0; ///< draws repeating the bound pipeline / pushed constants
     /// SSPC_DIAG_STREAM_STATS: streamed ranges first seen / again in the frame unchanged / changed / unchanged since an
     /// earlier frame / changed since (count, bytes)
     std::array<u64, 5> stream_kinds{}, stream_kind_bytes{};
@@ -283,6 +284,10 @@ private:
         u64 hash = 0, flip = 0;
     };
     std::unordered_map<u64, StreamSeen> stream_seen_; ///< SSPC_DIAG_STREAM_STATS
+    // what this command buffer has bound/pushed last (reset by Begin): repeats are not recorded again
+    VkPipeline gfx_pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout push_layout_ = VK_NULL_HANDLE; ///< the layout of the last push constants (either bind point)
+    PushData push_last_{};
     bool dyn_vertex_valid_ = false;
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
 

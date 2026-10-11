@@ -324,6 +324,8 @@ bool Executor::Begin() {
     dyn_.bias_set = false;
     dyn_.color_masks_count = ~0u;
     dyn_vertex_valid_ = false;
+    gfx_pipeline_ = VK_NULL_HANDLE; // a new command buffer: nothing bound or pushed yet
+    push_layout_ = VK_NULL_HANDLE;
     ++stats_.batches;
     return true;
 }
@@ -1447,6 +1449,8 @@ bool Executor::PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bin
         return true;
     }
     if (p.push_descriptors) {
+        // (not skipped when equal to the last push: measured 0.04% of the draws repeat their descriptors - the flattened
+        // user data and streamed ranges take a new ring slice each draw)
         f.vkCmdPushDescriptorSetKHR(cur_.cb, bind, p.layout, 0, static_cast<u32>(w.size()), w.data());
         return true;
     }
@@ -2500,12 +2504,25 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
             pending_meta_clear_[target_cache_.htile] = false;
         }
     }
-    f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipeline);
+    // the pipeline, descriptors and push constants recorded only when they differ from what this command buffer has
+    // bound/pushed last (P4.6 night: ~83% of the draws keep the pipeline)
+    if (pipe->pipeline != gfx_pipeline_) {
+        f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipeline);
+        gfx_pipeline_ = pipe->pipeline;
+    } else {
+        ++stats_.binds_skipped;
+    }
     if (!PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_GRAPHICS, writes)) {
         Skipped(Skip::Pipeline, "descriptor set allocation");
         return;
     }
-    f.vkCmdPushConstants(cur_.cb, pipe->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
+    if (pipe->layout != push_layout_ || std::memcmp(&push, &push_last_, sizeof(PushData)) != 0) {
+        f.vkCmdPushConstants(cur_.cb, pipe->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
+        push_layout_ = pipe->layout;
+        push_last_ = push;
+    } else {
+        ++stats_.push_constants_skipped;
+    }
     SetDynamicState(regs, *st, d.indexed);
     // the hardware's depth/stencil clear (DB_RENDER_CONTROL clear bits): the pixels the draw covers take the clear
     // value - the draw is the game's clear rectangle, so its viewport within its scissor. Not the whole target: a
@@ -2909,6 +2926,8 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         return;
     }
     f.vkCmdPushConstants(cur_.cb, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushData), &push);
+    push_layout_ = pipe->layout; // (the next draw's layout differs: it pushes its own again)
+    push_last_ = push;
     u64 cid = 0;
     if (diag_ != nullptr && diag_->Enabled()) {
         std::string text = fmt::format("dispatch q{} seq {} packet {:#x} cs {:#x} groups {}x{}x{}{}", d.queue, d.seq,

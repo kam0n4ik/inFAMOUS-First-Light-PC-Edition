@@ -941,6 +941,8 @@ std::string Backend::Report() {
                            "write-after-read {}; stream ring mirrored {} MiB in {} copies\n",
                            s.barriers_elided, s.barriers_war, ring_->MirroredBytes() >> 20, s.ring_mirror_copies);
         out += fmt::format("small read-only ranges cached instead of streamed: {}\n", s.stream_promotions);
+        out += fmt::format("draws repeating the bound state (not recorded again): pipeline {}, push constants {}\n",
+                           s.binds_skipped, s.push_constants_skipped);
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",
                            s.wb_bytes_by[0] >> 20, s.wb_bytes_by[1] >> 20, s.wb_bytes_by[2] >> 20, s.flushes_full);
