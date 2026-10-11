@@ -69,6 +69,9 @@ public:
         return unordered_labels && VideoOut::IsLabel(addr, bytes);
     }
     bool Write(u64 addr, const void* src, u64 bytes) override {
+        if (executor != nullptr) {
+            executor->GuestMemoryChanged(); // (P4.7: no memoized stage preparation past the processor's write)
+        }
         if (VideoOut::LabelWrite(addr, src, bytes)) {
             return true;
         }
@@ -397,6 +400,15 @@ bool Backend::Start(const Options& o, std::string& error) {
     GS::FrontendOptions fo;
     fo.async = false; // modules ready before the draw that needs them (no draw waits for a worker)
     fo.translate = true;
+    // P4.7: a stage with its last ready preparation's inputs takes it again (the executor and the processor report
+    // every guest memory change); SSPC_DIAG_STAGE_MEMO=off - every stage prepared in full
+    {
+        char v[8] = {};
+        fo.stage_memo = !(GetEnvironmentVariableA("SSPC_DIAG_STAGE_MEMO", v, sizeof(v)) == 3 && std::string_view(v) == "off");
+        if (!fo.stage_memo) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_STAGE_MEMO=off - no memoized stage preparations");
+        }
+    }
     fo.profile = &profile_;
     frontend_ = std::make_unique<GS::ShaderFrontend>(fo);
     Vk::ExecutorOptions eo;
@@ -492,6 +504,7 @@ bool Backend::Start(const Options& o, std::string& error) {
     memory_.tracker = &tracker_;
     memory_.buffers = buffers_.get();
     memory_.executor = executor_.get();
+    executor_->SetMapGeneration(&memory_.map_gen); // P4.7: the frontend's reads keep backing runs between maps
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
     FrameLog::Start();
@@ -521,6 +534,7 @@ bool Backend::Start(const Options& o, std::string& error) {
 }
 
 void Backend::Apply(const Submission& s) {
+    executor_->GuestMemoryChanged(); // (P4.7: the guest's CPU may have written anything before it submitted)
     switch (s.kind) {
     case Submission::Kind::Graphics:
         ++submissions_;
@@ -939,6 +953,24 @@ std::string Backend::Report() {
                            "{}\n",
                            vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
         out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
+        out += fmt::format("frontend reads (P4.7): from a kept backing run {}, a run found {}, through the memory "
+                           "manager {}\n",
+                           s.read_run_hits, s.read_run_misses, s.read_run_none);
+        if (s.read_run_verified != 0) {
+            out += fmt::format("backing run read verification (SSPC_DIAG_READ_RUNS=verify): reads compared {}, "
+                               "different {}\n",
+                               s.read_run_verified, s.read_run_mismatches);
+        }
+        out += fmt::format("graphics bindings (P4.7 shadow): descriptors wanted {}, pushed {}, pushes left out {}; "
+                           "vertex buffer bindings left out {}, index buffer {}\n",
+                           s.desc_wanted, s.desc_pushed, s.desc_push_skipped, s.vb_binds_skipped, s.ib_binds_skipped);
+        out += fmt::format("streamed copies reused in their batch (P4.7): ranges {} ({} MiB)\n", s.stream_reused,
+                           s.stream_reused_bytes >> 20);
+        if (s.stream_verified != 0) {
+            out += fmt::format("streamed copy reuse verification (SSPC_DIAG_STREAM_REUSE=verify): reuses copied again "
+                               "{}, different bytes {}\n",
+                               s.stream_verified, s.stream_mismatches);
+        }
         out += fmt::format("memory waits met: {} (had blocked {}), CPU writes applied at them {}; met in the GPU's "
                            "order by a held fence {}\n",
                            s.acquires, s.acquires_blocked, s.acquires_applied, c.waits_met_held);
@@ -1038,6 +1070,19 @@ std::string Backend::Report() {
         const auto& p = pipelines_->Stats();
         out += fmt::format("pipelines: graphics {}, compute {}, modules {}, failures {} {}\n", p.graphics, p.compute,
                            p.modules, p.failures, p.first_failure);
+    }
+    if (frontend_) {
+        const auto& fs = frontend_->Stats();
+        out += fmt::format("stage preparations (P4.7 memo): taken again {}, prepared: memory changed since {}, other user "
+                           "data {}, other inputs {}; draws {}, dispatches {}, SRT reads {}\n",
+                           fs.memo_hits, fs.memo_miss_memory, fs.memo_miss_user_data, fs.memo_miss_other, fs.draws,
+                           fs.dispatches, fs.srt_reads);
+        if (fs.memo_verified != 0) {
+            out += fmt::format("stage memo verification (SSPC_DIAG_STAGE_MEMO=verify): hits prepared in full {}, "
+                               "different {}\n",
+                               fs.memo_verified, fs.memo_mismatches);
+        }
+        out += frontend_->MemoReport();
     }
     {
         const auto t = tracker_.GetStats();

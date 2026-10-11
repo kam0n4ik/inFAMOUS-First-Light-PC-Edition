@@ -37,6 +37,7 @@ struct PipelineObjects {
     bool push_descriptors = true;
     u32 bindings = 0;
     bool compute = false;
+    bool shared_layout = false; ///< the layouts belong to the factory's table (P4.7), not to this pipeline
 };
 
 struct PipelineStats {
@@ -67,6 +68,19 @@ private:
 
     DeviceContext& ctx_;
     const GS::DeviceProfile& profile_;
+    // P4.7: one descriptor set layout and pipeline layout per layout signature (graphics/compute), shared by every
+    // pipeline with it - push descriptors and push constants stay valid across their pipelines (the executor records
+    // only what changed); each pipeline has its own otherwise. Off unless SSPC_DIAG_SHARED_LAYOUTS=on: the A/B (3 pairs)
+    // found no time saved (docs\PHASE4_FOLIAGE_OPTIMIZATION.md).
+    struct SharedLayout {
+        VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        bool push_descriptors = true;
+        u32 bindings = 0;
+        std::vector<u64> desc; ///< (binding, type, count) of each binding: compared, the hash only finds it
+    };
+    std::unordered_map<u64, SharedLayout> layouts_;
+    bool share_layouts_ = false;
     std::unordered_map<u32, VkShaderModule> modules_;
     std::unordered_map<u64, VkShaderModule> aux_;
     std::unordered_map<u64, std::unique_ptr<PipelineObjects>> pipelines_;

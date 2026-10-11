@@ -22,12 +22,14 @@
 #include <intrin.h>
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "base/abi.h"
@@ -111,6 +113,9 @@ struct FrontendOptions {
     bool (*may_translate)(void* ctx, u64 footer_hash) = nullptr;
     void* may_translate_ctx = nullptr;
     u32 layout_retries = 2; ///< a first translation that failed reading guest memory (SRT, fetch shader) is retried
+    /// P4.7: a stage with the inputs of its last ready preparation takes it again. Only for an owner that reports every
+    /// guest memory change through GuestMemoryChanged() (the native backend's executor).
+    bool stage_memo = false;
 };
 
 struct FrontendStats {
@@ -125,6 +130,11 @@ struct FrontendStats {
     u64 translate_us = 0, emit_us = 0, spirv_bytes = 0;
     u64 srt_compile_failures = 0, srt_walk_failures = 0, srt_faults = 0, srt_reads = 0;
     u64 pipeline_reuse = 0;     ///< the draw kept the previous pipeline (modules and its register groups unchanged)
+    /// P4.7 stage memo: the stage's last preparation taken again (same program address, runtime, binding start, user
+    /// data; no guest memory change since); misses: guest memory changed since / user data differ / anything else
+    u64 memo_hits = 0, memo_miss_memory = 0, memo_miss_user_data = 0, memo_miss_other = 0;
+    /// SSPC_DIAG_STAGE_MEMO=verify: hits prepared in full anyway / those whose full preparation differed
+    u64 memo_verified = 0, memo_mismatches = 0;
     std::array<u64, static_cast<size_t>(ResourceStatus::Count)> resources{};
     u64 epochs = 0;
 };
@@ -146,6 +156,14 @@ public:
     void NewFrame();
     /// Guest memory written (P4.4's listener): programs there are read again at their next use.
     void Invalidate(u64 addr, u64 size);
+    /// Guest memory may have changed (a GPU command's write, the command processor's, a met wait, a new submission):
+    /// no stage takes its memoized preparation again - its resources are read anew (P4.7).
+    void GuestMemoryChanged() { memory_gen_.fetch_add(1, std::memory_order_relaxed); }
+    /// The generation of those changes (P4.7: the executor's streamed copies are reused while it stays).
+    u64 MemoryGeneration() const { return memory_gen_.load(std::memory_order_relaxed); }
+    /// SSPC_DIAG_MEMO_STATS=1: the stage memo's misses by cause (the user data dwords that differ, the input that
+    /// changed); empty without it.
+    std::string MemoReport() const;
     /// Waits until no translation is queued or running.
     void Drain();
     /// Stops the worker (the running translation finishes, queued ones are dropped); nothing is queued afterwards.
@@ -195,6 +213,27 @@ private:
     std::array<StageView, static_cast<size_t>(HwStage::Count)> stages_{};
     std::array<bool, static_cast<size_t>(HwStage::Count)> runtime_valid_{};
     std::array<u64, static_cast<size_t>(HwStage::Count)> stage_epoch_{};
+    // P4.7 stage memo: the inputs of each stage's last ready preparation (its StageView still holds the result). A
+    // stage with the same inputs and no guest memory change since is ready as it was - no program lookup, SRT walk,
+    // descriptor decode, key or module search (the foliage's thousands of draws repeat them). SSPC_DIAG_STAGE_MEMO=off:
+    // every stage prepared in full.
+    struct StageMemo {
+        bool valid = false;
+        u64 memory_gen = 0, program_epoch = 0, runtime_ver = 0, addr = 0;
+        BindingStart start;
+        std::array<u32, 16> user_data{};
+    };
+    std::array<StageMemo, static_cast<size_t>(HwStage::Count)> memo_{};
+    std::array<u64, static_cast<size_t>(HwStage::Count)> runtime_ver_{}; ///< bumped at every runtime rebuild
+    std::atomic<u64> memory_gen_{1}; ///< (atomic: a change may be reported from another thread)
+    bool memo_on_ = false;
+    bool memo_diag_ = false;                       ///< SSPC_DIAG_MEMO_STATS=1
+    bool memo_verify_ = false;                     ///< SSPC_DIAG_STAGE_MEMO=verify
+    std::unordered_map<u64, u64> memo_ud_masks_;   ///< (stage << 16 | the user data dwords that differ) -> misses
+    std::array<u64, 5> memo_other_by_{};           ///< misses by input: address, binding start, runtime, epoch, status
+    std::array<std::array<std::pair<u64, u64>, 8>, static_cast<size_t>(HwStage::Count)> memo_hist_{}; ///< (inputs, gen)
+    std::array<u32, static_cast<size_t>(HwStage::Count)> memo_hist_next_{};
+    std::array<u64, static_cast<size_t>(HwStage::Count)> memo_would_hit_{}; ///< misses an 8-entry memo would have had
     DrawPreparation prep_;
     u32 last_vs_ = 0, last_ps_ = 0, last_pipeline_ = 0;
     u32 next_module_ = 1;

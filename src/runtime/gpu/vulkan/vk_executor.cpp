@@ -20,6 +20,7 @@
 #include "base/log.h"
 #include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/gnm/gnm_host.h"
+#include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/shader/shader_frontend.h"
@@ -169,6 +170,21 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
       frontend_(frontend), presenter_(presenter), gds_(gds), options_(options) {
     images_.SetBeforeUpload([](void* self) { static_cast<Executor*>(self)->BeforeUpload(); }, this);
     buffers_.SetBeforeUpload([](void* self) { static_cast<Executor*>(self)->BeforeUpload(); }, this);
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_BIND_SHADOW", v, sizeof(v)) == 2 && std::string_view(v) == "on") {
+        bind_shadow_ = true;
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_DIAG_BIND_SHADOW=on - descriptor pushes and buffer bindings a draw "
+                               "repeats are left out");
+    }
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_STREAM_REUSE", v, sizeof(v)) > 0) {
+        if (std::string_view(v) == "off") {
+            stream_reuse_ = false;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_STREAM_REUSE=off - every small range streamed again");
+        } else if (std::string_view(v) == "verify") {
+            stream_verify_ = true;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_STREAM_REUSE=verify - every reuse copied again and "
+                                   "compared");
+        }
+    }
     char prof[4] = {};
     prof_ = GetEnvironmentVariableA("SSPC_GPU_PROFILE", prof, sizeof(prof)) == 1 && prof[0] == '1' &&
             ctx_.Caps().timestamp_period > 0.0f;
@@ -360,6 +376,10 @@ bool Executor::Begin() {
     dyn_vertex_valid_ = false;
     gfx_pipeline_ = VK_NULL_HANDLE; // a new command buffer: nothing bound or pushed yet
     push_layout_ = VK_NULL_HANDLE;
+    desc_layout_ = VK_NULL_HANDLE;
+    vb_valid_ = false;
+    ib_last_ = VK_NULL_HANDLE;
+    ib_type_last_ = VK_INDEX_TYPE_MAX_ENUM;
     ++stats_.batches;
     return true;
 }
@@ -553,6 +573,7 @@ void Executor::NoteAccesses(const std::vector<std::pair<u64, u64>>& reads,
     }
     if (unknown || !writes.empty()) {
         pending_writes_ = true;
+        frontend_.GuestMemoryChanged(); // (P4.7: no memoized stage preparation past a write)
     }
 }
 
@@ -1199,6 +1220,28 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
         }
         if (res == BufferCache::Residency::None && !promoted && !buffers_.HostWritePending(addr, size) &&
             !TimelineWritePending(addr, size)) {
+            // P4.7: these bytes streamed earlier in this batch and nothing written since - that slice again
+            StreamMemo* memo = nullptr;
+            const u64 gen = frontend_.MemoryGeneration();
+            u64 verify = 0; // SSPC_DIAG_STREAM_REUSE=verify: the hash of the slice a reuse would have taken
+            if (stream_reuse_) {
+                if (stream_memo_.empty()) {
+                    stream_memo_.resize(kStreamMemo);
+                }
+                memo = &stream_memo_[((addr >> 2) * 0x9E3779B97F4A7C15ull ^ size) >> (64 - 12)];
+                if (memo->addr == addr && memo->size == size && memo->batch == cur_.value && memo->gen == gen &&
+                    (memo->offset & (std::max<u64>(align, 4) - 1)) == 0) {
+                    if (!stream_verify_) {
+                        buffer = memo->buffer;
+                        offset = memo->offset;
+                        avail = size;
+                        ++stats_.stream_reused;
+                        stats_.stream_reused_bytes += size;
+                        return true;
+                    }
+                    verify = memo->hash | 1;
+                }
+            }
             StreamRing::Slice sl{};
             tt = GS::FineTicks();
             const u8* host = guest_.BackingPointer(addr, size);
@@ -1224,6 +1267,14 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                 avail = size;
                 ++stats_.streamed;
                 stats_.streamed_bytes += size;
+                if (memo != nullptr) {
+                    const u64 h = stream_verify_ ? RaceHash(sl.data, size) : 0;
+                    if (verify != 0) {
+                        ++stats_.stream_verified;
+                        stats_.stream_mismatches += (h | 1) != verify ? 1 : 0;
+                    }
+                    *memo = {addr, size, cur_.value, gen, sl.buffer, sl.offset, h};
+                }
                 // SSPC_DIAG_WATCH_DUMP=<hex address>: the bytes copied for a range starting there, per copy ->
                 // logs\p45\watch_dump.bin (flip id, size, bytes)
                 static const u64 dump_addr = [] {
@@ -1306,7 +1357,45 @@ bool Executor::TimelineReader::Read(u64 addr, void* dst, u64 bytes) {
         ++e_.stats_.gpu_write_read_syncs;
         e_.SyncFrom(1);
     }
+    // P4.7: a run of the physical backing read before (its host view: the same bytes CopySparse copies)
+    if (e_.map_gen_ != nullptr && GuestMemory::IsValidGpuMapping(addr, bytes)) {
+        const u64 gen = e_.map_gen_->load(std::memory_order_acquire);
+        for (const Run& r : runs_) {
+            if (r.gen == gen && r.host != nullptr && addr >= r.begin && addr + bytes <= r.end) {
+                std::memcpy(dst, r.host + (addr - r.begin), bytes);
+                ++e_.stats_.read_run_hits;
+                if (e_.read_verify_) {
+                    Verify(addr, dst, bytes);
+                }
+                return true;
+            }
+        }
+        const u64 block = (addr >> 20) + 1;
+        const bool known_none = std::ranges::any_of(no_run_, [&](const auto& n) { return n.first == block && n.second == gen; });
+        if (GuestMemory* gm = GetGuestMemory(); gm != nullptr && !known_none) {
+            u8* host = nullptr;
+            u64 rb = 0, rs = 0;
+            if (gm->BackingRun(addr, &host, &rb, &rs) && host != nullptr && addr >= rb && addr + bytes <= rb + rs) {
+                runs_[next_run_++ % runs_.size()] = {rb, rb + rs, host, gen};
+                std::memcpy(dst, host + (addr - rb), bytes);
+                ++e_.stats_.read_run_misses;
+                if (e_.read_verify_) {
+                    Verify(addr, dst, bytes);
+                }
+                return true;
+            }
+            no_run_[next_no_run_++ % no_run_.size()] = {block, gen};
+        }
+        ++e_.stats_.read_run_none;
+    }
     return GS::GameMemory().Read(addr, dst, bytes);
+}
+
+void Executor::TimelineReader::Verify(u64 addr, const void* dst, u64 bytes) {
+    verify_.resize(bytes);
+    const bool read = GS::GameMemory().Read(addr, verify_.data(), bytes);
+    ++e_.stats_.read_run_verified;
+    e_.stats_.read_run_mismatches += !read || std::memcmp(verify_.data(), dst, bytes) != 0 ? 1 : 0;
 }
 
 bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) {
@@ -1541,6 +1630,7 @@ void Executor::Synchronize(u32) {
 void Executor::SyncFrom(u32 source) {
     // the CPU side of a packet must land after the GPU work before it: complete everything handed on so far
     ++stats_.syncs;
+    frontend_.GuestMemoryChanged(); // (P4.7: write-backs land in the host's memory)
     if (device_lost_) {
         return;
     }
@@ -1601,8 +1691,27 @@ void Executor::Interrupt(u32 queue, Cp::FenceKind) {
     }
 }
 
+void Executor::GuestMemoryChanged() {
+    frontend_.GuestMemoryChanged();
+}
+
+void Executor::SetMapGeneration(const std::atomic<u64>* gen) {
+    char v[8] = {};
+    if (GetEnvironmentVariableA("SSPC_DIAG_READ_RUNS", v, sizeof(v)) == 3 && std::string_view(v) == "off") {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_READ_RUNS=off - every frontend read through the guest "
+                               "memory manager");
+        gen = nullptr;
+    } else if (std::string_view(v) == "verify") {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_READ_RUNS=verify - every read from a backing run is "
+                               "read through the memory manager too and compared");
+        read_verify_ = true;
+    }
+    map_gen_ = gen;
+}
+
 void Executor::Dma(const Cp::DmaOp& op) {
     ++stats_.dma;
+    frontend_.GuestMemoryChanged(); // (P4.7)
     if (op.timeline) {
         return; // recorded by CopyOnTimeline: the copy keeps the caches coherent itself
     }
@@ -1635,9 +1744,54 @@ bool Executor::PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bin
         return true;
     }
     if (p.push_descriptors) {
-        // (not skipped when equal to the last push: measured 0.04% of the draws repeat their descriptors - the flattened
-        // user data and streamed ranges take a new ring slice each draw)
-        f.vkCmdPushDescriptorSetKHR(cur_.cb, bind, p.layout, 0, static_cast<u32>(w.size()), w.data());
+        // (a whole push repeats in 0.04% of the draws - the flattened user data and streamed ranges take a new ring slice
+        // each draw - but most of its descriptors do: P4.7 pushes only those that differ from what this command buffer
+        // pushed with this layout; push descriptors are updated incrementally, a push with another layout makes them all
+        // undefined - then the whole set again)
+        if (bind != VK_PIPELINE_BIND_POINT_GRAPHICS || !bind_shadow_) {
+            f.vkCmdPushDescriptorSetKHR(cur_.cb, bind, p.layout, 0, static_cast<u32>(w.size()), w.data());
+            return true;
+        }
+        stats_.desc_wanted += w.size();
+        const bool same_layout = p.layout == desc_layout_;
+        if (!same_layout) {
+            for (DescShadow& d : desc_shadow_) {
+                d.valid = false;
+            }
+            desc_layout_ = p.layout;
+        }
+        desc_changed_.clear();
+        for (const VkWriteDescriptorSet& x : w) {
+            if (x.dstBinding >= desc_shadow_.size()) {
+                desc_shadow_.resize(x.dstBinding + 1);
+            }
+            DescShadow& d = desc_shadow_[x.dstBinding];
+            const bool buffer = x.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            const bool same = x.descriptorCount == 1 && d.valid && d.type == x.descriptorType &&
+                              (buffer ? (d.buffer.buffer == x.pBufferInfo->buffer &&
+                                         d.buffer.offset == x.pBufferInfo->offset && d.buffer.range == x.pBufferInfo->range)
+                                      : (d.image.sampler == x.pImageInfo->sampler &&
+                                         d.image.imageView == x.pImageInfo->imageView &&
+                                         d.image.imageLayout == x.pImageInfo->imageLayout));
+            if (same) {
+                continue;
+            }
+            desc_changed_.push_back(x);
+            d.valid = x.descriptorCount == 1; // (an array of views: pushed whole each time)
+            d.type = x.descriptorType;
+            if (buffer) {
+                d.buffer = *x.pBufferInfo;
+            } else {
+                d.image = *x.pImageInfo;
+            }
+        }
+        if (desc_changed_.empty()) {
+            ++stats_.desc_push_skipped;
+            return true;
+        }
+        stats_.desc_pushed += desc_changed_.size();
+        f.vkCmdPushDescriptorSetKHR(cur_.cb, bind, p.layout, 0, static_cast<u32>(desc_changed_.size()),
+                                    desc_changed_.data());
         return true;
     }
     const VkDescriptorSetAllocateInfo ai{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1653,6 +1807,9 @@ bool Executor::PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bin
     }
     f.vkUpdateDescriptorSets(ctx_.Device(), static_cast<u32>(w.size()), w.data(), 0, nullptr);
     f.vkCmdBindDescriptorSets(cur_.cb, bind, p.layout, 0, 1, &set, 0, nullptr);
+    if (bind == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        desc_layout_ = VK_NULL_HANDLE; // (P4.7: set 0 bound - the descriptors pushed before are no longer there)
+    }
     ++stats_.descriptor_sets;
     return true;
 }
@@ -2776,8 +2933,16 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         ++dyn_skipped_;
     }
     if (!vbufs.empty()) {
-        f.vkCmdBindVertexBuffers(cur_.cb, 0, static_cast<u32>(vbufs.size()), vbufs.data(), voffs.data());
-        stats_.vertex_bindings += vbufs.size();
+        // (P4.7: not again when this command buffer has these bound - the foliage's instanced draws repeat their mesh)
+        if (bind_shadow_ && vb_valid_ && same_input(vbufs, vb_last_) && same_input(voffs, vb_off_last_)) {
+            ++stats_.vb_binds_skipped;
+        } else {
+            f.vkCmdBindVertexBuffers(cur_.cb, 0, static_cast<u32>(vbufs.size()), vbufs.data(), voffs.data());
+            stats_.vertex_bindings += vbufs.size();
+            vb_last_ = vbufs;
+            vb_off_last_ = voffs;
+            vb_valid_ = true;
+        }
     }
     // the fetch shader's vertex/instance offsets (the bridge's GetDrawOffsets)
     const GS::FetchShader& fetch = vs.module->result.reflection.fetch;
@@ -2885,7 +3050,15 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     } else {
     if (d.indexed) {
         if (ibuf != VK_NULL_HANDLE) {
-            f.vkCmdBindIndexBuffer(cur_.cb, ibuf, ioff, idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+            const VkIndexType it = idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            if (bind_shadow_ && ibuf == ib_last_ && ioff == ib_off_last_ && it == ib_type_last_) {
+                ++stats_.ib_binds_skipped; // (P4.7: the bound one)
+            } else {
+                f.vkCmdBindIndexBuffer(cur_.cb, ibuf, ioff, it);
+                ib_last_ = ibuf;
+                ib_off_last_ = ioff;
+                ib_type_last_ = it;
+            }
         }
         ++stats_.indexed;
     }

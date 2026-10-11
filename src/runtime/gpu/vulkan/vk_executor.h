@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -96,6 +97,16 @@ struct ExecutorStats {
     u64 target_cache_hits = 0, target_cache_misses = 0;
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
+    /// P4.7 frontend reads: from a backing run kept / a run found for it / through the guest memory manager
+    u64 read_run_hits = 0, read_run_misses = 0, read_run_none = 0;
+    u64 read_run_verified = 0, read_run_mismatches = 0; ///< SSPC_DIAG_READ_RUNS=verify
+    /// P4.7 binding shadow: graphics descriptors wanted / pushed, pushes left out (nothing differed), vertex and index
+    /// buffer bindings left out (the bound ones)
+    u64 desc_wanted = 0, desc_pushed = 0, desc_push_skipped = 0, vb_binds_skipped = 0, ib_binds_skipped = 0;
+    /// P4.7: streamed ranges / flattened user data that took the batch's earlier slice of the same bytes
+    u64 stream_reused = 0, stream_reused_bytes = 0;
+    /// SSPC_DIAG_STREAM_REUSE=verify: reuses copied again anyway / those whose bytes differed from the earlier slice
+    u64 stream_verified = 0, stream_mismatches = 0;
     /// met WAIT_REG_MEM on memory (of them: had blocked; the CPU had written tracked memory since the last drain - before
     /// P4.5 the work after the wait read the older copies)
     u64 acquires = 0, acquires_blocked = 0, acquires_applied = 0;
@@ -177,6 +188,12 @@ public:
     void SetWriteShadowRing(StreamRing* ring) { shadow_ring_ = ring; }
     /// Synchronize for a CPU read of guest memory by the command processor (its own memory reads).
     void SyncFromMemoryRead() { SyncFrom(2); }
+    /// The command processor wrote guest memory, or the guest submitted (its CPU may have written anything before):
+    /// the frontend's memoized stage preparations are not taken again (P4.7).
+    void GuestMemoryChanged();
+    /// P4.7: the backend's generation of guest maps (bumped by every map/unmap, any thread): the frontend's reads keep
+    /// backing runs while it is unchanged. nullptr: every read through the guest memory manager.
+    void SetMapGeneration(const std::atomic<u64>* gen);
 
     /// A write recorded on the GPU's timeline that has not completed overlaps [addr, addr + bytes): a CPU read of that
     /// memory has to Synchronize first (the command processor's reads, the frontend's descriptor reads).
@@ -306,6 +323,41 @@ private:
     VkPipeline gfx_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout push_layout_ = VK_NULL_HANDLE; ///< the layout of the last push constants (either bind point)
     PushData push_last_{};
+    // P4.7: what this command buffer has pushed for graphics descriptors and bound as vertex/index buffers - a draw
+    // records only the descriptors that differ (push descriptors are updated incrementally and stay valid until a push
+    // with another layout) and no buffer binding it repeats. Off unless SSPC_DIAG_BIND_SHADOW=on: it pushes ~64% fewer
+    // descriptors on the beach, but the A/B (3 pairs) found no time saved (docs\PHASE4_FOLIAGE_OPTIMIZATION.md).
+    struct DescShadow {
+        bool valid = false;
+        VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+        VkDescriptorBufferInfo buffer{};
+        VkDescriptorImageInfo image{};
+    };
+    bool bind_shadow_ = false;
+    // P4.7: small ranges streamed in this batch, by range: the same range again with no guest memory change since
+    // takes the slice it got (57% of the streamed copies on the beach were the same bytes again in the frame - one mesh
+    // drawn into each shadow cascade and the main pass). Same batch only: a slice lives until its batch completes.
+    // SSPC_DIAG_STREAM_REUSE=off: every range copied again.
+    struct StreamMemo {
+        u64 addr = 0, size = 0, batch = 0, gen = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        u64 offset = 0;
+        u64 hash = 0; ///< SSPC_DIAG_STREAM_REUSE=verify: of the bytes copied
+    };
+    static constexpr u32 kStreamMemo = 4096;
+    bool stream_reuse_ = true;
+    bool stream_verify_ = false; ///< SSPC_DIAG_STREAM_REUSE=verify: every reuse copied again, the bytes compared
+    bool read_verify_ = false;   ///< SSPC_DIAG_READ_RUNS=verify: every run read through the manager too, compared
+    std::vector<StreamMemo> stream_memo_;
+    VkPipelineLayout desc_layout_ = VK_NULL_HANDLE; ///< the layout of the graphics push descriptors in desc_shadow_
+    std::vector<DescShadow> desc_shadow_;            ///< by binding
+    std::vector<VkWriteDescriptorSet> desc_changed_; ///< (capacity reused)
+    std::vector<VkBuffer> vb_last_;
+    std::vector<VkDeviceSize> vb_off_last_;
+    bool vb_valid_ = false;
+    VkBuffer ib_last_ = VK_NULL_HANDLE;
+    u64 ib_off_last_ = 0;
+    VkIndexType ib_type_last_ = VK_INDEX_TYPE_MAX_ENUM;
     bool dyn_vertex_valid_ = false;
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
 
@@ -479,6 +531,22 @@ private:
 
     private:
         Executor& e_;
+        // P4.7: the physical backing's host view of the runs read last - the frontend's SRT walks read ~11 small
+        // pieces a stage, each through the guest memory manager (a virtual call and a page table walk). A guest map or
+        // unmap anywhere drops them (the backend's map generation); addresses without a backing run are remembered by
+        // their 1 MiB block so they do not ask again. SSPC_DIAG_READ_RUNS=off: every read through the manager.
+        struct Run {
+            u64 begin = 0, end = 0;
+            const u8* host = nullptr;
+            u64 gen = 0;
+        };
+        std::array<Run, 4> runs_{};
+        u32 next_run_ = 0;
+        std::array<std::pair<u64, u64>, 4> no_run_{}; ///< (1 MiB block + 1, generation) without a backing run
+        u32 next_no_run_ = 0;
+        std::vector<u8> verify_; ///< SSPC_DIAG_READ_RUNS=verify
+
+        void Verify(u64 addr, const void* dst, u64 bytes); ///< SSPC_DIAG_READ_RUNS=verify
     };
     struct TimelineWrite {
         u64 begin = 0, end = 0, value = 0;
@@ -534,6 +602,7 @@ private:
         if (queue < guest_epoch_.size()) {
             ++guest_epoch_[queue];
         }
+        GuestMemoryChanged(); // (P4.7: a guest ordering point - the CPU may write past it)
     }
     PendingRanges pend_;
     std::array<u64, Cp::kNumQueues> guest_flush_{}; ///< diagnostics: event types the guest wrote since the queue's last dispatch
@@ -548,6 +617,7 @@ private:
         ++stats_.unknown_by[site < stats_.unknown_by.size() ? site : 6];
         pending_writes_ = true;
         pend_.unknown = true;
+        GuestMemoryChanged(); // (P4.7: no memoized stage preparation past a write)
     }
     /// The barrier a dispatch or a timeline copy needs before it: false when its ranges touch nothing pending.
     bool NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads, const std::vector<std::pair<u64, u64>>& writes,
@@ -567,6 +637,7 @@ private:
     bool write_run_ = false;                     ///< the commands recorded last were timeline writes
     std::vector<std::pair<u64, u64>> run_ranges_; ///< the ranges that run wrote (a write over one needs a barrier)
     TimelineReader reader_{*this};
+    const std::atomic<u64>* map_gen_ = nullptr; ///< P4.7 (SetMapGeneration)
     Diagnostics* diag_ = nullptr;
     VkQueryPool queries_ = VK_NULL_HANDLE; ///< two timestamps per batch slot
     u32 next_query_slot_ = 0;

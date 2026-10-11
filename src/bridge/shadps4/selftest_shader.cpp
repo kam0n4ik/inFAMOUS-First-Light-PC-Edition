@@ -897,6 +897,49 @@ void TestCache(TestGroup& g) {
                 (groups & Cp::Bit(Cp::Group::DepthFormat)) &&
                 !(groups & (Cp::Bit(Cp::Group::Viewport) | Cp::Bit(Cp::Group::Scissor))),
             "");
+    // P4.7 stage memo: the same inputs take the last preparation again; any reported change prepares anew
+    {
+        DrawSetup sm;
+        GS::ShaderFrontend mfe({.async = false, .profile = &profile, .stage_memo = true});
+        mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        sm.d.changed = 0;
+        const u64 h0 = mfe.Stats().memo_hits;
+        const auto& m1 = mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        const u64 h1 = mfe.Stats().memo_hits;
+        g.Check("stage memo: the same draw again - both stages taken again, the same pipeline",
+                m1.ready && h1 == h0 + 2 && m1.pipeline_reused, fmt::format("hits {} -> {}", h0, h1));
+        sm.d.user_data[1][5] ^= 0x10; // a VS user data register
+        mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        g.Check("stage memo: other VS user data - the VS prepared anew, the PS taken again",
+                mfe.Stats().memo_hits == h1 + 1 && mfe.Stats().memo_miss_user_data == 1, "");
+        const u64 h2 = mfe.Stats().memo_hits;
+        mfe.GuestMemoryChanged();
+        const auto& m2 = mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        g.Check("stage memo: guest memory changed - both stages prepared anew (still ready)",
+                m2.ready && mfe.Stats().memo_hits == h2 && mfe.Stats().memo_miss_memory == 2, "");
+        mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        const u64 h3 = mfe.Stats().memo_hits;
+        mfe.NewFrame();
+        mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        const u64 h4 = mfe.Stats().memo_hits;
+        mfe.Invalidate(0x10001000, 4);
+        mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        g.Check("stage memo: a new frame and a written program - prepared anew each time",
+                h3 == h2 + 2 && h4 == h3 && mfe.Stats().memo_hits == h4, fmt::format("hits {} {} {}", h3, h4,
+                                                                                     mfe.Stats().memo_hits));
+        sm.regs.WriteReg(GS::Reg::CbColor0Base + GS::Reg::CbColorInfoOffset, (12u << 2) | (7u << 8));
+        sm.d.changed = Cp::Bit(Cp::Group::ColorFormat);
+        const u64 o0 = mfe.Stats().memo_miss_other;
+        mfe.PrepareDraw(sm.d, sm.regs, sm.mem);
+        g.Check("stage memo: runtime registers changed - prepared anew", mfe.Stats().memo_miss_other > o0, "");
+        GS::ShaderFrontend nfe({.async = false, .profile = &profile});
+        DrawSetup sn;
+        nfe.PrepareDraw(sn.d, sn.regs, sn.mem);
+        sn.d.changed = 0;
+        nfe.PrepareDraw(sn.d, sn.regs, sn.mem);
+        g.Check("stage memo: off unless the owner asks for it (it must report memory changes)",
+                nfe.Stats().memo_hits == 0, "");
+    }
     // the asynchronous worker: queued translations finish; the draw becomes ready
     DrawSetup s2;
     GS::ShaderFrontend async_fe({.async = true, .profile = &profile});

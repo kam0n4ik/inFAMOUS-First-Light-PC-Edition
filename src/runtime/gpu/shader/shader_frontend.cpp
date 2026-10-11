@@ -124,6 +124,30 @@ public:
     }
 };
 
+/// SSPC_DIAG_STAGE_MEMO=verify: what a stage's preparation produced - its module, key, flattened user data (every
+/// descriptor the SRT walk loaded), buffer and vertex bindings. Never 0.
+u64 StageFingerprint(const StageView& s) {
+    u64 h = 0xCBF29CE484222325ull;
+    const auto mix = [&h](u64 v) { h = (h ^ v) * 0x100000001B3ull; };
+    mix(reinterpret_cast<uintptr_t>(s.module));
+    mix(s.key.hash);
+    mix(s.end.unified | (u64{s.end.buffer} << 32));
+    for (const u32 w : s.plan.flat) {
+        mix(w);
+    }
+    for (const BufferBinding& b : s.plan.buffers) {
+        mix(b.address);
+        mix(b.size);
+    }
+    for (const VertexBinding& v : s.plan.vertices) {
+        mix(v.read[0] | (u64{v.read[1]} << 32));
+        mix(v.read[2] | (u64{v.read[3]} << 32));
+        mix(v.address);
+    }
+    mix(s.plan.images.size() | (s.plan.samplers.size() << 32));
+    return h | 1;
+}
+
 } // namespace
 
 GuestReader& GameMemory() {
@@ -136,6 +160,14 @@ GuestReader& GameMemory() {
 ShaderFrontend::ShaderFrontend(const FrontendOptions& options) : options_(options) {
     translator_ = options_.translator != nullptr ? options_.translator : GetShaderTranslator();
     programs_.SetValidation(options_.validation);
+    memo_on_ = options_.stage_memo;
+    if (char v[4] = {}; memo_on_ && GetEnvironmentVariableA("SSPC_DIAG_MEMO_STATS", v, sizeof(v)) == 1 && v[0] == '1') {
+        memo_diag_ = true;
+    }
+    if (char v[8] = {}; memo_on_ && GetEnvironmentVariableA("SSPC_DIAG_STAGE_MEMO", v, sizeof(v)) == 6 &&
+                        std::string_view(v) == "verify") {
+        memo_verify_ = true;
+    }
     (void)TicksToNs(0); // the TSC calibration (20 ms) now, not at the first draw
     if (options_.async && options_.translate) {
         worker_ = std::thread([this] { WorkerLoop(); });
@@ -154,6 +186,26 @@ ShaderFrontend::~ShaderFrontend() {
     }
 }
 
+std::string ShaderFrontend::MemoReport() const {
+    if (!memo_diag_) {
+        return {};
+    }
+    static constexpr const char* kStage[] = {"ps", "vs", "gs", "es", "hs", "ls", "cs"};
+    std::vector<std::pair<u64, u64>> v(memo_ud_masks_.begin(), memo_ud_masks_.end());
+    std::ranges::sort(v, [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string t = fmt::format("stage memo misses by input (SSPC_DIAG_MEMO_STATS): address {}, binding start {}, "
+                                "runtime {}, frame {}, not ready {}; user data dwords that differ (top):",
+                                memo_other_by_[0], memo_other_by_[1], memo_other_by_[2], memo_other_by_[3],
+                                memo_other_by_[4]);
+    t += fmt::format(" misses an 8-entry memo would have had: ps {}, vs {};", memo_would_hit_[0], memo_would_hit_[1]);
+    for (size_t i = 0; i < v.size() && i < 16; ++i) {
+        const u32 stage = static_cast<u32>(v[i].first >> 16);
+        t += fmt::format(" {} {:#06x}: {};", stage < std::size(kStage) ? kStage[stage] : "?", v[i].first & 0xFFFF,
+                         v[i].second);
+    }
+    return t + "\n";
+}
+
 const StageView& ShaderFrontend::Stage(HwStage stage) const {
     return stages_[static_cast<size_t>(stage)];
 }
@@ -161,6 +213,7 @@ const StageView& ShaderFrontend::Stage(HwStage stage) const {
 void ShaderFrontend::NewFrame() {
     programs_.NewEpoch();
     ++stats_.epochs;
+    ++memory_gen_;
     // fold what the worker counted
     std::scoped_lock lock{mutex_};
     stats_.translations += std::exchange(w_translations_, 0);
@@ -175,6 +228,7 @@ void ShaderFrontend::NewFrame() {
 void ShaderFrontend::Invalidate(u64 addr, u64 size) {
     programs_.Invalidate(addr, size);
     stage_epoch_.fill(0); // no stage keeps its program without asking the cache
+    ++memory_gen_;        // nor its memoized preparation (P4.7)
 }
 
 void ShaderFrontend::Stop() {
@@ -334,6 +388,56 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
                                          std::span<const u32, 16> user_data, const BindingStart& start,
                                          GuestReader& memory, bool may_queue) {
     const size_t si = static_cast<size_t>(hw);
+    // P4.7: the stage's last ready preparation again (its StageView holds it) when nothing it was built from changed
+    StageMemo& memo = memo_[si];
+    u64 verify = 0; // SSPC_DIAG_STAGE_MEMO=verify: a hit prepared in full anyway - the fingerprint of what it would give
+    if (memo_on_ && memo.valid) {
+        const bool same_inputs = memo.addr == addr && memo.start == start && memo.runtime_ver == runtime_ver_[si] &&
+                                 memo.program_epoch == programs_.Epoch() && s.status == StageStatus::Ready &&
+                                 s.module != nullptr;
+        const bool same_ud = std::memcmp(memo.user_data.data(), user_data.data(), sizeof(memo.user_data)) == 0;
+        if (same_inputs && same_ud && memo.memory_gen == memory_gen_ &&
+            s.module->state.load(std::memory_order_acquire) == ModuleState::Ready) {
+            if (!memo_verify_) {
+                ++stats_.memo_hits;
+                ++s.module->uses;
+                return StageStatus::Ready;
+            }
+            verify = StageFingerprint(s);
+            ++stats_.memo_verified;
+            ++stats_.memo_mismatches; // (taken back below when the full preparation is ready and the same)
+        } else {
+            ++(!same_inputs ? stats_.memo_miss_other
+                            : !same_ud ? stats_.memo_miss_user_data : stats_.memo_miss_memory);
+        }
+        if (verify == 0 && memo_diag_) { // SSPC_DIAG_MEMO_STATS=1: why the stages miss (gpu_native.txt)
+            if (same_inputs && !same_ud) {
+                u32 mask = 0;
+                for (u32 i = 0; i < 16; ++i) {
+                    mask |= memo.user_data[i] != user_data[i] ? 1u << i : 0u;
+                }
+                ++memo_ud_masks_[(u64{si} << 16) | mask];
+            } else if (!same_inputs) {
+                ++memo_other_by_[memo.addr != addr                          ? 0
+                                 : !(memo.start == start)                   ? 1
+                                 : memo.runtime_ver != runtime_ver_[si]     ? 2
+                                 : memo.program_epoch != programs_.Epoch() ? 3
+                                                                            : 4];
+            }
+            // would a memo of the stage's last 8 preparations have had it (a draw alternating between programs)?
+            u64 h = addr ^ (u64{start.unified} << 48) ^ (u64{start.buffer} << 40) ^ (runtime_ver_[si] << 20);
+            for (const u32 w : user_data) {
+                h = (h ^ w) * 0x100000001B3ull;
+            }
+            const u64 g = memory_gen_.load(std::memory_order_relaxed);
+            auto& hist = memo_hist_[si];
+            if (std::ranges::any_of(hist, [&](const auto& e) { return e.first == h && e.second == g; })) {
+                ++memo_would_hit_[si];
+            }
+            hist[memo_hist_next_[si]++ % hist.size()] = {h, g};
+        }
+    }
+    memo.valid = false;
     s.start = start;
     s.end = start;
     s.module = nullptr;
@@ -471,6 +575,17 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         s.end = EndOf(start, s.plan);
     }
     ++m->uses;
+    if (verify != 0 && StageFingerprint(s) == verify) {
+        --stats_.memo_mismatches;
+    }
+    // (the generation after the reads: a read that waited for a GPU write saw it)
+    memo.valid = true;
+    memo.memory_gen = memory_gen_;
+    memo.program_epoch = programs_.Epoch();
+    memo.runtime_ver = runtime_ver_[si];
+    memo.addr = addr;
+    memo.start = start;
+    std::memcpy(memo.user_data.data(), user_data.data(), sizeof(memo.user_data));
     return StageStatus::Ready;
 }
 
@@ -499,6 +614,7 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         if (!runtime_valid_[si] || (d.changed & kRuntimeGroups) != 0 || d.indirect) {
             const u32 vtx = d.indirect ? d.base_vtx_loc : 0, inst = d.indirect ? d.start_inst_loc : 0;
             runtime_valid_[si] = BuildGraphicsRuntime(regs, hw, sw, vtx, inst, s.runtime);
+            ++runtime_ver_[si];
             ++stats_.runtime_builds;
         } else {
             ++stats_.runtime_reuse;
@@ -553,6 +669,7 @@ const DrawPreparation& ShaderFrontend::PrepareDispatch(const Cp::DispatchDescrip
     prep_ = {};
     StageView& s = stages_[static_cast<size_t>(HwStage::Cs)];
     BuildComputeRuntime(cs, s.runtime);
+    ++runtime_ver_[static_cast<size_t>(HwStage::Cs)];
     ++stats_.runtime_builds;
     const std::span<const u32, 16> ud(d.user_data);
     s.status = PrepareStage(s, HwStage::Cs, SwStage::Compute, d.shader.address, ud, BindingStart{}, memory, true);

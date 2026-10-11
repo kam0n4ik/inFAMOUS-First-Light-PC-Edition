@@ -3,6 +3,8 @@
 // SecondSonPC — the backend's Vulkan pipelines (P4.4). See vk_pipelines.h. The graphics pipeline's fixed function is
 // ported from shadPS4's renderer_vulkan/vk_graphics_pipeline.cpp (GPL-2.0-or-later): the translated SPIR-V is the
 // bridge's, so the pipeline around it must be built the same way.
+#include <windows.h>
+
 #include "runtime/gpu/vulkan/vk_pipelines.h"
 
 #include <algorithm>
@@ -54,7 +56,12 @@ u64 LayoutSignature(std::span<const GS::ResourceBindingPlan* const> plans) {
 }
 
 PipelineFactory::PipelineFactory(DeviceContext& ctx, const GS::DeviceProfile& profile)
-    : ctx_(ctx), profile_(profile) {}
+    : ctx_(ctx), profile_(profile) {
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_SHARED_LAYOUTS", v, sizeof(v)) == 2 && std::string_view(v) == "on") {
+        share_layouts_ = true;
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_DIAG_SHARED_LAYOUTS=on - one pipeline layout per binding signature");
+    }
+}
 
 PipelineFactory::~PipelineFactory() {
     const auto& f = Fn();
@@ -63,12 +70,19 @@ PipelineFactory::~PipelineFactory() {
         if (p->pipeline != VK_NULL_HANDLE) {
             f.vkDestroyPipeline(dev, p->pipeline, nullptr);
         }
+        if (p->shared_layout) {
+            continue; // (the table's, below)
+        }
         if (p->layout != VK_NULL_HANDLE) {
             f.vkDestroyPipelineLayout(dev, p->layout, nullptr);
         }
         if (p->set_layout != VK_NULL_HANDLE) {
             f.vkDestroyDescriptorSetLayout(dev, p->set_layout, nullptr);
         }
+    }
+    for (auto& [k, l] : layouts_) {
+        f.vkDestroyPipelineLayout(dev, l.layout, nullptr);
+        f.vkDestroyDescriptorSetLayout(dev, l.set_layout, nullptr);
     }
     for (auto& [k, m] : modules_) {
         f.vkDestroyShaderModule(dev, m, nullptr);
@@ -161,6 +175,29 @@ bool PipelineFactory::MakeLayout(std::span<const GS::ResourceBindingPlan* const>
     }
     out.bindings = count;
     out.push_descriptors = count < ctx_.Caps().max_push_descriptors;
+    // P4.7: the layouts of this binding set, if made before (one per set of bindings, shared by its pipelines)
+    std::vector<u64> desc;
+    SharedLayout* shared = nullptr;
+    if (share_layouts_) {
+        desc.reserve(bindings.size() + 1);
+        u64 h = compute ? 0xC0 : 0x6F;
+        desc.push_back(compute ? 1 : 0);
+        for (const auto& b : bindings) {
+            desc.push_back((u64{b.binding} << 32) | (u64{static_cast<u32>(b.descriptorType)} << 16) | b.descriptorCount);
+            h = Mix(h, desc.back());
+        }
+        auto [it, inserted] = layouts_.try_emplace(h);
+        if (!inserted && it->second.desc == desc) {
+            out.set_layout = it->second.set_layout;
+            out.layout = it->second.layout;
+            out.push_descriptors = it->second.push_descriptors;
+            out.shared_layout = true;
+            return true;
+        }
+        if (inserted) {
+            shared = &it->second; // filled below once both layouts exist
+        } // (another set with this hash: this pipeline keeps layouts of its own)
+    }
     const VkDescriptorSetLayoutCreateInfo dci{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .flags = out.push_descriptors ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0u,
@@ -179,6 +216,10 @@ bool PipelineFactory::MakeLayout(std::span<const GS::ResourceBindingPlan* const>
     if (Fn().vkCreatePipelineLayout(ctx_.Device(), &pci, nullptr, &out.layout) != VK_SUCCESS) {
         error = "vkCreatePipelineLayout failed";
         return false;
+    }
+    if (shared != nullptr) {
+        *shared = {out.set_layout, out.layout, out.push_descriptors, out.bindings, std::move(desc)};
+        out.shared_layout = true;
     }
     return true;
 }
@@ -387,8 +428,10 @@ const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::Grap
                                           .layout = obj->layout};
     const VkResult r = f.vkCreateGraphicsPipelines(ctx_.Device(), VK_NULL_HANDLE, 1, &ci, nullptr, &obj->pipeline);
     if (r != VK_SUCCESS) {
-        f.vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
-        f.vkDestroyDescriptorSetLayout(ctx_.Device(), obj->set_layout, nullptr);
+        if (!obj->shared_layout) {
+            f.vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
+            f.vkDestroyDescriptorSetLayout(ctx_.Device(), obj->set_layout, nullptr);
+        }
         return fail(fmt::format("vkCreateGraphicsPipelines failed ({})", static_cast<int>(r)));
     }
     ++stats_.graphics;
@@ -430,8 +473,10 @@ const PipelineObjects* PipelineFactory::Compute(const GS::Module& cs, const GS::
     if (r != VK_SUCCESS) {
         error = fmt::format("vkCreateComputePipelines failed ({})", static_cast<int>(r));
         ++stats_.failures;
-        Fn().vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
-        Fn().vkDestroyDescriptorSetLayout(ctx_.Device(), obj->set_layout, nullptr);
+        if (!obj->shared_layout) {
+            Fn().vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
+            Fn().vkDestroyDescriptorSetLayout(ctx_.Device(), obj->set_layout, nullptr);
+        }
         return nullptr;
     }
     ++stats_.compute;
