@@ -93,6 +93,8 @@ struct ExecutorStats {
     u64 acquires = 0, acquires_blocked = 0, acquires_applied = 0;
     u64 waits_by_held = 0; ///< WAIT_REG_MEM met in the GPU's order by a held fence (a barrier before the next command)
     std::array<u64, 9> gb_sites{}; ///< global barriers by GlobalBarrier site
+    u64 barriers_elided = 0; ///< dispatches/timeline copies after writes that touched none of their ranges: no barrier
+    u64 barriers_war = 0;    ///< barriers for a write over a range read since the last one (no write pending)
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
     std::string first_skip[static_cast<size_t>(Skip::Count)];
@@ -395,6 +397,33 @@ private:
     bool rendering_ = false;
     RenderKey render_{};
     bool pending_writes_ = false; ///< storage writes since the last global barrier
+    /// What the commands since the last global barrier accessed, where known (P4.6 night sprint): the guest memory
+    /// ranges dispatches and timeline copies read and wrote. A dispatch or a copy that touches none of the ranges
+    /// written since (and writes none read since) needs no barrier of its own; anything else - a write of unknown
+    /// extent (draws, images, GDS, LDS, timeline writes, a met wait) - makes `unknown` true and the next command
+    /// barriers as before. SSPC_DIAG_BARRIER_RANGES=off: always a barrier (the P4.6 behaviour).
+    struct PendingRanges {
+        std::vector<std::pair<u64, u64>> writes, reads;
+        bool unknown = false;
+        void Clear() {
+            writes.clear();
+            reads.clear();
+            unknown = false;
+        }
+    };
+    PendingRanges pend_;
+    /// A write of unknown extent since the last barrier: the next command barriers.
+    void MarkWrites() {
+        pending_writes_ = true;
+        pend_.unknown = true;
+    }
+    /// The barrier a dispatch or a timeline copy needs before it: false when its ranges touch nothing pending.
+    bool NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads, const std::vector<std::pair<u64, u64>>& writes,
+                      bool unknown);
+    /// Its accesses noted for the next commands' decisions (after it was recorded).
+    void NoteAccesses(const std::vector<std::pair<u64, u64>>& reads, const std::vector<std::pair<u64, u64>>& writes,
+                      bool unknown);
+    std::vector<std::pair<u64, u64>> acc_reads_, acc_writes_; ///< the command's own ranges (capacity reused)
     bool want_flush_ = false;
     // CMASK/HTILE addresses a compute clear marked: the target clears at its next rendering
     std::unordered_map<u64, bool> pending_meta_clear_;

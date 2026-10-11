@@ -908,6 +908,9 @@ std::string Backend::Report() {
                            "copy {}, upload {}, before a draw {}, before a dispatch {}\n",
                            s.gb_sites[0], s.gb_sites[1], s.gb_sites[2], s.gb_sites[3], s.gb_sites[4], s.gb_sites[5],
                            s.gb_sites[6], s.gb_sites[7], s.gb_sites[8]);
+        out += fmt::format("barriers by ranges: elided {} (dispatches/timeline copies touching nothing written since), "
+                           "write-after-read {}; stream ring mirrored {} MiB in {} copies\n",
+                           s.barriers_elided, s.barriers_war, ring_->MirroredBytes() >> 20, s.ring_mirror_copies);
         out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
                            "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
                            s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,
