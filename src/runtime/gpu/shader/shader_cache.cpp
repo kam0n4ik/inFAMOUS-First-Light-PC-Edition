@@ -95,6 +95,8 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
     }
     ++program->addresses;
     addresses_[key] = AddressEntry{program, epoch_, scratch_.footer.shader_hash, id.length, false};
+    addr_lo_ = std::min(addr_lo_, addr);
+    addr_hi_ = std::max(addr_hi_, addr + id.length + kFooterBytes + kFooterSearchBytes);
     out.program = program;
     out.footer_hash = scratch_.footer.shader_hash;
     return out;
@@ -102,6 +104,9 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
 
 void ProgramCache::Invalidate(u64 addr, u64 size) {
     const u64 end = addr + size;
+    if (end <= addr_lo_ || addr >= addr_hi_) {
+        return; // no program's code or footer there (the walk over every entry was ~1% of the GPU thread)
+    }
     for (auto& [key, entry] : addresses_) {
         const u64 start = key >> 3;
         // the program's code and its footer

@@ -85,14 +85,14 @@ public:
             if (r.host != nullptr && r.gen == gen && addr >= r.begin && addr + bytes <= r.end) {
                 std::memcpy(r.host + (addr - r.begin), src, bytes);
                 if (buffers != nullptr) {
-                    buffers->Invalidate(addr, bytes);
+                    buffers->InvalidateIfCached(addr, bytes);
                 }
                 return true;
             }
         }
         if (gm->TryWriteBacking(reinterpret_cast<void*>(addr), src, bytes)) {
             if (buffers != nullptr) {
-                buffers->Invalidate(addr, bytes); // written past the tracker: the video memory copy is older
+                buffers->InvalidateIfCached(addr, bytes); // written past the tracker: the video memory copy is older
             }
             u8* host = nullptr;
             u64 rb = 0, rs = 0;
@@ -114,7 +114,7 @@ public:
         }
         std::memcpy(reinterpret_cast<void*>(addr), src, bytes);
         if (buffers != nullptr) {
-            buffers->Invalidate(addr, bytes);
+            buffers->InvalidateIfCached(addr, bytes);
         }
         return true;
     }
@@ -1011,8 +1011,8 @@ std::string Backend::Report() {
                            b.wb_hist_count[2], b.wb_hist_bytes[2] >> 20, b.wb_hist_count[3], b.wb_hist_bytes[3] >> 20,
                            b.wb_hist_count[4], b.wb_hist_bytes[4] >> 20, b.wb_commands);
         out += fmt::format("write-backs of changed words only (large ranges): {} MiB compared in {} dispatches, shadows "
-                           "made from the host {}\n",
-                           b.wb_diff_bytes >> 20, b.wb_diff_dispatches, b.wb_shadow_inits);
+                           "made from the host {}; prepares answered by the batch's memo {}\n",
+                           b.wb_diff_bytes >> 20, b.wb_diff_dispatches, b.wb_shadow_inits, b.prep_memo_hits);
         if (b.wb_checked_bytes != 0) {
             out += fmt::format("write-backs checked (SSPC_DIAG_WB_DIRTY): {} MiB, changed 256-byte chunks {} ({} MiB), "
                                "changed words {} ({} KiB)\n",

@@ -45,6 +45,7 @@ struct BufferCacheStats {
     /// write-back ranges by size (<=4 KiB, <=64 KiB, <=1 MiB, <=4 MiB, larger): count, bytes; copy commands recorded
     std::array<u64, 5> wb_hist_count{}, wb_hist_bytes{};
     u64 wb_commands = 0;
+    u64 prep_memo_hits = 0; ///< Prepare calls answered by the batch's memo
     u64 wb_diff_bytes = 0, wb_diff_dispatches = 0, wb_shadow_inits = 0; ///< write-backs by the changed-words shader
     u64 wb_checked_bytes = 0, wb_dirty_chunks = 0, wb_dirty_words = 0; ///< SSPC_DIAG_WB_DIRTY (256-byte chunks, words)
     std::string first_error;
@@ -91,6 +92,9 @@ public:
     bool Promotable(u64 addr, u64 size, u64 frame);
     /// The guest wrote or unmapped [addr, addr + size) behind the GPU's back: the pages are uploaded again. Any thread.
     void Invalidate(u64 addr, u64 size);
+    /// Invalidate when some page of the range is valid in video memory (the GPU thread only: it reads the block table
+    /// unlocked; the invalidations already queued are applied before any upload, so a valid page here is current).
+    void InvalidateIfCached(u64 addr, u64 size);
     /// The write tracker's report: the CPU wrote some page of each 64 KiB block of [addr, addr + size) (a fault gives
     /// the whole block back). Pages the GPU wrote in a batch not completed stay valid: their data is the newer one
     /// and reaches the host at that batch's end - uploading the host's older copy over them would lose it (review
@@ -111,7 +115,10 @@ public:
     /// The end of a batch: the copies of its GPU writes back to the host (`cb` outside rendering).
     void RecordWriteBack(VkCommandBuffer cb, u64 seq);
     /// SSPC_DIAG_MEASURE=skip_wb only: the batch's written ranges forgotten (no write-back).
-    void DropWriteBack() { written_.clear(); }
+    void DropWriteBack() {
+        written_.clear();
+        ++valid_gen_;
+    }
     /// SSPC_DIAG_WB_DIRTY=1: the completed write-backs compared with the host's bytes before them (Collect calls it).
     void CheckWriteBacks(u64 completed);
     /// Before the batch is submitted: binds the memory its commands need (vkQueueBindSparse, the queue's lock held by
@@ -195,6 +202,15 @@ private:
         u64 seq;
     };
     std::vector<DeferredInval> deferred_inval_;
+    /// Prepare's memo of cached ranges prepared in the batch (`seq`) while nothing invalidated pages or dropped written
+    /// ranges (`gen` == valid_gen_)
+    struct PrepMemo {
+        u64 addr = 0, size = 0, seq = 0, gen = 0;
+        bool write = false;
+    };
+    std::array<PrepMemo, 8> prep_memo_{};
+    u32 prep_next_ = 0;
+    u64 valid_gen_ = 1;
     std::vector<std::pair<VkBuffer, VkBufferCopy>> wb_regions_; ///< RecordWriteBack's scratch
     std::vector<VkBufferCopy> wb_copies_;
     struct WbSnap {

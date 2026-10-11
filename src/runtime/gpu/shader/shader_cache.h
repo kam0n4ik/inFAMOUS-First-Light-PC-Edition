@@ -121,6 +121,7 @@ private:
         bool dirty = false;
     };
     std::unordered_map<u64, AddressEntry> addresses_; ///< key: address << 3 | stage
+    u64 addr_lo_ = ~0ull, addr_hi_ = 0; ///< the bytes any entry covers (Invalidate: ranges outside need no walk)
     std::unordered_map<ProgramIdentity, std::unique_ptr<Program>, ProgramIdentityHash> programs_;
     ProgramImage scratch_;
     std::vector<u32> scan_;

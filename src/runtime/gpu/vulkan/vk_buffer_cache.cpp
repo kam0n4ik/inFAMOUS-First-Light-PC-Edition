@@ -143,6 +143,26 @@ void BufferCache::Invalidate(u64 addr, u64 size) {
     has_inval_.store(true, std::memory_order_release);
 }
 
+void BufferCache::InvalidateIfCached(u64 addr, u64 size) {
+    // the GPU thread's own write (the command processor's): nothing to queue when no page of it is in video memory
+    // (the block table is the GPU thread's) - the compute rings' read pointers are written after every packet, and
+    // each queued invalidation cost a lock and a later scan (3% of the GPU thread in the village)
+    if (size == 0 || !Ok()) {
+        return;
+    }
+    const u64 end = std::min(addr + size, space_);
+    if (addr >= end) {
+        return;
+    }
+    const u64 first_page = addr >> kPageBits, last_page = (end - 1) >> kPageBits;
+    for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
+        if (const Block* blk = FindBlock(b); blk != nullptr && (blk->valid & PageMask(b, first_page, last_page)) != 0) {
+            Invalidate(addr, size);
+            return;
+        }
+    }
+}
+
 void BufferCache::InvalidateCoarse(u64 addr, u64 size) {
     if (size == 0) {
         return;
@@ -167,6 +187,7 @@ void BufferCache::ApplyInvalidations() {
         coarse.swap(pending_coarse_);
     }
     const size_t exact = ranges.size();
+    ++valid_gen_; // (pages may stop being valid: Prepare's memo is stale)
     // (a write-back shadow under an exact report needs nothing: those pages are invalid now, and a GPU write there - the
     // only thing compared with the shadow - uploads them first, which copies the same host bytes into the shadow)
     ranges.insert(ranges.end(), coarse.begin(), coarse.end());
@@ -508,6 +529,15 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         return fallback();
     }
     ApplyInvalidations();
+    // the same range prepared in this batch since anything could invalidate it: nothing to do again (P4.6 night: a
+    // 12 MiB particle pool bound by ~1500 dispatches a frame walked its ~190 blocks each time)
+    for (const PrepMemo& m : prep_memo_) {
+        if (m.seq == seq && m.gen == valid_gen_ && m.addr == addr && m.size == size && (m.write || !write)) {
+            ++stats_.prep_memo_hits;
+            out = {buffer_, addr, space_ - addr, true};
+            return true;
+        }
+    }
     u64 t0 = Gpu::Shader::FineTicks();
     // (a large range is checked first: its tracking test would walk the whole range for nothing)
     if (size > kMaxCached || stats_.resident_bytes >= budget_ || !tracker_->CanArm(addr, size)) {
@@ -619,6 +649,7 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         }
     }
     out = {buffer_, addr, space_ - addr, true};
+    prep_memo_[prep_next_++ % prep_memo_.size()] = {addr, size, seq, valid_gen_, write};
     return true;
 }
 
@@ -678,6 +709,7 @@ void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) 
             }
         }
         written_.swap(rest);
+        ++valid_gen_; // (written ranges left the batch's list)
         const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                                   .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                                   .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -744,6 +776,7 @@ void BufferCache::Collect(u64 completed) {
                 return false;
             }
             blk->valid &= static_cast<u16>(~d.mask);
+            ++valid_gen_;
             return true;
         });
     }
