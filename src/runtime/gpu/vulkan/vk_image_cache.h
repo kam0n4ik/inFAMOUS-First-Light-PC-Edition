@@ -62,6 +62,9 @@ struct CachedImage {
     /// The CPU wrote a 64 KiB block it shares with other memory (or it has no whole block): maybe into it, maybe beside
     /// it. Its texels are kept (a neighbour's writes are common), but it is no source to expand from (P4.5).
     bool maybe_newer = false;
+    /// Its pages are write-protected since it was last written by the GPU (the CPU's writes there are seen): only then
+    /// may a write-back go over its memory (P4.5 review M1b)
+    bool write_tracked = false;
     u64 last_seq = 0;
     u64 last_frame = 0; ///< ImageCache::NewFrame count at its last use
     std::unordered_map<u64, VkImageView> views;
@@ -104,6 +107,11 @@ struct GpuEvictionCandidate {
     /// No copy back to its memory: MSAA, a volume, block-compressed, depth with stencil or not D32/D16, a tiling
     /// the tiler has no variant for (the bridge keeps every tiled one: "can't handle non-linear image downloads")
     bool no_write_path = false;
+    bool untracked = false;    ///< the CPU's writes to its memory are not seen (CachedImage::write_tracked false)
+    /// Another live GPU-written image over its memory was used later: that one holds the memory's latest texels
+    bool newer_overlap = false;
+    /// Another live GPU-written image over its memory, used earlier: a write-back would mark it memory-newer
+    bool older_overlap = false;
     u64 age_frames = 0;        ///< presented frames since its last use
 };
 inline constexpr u64 kGpuEvictStaleFrames = 120; ///< a GPU-written image whose memory is newer: dropped this old

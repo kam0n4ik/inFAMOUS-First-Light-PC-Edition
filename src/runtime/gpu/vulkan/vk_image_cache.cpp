@@ -205,8 +205,10 @@ void ImageCache::TrackGpuWritten(CachedImage& img) {
     const ImageLayout& l = img.layout;
     if (tracker_ != nullptr && l.guest_size != 0 && tracker_->CanArm(l.guest_address, l.guest_size)) {
         tracker_->Arm(l.guest_address, l.guest_size);
+        img.write_tracked = true;
         ++stats_.gpu_tracked;
     } else {
+        img.write_tracked = false;
         ++stats_.gpu_untracked; // the CPU's writes there are not seen (memory imported through the guest's pages)
     }
 }
@@ -582,8 +584,10 @@ void ImageCache::CopyImage(CachedImage& src, CachedImage& dst, VkCommandBuffer c
                              is3d ? std::max(s.size.depth >> m, 1u) : 1u};
         if (d.props.is_block && !s.props.is_block) {
             // the destination's level must hold that many whole blocks
-            const u32 bw = (std::max(d.size.width >> m, 1u) + 3) / 4, bh = (std::max(d.size.height >> m, 1u) + 3) / 4;
-            if (ext.width > bw || ext.height > bh) {
+            // and stay inside it: a level that is not whole blocks (tail mips 2x2, 1x1, 6 wide) would take the copy past
+            // its edge (vkCmdCopyImage's extent rule; review M3) - those keep memory's texels
+            const u32 dw = std::max(d.size.width >> m, 1u), dh = std::max(d.size.height >> m, 1u);
+            if (dw % 4 != 0 || dh % 4 != 0 || ext.width * 4 > dw || ext.height * 4 > dh) {
                 break;
             }
         }
@@ -846,8 +850,13 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
             }
         }
     }
-    if (target || use == Use::Storage) {
-        match->maybe_newer = false; // what the GPU writes now is its latest
+    if ((target || use == Use::Storage) && match->maybe_newer) {
+        // what the GPU writes now is its latest; the blocks a fault released are armed again (the CPU's later writes
+        // there are seen - a write-back must not go over them; review M1b)
+        match->maybe_newer = false;
+        if (match->gpu_written) {
+            TrackGpuWritten(*match);
+        }
     }
     if ((target || use == Use::Storage) && !match->gpu_written) {
         match->gpu_written = true;
@@ -1115,14 +1124,14 @@ GpuEviction ClassifyGpuEviction(const GpuEvictionCandidate& c) {
     if (c.in_flight) {
         return GpuEviction::Keep;
     }
-    if (c.memory_newer || c.superseded) {
+    if (c.memory_newer || c.superseded || c.newer_overlap) {
         // memory (or another image) holds the newer texels: nothing of this one is lost (the bridge frees a dirty
         // image without a download)
         return c.age_frames >= kGpuEvictStaleFrames ? GpuEviction::Drop : GpuEviction::Keep;
     }
     // its texels exist only in video memory: written back where a copy can, else kept - never freed with its texels
     // lost; nor written over memory the CPU may have written since (maybe_newer)
-    if (c.age_frames < kGpuEvictCleanFrames || c.maybe_newer || c.no_write_path) {
+    if (c.age_frames < kGpuEvictCleanFrames || c.maybe_newer || c.no_write_path || c.untracked || c.older_overlap) {
         return GpuEviction::Keep;
     }
     return GpuEviction::WriteBack;
@@ -1140,16 +1149,33 @@ std::vector<CachedImage*> ImageCache::EvictGpuWritten(u64 completed, u32 max) {
             continue;
         }
         const ImageLayout& l = img->layout;
+        const u64 age = (frame_ - std::min(frame_, img->last_frame)) * force_age_scale_;
+        bool newer_overlap = false, older_overlap = false;
+        if (age >= kGpuEvictStaleFrames) {
+            // other live GPU-written images over its memory (review M1a: a write-back must not put these texels over a
+            // newer image's, nor mark it memory-newer)
+            const u64 a0 = l.guest_address, e0 = a0 + l.guest_size;
+            auto it = by_address_.lower_bound(a0 > max_image_size_ ? a0 - max_image_size_ : 0);
+            for (; it != by_address_.end() && it->first < e0; ++it) {
+                const CachedImage* o = it->second;
+                if (o != img.get() && o->gpu_written && o->layout.guest_address < e0 &&
+                    a0 < o->layout.guest_address + o->layout.guest_size) {
+                    (o->last_seq > img->last_seq ? newer_overlap : older_overlap) = true;
+                }
+            }
+        }
         const GpuEviction a = ClassifyGpuEviction({.in_flight = img->last_seq > completed,
                                                    .memory_newer = img->memory_newer,
                                                    .superseded = img->superseded,
                                                    .maybe_newer = img->maybe_newer,
                                                    .no_write_path = NoWritePath(l, img->aspect, img->format),
-                                                   .age_frames = (frame_ - std::min(frame_, img->last_frame)) *
-                                                                 force_age_scale_});
+                                                   .untracked = !img->write_tracked,
+                                                   .newer_overlap = newer_overlap,
+                                                   .older_overlap = older_overlap,
+                                                   .age_frames = age});
         if (a != GpuEviction::Keep) {
             cand.emplace_back(img.get(), a);
-        } else if (img->last_seq <= completed && frame_ - std::min(frame_, img->last_frame) >= kGpuEvictCleanFrames) {
+        } else if (img->last_seq <= completed && age >= kGpuEvictCleanFrames) {
             ++no_path; // old enough, but no safe way to free it
         }
     }
@@ -1230,12 +1256,23 @@ bool ImageCache::WriteBackAndRetire(CachedImage* img, VkCommandBuffer cb, u64 se
             return false;
         }
         uoff = (static_cast<u64>(l.guest_size) + 255) & ~255ull;
-        linear = TempBuffer(uoff + 256, seq);
+        linear = TempBuffer(uoff + 512, seq);
         if (linear == VK_NULL_HANDLE) {
             error = "write-back temporary: no video memory";
             return false;
         }
         linear_base = 0;
+    }
+    VkPipeline detile = VK_NULL_HANDLE;
+    TilingParams dp;
+    if (l.IsTiled()) {
+        dp = BuildTilingParams(l, false);
+        if (!dp.supported || !DetilePipeline(dp, detile, error)) {
+            if (error.empty()) {
+                error = fmt::format("no detiler ({})", dp.reason);
+            }
+            return false;
+        }
     }
     const u64 cid = diag_ != nullptr && diag_->Enabled()
                         ? diag_->Begin(cb, seq,
@@ -1243,6 +1280,44 @@ bool ImageCache::WriteBackAndRetire(CachedImage* img, VkCommandBuffer cb, u64 se
                                                    l.guest_address, l.guest_size, l.pixel_format, l.size.width,
                                                    l.size.height, l.levels, l.layers, static_cast<u32>(l.tile_mode)))
                         : 0;
+    const auto push = [&](VkBuffer tiled, u64 tiled_offset, VkBuffer lin, u64 info_offset) {
+        const VkDescriptorBufferInfo t{tiled, tiled_offset, l.guest_size};
+        const VkDescriptorBufferInfo li{lin, 0, l.guest_size};
+        const VkDescriptorBufferInfo u{lin, info_offset, sizeof(TilingInfo)};
+        const VkWriteDescriptorSet w[3] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &t},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &li},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &u},
+        };
+        f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, detile_layout_, 0, 3, w);
+    };
+    const auto barrier = [&](VkPipelineStageFlags2 src_stage, VkAccessFlags2 src, VkPipelineStageFlags2 dst_stage,
+                             VkAccessFlags2 dst) {
+        const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = src_stage,
+                                  .srcAccessMask = src,
+                                  .dstStageMask = dst_stage,
+                                  .dstAccessMask = dst};
+        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                   .pMemoryBarriers = &mb};
+        f.vkCmdPipelineBarrier2(cb, &dep);
+    };
+    if (l.IsTiled()) {
+        // the guest's bytes detiled into the temporary first: what the image does not cover (row padding, gaps between
+        // levels) goes back as it was, not as the temporary's undefined bytes (review L6)
+        const u64 doff = uoff + 256;
+        f.vkCmdUpdateBuffer(cb, linear, doff, sizeof(TilingInfo), &dp.info);
+        barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
+        f.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, detile);
+        push(dst, dst_offset, linear, doff);
+        f.vkCmdDispatch(cb, std::max(dp.dispatch_x, 1u), 1, 1);
+        barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
     Transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                VK_ACCESS_2_TRANSFER_READ_BIT);
     std::vector<VkBufferImageCopy> copies;
@@ -1261,28 +1336,10 @@ bool ImageCache::WriteBackAndRetire(CachedImage* img, VkCommandBuffer cb, u64 se
                              static_cast<u32>(copies.size()), copies.data());
     if (l.IsTiled()) {
         f.vkCmdUpdateBuffer(cb, linear, uoff, sizeof(TilingInfo), &p.info);
-        VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                            .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
-                                             VK_ACCESS_2_UNIFORM_READ_BIT};
-        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
-                                   .pMemoryBarriers = &mb};
-        f.vkCmdPipelineBarrier2(cb, &dep);
+        barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
         f.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        const VkDescriptorBufferInfo tiled{dst, dst_offset, l.guest_size};
-        const VkDescriptorBufferInfo lin{linear, 0, l.guest_size};
-        const VkDescriptorBufferInfo uni{linear, uoff, sizeof(TilingInfo)};
-        const VkWriteDescriptorSet w[3] = {
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &tiled},
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lin},
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &uni},
-        };
-        f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, detile_layout_, 0, 3, w);
+        push(dst, dst_offset, linear, uoff);
         f.vkCmdDispatch(cb, std::max(p.dispatch_x, 1u), 1, 1);
     }
     if (cid != 0) {

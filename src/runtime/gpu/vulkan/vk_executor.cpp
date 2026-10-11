@@ -3011,6 +3011,7 @@ void Executor::CaptureImageAt() {
             SSPC_LOG(GPU, Warning, "DIAGNOSTIC: no GPU-written image at {:#x} at flip {}", w.addr, id);
             continue;
         }
+        images_.Touch(*img, cur_.value);
         EndRendering();
         if (pending_writes_) {
             GlobalBarrier();
@@ -3118,8 +3119,9 @@ void Executor::EvictGpuImages() {
         const u64 addr = img->layout.guest_address, bytes = img->layout.guest_size;
         VkBuffer buf = VK_NULL_HANDLE;
         u64 off = 0, avail = 0;
-        if (!GuestRange(addr, bytes, true, 4, buf, off, avail) || avail < bytes) {
-            continue; // kept (no write path to its memory now; a later call tries again)
+        if (!GuestRange(addr, bytes, true, 4, buf, off, avail) || avail < bytes ||
+            (img->layout.IsTiled() && off % std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 1) != 0)) {
+            continue; // kept (no write path to its memory now, or one the tiler cannot bind; a later call tries again)
         }
         EndRendering(); // GuestRange may have uploaded
         std::string err;
@@ -3154,6 +3156,9 @@ void Executor::Flip(const Cp::FlipMarker&) {
     if (has && presenter_ != nullptr && Begin()) {
         EndRendering();
         CachedImage* img = images_.FindTargetAt(buf.address);
+        if (img != nullptr) {
+            images_.Touch(*img, cur_.value); // the flip copy reads it in this batch (review M2)
+        }
         std::string err;
         if (img == nullptr) {
             // not rendered by the GPU (a CPU-drawn buffer): from guest memory

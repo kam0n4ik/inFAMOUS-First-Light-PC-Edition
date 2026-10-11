@@ -615,6 +615,13 @@ void TestImageCacheRules(TestGroup& g) {
             ev({.maybe_newer = true, .age_frames = 1000}) == E::Keep &&
                 ev({.no_write_path = true, .age_frames = 1000}) == E::Keep,
             "");
+    g.Check("GPU eviction: CPU writes to its memory not seen (untracked) -> kept, never written back (review M1b)",
+            ev({.untracked = true, .age_frames = 1000}) == E::Keep, "");
+    g.Check("GPU eviction: another GPU-written image over its memory used later -> dropped (that one holds the latest "
+            "texels); one used earlier -> kept, not written back over it (review M1a)",
+            ev({.newer_overlap = true, .age_frames = V::kGpuEvictStaleFrames}) == E::Drop &&
+                ev({.older_overlap = true, .age_frames = 1000}) == E::Keep,
+            "");
 }
 
 } // namespace
