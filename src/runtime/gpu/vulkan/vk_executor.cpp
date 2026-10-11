@@ -3285,7 +3285,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         // nothing recorded
     } else if (d.indirect) {
         f.vkCmdDispatchIndirect(cur_.cb, argbuf, argoff);
-    } else {
+    } else if (!SplitMergeLevels(d, csv, *pipe, push, writes, buf_infos)) {
         f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
     }
     DiagEnd(cid);
@@ -4019,6 +4019,122 @@ void Executor::ProbeDispatch(const Cp::DispatchDescriptor& d, const GS::StageVie
         ProbeCopies(fmt::format("f{}_{}_{}", flip, trace_.ordinal, after ? "post" : "pre"), cs, spec.bindings,
                     spec.max_bytes, d.indirect ? d.indirect_addr : 0, 12);
     }
+}
+
+bool Executor::SplitMergeLevels(const Cp::DispatchDescriptor& d, const GS::StageView& cs, const PipelineObjects& pipe,
+                                PushData& push, std::vector<VkWriteDescriptorSet>& writes,
+                                std::vector<VkDescriptorBufferInfo>& infos) {
+    // the particle sort ahead of the smoke draws (docs\SMOKE_SHADER_MAP.md section 4), by its content hash: its first
+    // pass merges widths 2..64 in one dispatch. Recorded so (logs\smoke_research s3-s5) its sorted list holds 549-956
+    // repeated particles a frame (the smoke flickers, SSPC-020); one width per dispatch (s6) none.
+    constexpr u64 kSortProgram = 0x80279384190567beull;
+    // SSPC_DIAG_SORT_SPLIT=off: recorded as the game has it. =keep:<w> (diagnostic): the widths below w in one dispatch
+    struct Mode {
+        bool off = false;
+        u64 keep = 0;
+    };
+    static const Mode mode = [] {
+        Mode m;
+        char v[32] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_SORT_SPLIT", v, sizeof(v)) > 0) {
+            const std::string_view s(v);
+            m.off = s == "off";
+            if (s.substr(0, 5) == "keep:") {
+                m.keep = std::strtoull(v + 5, nullptr, 10);
+            }
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_SORT_SPLIT={} - the particle sort's widths {}", s,
+                     m.off ? "merged in one dispatch as the game records them"
+                           : fmt::format("below {} in one dispatch, the others one each", m.keep));
+        }
+        return m;
+    }();
+    if (mode.off || cs.program == nullptr || cs.program->id.hash.lo != kSortProgram) {
+        return false;
+    }
+    // the program's buffers (its IR): #0 the count, #1 the draw arguments, #2 the pass (w, max), #3 -> #4 the merge
+    // (and after them the translator's own: the flattened user data)
+    const auto& b = cs.plan.buffers;
+    const auto guest = [&](size_t i) { return i < b.size() && b[i].kind == GS::BufferKind::Guest; };
+    const bool shape = b.size() >= 5 && infos.size() >= 5 && guest(0) && guest(1) && guest(2) && guest(3) && guest(4) &&
+                       !b[2].written && b[2].size >= 8 && b[2].size <= 16 && b[3].written && b[4].written && b[3].size == b[4].size;
+    if (!shape) {
+        if (split_logged_++ < 4) {
+            std::string kinds;
+            for (const auto& x : b) {
+                kinds += fmt::format(" {}:{:#x}+{:#x}{}", static_cast<u32>(x.kind), x.address, x.size, x.written ? "W" : "");
+            }
+            SSPC_LOG(GPU, Warning, "particle sort cs {:#x}: not the expected buffers, recorded as it is:{}", cs.address,
+                     kinds);
+        }
+        return false;
+    }
+    u32 p[4] = {};
+    if (!reader_.Read(b[2].address, p, std::min<u64>(b[2].size, 16))) {
+        return false;
+    }
+    const u64 w0 = p[0], max = p[1];
+    if (w0 == 0 || w0 * 2 > max) {
+        return false; // one width: the dispatch as it is
+    }
+    std::vector<u64> widths;
+    for (u64 w = w0; widths.empty() || w <= max; w *= 2) {
+        widths.push_back(w);
+    }
+    // the dispatches: [first level, last level]. Width w merges two runs of w/2 into one of w (after the first pass the
+    // list is in runs of 64: s6 85 order breaks for 5455 particles) - what its threads read the threads of the same w
+    // elements wrote at w/2: within one 32-wide subgroup up to w 32, the workgroup's two subgroups at 64 - on the PS4
+    // one wave64, in step
+    std::vector<std::pair<size_t, size_t>> runs;
+    for (size_t k = 0; k < widths.size(); ++k) {
+        if (k != 0 && widths[k] < mode.keep) {
+            runs.back().second = k;
+        } else {
+            runs.push_back({k, k});
+        }
+    }
+    const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
+    std::vector<StreamRing::Slice> slices(runs.size());
+    for (size_t r = 0; r < runs.size(); ++r) {
+        if (ring_.Allocate(16, align, cur_.value, slices[r]) != StreamRing::Status::Ok) {
+            return false;
+        }
+        const u32 q[4] = {static_cast<u32>(widths[runs[r].first]), static_cast<u32>(widths[runs[r].second]), p[2], p[3]};
+        std::memcpy(slices[r].data, q, sizeof(q));
+    }
+    const auto& f = Fn();
+    const u32 base = cs.start.buffer;
+    const VkDescriptorBufferInfo i2 = infos[2], i3 = infos[3], i4 = infos[4];
+    const PushData saved = push;
+    for (size_t r = 0; r < runs.size(); ++r) {
+        if (r != 0) {
+            GlobalBarrier(8); // the previous width's stores before this width's loads
+        }
+        infos[2] = {slices[r].buffer, slices[r].offset, 16};
+        // the shader's loop merges #3 -> #4 at its first width, #4 -> #3 at the next: a run starting at an odd level
+        // has them swapped, so every level reads and writes the lists it does in the one dispatch
+        const bool swap = (runs[r].first & 1) != 0;
+        infos[3] = swap ? i4 : i3;
+        infos[4] = swap ? i3 : i4;
+        if (base + 4 < push.buf_offsets.size()) {
+            push.buf_offsets[base + 2] = 0;
+            push.buf_offsets[base + 3] = swap ? saved.buf_offsets[base + 4] : saved.buf_offsets[base + 3];
+            push.buf_offsets[base + 4] = swap ? saved.buf_offsets[base + 3] : saved.buf_offsets[base + 4];
+        }
+        PushDescriptors(pipe, VK_PIPELINE_BIND_POINT_COMPUTE, writes);
+        f.vkCmdPushConstants(cur_.cb, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushData), &push);
+        f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
+    }
+    push_last_ = push; // what the command buffer has pushed last
+    infos[2] = i2;
+    infos[3] = i3;
+    infos[4] = i4;
+    push = saved;
+    stats_.merge_split_dispatches += runs.size();
+    if (split_logged_++ < 4) {
+        SSPC_LOG(GPU, Info, "particle sort cs {:#x} (widths {}..{}) recorded as {} dispatches", cs.address, w0,
+                 widths.back(), runs.size());
+    }
+    return true;
 }
 
 void Executor::CmdTraceInit() {

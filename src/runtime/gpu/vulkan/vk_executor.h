@@ -75,6 +75,7 @@ struct ExecutorStats {
     u64 submit_ns = 0;                          ///< CPU time in vkQueueSubmit2
     u64 lds_dispatches = 0, lds_max_bytes = 0;  ///< dispatches with the emulated LDS buffer
     u64 diag_skipped_draws = 0, diag_skipped_dispatches = 0; ///< SSPC_DIAG_SKIP_DRAWS / _DISPATCHES (diagnostic)
+    u64 merge_split_dispatches = 0; ///< the particle sort's dispatches recorded one width each (SplitMergeLevels)
     u64 streamed = 0, streamed_bytes = 0; ///< small read-only ranges the CPU rewrote, copied into the stream ring
     u64 ring_mirror_copies = 0;           ///< hybrid ring: host -> video memory copies at the head of submissions
     u64 stream_promotions = 0;            ///< small read-only ranges cached instead of streamed (BufferCache::Promotable)
@@ -358,6 +359,15 @@ private:
     void Probe(const Cp::DrawDescriptor& d, const GS::StageView& vs, const GS::StageView* ps);
     /// SSPC_DIAG_PROBE_CS (same form): the bindings of a matching dispatch before and after it.
     void ProbeDispatch(const Cp::DispatchDescriptor& d, const GS::StageView& cs, bool after);
+    /// SSPC-020: a dispatch of the particle sort (merge path, docs\SMOKE_SHADER_MAP.md section 4) that merges several
+    /// widths in one go (params w, max with 2w <= max: a width reads what other threads of the same dispatch wrote at the
+    /// one before, without a barrier - in step on the PS4, a race here) recorded as one dispatch per width with a barrier
+    /// between them; the same levels in the same order. true: recorded (instead of the dispatch). SSPC_DIAG_SORT_SPLIT=off:
+    /// as the game records it.
+    bool SplitMergeLevels(const Cp::DispatchDescriptor& d, const GS::StageView& cs, const PipelineObjects& pipe,
+                          PushData& push, std::vector<VkWriteDescriptorSet>& writes,
+                          std::vector<VkDescriptorBufferInfo>& infos);
+    u32 split_logged_ = 0;
     void ProbeCopies(const std::string& prefix, const GS::StageView& stage, const std::vector<s32>& bindings,
                      u64 max_bytes, u64 args_addr, u64 args_size);
     Histo histo_;

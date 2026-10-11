@@ -901,6 +901,10 @@ std::string Backend::Report() {
                                "dispatches\n",
                                s.diag_skipped_draws, s.diag_skipped_dispatches);
         }
+        if (s.merge_split_dispatches != 0) {
+            out += fmt::format("  particle sort (SSPC-020): {} dispatches recorded one merge width each\n",
+                               s.merge_split_dispatches);
+        }
     }
     if (images_) {
         const auto i = images_->Stats();
