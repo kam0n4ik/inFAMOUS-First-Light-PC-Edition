@@ -175,6 +175,11 @@ void BufferCache::ApplyInvalidations() {
                 }
                 // a coarse report keeps the pages the GPU wrote in a batch not completed (their data is newer)
                 const u16 mask = PageMask(b, first_page, last_page);
+                if (is_coarse && (blk.valid & mask) != 0) {
+                    // the CPU writes here: small ranges in this block are streamed for a while (doubling back-off)
+                    blk.cpu_writes = static_cast<u8>(std::min<u32>(blk.cpu_writes + 1u, 8u));
+                    blk.quiet_from = frame_ + (30ull << blk.cpu_writes);
+                }
                 const u16 keep = is_coarse && blk.pending_seq > completed_ ? static_cast<u16>(blk.gpu_pending & mask)
                                                                            : u16{0};
                 blk.valid &= static_cast<u16>(~(mask & ~keep));
@@ -285,6 +290,21 @@ BufferCache::Residency BufferCache::Classify(u64 addr, u64 size, Range& out) {
         return Residency::All;
     }
     return any ? Residency::Partial : Residency::None;
+}
+
+bool BufferCache::Promotable(u64 addr, u64 size, u64 frame) {
+    frame_ = std::max(frame_, frame);
+    if (!Ok() || tracker_ == nullptr || size == 0 || size > kMaxCached || addr + size > space_ ||
+        stats_.resident_bytes + (2ull << kBlockBits) > budget_ - budget_ / 8) {
+        return false;
+    }
+    const u64 first_block = addr >> kBlockBits, last_block = (addr + size - 1) >> kBlockBits;
+    for (u64 b = first_block; b <= last_block; ++b) {
+        if (const Block* blk = FindBlock(b); blk != nullptr && frame_ < blk->quiet_from) {
+            return false;
+        }
+    }
+    return tracker_->CanArm(addr, size);
 }
 
 bool BufferCache::AnyValid(u64 addr, u64 size) {

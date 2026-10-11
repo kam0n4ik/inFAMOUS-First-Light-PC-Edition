@@ -940,6 +940,23 @@ std::string Backend::Report() {
         out += fmt::format("barriers by ranges: elided {} (dispatches/timeline copies touching nothing written since), "
                            "write-after-read {}; stream ring mirrored {} MiB in {} copies\n",
                            s.barriers_elided, s.barriers_war, ring_->MirroredBytes() >> 20, s.ring_mirror_copies);
+        out += fmt::format("small read-only ranges cached instead of streamed: {}\n", s.stream_promotions);
+        out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
+                           "without {} MiB (full batches {})\n",
+                           s.wb_bytes_by[0] >> 20, s.wb_bytes_by[1] >> 20, s.wb_bytes_by[2] >> 20, s.flushes_full);
+        out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
+                           "ranges {}, read-after-write {}, write-after-write {}, write-after-read {}\n",
+                           s.barrier_why[0], s.barrier_why[1], s.barrier_why[2], s.barrier_why[3], s.barrier_why[4],
+                           s.barrier_why[5], s.barrier_why[6]);
+        if (s.stream_kinds[0] != 0) {
+            out += fmt::format("streamed ranges (SSPC_DIAG_STREAM_STATS): new {} ({} MiB), again in the frame unchanged {} "
+                               "({} MiB), again changed {} ({} MiB), unchanged since an earlier frame {} ({} MiB), "
+                               "changed since {} ({} MiB)\n",
+                               s.stream_kinds[0], s.stream_kind_bytes[0] >> 20, s.stream_kinds[1],
+                               s.stream_kind_bytes[1] >> 20, s.stream_kinds[2], s.stream_kind_bytes[2] >> 20,
+                               s.stream_kinds[3], s.stream_kind_bytes[3] >> 20, s.stream_kinds[4],
+                               s.stream_kind_bytes[4] >> 20);
+        }
         out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
                            "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
                            s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,

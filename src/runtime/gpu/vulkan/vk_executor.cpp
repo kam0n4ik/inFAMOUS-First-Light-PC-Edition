@@ -408,8 +408,18 @@ bool Executor::NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads,
         }
         return false;
     }
-    if (off || unknown || pend_.unknown || pend_.writes.size() + pend_.reads.size() > 256 ||
-        overlaps(reads, pend_.writes) || overlaps(writes, pend_.writes) || overlaps(writes, pend_.reads)) {
+    // why (counted): 0 off, 1 an unknown write pending, 2 this command's unknown accesses, 3 too many ranges, 4 RAW,
+    // 5 WAW, 6 WAR
+    const u32 why = off                                                   ? 0
+                    : pend_.unknown                                       ? 1
+                    : unknown                                             ? 2
+                    : pend_.writes.size() + pend_.reads.size() > 256      ? 3
+                    : overlaps(reads, pend_.writes)                       ? 4
+                    : overlaps(writes, pend_.writes)                      ? 5
+                    : overlaps(writes, pend_.reads)                       ? 6
+                                                                          : 7;
+    if (why != 7) {
+        ++stats_.barrier_why[why];
         return true;
     }
     ++stats_.barriers_elided;
@@ -453,7 +463,12 @@ void Executor::Flush() {
     if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
+    const u64 wb0 = buffers_.Stats().writeback_bytes;
     buffers_.RecordWriteBack(cur_.cb, cur_.value);
+    // (by the batch's end: 0 a fence/flip/sync/idle flush, 1 full with a fence or a timeline write, 2 full without)
+    stats_.wb_bytes_by[!flush_full_ ? 0 : batch_fence_ ? 1 : 2] += buffers_.Stats().writeback_bytes - wb0;
+    flush_full_ = false;
+    batch_fence_ = false;
     if (prof_) {
         ProfMark(5, "batch end: write-backs of the GPU's writes to the host");
     }
@@ -1004,7 +1019,25 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
         // nothing of it in video memory (the CPU wrote it, or it is new): the host's copy is current; a small read
         // is copied by the CPU into the stream ring (video memory) - no upload, no barrier, no break of rendering (the
         // bridge's stream buffer). The copy reads the physical backing's view (never faults).
-        if (res == BufferCache::Residency::None && !buffers_.HostWritePending(addr, size) &&
+        // P4.6 night: a range whose blocks the CPU has not written lately is cached instead (no copy each use; the
+        // tracker invalidates it at the CPU's next write and its block streams for a while). SSPC_DIAG_STREAM_PROMOTE=off:
+        // always streamed (the P4.6 behaviour).
+        static const bool promote = [] {
+            char v[8] = {};
+            const bool off = GetEnvironmentVariableA("SSPC_DIAG_STREAM_PROMOTE", v, sizeof(v)) == 3 &&
+                             std::string_view(v) == "off";
+            if (off) {
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_STREAM_PROMOTE=off - small read-only ranges are "
+                                       "always streamed");
+            }
+            return !off;
+        }();
+        const bool promoted = res == BufferCache::Residency::None && promote &&
+                              buffers_.Promotable(addr, size, VideoOut::NextFlipId());
+        if (promoted) {
+            ++stats_.stream_promotions;
+        }
+        if (res == BufferCache::Residency::None && !promoted && !buffers_.HostWritePending(addr, size) &&
             !TimelineWritePending(addr, size)) {
             StreamRing::Slice sl{};
             tt = GS::FineTicks();
@@ -1051,6 +1084,21 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                     wp != 0 && addr < wp + 4096 && wp < addr + size) {
                     race_.watch_copy_tsc = __rdtsc(); // this frame's copy of the watched page
                     race_.watch_copy_hits = g_watch_n.load(std::memory_order_acquire);
+                }
+                // SSPC_DIAG_STREAM_STATS=1: is a streamed range a repeat in the frame / unchanged since the last frame
+                // (counts in gpu_native.txt)
+                static const bool stream_stats = [] {
+                    char v[4] = {};
+                    return GetEnvironmentVariableA("SSPC_DIAG_STREAM_STATS", v, sizeof(v)) == 1 && v[0] == '1';
+                }();
+                if (stream_stats) {
+                    const u64 h = RaceHash(sl.data, size);
+                    const u64 flip = VideoOut::NextFlipId();
+                    auto& e = stream_seen_[(addr << 16) ^ size];
+                    const u32 kind = e.flip == 0 ? 0 : e.flip == flip ? (e.hash == h ? 1 : 2) : (e.hash == h ? 3 : 4);
+                    ++stats_.stream_kinds[kind];
+                    stats_.stream_kind_bytes[kind] += size;
+                    e = {h, flip};
                 }
                 if (race_.on) {
                     const u64 h = RaceHash(sl.data, size);
@@ -1102,6 +1150,7 @@ bool Executor::TimelineReader::Read(u64 addr, void* dst, u64 bytes) {
 }
 
 bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) {
+    batch_fence_ = true;
     // vkCmdUpdateBuffer: 4-byte aligned, up to 64 KiB; guest memory only (VideoOut's labels are host memory)
     if (bytes == 0 || bytes > 65536 || (dst & 3) != 0 || (bytes & 3) != 0 || dst >= (1ull << 40)) {
         ++stats_.tw_fail_shape;
@@ -1357,6 +1406,7 @@ void Executor::SyncFrom(u32 source) {
 }
 
 void Executor::Fence(const Cp::FenceOp& op) {
+    batch_fence_ = true;
     if (op.deferred && !op.written) {
         want_flush_ = true; // the processor holds it until the GPU completes the work before it
     }
@@ -2668,6 +2718,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
     if (commands_ >= options_.max_draws_per_batch) {
         ++stats_.flushes_full;
+        flush_full_ = true;
         Flush();
     }
 }
@@ -3506,6 +3557,7 @@ void Executor::EvictGpuImages() {
 }
 
 void Executor::Flip(const Cp::FlipMarker&) {
+    batch_fence_ = true;
     images_.NewFrame();
     EvictGpuImages();
     CaptureImageAt();

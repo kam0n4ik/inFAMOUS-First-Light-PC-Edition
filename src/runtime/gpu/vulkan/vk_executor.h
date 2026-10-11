@@ -75,6 +75,10 @@ struct ExecutorStats {
     u64 lds_dispatches = 0, lds_max_bytes = 0;  ///< dispatches with the emulated LDS buffer
     u64 streamed = 0, streamed_bytes = 0; ///< small read-only ranges the CPU rewrote, copied into the stream ring
     u64 ring_mirror_copies = 0;           ///< hybrid ring: host -> video memory copies at the head of submissions
+    u64 stream_promotions = 0;            ///< small read-only ranges cached instead of streamed (BufferCache::Promotable)
+    /// SSPC_DIAG_STREAM_STATS: streamed ranges first seen / again in the frame unchanged / changed / unchanged since an
+    /// earlier frame / changed since (count, bytes)
+    std::array<u64, 5> stream_kinds{}, stream_kind_bytes{};
     u64 t_front = 0, t_bind = 0, t_range = 0, t_image = 0; ///< TSC ticks: frontend, resource binding (of it buffers, images)
     /// TSC ticks of a draw's other stages: pipeline lookup, targets, vertex/index/indirect ranges, barriers and layouts,
     /// the commands (rendering, state, descriptors, the draw); the dispatches' whole recording
@@ -95,6 +99,10 @@ struct ExecutorStats {
     std::array<u64, 9> gb_sites{}; ///< global barriers by GlobalBarrier site
     u64 barriers_elided = 0; ///< dispatches/timeline copies after writes that touched none of their ranges: no barrier
     u64 barriers_war = 0;    ///< barriers for a write over a range read since the last one (no write pending)
+    /// barriers kept by NeedsBarrier, why: off, an unknown write pending, the command's own unknown accesses, too many
+    /// ranges, read-after-write, write-after-write, write-after-read
+    std::array<u64, 7> barrier_why{};
+    std::array<u64, 3> wb_bytes_by{}; ///< write-back bytes by batch end: fence/flip/sync/idle, full+fence, full only
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
     std::string first_skip[static_cast<size_t>(Skip::Count)];
@@ -270,6 +278,10 @@ private:
         VkImageView view = VK_NULL_HANDLE;
     };
     std::unordered_map<u64, TexMemo> tex_memo_;
+    struct StreamSeen {
+        u64 hash = 0, flip = 0;
+    };
+    std::unordered_map<u64, StreamSeen> stream_seen_; ///< SSPC_DIAG_STREAM_STATS
     bool dyn_vertex_valid_ = false;
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
 
@@ -425,6 +437,8 @@ private:
                       bool unknown);
     std::vector<std::pair<u64, u64>> acc_reads_, acc_writes_; ///< the command's own ranges (capacity reused)
     bool want_flush_ = false;
+    bool flush_full_ = false;  ///< the flush in progress ends a full batch (max_draws_per_batch)
+    bool batch_fence_ = false; ///< the open batch holds a fence, a flip or a timeline write
     // CMASK/HTILE addresses a compute clear marked: the target clears at its next rendering
     std::unordered_map<u64, bool> pending_meta_clear_;
     ExecutorStats stats_;

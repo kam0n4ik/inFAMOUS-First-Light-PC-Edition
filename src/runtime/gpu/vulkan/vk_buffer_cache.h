@@ -77,6 +77,12 @@ public:
     enum class Residency : u8 { None, Partial, All };
     /// How much of a range (up to the cached size) is valid in video memory: one pass. All: `out` set.
     Residency Classify(u64 addr, u64 size, Range& out);
+    /// P4.6 night: a small read-only range nothing of which is in video memory (the executor streams those - copies
+    /// them into the stream ring each use) may be cached instead: it can be tracked, the budget has room and no CPU
+    /// write hit its blocks recently (a block whose cached pages the CPU wrote waits 60 frames, then 120, ... before
+    /// it is cached again). Measured on the beach: ~93% of the streamed bytes were the same bytes as the range's last
+    /// copy (in the frame or an earlier one).
+    bool Promotable(u64 addr, u64 size, u64 frame);
     /// The guest wrote or unmapped [addr, addr + size) behind the GPU's back: the pages are uploaded again. Any thread.
     void Invalidate(u64 addr, u64 size);
     /// The write tracker's report: the CPU wrote some page of each 64 KiB block of [addr, addr + size) (a fault gives
@@ -116,9 +122,12 @@ private:
     struct Block {
         u16 valid = 0; ///< pages whose video memory copy is current
         bool bound = false;
+        u8 cpu_writes = 0; ///< CPU writes the tracker reported over cached pages (capped): the promotion back-off
         u16 gpu_pending = 0; ///< pages the GPU writes in submission `pending_seq` (the host's copy is older until then)
         u64 pending_seq = 0;
+        u64 quiet_from = 0; ///< the frame from which a small read-only range here is cached again instead of streamed
     };
+    u64 frame_ = 0; ///< the frame Promotable saw last
     /// The block table: leaves of 4096 blocks (256 MiB of addresses) made when first touched - a lookup is two array
     /// indexings (it was a hash map: binding checks and scans 5.6 ms a frame for ~6200 ranges, e1).
     static constexpr u64 kLeafBits = 12;
