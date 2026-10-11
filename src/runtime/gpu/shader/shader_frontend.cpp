@@ -57,6 +57,19 @@ const bool g_fine_timing = [] {
     return GetEnvironmentVariableA("SSPC_GPU_TIMINGS", v, sizeof(v)) == 1 && v[0] == '1';
 }();
 
+const u32 g_fine_every = [] {
+    char v[32] = {};
+    const DWORD n = GetEnvironmentVariableA("SSPC_GPU_TIMINGS", v, sizeof(v));
+    const std::string_view s(v, n < sizeof(v) ? n : 0);
+    if (!s.starts_with("sample")) {
+        return 0u;
+    }
+    const u32 every = s.size() > 7 && s[6] == ':' ? static_cast<u32>(std::strtoul(v + 7, nullptr, 10)) : 32u;
+    return std::max<u32>(every, 1);
+}();
+
+bool g_fine_now = false;
+
 u64 TicksToNs(u64 ticks) {
     return static_cast<u64>(static_cast<double>(ticks) / TicksPerNs());
 }
@@ -460,7 +473,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         s.program_error = l.error;
         stage_epoch_[si] = programs_.Epoch();
     }
-    if (g_fine_timing) {
+    if (g_fine_timing || g_fine_now) {
         times_.program.Add(TicksToNs(Ticks() - tp));
     }
     if (s.program == nullptr) {
@@ -532,11 +545,11 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         stats_.resources[i] += s.plan.status_counts[i];
     }
     const u64 tk = FineTicks();
-    if (g_fine_timing) {
+    if (g_fine_timing || g_fine_now) {
         times_.resources.Add(TicksToNs(tk - tr));
     }
     BuildSpecializationKey(s.runtime, start, r, fetch, s.plan, s.key);
-    if (g_fine_timing) {
+    if (g_fine_timing || g_fine_now) {
         times_.key.Add(TicksToNs(Ticks() - tk));
     }
     s.end = EndOf(start, s.plan);
@@ -602,7 +615,7 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
     if (DecodeStages(regs.Get(Reg::VgtShaderStagesEn)) != StageConfig::Vs) {
         ++stats_.unsupported;
         prep_.unsupported = true;
-        if (g_fine_timing) {
+        if (g_fine_timing || g_fine_now) {
             times_.draw.Add(TicksToNs(Ticks() - t0));
         }
         return prep_;
@@ -651,7 +664,7 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
             last_ps_ = ps_id;
             last_vs_ = vs_id;
         }
-        if (g_fine_timing) {
+        if (g_fine_timing || g_fine_now) {
             times_.pipeline.Add(TicksToNs(Ticks() - tp));
         }
         prep_.ready = true;
@@ -660,7 +673,7 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         ++stats_.waiting;
         last_pipeline_ = 0;
     }
-    if (g_fine_timing) {
+    if (g_fine_timing || g_fine_now) {
         times_.draw.Add(TicksToNs(Ticks() - t0));
     }
     return prep_;
@@ -687,7 +700,7 @@ const DrawPreparation& ShaderFrontend::PrepareDispatch(const Cp::DispatchDescrip
     } else {
         ++stats_.waiting;
     }
-    if (g_fine_timing) {
+    if (g_fine_timing || g_fine_now) {
         times_.dispatch.Add(TicksToNs(Ticks() - t0));
     }
     return prep_;

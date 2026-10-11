@@ -55,6 +55,7 @@
 #include "base/log.h"
 #include "runtime/exports.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/inspector.h"
 #include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/gnm/gnm_init_sequences.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -631,6 +632,7 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
     }
     const s32 submitted = PerformSubmit(*host, count, dcbs, dcb_sizes);
     FrameLog::GameFlip(); // the flip was requested (PatchFlipRequest): its row ends here, submitted or not
+    Inspector::FlipThread(); // (P4.8: this thread's CPU time per frame, when the inspector runs)
     g_last_submit_tsc.store(__rdtsc(), std::memory_order_release);
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::Submitted);

@@ -9,6 +9,7 @@
 #include "runtime/filesystem/file_system.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include <windows.h>
 
 #include "base/log.h"
+#include "runtime/gpu/inspector.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/directory.h"
 #include "runtime/filesystem/fs_host.h"
@@ -712,6 +714,21 @@ std::string ThreadName() {
     return out;
 }
 
+/// A read the Performance Inspector counts (P4.8; off: the call alone).
+template <typename F>
+s64 CountedRead(F&& read) {
+    if (!Gpu::Inspector::On()) {
+        return read();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const s64 r = read();
+    Gpu::Inspector::FileRead(r > 0 ? static_cast<u64>(r) : 0,
+                             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - t0)
+                                                  .count()));
+    return r;
+}
+
 SSPC_SYSV_ABI s32 KernelOpen(const char* path, s32 flags, u16 mode) {
     const s32 r = PosixOpen(path, flags, mode);
     if (r < 0) {
@@ -731,11 +748,11 @@ SSPC_SYSV_ABI s32 KernelClose(s32 fd) {
 }
 
 SSPC_SYSV_ABI s64 KernelRead(s32 fd, void* buf, u64 nbytes) {
-    return ToOrbis(PosixRead(fd, buf, nbytes), "sceKernelRead");
+    return ToOrbis(CountedRead([&] { return PosixRead(fd, buf, nbytes); }), "sceKernelRead");
 }
 
 SSPC_SYSV_ABI s64 KernelPread(s32 fd, void* buf, u64 nbytes, s64 offset) {
-    return ToOrbis(PosixPread(fd, buf, nbytes, offset), "sceKernelPread");
+    return ToOrbis(CountedRead([&] { return PosixPread(fd, buf, nbytes, offset); }), "sceKernelPread");
 }
 
 SSPC_SYSV_ABI s64 KernelWrite(s32 fd, const void* buf, u64 nbytes) {
@@ -796,7 +813,7 @@ SSPC_SYSV_ABI s32 KernelUnlink(const char* path) {
 
 // libc.prx's _read/_write: POSIX results (-1 + errno).
 SSPC_SYSV_ABI s64 Read(s32 fd, void* buf, u64 nbytes) {
-    return PosixRead(fd, buf, nbytes);
+    return CountedRead([&] { return PosixRead(fd, buf, nbytes); });
 }
 
 SSPC_SYSV_ABI s64 Write(s32 fd, const void* buf, u64 nbytes) {

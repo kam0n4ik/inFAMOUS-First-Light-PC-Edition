@@ -15,6 +15,13 @@ void StartVramLog(u32 interval_seconds);
 /// hook, if set, runs in both cases.
 void LogVramSample(const char* reason, bool allow_init = true);
 
+/// The process's video memory as the OS counts it (DXGI; every allocation of the process, the driver's included).
+struct VideoMemoryInfo {
+    u64 local_usage = 0, local_budget = 0, nonlocal_usage = 0, nonlocal_budget = 0; ///< bytes
+};
+/// Queries it without logging (the Performance Inspector, once a second). false: no adapter.
+bool QueryVideoMemory(VideoMemoryInfo& out);
+
 /// Called after every sample with the same reason ("sample", "crash", ...); set by the GPU bridge.
 using VramSampleHook = void (*)(const char* reason);
 void SetVramSampleHook(VramSampleHook hook);

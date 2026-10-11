@@ -121,6 +121,9 @@ private:
         bool dirty = false;
     };
     std::unordered_map<u64, AddressEntry> addresses_; ///< key: address << 3 | stage
+    /// P4.9: the entries looked up last (direct-mapped by key) - the map's hashing and bucket walk on every stage of every
+    /// draw were ~1.4% of the GPU thread (village); its entries are never erased, so the pointers stay valid
+    std::array<std::pair<u64, AddressEntry*>, 256> addr_memo_{};
     u64 addr_lo_ = ~0ull, addr_hi_ = 0; ///< the bytes any entry covers (Invalidate: ranges outside need no walk)
     std::unordered_map<ProgramIdentity, std::unique_ptr<Program>, ProgramIdentityHash> programs_;
     ProgramImage scratch_;
@@ -148,10 +151,26 @@ public:
     u64 reads = 0, changed = 0;
 
 private:
+    const Entry& GetEntry(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation, Entry& e);
     std::unordered_map<u64, Entry> entries_;
+    std::array<std::pair<u64, Entry*>, 256> memo_{}; ///< P4.9: entries looked up last (never erased: stable pointers)
     std::vector<u32> scratch_;
 };
 
 inline constexpr u32 kMaxFetchDwords = 512;
+
+/// P4.9: the direct-mapped memos in front of the frontend's and the executor's u64-keyed maps (SSPC_P49_LOOKUP_MEMO=0:
+/// every lookup through the map, the earlier behaviour)
+bool LookupMemoOn();
+/// SSPC_P49_LOOKUP_MEMO=verify: every memo hit is looked up in its map too and the entries compared (the counts in
+/// gpu_native.txt; the GPU thread's)
+bool LookupMemoVerify();
+struct LookupMemoChecks {
+    u64 verified = 0, mismatches = 0;
+};
+LookupMemoChecks& LookupMemoCounts();
+inline size_t LookupMemoSlot(u64 key) {
+    return static_cast<size_t>((key * 0x9E3779B97F4A7C15ull) >> 56); // 256 slots
+}
 
 } // namespace SecondSon::Gpu::Shader

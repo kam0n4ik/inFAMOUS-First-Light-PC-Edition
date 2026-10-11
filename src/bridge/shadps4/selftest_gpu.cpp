@@ -28,6 +28,7 @@
 #include "core/libraries/kernel/memory.h"
 #include "runtime/gpu/backend.h"
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/inspector.h"
 #include "runtime/gpu/pm4.h"
 #include "runtime/gpu/pm4_stats.h"
 #include "runtime/gpu/vulkan/vk_foundation.h"
@@ -624,10 +625,63 @@ void TestImageCacheRules(TestGroup& g) {
             "");
 }
 
+/// P4.8: the Performance Inspector's effect catalog and the target rules (classification never by pipeline number).
+void TestInspectorCatalog(TestGroup& g) {
+    namespace I = Gpu::Inspector;
+    I::Catalog c;
+    std::string first;
+    const u32 bad = c.Parse("# comment\n"
+                            "vs 7d22e10251c65380 Smoke confirmed  smoke VS\n"
+                            "ps 1a4f64edc772a286 Smoke confirmed\n"
+                            "cs a99b7ef49eca794  ParticleSimulation shared  15 hex digits\r\n"
+                            "ps 1111 Foliage probable\n"
+                            "vs 2222 Geometry rule\n"        // rule is not a catalog basis
+                            "xs 3333 Smoke confirmed\n"      // no such stage
+                            "vs zz Smoke confirmed\n"        // not hex
+                            "cs 4444 NoSuchCategory probable\n",
+                            &first);
+    g.Check("catalog: 4 entries parsed, 4 malformed lines counted (basis rule, stage, hex, category), comments skipped",
+            c.Size() == 4 && bad == 4 && first.starts_with("vs 2222"),
+            fmt::format("size {} bad {} first '{}'", c.Size(), bad, first));
+    const I::Class* cs = c.Find('c', 0xa99b7ef49eca794ull);
+    g.Check("catalog: a compute entry by its content hash, the shared basis",
+            cs != nullptr && cs->category == I::Category::ParticleSimulation && cs->basis == I::Basis::Shared, "");
+    const I::DrawShape shadow{.colors = 0, .depth = true, .width = 1024, .height = 1024};
+    const I::DrawShape gbuf{.colors = 5, .depth = true, .width = 1920, .height = 1080};
+    const I::DrawShape post{.colors = 1, .depth = false, .width = 1920, .height = 1080, .count = 3};
+    const I::DrawShape prepass{.colors = 0, .depth = true, .width = 1920, .height = 1080};
+    const I::DrawShape plain{.colors = 1, .depth = true, .width = 1920, .height = 1080, .count = 300, .indexed = true};
+    g.Check("catalog: a draw takes its PS entry before its VS entry, the VS entry without a PS entry, a rule otherwise",
+            c.Draw(0x7d22e10251c65380ull, 0x1111, true, shadow).category == I::Category::Foliage &&
+                c.Draw(0x7d22e10251c65380ull, 0x9999, true, shadow).category == I::Category::Smoke &&
+                c.Draw(0x7d22e10251c65380ull, 0x1111, false, shadow).category == I::Category::Smoke &&
+                c.Draw(0x5555, 0x6666, true, shadow).basis == I::Basis::Rule,
+            "");
+    g.Check("rules: square depth-only target = shadows, depth-only otherwise and 3+ colour targets = geometry, a small "
+            "full-screen draw = post-processing, anything else unknown",
+            I::RuleForDraw(shadow).category == I::Category::Shadows &&
+                I::RuleForDraw(gbuf).category == I::Category::Geometry &&
+                I::RuleForDraw(prepass).category == I::Category::Geometry &&
+                I::RuleForDraw(post).category == I::Category::PostProcessing &&
+                I::RuleForDraw(plain).category == I::Category::Unknown && I::RuleForDraw(plain).basis == I::Basis::None,
+            "");
+    g.Check("catalog: a dispatch without an entry is ComputeOther by rule",
+            c.Dispatch(0x7777).category == I::Category::ComputeOther && c.Dispatch(0x7777).basis == I::Basis::Rule, "");
+    bool names = true;
+    for (size_t i = 0; i < I::kCategories; ++i) {
+        I::Category back{};
+        names = names && I::CategoryFromName(I::CategoryName(static_cast<I::Category>(i)), back) &&
+                back == static_cast<I::Category>(i);
+    }
+    g.Check("categories: every name maps back to its category", names, "");
+}
+
 } // namespace
 
 std::vector<TestGroup> TestGpu(const App::Config& cfg) {
-    std::vector<TestGroup> out(6);
+    std::vector<TestGroup> out(7);
+    out[6].name = "Inspector(catalog)";
+    TestInspectorCatalog(out[6]);
     out[0].name = "Pm4Decode";
     out[1].name = "Pm4Stats";
     out[2].name = "GpuOwners";

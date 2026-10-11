@@ -51,6 +51,11 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
         SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BIND_HOST_WAIT=1 - sparse binds complete on the host, "
                                "batches do not wait for them on the queue");
     }
+    if (char bu[4] = {}; GetEnvironmentVariableA("SSPC_P49_BLOCK_UPLOAD", bu, sizeof(bu)) == 1 && bu[0] == '1') {
+        block_upload_ = true;
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P49_BLOCK_UPLOAD=1 - a block's first missing page brings its other used, "
+                               "invalid pages along (one upload a block)");
+    }
     if (!ctx_.Caps().sparse_buffer) {
         stats_.first_error = "no sparse buffers (sparseBinding/sparseResidencyBuffer, a sparse binding queue)";
         SSPC_LOG(GPU, Warning, "native backend: buffer cache off: {}", stats_.first_error);
@@ -574,7 +579,23 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         Block& blk = GetBlock(b);
         const u16 mask = PageMask(b, first_page, last_page);
         u16 missing = static_cast<u16>(mask & ~blk.valid);
-        blk.valid |= mask;
+        // P4.9: a CPU write gives the whole block back; the bindings of the frame then asked for its pages one part at a
+        // time - each an upload, a protection (a system call) and two or three full barriers (village: ~330 uploads a
+        // frame for ~30 blocks). The block's other pages a binding used before and that are invalid now come along
+        // with the first: invalid pages hold nothing newer than the host (the same pages a later binding would upload,
+        // recorded earlier - the barriers below order them after the batch's earlier writes the same way).
+        if (const u16 extra = static_cast<u16>(blk.used & ~blk.valid & ~mask); missing != 0 && extra != 0 && block_upload_) {
+            GuestBuffers::View v{};
+            GuestBuffers::Failure fl{};
+            if (guest_.Get(b << kBlockBits, 1ull << kBlockBits, seq, v, fl)) {
+                missing |= extra;
+                stats_.block_upload_pages += static_cast<u64>(std::popcount(extra));
+            } else {
+                ++stats_.block_upload_refused; // not importable whole: only the binding's pages
+            }
+        }
+        blk.used |= mask;
+        blk.valid |= mask | missing;
         while (missing != 0) {
             const u32 lo = static_cast<u32>(std::countr_zero(missing));
             u32 hi = lo;

@@ -64,10 +64,30 @@ u64 TicksToNs(u64 ticks);
 /// The per-stage timers of the hot path (frontend steps, binding, buffer classification, ...): on with
 /// SSPC_GPU_TIMINGS=1 only - tens of TSC reads a draw were a measurable share of the recording (P4.6). Off: FineTicks()
 /// is 0 (the stage sums stay 0); the coarse timers (recording, submission, waits) always count.
+/// P4.9: SSPC_GPU_TIMINGS=sample[:N] (N 32 when not given) - the same timers for every N-th draw/dispatch only (a
+/// FineSample around it sets g_fine_now): the stage sums are 1/N of the whole; reports multiply them by FineScale().
 extern const bool g_fine_timing;
+extern const u32 g_fine_every;
+extern bool g_fine_now; ///< the GPU thread's (the only one that reads FineTicks)
 inline u64 FineTicks() {
-    return g_fine_timing ? __rdtsc() : 0;
+    return (g_fine_timing || g_fine_now) ? __rdtsc() : 0;
 }
+inline u64 FineScale() {
+    return g_fine_every != 0 ? g_fine_every : 1;
+}
+/// Around one draw/dispatch: its stage timers run when it is the counter's N-th (sampled mode only).
+class FineSample {
+public:
+    explicit FineSample(u32& counter) {
+        if (g_fine_every != 0 && ++counter >= g_fine_every) {
+            counter = 0;
+            g_fine_now = true;
+        }
+    }
+    ~FineSample() { g_fine_now = false; }
+    FineSample(const FineSample&) = delete;
+    FineSample& operator=(const FineSample&) = delete;
+};
 
 enum class StageStatus : u8 {
     Ready,       ///< module ready, resources resolved

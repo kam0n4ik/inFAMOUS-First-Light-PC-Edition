@@ -24,6 +24,7 @@
 #include "runtime/gpu/gnm/gnm_driver.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/cpu_sampler.h"
 #include "runtime/gpu/page_tracker.h"
@@ -181,6 +182,7 @@ public:
 
     // ---- MemoryListener (the guest memory manager's threads)
     void OnUnmap(u64 addr, u64 size) override {
+        Inspector::GuestMap(true);
         memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (guest_) {
@@ -193,6 +195,7 @@ public:
     }
     void OnRegister(u64, u64) override {}
     void OnMap(u64 addr, u64 size) override {
+        Inspector::GuestMap(false);
         memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (images_) {
@@ -287,6 +290,9 @@ private:
     std::string first_cp_error_;
     // the GPU thread's running totals for the frame log (P4.6): busy (rounds, polls, flushes); idle by what it waited for
     u64 tot_busy_ns_ = 0, tot_blocked_label_ns_ = 0, tot_blocked_other_ns_ = 0, tot_empty_ns_ = 0;
+    // P4.8 (the Performance Inspector): the loop's time split further - before a round (submissions, invalidations,
+    // the CPU's writes drained), rounds, polls, flushes; of the idle time, the part the GPU had work
+    u64 tot_pre_ns_ = 0, tot_round_ns_ = 0, tot_poll_ns_ = 0, tot_flush_ns_ = 0, tot_idle_gpu_ns_ = 0;
     std::chrono::steady_clock::time_point round_t0_{}; ///< the current round's start (OnFlip runs inside it)
     u64 label_base_ = 0;                               ///< VideoOut's buffer labels (a wait on them waits for a flip)
 };
@@ -508,12 +514,22 @@ bool Backend::Start(const Options& o, std::string& error) {
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
     FrameLog::Start();
+    // P4.8: SSPC_INSPECTOR=light - the Performance Inspector (off otherwise: nothing of it runs)
+    if (Inspector::Start({.logs_dir = o.logs_dir,
+                          .device = ctx_->Name(),
+                          .timestamp_period = ctx_->Caps().timestamp_period,
+                          .fine_timing = GS::g_fine_timing || GS::g_fine_every != 0})) {
+        executor_->SetInspector(Inspector::GetCatalog(), Inspector::GpuEvery());
+    }
     executor_->SetFlipHook([](void* self, u64 value) { static_cast<Backend*>(self)->OnFlip(value); }, this);
     Gnm::SetHost(this);
     VideoOut::SetLabelCallback([](void* ctx) { static_cast<Backend*>(ctx)->cv_.notify_one(); }, this);
     VideoOut::Start(this);
     stop_.store(false);
     thread_ = std::thread([this] { Loop(); });
+    if (Inspector::On()) {
+        Inspector::SetGpuThread(reinterpret_cast<HANDLE>(thread_.native_handle()));
+    }
     if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_SAMPLE", v, sizeof(v)) > 0 && v[0] == '1') {
         char delay[16] = {};
         const u32 after = GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_AFTER", delay, sizeof(delay)) > 0
@@ -597,6 +613,7 @@ void Backend::Loop() {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count());
     };
     while (!stop_.load(std::memory_order_acquire)) {
+        const auto iter_t0 = Clock::now();
         {
             std::unique_lock lock{mutex_};
             local.swap(queue_);
@@ -620,6 +637,7 @@ void Backend::Loop() {
         bool progress = false, blocked = false, pending = false, blocked_label = false;
         const auto cp_t0 = Clock::now();
         round_t0_ = cp_t0;
+        tot_pre_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(cp_t0 - iter_t0).count());
         // SSPC_DIAG_QUEUE_ORDER=compute-first: the compute queues stepped before the graphics queue in each round (an
         // experiment on async compute's place relative to the graphics frame's end-of-pipe; P4.5)
         static const bool compute_first = [] {
@@ -660,11 +678,13 @@ void Backend::Loop() {
         const u64 round_ns = ns_since(cp_t0);
         prof_cp += round_ns;
         tot_busy_ns_ += round_ns;
+        tot_round_ns_ += round_ns;
         const auto poll_t0 = Clock::now();
         executor_->Poll(); // completed batches: the processor writes its held labels now
         const u64 poll_ns = ns_since(poll_t0);
         prof_poll += poll_ns;
         tot_busy_ns_ += poll_ns;
+        tot_poll_ns_ += poll_ns;
         if (executor_->DeviceLost()) {
             // VK_ERROR_DEVICE_LOST: the report is written, nothing more is submitted; the process ends with an
             // explicit status (a run with a lost device is not a successful run)
@@ -680,6 +700,10 @@ void Backend::Loop() {
             const double secs = std::chrono::duration<double>(now - rate_t0).count();
             const double frames = std::max<double>(1.0, static_cast<double>(s.flips - rate_flips));
             const auto per_frame = [&](double ns) { return ns / 1e6 / frames; };
+            // the stage timers' sums (TSC ticks); sampled (SSPC_GPU_TIMINGS=sample:N): of every N-th command, times N
+            const auto fine_frame = [&](u64 ticks) {
+                return per_frame(static_cast<double>(GS::TicksToNs(ticks)) * static_cast<double>(GS::FineScale()));
+            };
             SSPC_LOG(GPU, Info,
                      "native backend: {:.1f} flips/s, {:.0f} draws/s over the last {:.1f} s: recording {} ms, waiting "
                      "for the GPU {} ms, writes on the timeline {} | per frame (ms): command processor {:.1f} (of it "
@@ -697,26 +721,26 @@ void Backend::Loop() {
                      "native backend: recording per frame (ms): frontend {:.1f}, binding {:.1f} (buffers {:.1f}, images "
                      "{:.1f}); streamed {:.0f} small ranges ({:.1f} MiB) per frame; stream ring waits {}, mirrored "
                      "{:.1f} MiB per frame",
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_front - rate_front))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_bind - rate_bind))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_range - rate_range))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_image - rate_image))),
+                     fine_frame(s.t_front - rate_front),
+                     fine_frame(s.t_bind - rate_bind),
+                     fine_frame(s.t_range - rate_range),
+                     fine_frame(s.t_image - rate_image),
                      static_cast<double>(s.streamed - rate_streamed) / frames,
                      static_cast<double>(s.streamed_bytes - rate_streamed_bytes) / 1048576.0 / frames,
                      ring_->Waits() - rate_ring_waits,
                      static_cast<double>(ring_->MirroredBytes() - rate_mirrored) / 1048576.0 / frames);
             rate_ring_waits = ring_->Waits();
             rate_mirrored = ring_->MirroredBytes();
-            if (GS::g_fine_timing) { // (the stages are timed with SSPC_GPU_TIMINGS=1 only)
+            if (GS::g_fine_timing || GS::g_fine_every != 0) { // (SSPC_GPU_TIMINGS=1 or sample[:N] only)
                 SSPC_LOG(GPU, Info,
                          "native backend: draw stages per frame (ms): pipeline {:.1f}, targets {:.1f}, vertex/index {:.1f}, "
                          "barriers/layouts {:.1f}, commands {:.1f}; dispatches whole {:.1f}",
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_pipe - rate_pipe))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_targets - rate_targets))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_vertex - rate_vertex))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_layout - rate_layout))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_emit - rate_emit))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_dispatch - rate_dispatch))));
+                         fine_frame(s.t_pipe - rate_pipe),
+                         fine_frame(s.t_targets - rate_targets),
+                         fine_frame(s.t_vertex - rate_vertex),
+                         fine_frame(s.t_layout - rate_layout),
+                         fine_frame(s.t_emit - rate_emit),
+                         fine_frame(s.t_dispatch - rate_dispatch));
                 rate_pipe = s.t_pipe;
                 rate_targets = s.t_targets;
                 rate_vertex = s.t_vertex;
@@ -726,11 +750,11 @@ void Backend::Loop() {
                 SSPC_LOG(GPU, Info,
                          "native backend: buffers per frame (ms): classify {:.1f}, host pointer {:.1f}, ring {:.1f}, copy {:.1f}, "
                          "cache prepare {:.1f} ({:.0f} calls)",
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_classify - rate_classify))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_hostptr - rate_hostptr))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_alloc - rate_alloc))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_copy - rate_copy))),
-                         per_frame(static_cast<double>(GS::TicksToNs(s.t_prepare - rate_prepare))),
+                         fine_frame(s.t_classify - rate_classify),
+                         fine_frame(s.t_hostptr - rate_hostptr),
+                         fine_frame(s.t_alloc - rate_alloc),
+                         fine_frame(s.t_copy - rate_copy),
+                         fine_frame(s.t_prepare - rate_prepare),
                          static_cast<double>(s.n_prepare - rate_nprep) / frames);
                 rate_classify = s.t_classify;
                 rate_hostptr = s.t_hostptr;
@@ -742,12 +766,12 @@ void Backend::Loop() {
                 SSPC_LOG(GPU, Info,
                          "native backend: cache prepare per frame (ms): large ranges {:.1f}, bind {:.1f}, scan {:.1f}, upload "
                          "hook {:.1f}, write-protect {:.1f}, copies {:.1f} ({:.0f} uploading calls)",
-                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_large - rate_tl))),
-                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_bound - rate_tb))),
-                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_scan - rate_ts))),
-                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_hook - rate_th))),
-                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_arm - rate_ta))),
-                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_copy - rate_tc))),
+                         fine_frame(bc.t_large - rate_tl),
+                         fine_frame(bc.t_bound - rate_tb),
+                         fine_frame(bc.t_scan - rate_ts),
+                         fine_frame(bc.t_hook - rate_th),
+                         fine_frame(bc.t_arm - rate_ta),
+                         fine_frame(bc.t_copy - rate_tc),
                          static_cast<double>(bc.n_upload_calls - rate_nu) / frames);
             }
             const auto& bc = buffers_->Stats();
@@ -786,6 +810,7 @@ void Backend::Loop() {
             const u64 flush_ns = ns_since(flush_t0);
             prof_flush += flush_ns;
             tot_busy_ns_ += flush_ns;
+            tot_flush_ns_ += flush_ns;
         }
         if (progress) {
             continue;
@@ -837,6 +862,7 @@ void Backend::Loop() {
         prof_idle_blocked += blocked ? idle_ns : 0;
         prof_idle_gpu += busy ? idle_ns : 0;
         (blocked ? (blocked_label ? tot_blocked_label_ns_ : tot_blocked_other_ns_) : tot_empty_ns_) += idle_ns;
+        tot_idle_gpu_ns_ += busy ? idle_ns : 0;
     }
 }
 
@@ -864,9 +890,48 @@ void Backend::OnFlip(u64 gpu_value) {
     t.pipeline_ns = p.create_ns;
     t.module_ns = p.module_ns;
     FrameLog::CpFlip(gpu_value, t, executor_->LastUnblockTsc());
+    if (Inspector::On()) {
+        Inspector::CpTotals it;
+        const u64 partial = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - round_t0_).count());
+        it.pre_ns = tot_pre_ns_;
+        it.round_ns = tot_round_ns_ + partial; // (the flip marker is inside a round: its time so far)
+        it.poll_ns = tot_poll_ns_;
+        it.flush_ns = tot_flush_ns_;
+        it.idle_label_ns = tot_blocked_label_ns_;
+        it.idle_other_ns = tot_blocked_other_ns_;
+        it.idle_empty_ns = tot_empty_ns_;
+        it.idle_gpu_ns = tot_idle_gpu_ns_;
+        for (size_t i = 0; i < 3; ++i) {
+            it.sync_ns[i] = s.sync_eff_us[i] * 1000;
+            it.syncs[i] = s.sync_eff[i];
+        }
+        it.submit_ns = s.submit_ns;
+        const auto& bs = buffers_->Stats();
+        const auto is = images_->Stats();
+        it.wb_bytes = bs.writeback_bytes;
+        it.buf_upload_bytes = bs.upload_bytes;
+        it.buf_resident_bytes = bs.resident_bytes;
+        it.img_uploads = is.uploads;
+        it.img_upload_bytes = is.upload_bytes;
+        it.img_created = is.created;
+        it.img_resident_bytes = is.bytes;
+        it.streamed_bytes = s.streamed_bytes;
+        it.mirrored_bytes = ring_->MirroredBytes();
+        it.barriers = s.global_barriers;
+        it.render_passes = s.render_passes;
+        it.stage_ticks = {s.t_front, s.t_bind, s.t_range, s.t_image, s.t_pipe,
+                          s.t_targets, s.t_vertex, s.t_layout, s.t_emit, s.t_dispatch};
+        for (u64& t : it.stage_ticks) {
+            t *= GS::FineScale(); // (sampled timers: every N-th command's sums, P4.9)
+        }
+        it.categories = executor_->InspectorCategories();
+        Inspector::CpFrame(FrameLog::GetProgress().cp - 1, it); // (CpFlip counted this frame)
+    }
 }
 
 void Backend::Stop() {
+    Inspector::StopSampling(); // while the sampled thread still exists
     sampler_.Stop(); // while the sampled thread still exists
     game_sampler_.Stop();
     stop_.store(true, std::memory_order_release);
@@ -887,6 +952,11 @@ void Backend::Stop() {
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
+    if (Inspector::On() && executor_) {
+        Inspector::WriteFile("pipelines.csv", executor_->InspectorPipelines());
+        Inspector::WriteFile("gpu_native.txt", Report());
+    }
+    Inspector::Stop();
     if (sampler_.Running()) {
         std::ofstream(options_.logs_dir / "gpu_cpu_profile.txt", std::ios::trunc) << sampler_.Report(60);
     }
@@ -1066,6 +1136,12 @@ std::string Backend::Report() {
         out += fmt::format("write-backs of changed words only (large ranges): {} MiB compared in {} dispatches, shadows "
                            "made from the host {}; prepares answered by the batch's memo {}\n",
                            b.wb_diff_bytes >> 20, b.wb_diff_dispatches, b.wb_shadow_inits, b.prep_memo_hits);
+        out += fmt::format("uploads by bindings (P4.9): prepares that uploaded {}, pages brought along with their block's "
+                           "first missing page {} (blocks not importable whole {})\n",
+                           b.n_upload_calls, b.block_upload_pages, b.block_upload_refused);
+        out += fmt::format("lookup memos (P4.9): {}; verified hits {}, mismatches {}\n",
+                           GS::LookupMemoOn() ? (GS::LookupMemoVerify() ? "on, verify" : "on") : "off",
+                           GS::LookupMemoCounts().verified, GS::LookupMemoCounts().mismatches);
         if (b.wb_checked_bytes != 0) {
             out += fmt::format("write-backs checked (SSPC_DIAG_WB_DIRTY): {} MiB, changed 256-byte chunks {} ({} MiB), "
                                "changed words {} ({} KiB)\n",

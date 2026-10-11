@@ -2,6 +2,7 @@
 #include "base/vram_monitor.h"
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <dxgi1_4.h>
 #include <windows.h>
@@ -16,12 +17,21 @@ namespace {
 
 IDXGIAdapter3* g_adapter = nullptr;
 bool g_tried = false;
+std::mutex g_adapter_mutex; ///< the first Adapter() (the log's thread and the Performance Inspector's)
+std::atomic<bool> g_ready{false};
 std::atomic<VramSampleHook> g_hook{nullptr};
 
 IDXGIAdapter3* Adapter() {
+    if (g_ready.load(std::memory_order_acquire)) {
+        return g_adapter; // (no lock once made: the crash handler's sample)
+    }
+    std::scoped_lock lock{g_adapter_mutex};
     if (g_tried) {
         return g_adapter;
     }
+    struct Ready {
+        ~Ready() { g_ready.store(true, std::memory_order_release); }
+    } ready;
     g_tried = true;
     IDXGIFactory4* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) {
@@ -89,6 +99,20 @@ void LogVramSample(const char* reason, bool allow_init) {
     if (const VramSampleHook hook = g_hook.load(); hook != nullptr) {
         hook(reason);
     }
+}
+
+bool QueryVideoMemory(VideoMemoryInfo& out) {
+    IDXGIAdapter3* adapter = Adapter();
+    if (adapter == nullptr) {
+        return false;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, nonlocal{};
+    if (FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) ||
+        FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
+        return false;
+    }
+    out = {local.CurrentUsage, local.Budget, nonlocal.CurrentUsage, nonlocal.Budget};
+    return true;
 }
 
 void SetVramSampleHook(VramSampleHook hook) {

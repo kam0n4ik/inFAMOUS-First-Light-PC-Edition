@@ -76,6 +76,9 @@ s32 Hi16(u32 v) {
 
 constexpr u32 kQuerySlots = 1024; ///< batches in flight stay far below
 constexpr u32 kProfBatches = 64, kProfPerBatch = 2048; ///< the profiler's pool: batch slots x timestamps
+/// P4.8 Performance Inspector: batch slots x timestamps at category changes (a batch has ~500 commands; the
+/// draws of one pass share a category, so far fewer changes)
+constexpr u32 kInspBatches = 128, kInspPerBatch = 512;
 
 constexpr VkPipelineStageFlags2 kGraphicsShaders = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
                                                    VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
@@ -185,6 +188,10 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                                    "compared");
         }
     }
+    if (!GS::LookupMemoOn()) {
+        SSPC_LOG(GPU, Warning, "SSPC_P49_LOOKUP_MEMO=0 - programs, fetch shaders and textures are looked up in their maps "
+                               "every time (the P4.8 behaviour)");
+    }
     char prof[4] = {};
     prof_ = GetEnvironmentVariableA("SSPC_GPU_PROFILE", prof, sizeof(prof)) == 1 && prof[0] == '1' &&
             ctx_.Caps().timestamp_period > 0.0f;
@@ -238,6 +245,9 @@ Executor::~Executor() {
     const VkDevice dev = ctx_.Device();
     if (queries_ != VK_NULL_HANDLE) {
         f.vkDestroyQueryPool(dev, queries_, nullptr);
+    }
+    if (insp_pool_ != VK_NULL_HANDLE) {
+        f.vkDestroyQueryPool(dev, insp_pool_, nullptr);
     }
     if (prof_pool_ != VK_NULL_HANDLE) {
         f.vkDestroyQueryPool(dev, prof_pool_, nullptr);
@@ -363,6 +373,21 @@ bool Executor::Begin() {
         f.vkCmdResetQueryPool(cur_.cb, prof_pool_, cur_.prof_base, kProfPerBatch);
         f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_pool_, cur_.prof_base);
         cur_.prof_count = 1;
+    }
+    // P4.8: the inspector's category timestamps (every insp_every_-th frame; never more batch slots than the pool has
+    // in flight)
+    cur_.insp_base = ~0u;
+    cur_.insp_count = 0;
+    cur_.insp_slots.clear();
+    cur_.insp_last = 0xFF;
+    cur_.insp_overflow = false;
+    cur_.insp_frame = insp_frame_;
+    if (insp_pool_ != VK_NULL_HANDLE && insp_every_ != 0 && insp_frame_ % insp_every_ == 0 &&
+        in_flight_.size() + 2 < kInspBatches) {
+        cur_.insp_base = (insp_next_batch_++ % kInspBatches) * kInspPerBatch;
+        f.vkCmdResetQueryPool(cur_.cb, insp_pool_, cur_.insp_base, kInspPerBatch);
+        open_ = true; // (InspMark records into the open batch)
+        InspMark(Inspector::kGpuBatchStart);
     }
     open_ = true;
     commands_ = 0;
@@ -602,6 +627,7 @@ void Executor::Flush() {
     if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
+    InspMark(Inspector::kGpuTransfer);
     const u64 wb0 = buffers_.Stats().writeback_bytes;
     // SSPC_DIAG_MEASURE=skip_wb: MEASUREMENT ONLY (the host never sees the GPU's buffer writes) - the write-backs'
     // GPU cost without the profiler (never a configuration)
@@ -638,6 +664,10 @@ void Executor::Flush() {
     pending_writes_ = false;
     pend_.Clear();
     EndLabel();
+    if (cur_.insp_base != ~0u && cur_.insp_count < kInspPerBatch) {
+        f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, insp_pool_, cur_.insp_base + cur_.insp_count);
+        ++cur_.insp_count; // (the end: no interval starts at it)
+    }
     if (cur_.query_slot != ~0u) {
         f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries_, cur_.query_slot * 2 + 1);
     }
@@ -764,13 +794,48 @@ void Executor::Poll() {
                 ts[1] >= ts[0]) {
                 stats_.gpu_busy_ns += static_cast<u64>(static_cast<double>(ts[1] - ts[0]) * ctx_.Caps().timestamp_period);
                 ++stats_.gpu_batches_timed;
+                if (insp_catalog_ != nullptr) {
+                    // the frame's GPU time: the union of its batches' intervals (one queue; a batch's start may come
+                    // before the previous one's end - its top-of-pipe timestamp)
+                    Inspector::GpuFrameTimes& acc = insp_acc_[b.insp_frame % insp_acc_.size()];
+                    const u64 from = std::max(ts[0], insp_last_end_);
+                    if (ts[1] > from) {
+                        acc.busy_ns += static_cast<u64>(static_cast<double>(ts[1] - from) * ctx_.Caps().timestamp_period);
+                    }
+                    insp_last_end_ = std::max(insp_last_end_, ts[1]);
+                    ++acc.batches;
+                }
             }
             b.query_slot = ~0u;
+        }
+        if (b.insp_base != ~0u) {
+            Inspector::GpuFrameTimes& acc = insp_acc_[b.insp_frame % insp_acc_.size()];
+            u64 ts[kInspPerBatch];
+            if (b.insp_count >= 2 &&
+                Fn().vkGetQueryPoolResults(ctx_.Device(), insp_pool_, b.insp_base, b.insp_count, b.insp_count * 8, ts, 8,
+                                           VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                const double period = ctx_.Caps().timestamp_period;
+                for (u32 i = 0; i + 1 < b.insp_count && i < b.insp_slots.size(); ++i) {
+                    if (ts[i + 1] > ts[i]) {
+                        acc.slot_ns[b.insp_slots[i]] += static_cast<u64>(static_cast<double>(ts[i + 1] - ts[i]) * period);
+                    }
+                }
+                acc.timed = true;
+            }
+            acc.overflow += b.insp_overflow ? 1 : 0;
+            b.insp_base = ~0u;
         }
         if (b.prof_base != ~0u) {
             ProfCollect(b);
         }
         free_.push_back(std::move(b));
+    }
+    while (!insp_frame_ends_.empty() && insp_frame_ends_.front().value <= completed) {
+        const u32 n = insp_frame_ends_.front().n;
+        insp_frame_ends_.pop_front();
+        Inspector::GpuFrameTimes& acc = insp_acc_[n % insp_acc_.size()];
+        Inspector::GpuFrame(n, acc);
+        acc = {};
     }
     ring_.Collect(completed);
     if (shadow_ring_ != nullptr) {
@@ -848,6 +913,80 @@ void Executor::OnDeviceLost(const char* where, u64 value) {
     } else {
         SSPC_LOG(GPU, Error, "native backend: VK_ERROR_DEVICE_LOST ({}, submission {})", where, value);
     }
+}
+
+void Executor::SetInspector(const Inspector::Catalog* catalog, u32 gpu_every) {
+    insp_catalog_ = catalog;
+    insp_every_ = 0;
+    if (catalog == nullptr || gpu_every == 0 || queries_ == VK_NULL_HANDLE) {
+        return;
+    }
+    const VkQueryPoolCreateInfo qi{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                   .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                   .queryCount = kInspBatches * kInspPerBatch};
+    if (Fn().vkCreateQueryPool(ctx_.Device(), &qi, nullptr, &insp_pool_) == VK_SUCCESS) {
+        insp_every_ = gpu_every;
+    } else {
+        insp_pool_ = VK_NULL_HANDLE;
+        SSPC_LOG(GPU, Warning, "Performance Inspector: no query pool for the category timestamps - no GPU times");
+    }
+}
+
+void Executor::InspMark(size_t slot) {
+    if (cur_.insp_base == ~0u || !open_ || slot == cur_.insp_last) {
+        return;
+    }
+    if (cur_.insp_count + 1 >= kInspPerBatch) { // (one kept for the batch's end)
+        cur_.insp_overflow = true;
+        return;
+    }
+    Fn().vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, insp_pool_, cur_.insp_base + cur_.insp_count);
+    ++cur_.insp_count;
+    cur_.insp_slots.push_back(static_cast<u8>(slot));
+    cur_.insp_last = static_cast<u8>(slot);
+}
+
+Inspector::Class Executor::InspClassifyDraw(const GS::StageView& vs, const GS::StageView& ps, bool has_ps,
+                                            const Inspector::DrawShape& shape) {
+    const u64 vc = vs.program != nullptr ? vs.program->id.hash.lo : 0;
+    const u64 pc = has_ps && ps.program != nullptr ? ps.program->id.hash.lo : 0;
+    InspDrawMemo& m = insp_draw_memo_[((vc * 0x9E3779B97F4A7C15ull) ^ (pc * 0xC2B2AE3D27D4EB4Full)) >> 54];
+    if (!m.valid || m.vs != vc || m.ps != pc || m.has_ps != has_ps) {
+        m = {vc, pc, insp_catalog_->DrawEntry(vc, pc, has_ps), true, has_ps};
+    }
+    return m.entry != nullptr ? *m.entry : Inspector::RuleForDraw(shape);
+}
+
+Inspector::Class Executor::InspClassifyDispatch(const GS::StageView& cs) {
+    const u64 cc = cs.program != nullptr ? cs.program->id.hash.lo : 0;
+    InspDispatchMemo& m = insp_dispatch_memo_[(cc * 0x9E3779B97F4A7C15ull) >> 56];
+    if (!m.valid || m.cs != cc) {
+        m = {cc, insp_catalog_->Dispatch(cc), true};
+    }
+    return m.cls;
+}
+
+std::string Executor::InspectorPipelines() const {
+    const double ns_per_tick = static_cast<double>(GS::TicksToNs(1'000'000)) / 1e6;
+    std::string out = "kind,id,category,basis,count,instances,vertices,groups,indirect,single_group,cpu_ms,vs_addr,vs,"
+                      "ps_addr,ps,cs_addr,cs,prim,colors,depth,width,height\n";
+    for (size_t i = 0; i < insp_pipelines_.size(); ++i) {
+        const InspPipeline& p = insp_pipelines_[i];
+        if (p.draws == 0) {
+            continue;
+        }
+        out += fmt::format("draw,{},{},{},{},{},{},,{},,{:.3f},{:x},{:x},{:x},{:x},,,{},{},{},{},{}\n", i,
+                           Inspector::CategoryName(p.cls.category), Inspector::BasisName(p.cls.basis), p.draws,
+                           p.instances, p.vertices, p.indirect, static_cast<double>(p.cpu_ticks) * ns_per_tick / 1e6,
+                           p.vs_addr, p.vs, p.ps_addr, p.ps, p.prim, p.colors, p.depth ? 1 : 0, p.width, p.height);
+    }
+    for (const auto& [content, p] : insp_programs_) {
+        out += fmt::format("dispatch,,{},{},{},,,{},{},{},{:.3f},,,,,{:x},{:x},,,,,\n",
+                           Inspector::CategoryName(p.cls.category), Inspector::BasisName(p.cls.basis), p.dispatches,
+                           p.groups, p.indirect, p.single_group, static_cast<double>(p.cpu_ticks) * ns_per_tick / 1e6,
+                           p.address, content);
+    }
+    return out;
 }
 
 void Executor::ProfMark(u64 key, const std::string& label) {
@@ -1486,6 +1625,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
+    InspMark(Inspector::kGpuTransfer);
     const VkBufferCopy region{.srcOffset = soff, .dstOffset = doff, .size = bytes};
     Fn().vkCmdCopyBuffer(cur_.cb, sbuf, dbuf, 1, &region);
     DiagEnd(cid);
@@ -1962,7 +2102,20 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             for (const u32 w : im.desc.raw) {
                 memo_key = (memo_key ^ w) * 0x100000001B3ull;
             }
-            memo = &tex_memo_[memo_key];
+            auto& slot = tex_slot_[GS::LookupMemoSlot(memo_key)];
+            if (slot.second != nullptr && slot.first == memo_key) {
+                memo = slot.second;
+                if (GS::LookupMemoVerify()) {
+                    const auto it = tex_memo_.find(memo_key);
+                    ++GS::LookupMemoCounts().verified;
+                    GS::LookupMemoCounts().mismatches += it == tex_memo_.end() || &it->second != memo ? 1 : 0;
+                }
+            } else {
+                memo = &tex_memo_[memo_key];
+                if (GS::LookupMemoOn()) {
+                    slot = {memo_key, memo};
+                }
+            }
             CachedImage* m = memo->img;
             if (m != nullptr && memo->epoch == images_.Epoch() && memo->raw == im.desc.raw && memo->flags == flags &&
                 ((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written))) {
@@ -2326,6 +2479,7 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
 
 void Executor::Draw(const Cp::DrawDescriptor& d) {
     const u64 t0 = GS::Ticks();
+    const GS::FineSample fine_sample(fine_counter_); // (SSPC_GPU_TIMINGS=sample:N: this draw's stage timers)
     ++stats_.draws;
     ++trace_.ordinal;
     const auto& f = Fn();
@@ -2540,6 +2694,23 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     target_cache_.depth_img = depth_img;
     }
     stage(stats_.t_targets);
+    Inspector::Class insp_cls{};
+    if (insp_catalog_ != nullptr) {
+        Inspector::DrawShape sh;
+        for (const CachedImage* c : color_img) {
+            sh.colors += c != nullptr ? 1 : 0;
+        }
+        sh.depth = depth_img != nullptr;
+        sh.width = key.width;
+        sh.height = key.height;
+        sh.primitive = d.primitive_type;
+        sh.count = d.index_count;
+        sh.instances = std::max<u32>(d.instance_count, 1);
+        sh.indexed = d.indexed;
+        sh.indirect = d.indirect;
+        insp_cls = InspClassifyDraw(vs, ps, has_ps, sh);
+        InspMark(static_cast<size_t>(insp_cls.category)); // (its uploads, barriers and render pass changes count to it)
+    }
     if (histo_.active) {
         // SSPC_DIAG_TARGET_WATCH=<hex address>: every draw rendering into that target (any MRT slot) with its export
         // state (P4.5: a channel of a target lost)
@@ -3170,7 +3341,41 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     if (writes_memory) {
         MarkWrites(0);
     }
-    stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
+    const u64 draw_ticks = GS::Ticks() - t0;
+    stats_.record_ns += GS::TicksToNs(draw_ticks);
+    if (insp_catalog_ != nullptr) {
+        auto& c = insp_cat_[static_cast<size_t>(insp_cls.category)];
+        const u64 inst = d.indirect ? 0 : instances, verts = d.indirect ? 0 : d.index_count;
+        ++c.draws;
+        c.instances += inst;
+        c.vertices += verts * std::max<u64>(inst, 1);
+        c.cpu_ticks += draw_ticks;
+        if (prep.pipeline < (1u << 20)) {
+            if (insp_pipelines_.size() <= prep.pipeline) {
+                insp_pipelines_.resize(prep.pipeline + 1);
+            }
+            InspPipeline& p = insp_pipelines_[prep.pipeline];
+            if (p.draws == 0) {
+                p.vs = vs.program != nullptr ? vs.program->id.hash.lo : 0;
+                p.ps = has_ps && ps.program != nullptr ? ps.program->id.hash.lo : 0;
+                p.vs_addr = vs.address;
+                p.ps_addr = has_ps ? ps.address : 0;
+                p.cls = insp_cls;
+                p.prim = d.primitive_type;
+                p.width = key.width;
+                p.height = key.height;
+                p.depth = depth_img != nullptr;
+                for (const CachedImage* ci : color_img) {
+                    p.colors += ci != nullptr ? 1 : 0;
+                }
+            }
+            ++p.draws;
+            p.instances += inst;
+            p.vertices += verts * std::max<u64>(inst, 1);
+            p.indirect += d.indirect ? 1 : 0;
+            p.cpu_ticks += draw_ticks;
+        }
+    }
     if (commands_ >= options_.max_draws_per_batch) {
         ++stats_.flushes_full;
         flush_full_ = true;
@@ -3180,6 +3385,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
 
 void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     const u64 t0 = GS::Ticks();
+    const GS::FineSample fine_sample(fine_counter_); // (SSPC_GPU_TIMINGS=sample:N: this dispatch's stage timers)
     ++stats_.dispatches;
     ++trace_.ordinal;
     const auto& f = Fn();
@@ -3211,6 +3417,11 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         Label((1ull << 62) | csv.address,
               fmt::format("X cs{:x} {}x{}x{}{} @{:x}", csv.address, d.groups[0], d.groups[1], d.groups[2],
                           d.indirect ? " indirect" : "", d.packet_addr));
+    }
+    Inspector::Class insp_cls{};
+    if (insp_catalog_ != nullptr) {
+        insp_cls = InspClassifyDispatch(csv);
+        InspMark(static_cast<size_t>(insp_cls.category)); // (its uploads and barriers count to it)
     }
     lds_groups_ = std::max<u64>(1, u64{cs->values[Cp::Reg::ComputeDimX]} * cs->values[Cp::Reg::ComputeDimX + 1] *
                                        cs->values[Cp::Reg::ComputeDimX + 2]);
@@ -3603,8 +3814,29 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         ++stats_.unknown_by[1];
     }
     NoteAccesses(acc_reads_, acc_writes_, acc_unknown, tag);
-    stats_.t_dispatch += GS::Ticks() - t0;
-    stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
+    const u64 dispatch_ticks = GS::Ticks() - t0;
+    if (GS::g_fine_timing || GS::g_fine_now) {
+        stats_.t_dispatch += dispatch_ticks; // a stage timer like the others (sampled: every N-th dispatch's, P4.9)
+    }
+    stats_.record_ns += GS::TicksToNs(dispatch_ticks);
+    if (insp_catalog_ != nullptr) {
+        auto& c = insp_cat_[static_cast<size_t>(insp_cls.category)];
+        const u64 groups = d.indirect ? 0
+                                      : u64{d.groups[0]} * std::max<u32>(d.groups[1], 1) * std::max<u32>(d.groups[2], 1);
+        ++c.dispatches;
+        c.groups += groups;
+        c.cpu_ticks += dispatch_ticks;
+        InspProgram& p = insp_programs_[csv.program != nullptr ? csv.program->id.hash.lo : csv.address];
+        if (p.dispatches == 0) {
+            p.address = csv.address;
+            p.cls = insp_cls;
+        }
+        ++p.dispatches;
+        p.groups += groups;
+        p.single_group += groups == 1 ? 1 : 0;
+        p.indirect += d.indirect ? 1 : 0;
+        p.cpu_ticks += dispatch_ticks;
+    }
 }
 
 void Executor::CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h) {
@@ -4558,6 +4790,7 @@ void Executor::Flip(const Cp::FlipMarker&) {
                 // the scanout reads the bytes in the VideoOut buffer's pixel format (the bridge views the image with
                 // it): A8R8G8B8 is B,G,R,A in memory, whatever format the colour target was created with
                 const VkFormat shown = DisplayFormat(buf.pixel_format, img->format);
+                InspMark(Inspector::kGpuFrameCopy);
                 const u64 cid = DiagBegin(fmt::format("flip copy {} as fmt {} {}x{} -> frame {}", DescribeImage(*img),
                                                       static_cast<int>(shown), w, h, frame));
                 if (!presenter_->RecordCopy(cur_.cb, frame, img->image, shown, w, h)) {
@@ -4585,6 +4818,10 @@ void Executor::Flip(const Cp::FlipMarker&) {
     Flush();
     if (VideoOut::OnFlipMarker(value, frame) && flip_hook_ != nullptr) {
         flip_hook_(flip_ctx_, value);
+        if (insp_catalog_ != nullptr) {
+            insp_frame_ends_.push_back({insp_frame_, value}); // (Poll hands its GPU time on once it completed)
+        }
+        ++insp_frame_; // (FrameLog's flip marker index: the hook's calls)
     }
     frontend_.NewFrame();
 }

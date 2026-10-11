@@ -46,6 +46,9 @@ struct BufferCacheStats {
     std::array<u64, 5> wb_hist_count{}, wb_hist_bytes{};
     u64 wb_commands = 0;
     u64 prep_memo_hits = 0; ///< Prepare calls answered by the batch's memo
+    /// P4.9: pages uploaded with another binding's first missing page of their block (used before, invalid now); blocks
+    /// not extended because the block is not importable whole
+    u64 block_upload_pages = 0, block_upload_refused = 0;
     u64 wb_diff_bytes = 0, wb_diff_dispatches = 0, wb_shadow_inits = 0; ///< write-backs by the changed-words shader
     u64 wb_checked_bytes = 0, wb_dirty_chunks = 0, wb_dirty_words = 0; ///< SSPC_DIAG_WB_DIRTY (256-byte chunks, words)
     std::string first_error;
@@ -141,6 +144,7 @@ private:
         bool bound = false;
         u8 cpu_writes = 0; ///< CPU writes the tracker reported over cached pages (capped): the promotion back-off
         u16 gpu_pending = 0; ///< pages the GPU writes in submission `pending_seq` (the host's copy is older until then)
+        u16 used = 0;        ///< pages a binding asked for (P4.9: uploaded together once invalid)
         u64 pending_seq = 0;
         u64 quiet_from = 0; ///< the frame from which a small read-only range here is cached again instead of streamed
     };
@@ -241,6 +245,9 @@ private:
     /// The shadow of exactly [b, e) (made, or its host bytes copied in when not in step: `inited`); nullptr: none.
     WbShadow* ShadowFor(u64 b, u64 e, VkCommandBuffer cb, u64 seq, bool& inited);
     bool host_wait_binds_ = false; ///< the binds complete on the host (validation runs; SSPC_DIAG_BIND_HOST_WAIT=1)
+    /// P4.9 experiment (off; SSPC_P49_BLOCK_UPLOAD=1): a block's first missing page brings the block's other used,
+    /// invalid pages along - village GPU busy -5.9 ms a frame, but no FPS gain measured (docs\PHASE4_P49_*.md)
+    bool block_upload_ = false;
     void (*before_upload_)(void*) = nullptr;
     void* before_upload_ctx_ = nullptr;
     BufferCacheStats stats_;

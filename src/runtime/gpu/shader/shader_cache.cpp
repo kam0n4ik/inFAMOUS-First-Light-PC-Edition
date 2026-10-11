@@ -1,4 +1,6 @@
 // SecondSonPC — the shader frontend's caches (P4.3). See shader_cache.h.
+#include <windows.h>
+
 #include "runtime/gpu/shader/shader_cache.h"
 
 #include <algorithm>
@@ -30,16 +32,50 @@ Module* Program::FindModule(const SpecializationKey& key, u64& collisions) {
     return nullptr;
 }
 
+bool LookupMemoOn() {
+    static const bool on = [] {
+        char v[4] = {};
+        return !(GetEnvironmentVariableA("SSPC_P49_LOOKUP_MEMO", v, sizeof(v)) == 1 && v[0] == '0');
+    }();
+    return on;
+}
+
+bool LookupMemoVerify() {
+    static const bool verify = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("SSPC_P49_LOOKUP_MEMO", v, sizeof(v)) == 6 && std::string_view(v) == "verify";
+    }();
+    return verify;
+}
+
+LookupMemoChecks& LookupMemoCounts() {
+    static LookupMemoChecks counts;
+    return counts;
+}
+
 ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage stage) {
     ++stats_.lookups;
     Lookup out;
     const u64 key = (addr << 3) | static_cast<u64>(stage);
-    auto it = addresses_.find(key);
-    if (it != addresses_.end() && !it->second.dirty && validation_ == Validation::PerFrame &&
-        it->second.epoch == epoch_) {
+    AddressEntry* entry = nullptr;
+    auto& slot = addr_memo_[LookupMemoSlot(key)];
+    if (slot.second != nullptr && slot.first == key) {
+        entry = slot.second;
+        if (LookupMemoVerify()) {
+            const auto it = addresses_.find(key);
+            ++LookupMemoCounts().verified;
+            LookupMemoCounts().mismatches += it == addresses_.end() || &it->second != entry ? 1 : 0;
+        }
+    } else if (const auto it = addresses_.find(key); it != addresses_.end()) {
+        entry = &it->second;
+        if (LookupMemoOn()) {
+            slot = {key, entry};
+        }
+    }
+    if (entry != nullptr && !entry->dirty && validation_ == Validation::PerFrame && entry->epoch == epoch_) {
         ++stats_.trusted;
-        out.program = it->second.program;
-        out.footer_hash = it->second.footer_hash;
+        out.program = entry->program;
+        out.footer_hash = entry->footer_hash;
         return out;
     }
     // read and compare (the first use of the address, or its revalidation)
@@ -49,20 +85,20 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
     if (e != ProgramError::None) {
         ++stats_.errors[static_cast<size_t>(e)];
         out.error = e;
-        if (it != addresses_.end()) {
-            it->second.dirty = true; // not trusted until it reads again
+        if (entry != nullptr) {
+            entry->dirty = true; // not trusted until it reads again
         }
         return out;
     }
     stats_.bytes_read += scratch_.code.size() * 4 + kFooterBytes;
-    if (it != addresses_.end()) {
-        Program* p = it->second.program;
+    if (entry != nullptr) {
+        Program* p = entry->program;
         if (p->code.size() == scratch_.code.size() &&
             std::memcmp(p->code.data(), scratch_.code.data(), p->code.size() * 4) == 0) {
             ++stats_.same;
-            it->second.epoch = epoch_;
-            it->second.dirty = false;
-            it->second.footer_hash = scratch_.footer.shader_hash;
+            entry->epoch = epoch_;
+            entry->dirty = false;
+            entry->footer_hash = scratch_.footer.shader_hash;
             out.program = p;
             out.footer_hash = scratch_.footer.shader_hash;
             return out;
@@ -132,7 +168,23 @@ std::vector<Program*> ProgramCache::All() const {
 const FetchCache::Entry& FetchCache::Get(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch,
                                          Validation validation) {
     const u64 key = (addr << 8) ^ sgpr_base;
-    Entry& e = entries_[key];
+    auto& slot = memo_[LookupMemoSlot(key)];
+    if (slot.second == nullptr || slot.first != key) {
+        Entry* found = &entries_[key];
+        if (!LookupMemoOn()) {
+            return GetEntry(memory, addr, sgpr_base, epoch, validation, *found);
+        }
+        slot = {key, found};
+    } else if (LookupMemoVerify()) {
+        const auto it = entries_.find(key);
+        ++LookupMemoCounts().verified;
+        LookupMemoCounts().mismatches += it == entries_.end() || &it->second != slot.second ? 1 : 0;
+    }
+    return GetEntry(memory, addr, sgpr_base, epoch, validation, *slot.second);
+}
+
+const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch,
+                                              Validation validation, Entry& e) {
     if (e.epoch == epoch && validation == Validation::PerFrame && e.epoch != 0) {
         return e;
     }

@@ -14,7 +14,9 @@ namespace SecondSon::Gpu::FrameLog {
 
 namespace {
 
-constexpr u32 kCap = 1u << 15; ///< frames (27 min at 20 FPS, 9 min at 60)
+/// Frames kept (27 min at 20 FPS, 9 min at 60): a ring - the CSV at the stop has the last kCap (P4.8: the Performance
+/// Inspector streams every row while the game runs).
+constexpr u32 kCap = 1u << 15;
 
 struct Row {
     u64 game_submit = 0, flip_enter = 0, game_flip = 0, done_enter = 0, done_exit = 0; ///< the game's threads (TSC)
@@ -32,13 +34,14 @@ struct State {
     std::atomic<u32> present_n{0}; ///< EOP flips presented
     std::atomic<u64> idle_wait_ns{0}, idle_waits{0};
     u32 cp_n = 0, done_n = 0; ///< the GPU thread's
+    std::atomic<u32> cp_n_pub{0}, done_n_pub{0}; ///< ... published (P4.8: the inspector's writer reads them)
 };
 
 State g_state;
 std::atomic<bool> g_started{false};
 
 Row* At(u32 i) {
-    return i < kCap ? &g_state.rows[i] : nullptr;
+    return &g_state.rows[i % kCap];
 }
 
 bool On() {
@@ -85,6 +88,7 @@ void GameFlip() {
     if (Row* r = At(n); r != nullptr) {
         r->game_flip = Kernel::Clock::ReadTsc();
     }
+    *At(n + 1) = Row{}; // the ring's slot of the next frame (kCap frames ago): nothing writes it before this flip
     g_state.game_n.store(n + 1, std::memory_order_release);
 }
 
@@ -121,6 +125,7 @@ void CpFlip(u64 gpu_value, const GpuThreadTotals& totals, u64 last_unblock_tsc) 
         r->idle_waits = g_state.idle_waits.load(std::memory_order_relaxed);
     }
     ++g_state.cp_n;
+    g_state.cp_n_pub.store(g_state.cp_n, std::memory_order_release);
 }
 
 void GpuCompleted(u64 completed) {
@@ -129,16 +134,13 @@ void GpuCompleted(u64 completed) {
     }
     while (g_state.done_n < g_state.cp_n) {
         Row* r = At(g_state.done_n);
-        if (r == nullptr) {
-            g_state.done_n = g_state.cp_n;
-            break;
-        }
         if (r->gpu_value > completed) {
             break;
         }
         r->gpu_done = Kernel::Clock::ReadTsc();
         ++g_state.done_n;
     }
+    g_state.done_n_pub.store(g_state.done_n, std::memory_order_release);
 }
 
 void Presented() {
@@ -149,6 +151,46 @@ void Presented() {
     if (Row* r = At(n); r != nullptr) {
         r->present = Kernel::Clock::ReadTsc();
     }
+}
+
+u64 StartTsc() {
+    return On() ? g_state.start : 0;
+}
+
+Progress GetProgress() {
+    if (!On()) {
+        return {};
+    }
+    return {g_state.game_n.load(std::memory_order_acquire), g_state.cp_n_pub.load(std::memory_order_acquire),
+            g_state.done_n_pub.load(std::memory_order_acquire), g_state.present_n.load(std::memory_order_acquire)};
+}
+
+bool Read(u32 n, RowView& out) {
+    if (!On()) {
+        return false;
+    }
+    const u32 newest = std::max({g_state.game_n.load(std::memory_order_acquire),
+                                 g_state.cp_n_pub.load(std::memory_order_acquire),
+                                 g_state.present_n.load(std::memory_order_acquire)});
+    if (newest >= kCap && n < newest - kCap + 1) {
+        return false; // the ring holds a later frame there
+    }
+    const Row& r = *At(n);
+    out.game_submit = r.game_submit;
+    out.flip_enter = r.flip_enter;
+    out.game_flip = r.game_flip;
+    out.done_enter = r.done_enter;
+    out.done_exit = r.done_exit;
+    out.submits = r.submits;
+    out.cp_flip = r.cp_flip;
+    out.gpu_value = r.gpu_value;
+    out.gpu_done = r.gpu_done;
+    out.last_unblock = r.last_unblock;
+    out.present = r.present;
+    out.idle_wait_ns = r.idle_wait_ns;
+    out.idle_waits = r.idle_waits;
+    out.totals = r.totals;
+    return true;
 }
 
 double Seconds() {
@@ -175,10 +217,11 @@ bool Write(const std::filesystem::path& file) {
            "gpu_done_ms,present_ms,game_idle_wait_ms,game_idle_waits,cp_ms,record_ms,sync_ms,blocked_label_ms,"
            "blocked_other_ms,empty_ms,gpu_busy_ms,draws,dispatches,batches,blocks,shaders,shader_ms,shader_disk,"
            "pipelines,pipeline_ms,module_ms\n";
-    const u32 rows = std::min(kCap, std::max({g_state.game_n.load(), g_state.cp_n, g_state.present_n.load()}));
+    const u32 total = std::max({g_state.game_n.load(), g_state.cp_n, g_state.present_n.load()});
+    const u32 first = total > kCap ? total - kCap : 0; // (the ring: the last kCap frames)
     const Row* prev = nullptr;
-    for (u32 i = 0; i < rows; ++i) {
-        const Row& r = g_state.rows[i];
+    for (u32 i = first; i < total; ++i) {
+        const Row& r = *At(i);
         out << fmt::format("{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{:.3f},{:.3f},{:.3f},{:.3f}", i, ms(r.game_submit),
                            ms(r.flip_enter), ms(r.game_flip), ms(r.done_enter), ms(r.done_exit), r.submits,
                            ms(r.cp_flip), ms(r.last_unblock), ms(r.gpu_done), ms(r.present));

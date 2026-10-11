@@ -20,6 +20,7 @@
 
 #include "base/abi.h"
 #include "runtime/gpu/command_processor.h"
+#include "runtime/gpu/inspector.h"
 #include "runtime/gpu/shader/gcn_program.h"
 #include "runtime/gpu/vulkan/vk_api.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
@@ -213,6 +214,14 @@ public:
 
     const ExecutorStats& Stats() const { return stats_; }
 
+    /// P4.8 Performance Inspector (SSPC_INSPECTOR): the draws and dispatches classified by effect category and counted
+    /// (recording CPU time included); GPU timestamps at category changes in every `gpu_every`-th frame (0: none), read
+    /// once the batch completed; each frame's GPU time handed to Inspector::GpuFrame. nullptr: all of it off.
+    void SetInspector(const Inspector::Catalog* catalog, u32 gpu_every);
+    const Inspector::CategoryTotals& InspectorCategories() const { return insp_cat_; }
+    /// The run's draws by pipeline and dispatches by program (CSV, Inspector::WriteFile("pipelines.csv")).
+    std::string InspectorPipelines() const;
+
 private:
     struct Batch {
         VkCommandPool pool = VK_NULL_HANDLE;
@@ -235,6 +244,13 @@ private:
         };
         std::vector<ClockFence> clock_fences;
         u32 clock_base = ~0u; ///< its block of clock_pool_ queries
+        // P4.8 Performance Inspector: a timestamp at each change of effect category (insp_slots: the slot of the
+        // interval each one starts), the frame (flip hook count) it was recorded in
+        u32 insp_base = ~0u, insp_count = 0;
+        std::vector<u8> insp_slots;
+        u8 insp_last = 0xFF;
+        bool insp_overflow = false;
+        u32 insp_frame = 0;
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};
@@ -315,6 +331,9 @@ private:
         VkImageView view = VK_NULL_HANDLE;
     };
     std::unordered_map<u64, TexMemo> tex_memo_;
+    /// P4.9: tex_memo_'s entries looked up last, direct-mapped by key (never erased: the pointers stay valid) - the map's
+    /// hashing on every texture of every draw was ~1.1% of the GPU thread (village); SSPC_P49_LOOKUP_MEMO=0: off
+    std::array<std::pair<u64, TexMemo*>, 256> tex_slot_{};
     struct StreamSeen {
         u64 hash = 0, flip = 0;
     };
@@ -671,6 +690,7 @@ private:
     std::vector<std::pair<u64, OwnedBuffer>> lds_retired_; ///< outgrown, until the batches using them complete
     u64 lds_groups_ = 1;
     u32 lds_group_bytes_ = 0;
+    u32 fine_counter_ = 0; ///< SSPC_GPU_TIMINGS=sample:N - the commands since the last timed one (P4.9)
     u64 lds_logged_ = 0;
     std::vector<CachedImage*> info_images_; ///< the image of each image descriptor info of the draw (nullptr: none)
     bool device_lost_ = false;
@@ -680,6 +700,52 @@ private:
     void* flip_ctx_ = nullptr;
     u64 last_unblock_tsc_ = 0;
     u64 batch_first_cmd_ = 0, batch_last_cmd_ = 0;
+
+    // P4.8 Performance Inspector (SetInspector)
+    const Inspector::Catalog* insp_catalog_ = nullptr;
+    u32 insp_every_ = 0;
+    VkQueryPool insp_pool_ = VK_NULL_HANDLE;
+    u32 insp_next_batch_ = 0;
+    Inspector::CategoryTotals insp_cat_{};
+    u32 insp_frame_ = 0; ///< flip hooks called (FrameLog's flip marker index)
+    struct InspFrameEnd {
+        u32 n = 0;
+        u64 value = 0; ///< the timeline value its flip's batch completes at
+    };
+    std::deque<InspFrameEnd> insp_frame_ends_;
+    std::array<Inspector::GpuFrameTimes, 8> insp_acc_{}; ///< by frame % 8: completed batches' times so far
+    u64 insp_last_end_ = 0;                              ///< the latest batch end timestamp (the union of intervals)
+    struct InspDrawMemo {
+        u64 vs = 0, ps = 0;
+        const Inspector::Class* entry = nullptr; ///< the catalog's (nullptr: the rules decide per draw)
+        bool valid = false, has_ps = false;
+    };
+    std::array<InspDrawMemo, 1024> insp_draw_memo_{};
+    struct InspDispatchMemo {
+        u64 cs = 0;
+        Inspector::Class cls;
+        bool valid = false;
+    };
+    std::array<InspDispatchMemo, 256> insp_dispatch_memo_{};
+    struct InspPipeline {
+        u64 draws = 0, instances = 0, vertices = 0, cpu_ticks = 0, indirect = 0;
+        u64 vs = 0, ps = 0, vs_addr = 0, ps_addr = 0;
+        Inspector::Class cls;
+        u32 prim = 0, colors = 0, width = 0, height = 0;
+        bool depth = false;
+    };
+    std::vector<InspPipeline> insp_pipelines_; ///< by pipeline id (this run's numbering)
+    struct InspProgram {
+        u64 dispatches = 0, groups = 0, cpu_ticks = 0, indirect = 0, single_group = 0;
+        u64 address = 0;
+        Inspector::Class cls;
+    };
+    std::unordered_map<u64, InspProgram> insp_programs_; ///< by compute shader content hash
+    /// A timestamp where the GPU's work turns to `slot` (a Category or kGpu*): its interval begins.
+    void InspMark(size_t slot);
+    Inspector::Class InspClassifyDraw(const GS::StageView& vs, const GS::StageView& ps, bool has_ps,
+                                      const Inspector::DrawShape& shape);
+    Inspector::Class InspClassifyDispatch(const GS::StageView& cs);
 
     // SSPC_GPU_MARKERS=1 (P4.6-G6, diagnostic): a debug label around each run of commands of one graphics pipeline with
     // the same target registers / one compute shader / one kind of transfer (a GPU profiler's capture gives time and

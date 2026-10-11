@@ -52,6 +52,24 @@ void GpuCompleted(u64 completed);
 void Presented();
 /// Seconds since the log started (the origin of the CSV's times); -1 before it started.
 double Seconds();
+/// The TSC at the log's start (0 before it started).
+u64 StartTsc();
+
+/// P4.8 (the Performance Inspector streams the rows while the game runs): the rows are a ring of the last kCap frames;
+/// a row's fields as they are now (TSC values, 0 when not reached yet).
+struct RowView {
+    u64 game_submit = 0, flip_enter = 0, game_flip = 0, done_enter = 0, done_exit = 0;
+    u32 submits = 0;
+    u64 cp_flip = 0, gpu_value = 0, gpu_done = 0, last_unblock = 0, present = 0;
+    u64 idle_wait_ns = 0, idle_waits = 0;
+    GpuThreadTotals totals;
+};
+struct Progress {
+    u32 game = 0, cp = 0, done = 0, present = 0; ///< flips requested / flip markers reached / completed / presented
+};
+Progress GetProgress();
+/// Frame `n`'s row; false when the log has not started or the ring holds a later frame there.
+bool Read(u32 n, RowView& out);
 /// The CSV (once the backend's threads stopped). false: not started or not written.
 bool Write(const std::filesystem::path& file);
 
