@@ -73,6 +73,8 @@ bool BufferLabelAddress(s32 handle, u64& address);
 /// processor's memory serves reads and writes of them here. true: [addr, addr + bytes) is inside the labels.
 bool LabelRead(u64 addr, void* dst, u64 bytes);
 bool LabelWrite(u64 addr, const void* src, u64 bytes);
+/// [addr, addr + bytes) is inside the labels (no GPU work reads them; P4.6).
+bool IsLabel(u64 addr, u64 bytes);
 /// Called (from the present thread) after a label changed: the backend wakes its waiting queues.
 void SetLabelCallback(void (*fn)(void* ctx), void* ctx);
 

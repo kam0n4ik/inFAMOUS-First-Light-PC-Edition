@@ -82,6 +82,7 @@ struct ExecutorStats {
     u64 n_prepare = 0;
     u64 tw_fail_shape = 0, tw_fail_import = 0; ///< WriteOnTimeline refusals: size/alignment/address, no import
     u64 timeline_copies = 0, timeline_copy_bytes = 0, tc_refused = 0;
+    u64 timeline_gds = 0, gds_refused = 0; ///< DMA_DATA to/from GDS on the timeline (P4.6)
     u64 shadows = 0, shadow_bytes = 0, shadow_overlaps = 0, shadow_no_room = 0, shadow_too_large = 0;
     u64 target_cache_hits = 0, target_cache_misses = 0;
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
@@ -89,6 +90,7 @@ struct ExecutorStats {
     /// met WAIT_REG_MEM on memory (of them: had blocked; the CPU had written tracked memory since the last drain - before
     /// P4.5 the work after the wait read the older copies)
     u64 acquires = 0, acquires_blocked = 0, acquires_applied = 0;
+    u64 waits_by_held = 0; ///< WAIT_REG_MEM met in the GPU's order by a held fence (a barrier before the next command)
     std::array<u64, 9> gb_sites{}; ///< global barriers by GlobalBarrier site
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
@@ -132,11 +134,21 @@ public:
     void Synchronize(u32 queue) override;
     bool WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) override;
     bool CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) override;
+    bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
+                       u32 pattern) override;
     void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
+    void WaitMetByHeldFence(u32 queue) override;
     /// What MemoryAcquired runs: the backend applies the guest's CPU writes seen so far to the caches (true: some).
     void SetAcquireHook(bool (*hook)(void*), void* ctx) {
         acquire_hook_ = hook;
         acquire_ctx_ = ctx;
+    }
+    /// TSC of the last met WAIT_REG_MEM on memory that had blocked (the frame log, P4.6).
+    u64 LastUnblockTsc() const { return last_unblock_tsc_; }
+    /// Called at each flip marker queued for presentation (after its batch was submitted), with its timeline value.
+    void SetFlipHook(void (*hook)(void*, u64), void* ctx) {
+        flip_hook_ = hook;
+        flip_ctx_ = ctx;
     }
     /// Dense video memory for the written buffers of dispatches (see PrepareShadows); null: they write in place.
     void SetWriteShadowRing(StreamRing* ring) { shadow_ring_ = ring; }
@@ -421,6 +433,9 @@ private:
     bool device_lost_ = false;
     bool (*acquire_hook_)(void*) = nullptr;
     void* acquire_ctx_ = nullptr;
+    void (*flip_hook_)(void*, u64) = nullptr;
+    void* flip_ctx_ = nullptr;
+    u64 last_unblock_tsc_ = 0;
     u64 batch_first_cmd_ = 0, batch_last_cmd_ = 0;
 };
 

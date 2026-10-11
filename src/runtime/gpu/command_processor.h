@@ -48,6 +48,9 @@ public:
     virtual bool Read(u64 addr, void* dst, u64 bytes) = 0;
     /// Isolated mode only; false if any part is not writable (nothing written then).
     virtual bool Write(u64 addr, const void* src, u64 bytes) = 0;
+    /// Memory no GPU work reads or writes (VideoOut's buffer labels): a WRITE_DATA there lands when the processor
+    /// reaches it, as the hardware's micro engine writes it - not after the earlier GPU work (P4.6).
+    virtual bool Unordered(u64 /*addr*/, u64 /*bytes*/) { return false; }
 };
 
 inline constexpr u32 kGraphicsQueue = 0;
@@ -195,10 +198,22 @@ public:
     /// Isolated: a DMA_DATA memory-to-memory copy recorded on the GPU's timeline after the GPU work before it, instead
     /// of Synchronize + a CPU copy (P4.4). true: recorded - the processor copies nothing itself.
     virtual bool CopyOnTimeline(u32 /*queue*/, u64 /*seq*/, u64 /*src*/, u64 /*dst*/, u64 /*bytes*/) { return false; }
+    /// Isolated: a DMA_DATA with GDS on one side recorded on the GPU's timeline (GDS is the executor's buffer, which the
+    /// shaders bind and Options::gds maps): DataToGds fills `pattern`, MemoryToGds copies from `memory`, GdsToMemory to
+    /// it; `gds_offset` in bytes. true: recorded - the processor touches neither side (P4.6).
+    virtual bool GdsOnTimeline(u32 /*queue*/, u64 /*seq*/, DmaKind /*kind*/, u64 /*memory*/, u32 /*gds_offset*/,
+                               u32 /*bytes*/, u32 /*pattern*/) {
+        return false;
+    }
     /// Isolated: a WAIT_REG_MEM on memory was met (`blocked`: it had blocked before). The guest's CPU writes that came
     /// before the value it waited for (data published with a flag) belong to the work after it: an executor holding
     /// copies of guest memory applies the CPU writes seen so far before recording more (P4.5).
     virtual void MemoryAcquired(u32 /*queue*/, bool /*blocked*/, u64 /*poll_address*/) {}
+    /// Isolated with Options::waits_by_held_fences: a WAIT_REG_MEM was met in the GPU's order - a fence held for work
+    /// already handed on will write a value meeting it (EVENT_WRITE_EOS then a wait for it: the GPU waiting for its own
+    /// shaders). The executor orders everything after it after all earlier work (a full barrier); the fence's memory is
+    /// still written only when that work completed (P4.6).
+    virtual void WaitMetByHeldFence(u32 /*queue*/) {}
 };
 
 /// Before/after every packet (validation; nullptr: none).
@@ -257,10 +272,18 @@ struct Counters {
     u64 draws = 0, dispatches = 0, dispatches_disabled = 0, flips = 0;
     u64 fences = 0, fences_deferred = 0, fences_written = 0, fences_dropped = 0;
     u64 waits = 0, waits_blocked = 0, cache_actions = 0;
+    /// Isolated: how long the WAIT_REG_MEM that blocked stayed blocked (<50 us, 100, 200, 500 us, 1, 1.5, 2, 5, 10 ms,
+    /// longer; P4.6: the GPU thread's polling granularity)
+    std::array<u64, 10> block_hist{};
+    u64 waits_met_held = 0; ///< Isolated: WAIT_REG_MEM met in the GPU's order by a held fence (waits_by_held_fences)
     u64 timeline_writes = 0; ///< Isolated: WRITE_DATA / DMA fills the executor recorded on the GPU's timeline
     u64 timeline_copies = 0; ///< Isolated: DMA_DATA memory-to-memory copies the executor recorded on the timeline
+    u64 timeline_gds = 0;    ///< Isolated: DMA_DATA to/from GDS the executor recorded on the timeline (P4.6)
     u64 sync_write_data = 0;                 ///< Isolated: WRITE_DATA waits for the GPU (not on the timeline)
     std::array<u64, 8> sync_dma{};           ///< Isolated: DMA_DATA waits for the GPU, by DmaKind
+    std::array<u64, 8> sync_dma_ns{};        ///< ... their time (P4.6)
+    u64 sync_write_data_ns = 0;
+    u64 unordered_writes = 0; ///< Isolated: WRITE_DATA to memory no GPU work reads (VideoOut labels): written at once
     std::array<u64, 4> sync_dma_m2m_size{};  ///< memory-to-memory sizes: <=256 B, <=4 KiB, <=64 KiB, larger
     u64 dma = 0, dma_bytes = 0, dma_command_patches = 0, dma_prefetch = 0;
     u64 writes = 0, write_bytes = 0;
@@ -286,6 +309,12 @@ struct Options {
     /// GDS (kGdsBytes) the processor's DMA and fences use; nullptr: its own. An executor whose shaders bind GDS passes
     /// its host-visible GDS buffer, so the CP side and the shaders see one GDS.
     u8* gds = nullptr;
+    /// Isolated: a WAIT_REG_MEM on memory that a held fence (any queue: the executor records every queue in one
+    /// order) will meet passes at once, GpuWork::WaitMetByHeldFence ordering the work after it on the GPU - instead of
+    /// the processor stopping until the GPU completed everything before the fence (P4.6).
+    bool waits_by_held_fences = false;
+    /// Isolated: DMA_DATA to/from GDS offered to GpuWork::GdsOnTimeline (else Synchronize and the CPU copies; P4.6).
+    bool gds_on_timeline = false;
 };
 
 class CommandProcessor {
@@ -362,6 +391,8 @@ public:
     }
     bool QueueFaulted(u32 queue) const;
     bool QueueBlocked(u32 queue) const;
+    /// The memory address (or 1 << 63 | register) the queue's blocked WAIT_REG_MEM polls; 0 when it is not blocked.
+    u64 BlockedPoll(u32 queue) const;
     u32 PendingSubmissions(u32 queue) const;
     /// The current submission of a ring queue began by completing a packet carried from the previous span.
     bool StartedMidPacket(u32 queue) const;
@@ -387,6 +418,8 @@ private:
     Queue* Q(u32 queue) const;
     /// Isolated (diagnostics): a fence held for the GPU (any queue) will write `poll` with a value meeting the wait.
     bool HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref) const;
+    /// Isolated: a held fence writes GDS data (RELEASE_MEM data_sel 5, EVENT_WRITE_EOS GDS store) when it completes.
+    bool HeldGdsFence() const;
     /// Isolated (diagnostics): the WAIT_REG_MEM addresses the queues blocked on, the time they blocked.
     struct WaitStat {
         u64 count = 0, ns = 0, held = 0;

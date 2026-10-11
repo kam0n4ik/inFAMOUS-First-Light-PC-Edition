@@ -50,6 +50,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/cp_replay.cpp
     src/runtime/gpu/cp_shadow.cpp
     src/runtime/gpu/cp_validation.cpp
+    src/runtime/gpu/frame_log.cpp
     src/runtime/gpu/frame_pacing.cpp
     src/runtime/gpu/gnm/gnm_driver.cpp
     src/runtime/gpu/pm4.cpp

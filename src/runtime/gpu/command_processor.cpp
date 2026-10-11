@@ -234,6 +234,11 @@ bool CommandProcessor::QueueBlocked(u32 queue) const {
     return q && q->blocked;
 }
 
+u64 CommandProcessor::BlockedPoll(u32 queue) const {
+    const Queue* q = Q(queue);
+    return q && q->blocked ? q->block_poll : 0;
+}
+
 bool CommandProcessor::StartedMidPacket(u32 queue) const {
     const Queue* q = Q(queue);
     return q && q->started_mid_packet;
@@ -768,8 +773,16 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
                 ++q.work_seq; // on the GPU's timeline: fences after it wait for it
                 ++stats_.timeline_writes;
             } else {
-                ++stats_.sync_write_data;
-                options_.work->Synchronize(q.id);
+                if (options_.memory->Unordered(dst, data.size_bytes())) {
+                    ++stats_.unordered_writes; // no GPU work reads it: the earlier work need not complete first
+                } else {
+                    ++stats_.sync_write_data;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    options_.work->Synchronize(q.id);
+                    stats_.sync_write_data_ns += static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                            .count());
+                }
                 if (!options_.memory->Write(dst, data.data(), data.size_bytes())) {
                     return Fail(q, CpErrorKind::MemoryWriteFailed, addr, op, n,
                                 fmt::format("{} bytes at {:#x}", data.size_bytes(), dst));
@@ -1254,6 +1267,20 @@ StepStatus CommandProcessor::DmaData(Queue& q, u64 addr, std::span<const u32> p)
         options_.work->Dma(d);
         return StepStatus::Packet;
     }
+    // (not while a fence that writes GDS data to memory is held: it reads the mapped GDS when its work completed, and
+    // this GDS write may already have run on the GPU by then)
+    if (gds && options_.gds_on_timeline && !(d.kind == DmaKind::GdsToMemory && OverlapsPendingCommands(q, dst, bytes)) &&
+        !HeldGdsFence() &&
+        options_.work->GdsOnTimeline(q.id, q.work_seq + 1, d.kind, d.kind == DmaKind::GdsToMemory ? dst : src,
+                                     static_cast<u32>(gds_off), bytes, b[1])) {
+        // on the GPU's timeline after the earlier work (the shaders' GDS accesses too): no wait for it (P4.6)
+        ++q.work_seq;
+        ++stats_.timeline_gds;
+        d.executed = true;
+        d.timeline = true;
+        options_.work->Dma(d);
+        return StepStatus::Packet;
+    }
     if (d.kind == DmaKind::DataToMemory) {
         // a fill: known bytes, written on the GPU's timeline when the executor can (no wait for the earlier work)
         fill(tmp);
@@ -1272,7 +1299,12 @@ StepStatus CommandProcessor::DmaData(Queue& q, u64 addr, std::span<const u32> p)
     if (d.kind == DmaKind::MemoryToMemory) {
         ++stats_.sync_dma_m2m_size[bytes <= 256 ? 0 : bytes <= 4096 ? 1 : bytes <= 65536 ? 2 : 3];
     }
-    options_.work->Synchronize(q.id);
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        options_.work->Synchronize(q.id);
+        stats_.sync_dma_ns[static_cast<size_t>(d.kind) & 7] += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
     switch (d.kind) {
     case DmaKind::MemoryToMemory:
     case DmaKind::MemoryToGds:
@@ -1452,13 +1484,25 @@ bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 
         if (qp == nullptr || qp->fence_count == 0) {
             continue;
         }
-        for (u32 i = 0; i < qp->fence_count; ++i) {
+        // the queue's last held fence to that address is the value its memory keeps once they all completed
+        for (u32 i = qp->fence_count; i-- > 0;) {
             const FenceOp& f = qp->fences[(qp->fence_head + i) % kMaxFences];
-            if (f.data_sel != 1 && f.data_sel != 2) {
-                continue; // no data, a clock or a counter (its value is not known), GDS
-            }
             u32 v = 0;
-            if (f.addr == poll) {
+            if (f.kind == FenceKind::EndOfShader) {
+                // EVENT_WRITE_EOS "signal fence": 32 bits of known data (P4.6); a GDS store there: not known
+                if (f.addr != poll) {
+                    continue;
+                }
+                if (f.eos_command != 2) {
+                    break;
+                }
+                v = static_cast<u32>(f.data);
+            } else if (f.data_sel != 1 && f.data_sel != 2) {
+                if (f.data_sel != 0 && f.addr <= poll && poll < f.addr + 8) {
+                    break; // a clock, a counter or GDS written there: not known
+                }
+                continue; // no data
+            } else if (f.addr == poll) {
                 v = static_cast<u32>(f.data);
             } else if (f.data_sel == 2 && f.addr + 4 == poll) {
                 v = static_cast<u32>(f.data >> 32);
@@ -1466,6 +1510,24 @@ bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 
                 continue;
             }
             if (WaitHolds(function, v & mask, ref)) {
+                return true;
+            }
+            break; // the queue's last write there does not meet it
+        }
+    }
+    return false;
+}
+
+bool CommandProcessor::HeldGdsFence() const {
+    for (u32 id = 0; id < kNumQueues; ++id) {
+        const Queue* qp = Q(id);
+        if (qp == nullptr) {
+            continue;
+        }
+        for (u32 i = 0; i < qp->fence_count; ++i) {
+            const FenceOp& f = qp->fences[(qp->fence_head + i) % kMaxFences];
+            if ((f.kind == FenceKind::EndOfShader && f.eos_command != 2) ||
+                (f.kind != FenceKind::EndOfShader && f.data_sel == 5)) {
                 return true;
             }
         }
@@ -1539,6 +1601,13 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count());
     };
+    if (!ok && memory && options_.waits_by_held_fences && options_.work != nullptr &&
+        HeldFenceSatisfies(key, function, b[4], ref)) {
+        // met in the GPU's order: the work before the fence is already handed on (P4.6)
+        ok = true;
+        ++stats_.waits_met_held;
+        options_.work->WaitMetByHeldFence(q.id);
+    }
     if (!ok) {
         if (!q.blocked) {
             ++stats_.waits_blocked;
@@ -1548,6 +1617,15 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
         }
         q.blocked = true;
         return StepStatus::Blocked;
+    }
+    if (q.blocked) {
+        constexpr u64 kEdgesUs[] = {50, 100, 200, 500, 1000, 1500, 2000, 5000, 10000};
+        const u64 us = (now_ns() - q.block_t0) / 1000;
+        size_t bin = 0;
+        while (bin < std::size(kEdgesUs) && us >= kEdgesUs[bin]) {
+            ++bin;
+        }
+        ++stats_.block_hist[bin];
     }
     if (q.blocked && (wait_stats_.size() < 4096 || wait_stats_.contains(q.block_poll))) {
         WaitStat& w = wait_stats_[q.block_poll];
@@ -1591,6 +1669,10 @@ std::string CommandProcessor::WaitReport() const {
                            (k >> 63) ? "register" : "memory", k & ~(u64{1} << 63), w.count, w.ns / 1'000'000, w.held,
                            w.queues, w.function, w.ref, w.mask, w.last);
     }
+    const auto& h = stats_.block_hist;
+    out += fmt::format("WAIT_REG_MEM block durations: <50us {} | <100us {} | <200us {} | <500us {} | <1ms {} | <1.5ms {} | "
+                       "<2ms {} | <5ms {} | <10ms {} | longer {}\n",
+                       h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
     return out;
 }
 

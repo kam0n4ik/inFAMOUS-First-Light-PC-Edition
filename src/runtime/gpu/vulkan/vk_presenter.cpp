@@ -56,6 +56,76 @@ u8 ToByte(float v) {
     return static_cast<u8>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
 }
 
+// The FPS counter (P4.6): a 5x7 bitmap font for its few characters, drawn into a small host buffer and copied onto the
+// swapchain image after the frame's blit (no pipeline, no shader).
+constexpr u32 kOverlayW = 320, kOverlayH = 30, kGlyphScale = 3;
+
+/// Rows of a 5x7 glyph (bit 4 = leftmost column); nullptr: blank.
+const u8* Glyph(char c) {
+    static constexpr u8 kDigits[10][7] = {
+        {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+        {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}, {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E},
+        {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+        {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}, {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+        {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}, {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}};
+    static constexpr u8 kF[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10};
+    static constexpr u8 kP[7] = {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10};
+    static constexpr u8 kS[7] = {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E};
+    static constexpr u8 kM[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
+    static constexpr u8 kDot[7] = {0, 0, 0, 0, 0, 0x0C, 0x0C};
+    static constexpr u8 kSlash[7] = {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10};
+    if (c >= '0' && c <= '9') {
+        return kDigits[c - '0'];
+    }
+    switch (c) {
+    case 'F':
+        return kF;
+    case 'P':
+        return kP;
+    case 'S':
+        return kS;
+    case 'M':
+        return kM;
+    case '.':
+        return kDot;
+    case '/':
+        return kSlash;
+    default:
+        return nullptr;
+    }
+}
+
+/// `text` in white on a dark box, B8G8R8A8/R8G8B8A8 bytes (the same for grey values), kOverlayW x kOverlayH.
+void DrawOverlay(u8* px, std::string_view text) {
+    for (u32 i = 0; i < kOverlayW * kOverlayH; ++i) {
+        px[i * 4 + 0] = px[i * 4 + 1] = px[i * 4 + 2] = 16;
+        px[i * 4 + 3] = 255;
+    }
+    u32 x0 = 6;
+    const u32 y0 = (kOverlayH - 7 * kGlyphScale) / 2;
+    for (const char c : text) {
+        if (x0 + 5 * kGlyphScale > kOverlayW) {
+            break;
+        }
+        if (const u8* g = Glyph(c); g != nullptr) {
+            for (u32 row = 0; row < 7; ++row) {
+                for (u32 col = 0; col < 5; ++col) {
+                    if (((g[row] >> (4 - col)) & 1) == 0) {
+                        continue;
+                    }
+                    for (u32 dy = 0; dy < kGlyphScale; ++dy) {
+                        for (u32 dx = 0; dx < kGlyphScale; ++dx) {
+                            u8* p = px + ((y0 + row * kGlyphScale + dy) * kOverlayW + x0 + col * kGlyphScale + dx) * 4;
+                            p[0] = p[1] = p[2] = 240;
+                        }
+                    }
+                }
+            }
+        }
+        x0 += 6 * kGlyphScale;
+    }
+}
+
 } // namespace
 
 struct Presenter::Impl {
@@ -75,7 +145,13 @@ struct Presenter::Impl {
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
         s32 frame = -1; ///< the frame its commands read
+        OwnedBuffer overlay; ///< the FPS counter's pixels (free once the slot's fence signalled)
     };
+    // the FPS counter (P4.6; SSPC_FPS_OVERLAY=0 hides it): presented frames over the last half second
+    bool overlay_on = true;
+    std::deque<std::chrono::steady_clock::time_point> shown;
+    std::string overlay_text;
+    std::chrono::steady_clock::time_point overlay_t{};
     VkCommandPool pool = VK_NULL_HANDLE;
     std::array<Slot, 2> slots{};
     u32 slot = 0;
@@ -438,6 +514,7 @@ Presenter::~Presenter() {
         f.vkDestroySwapchainKHR(m.ctx.Device(), m.swapchain, nullptr);
     }
     for (auto& s : m.slots) {
+        DestroyBuffer(m.ctx, s.overlay);
         if (s.fence != VK_NULL_HANDLE) {
             f.vkDestroyFence(m.ctx.Device(), s.fence, nullptr);
         }
@@ -633,6 +710,53 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                                .dstOffsets = {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
         f.vkCmdBlitImage(s.cb, fr->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swap,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+    // the FPS counter over the frame, top left (P4.6): the shown frames of the last second, the text renewed twice a
+    // second; SSPC_FPS_OVERLAY=0 hides it
+    static const bool overlay_env = [] {
+        char v[8] = {};
+        return !(GetEnvironmentVariableA("SSPC_FPS_OVERLAY", v, sizeof(v)) == 1 && v[0] == '0');
+    }();
+    const bool byte_format = m.swap_format == VK_FORMAT_B8G8R8A8_UNORM || m.swap_format == VK_FORMAT_B8G8R8A8_SRGB ||
+                             m.swap_format == VK_FORMAT_R8G8B8A8_UNORM || m.swap_format == VK_FORMAT_R8G8B8A8_SRGB;
+    if (overlay_env && m.overlay_on && byte_format && m.extent.width >= kOverlayW + 8 &&
+        m.extent.height >= kOverlayH + 8) {
+        const auto now = std::chrono::steady_clock::now();
+        if (show) {
+            m.shown.push_back(now);
+        }
+        while (!m.shown.empty() && now - m.shown.front() > std::chrono::seconds(1)) {
+            m.shown.pop_front();
+        }
+        if (m.overlay_text.empty() || now - m.overlay_t >= std::chrono::milliseconds(500)) {
+            m.overlay_t = now;
+            double fps = 0.0;
+            if (m.shown.size() >= 2) {
+                const double span = std::chrono::duration<double>(m.shown.back() - m.shown.front()).count();
+                fps = span > 0.0 ? static_cast<double>(m.shown.size() - 1) / span : 0.0;
+            }
+            m.overlay_text = fps > 0.0 ? fmt::format("{:.1f} FPS  {:.1f} MS", fps, 1000.0 / fps) : "0.0 FPS";
+        }
+        if (s.overlay.buffer == VK_NULL_HANDLE) {
+            std::string err;
+            if (!CreateBuffer(m.ctx, u64{kOverlayW} * kOverlayH * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, s.overlay,
+                              err)) {
+                m.overlay_on = false;
+                SSPC_LOG(GPU, Warning, "native backend: no FPS counter ({})", err);
+            }
+        }
+        if (s.overlay.mapped != nullptr) {
+            DrawOverlay(s.overlay.mapped, m.overlay_text); // the slot's last use completed (its fence, above)
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            f.vkCmdPipelineBarrier2(s.cb, &dep); // clear/blit -> the counter on the same image
+            const VkBufferImageCopy region{.bufferOffset = 0,
+                                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                           .imageOffset = {8, 8, 0},
+                                           .imageExtent = {kOverlayW, kOverlayH, 1}};
+            f.vkCmdCopyBufferToImage(s.cb, s.overlay.buffer, swap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        }
     }
     b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;

@@ -54,10 +54,12 @@
 
 #include "base/log.h"
 #include "runtime/exports.h"
+#include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/gnm/gnm_init_sequences.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/pm4.h"
+#include "runtime/kernel/clock.h"
 #include "runtime/kernel/event_queues.h"
 #include "runtime/kernel/kernel.h"
 
@@ -284,7 +286,13 @@ void ReleaseSubmissionLock() {
 /// The bridge's WaitGpuIdle: until no SubmitDone holds the submission lock.
 void WaitGpuIdle() {
     std::unique_lock lk{g_idle_mutex};
+    if (!g_submission_locked) {
+        return;
+    }
+    const u64 t0 = __rdtsc();
     g_idle_cv.wait(lk, [] { return !g_submission_locked; });
+    FrameLog::GameIdleWait(static_cast<u64>(static_cast<double>(__rdtsc() - t0) * 1e9 /
+                                            static_cast<double>(std::max<u64>(Kernel::Clock::TscFrequency(), 1))));
 }
 
 /// The initialisation sequence for the game's SDK version (the bridge's choice, base PS4).
@@ -596,6 +604,7 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::SubmitEnter);
     }
+    FrameLog::GameFlipEnter();
     std::scoped_lock lk{g_submit_mutex};
     WaitGpuIdle();
     if (FramePacing::Enabled()) [[unlikely]] {
@@ -621,6 +630,7 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
         return patched;
     }
     const s32 submitted = PerformSubmit(*host, count, dcbs, dcb_sizes);
+    FrameLog::GameFlip(); // the flip was requested (PatchFlipRequest): its row ends here, submitted or not
     g_last_submit_tsc.store(__rdtsc(), std::memory_order_release);
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::Submitted);
@@ -660,6 +670,7 @@ SSPC_SYSV_ABI s32 SubmitDone() {
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::SubmitDone);
     }
+    const u64 enter_tsc = __rdtsc();
     std::scoped_lock lk{g_submit_mutex};
     WaitGpuIdle();
     Host* const host = CurrentHost("sceGnmSubmitDone");
@@ -672,6 +683,7 @@ SSPC_SYSV_ABI s32 SubmitDone() {
     }
     host->SubmitDone();
     g_send_init_packet = true;
+    FrameLog::GameSubmitDone(enter_tsc, __rdtsc());
     return kOk;
 }
 

@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include "base/log.h"
+#include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/native_videoout.h"
@@ -438,6 +439,7 @@ void Executor::Poll() {
         OnDeviceLost("vkGetSemaphoreCounterValue", completed + 1);
         return;
     }
+    FrameLog::GpuCompleted(completed);
     while (!in_flight_.empty() && in_flight_.front().value <= completed) {
         Batch b = std::move(in_flight_.front());
         in_flight_.pop_front();
@@ -1041,8 +1043,69 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     return true;
 }
 
+bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
+                             u32 pattern) {
+    // GDS is gds_ (a storage buffer the shaders bind): its DMA recorded in stream order instead of the processor
+    // waiting for the GPU and touching the mapped buffer (P4.6). Guest memory only on the other side.
+    if (bytes == 0 || (gds_offset & 3) != 0 || (bytes & 3) != 0 || gds_.buffer == VK_NULL_HANDLE ||
+        u64{gds_offset} + bytes > gds_.size || (kind != Cp::DmaKind::DataToGds && memory >= (1ull << 40)) ||
+        (kind != Cp::DmaKind::DataToGds && kind != Cp::DmaKind::MemoryToGds && kind != Cp::DmaKind::GdsToMemory)) {
+        ++stats_.gds_refused;
+        return false;
+    }
+    if (!Begin()) {
+        return false;
+    }
+    write_run_ = false;
+    // after every earlier access (the shaders' GDS atomics are storage writes; a fill/copy over GDS must also wait for
+    // their reads): one full barrier
+    GlobalBarrier(5);
+    VkBuffer mbuf = VK_NULL_HANDLE;
+    u64 moff = 0, mavail = 0;
+    if (kind != Cp::DmaKind::DataToGds &&
+        (!GuestRange(memory, bytes, kind == Cp::DmaKind::GdsToMemory, 4, mbuf, moff, mavail) || mavail < bytes)) {
+        ++stats_.gds_refused;
+        return false; // not noted: the processor copies after Synchronize
+    }
+    Note(queue, seq);
+    ++commands_;
+    EndRendering(); // GuestRange may have uploaded (it ordered itself)
+    const u64 cid = diag_ != nullptr && diag_->Enabled()
+                        ? DiagBegin(fmt::format("timeline GDS q{} seq {} kind {} memory {:#x} GDS +{:#x} ({} bytes)",
+                                                queue, seq, static_cast<u32>(kind), memory, gds_offset, bytes))
+                        : 0;
+    const auto& f = Fn();
+    switch (kind) {
+    case Cp::DmaKind::DataToGds:
+        f.vkCmdFillBuffer(cur_.cb, gds_.buffer, gds_offset, bytes, pattern);
+        break;
+    case Cp::DmaKind::MemoryToGds: {
+        const VkBufferCopy region{.srcOffset = moff, .dstOffset = gds_offset, .size = bytes};
+        f.vkCmdCopyBuffer(cur_.cb, mbuf, gds_.buffer, 1, &region);
+        break;
+    }
+    default: {
+        const VkBufferCopy region{.srcOffset = gds_offset, .dstOffset = moff, .size = bytes};
+        f.vkCmdCopyBuffer(cur_.cb, gds_.buffer, mbuf, 1, &region);
+        // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
+        timeline_writes_.push_back({memory, memory + bytes, cur_.value});
+        tw_lo_ = std::min(tw_lo_, memory);
+        tw_hi_ = std::max(tw_hi_, memory + bytes);
+        images_.Invalidate(memory, bytes);
+        break;
+    }
+    }
+    DiagEnd(cid);
+    pending_writes_ = true; // a later access of either side waits for it
+    ++stats_.timeline_gds;
+    return true;
+}
+
 void Executor::MemoryAcquired(u32, bool blocked, u64 poll_address) {
     ++stats_.acquires;
+    if (blocked) {
+        last_unblock_tsc_ = __rdtsc();
+    }
     if (g_watch_page.load(std::memory_order_relaxed) != 0 && race_.acquires.size() < 64) {
         race_.acquires.emplace_back(__rdtsc(), poll_address);
     }
@@ -1061,6 +1124,13 @@ void Executor::MemoryAcquired(u32, bool blocked, u64 poll_address) {
     if (!off && acquire_hook_ != nullptr && acquire_hook_(acquire_ctx_)) {
         ++stats_.acquires_applied;
     }
+}
+
+void Executor::WaitMetByHeldFence(u32) {
+    // the guest's GPU waits for its earlier work here (EVENT_WRITE_EOS + WAIT_REG_MEM): everything recorded after it
+    // waits for everything before it - the next command's global barrier (the batch-end barrier covers later batches)
+    ++stats_.waits_by_held;
+    pending_writes_ = true;
 }
 
 void Executor::BeforeUpload() {
@@ -3262,7 +3332,9 @@ void Executor::Flip(const Cp::FlipMarker&) {
     const u64 value = open_ ? cur_.value : timeline_.LastSubmitted();
     ++stats_.flushes_flip;
     Flush();
-    VideoOut::OnFlipMarker(value, frame);
+    if (VideoOut::OnFlipMarker(value, frame) && flip_hook_ != nullptr) {
+        flip_hook_(flip_ctx_, value);
+    }
     frontend_.NewFrame();
 }
 

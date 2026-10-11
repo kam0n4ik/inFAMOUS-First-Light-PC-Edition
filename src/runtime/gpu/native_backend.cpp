@@ -20,6 +20,7 @@
 #include "base/log.h"
 #include "runtime/gpu/backend.h"
 #include "runtime/gpu/command_processor.h"
+#include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/gnm/gnm_driver.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -62,6 +63,10 @@ public:
         }
         gm->CopySparse(addr, static_cast<u8*>(dst), bytes);
         return true;
+    }
+    bool unordered_labels = true; ///< P4.6 (SSPC_P46_SYNC=0: off)
+    bool Unordered(u64 addr, u64 bytes) override {
+        return unordered_labels && VideoOut::IsLabel(addr, bytes);
     }
     bool Write(u64 addr, const void* src, u64 bytes) override {
         if (VideoOut::LabelWrite(addr, src, bytes)) {
@@ -109,6 +114,7 @@ class Backend final : public Gnm::Host, public MemoryListener, public VideoOut::
 public:
     // ---- Gnm::Host (the game's threads)
     bool SubmitGraphics(u64 addr, u32 dwords, const u32* data) override {
+        FrameLog::GameSubmit();
         Push({.kind = Submission::Kind::Graphics, .addr = addr, .dwords = dwords, .data = data});
         return true;
     }
@@ -207,6 +213,8 @@ private:
     /// their next use): before the work the guest submitted after them, and at each met WAIT_REG_MEM on memory (data a
     /// CPU thread published with a flag; P4.5). true: there were some. GPU thread.
     bool DrainCpuWrites();
+    /// The executor reached a flip marker (its batch submitted, the flip queued): the frame log's row (P4.6).
+    void OnFlip(u64 gpu_value);
 
     Options options_;
     std::unique_ptr<Vk::DeviceContext> ctx_;
@@ -245,6 +253,10 @@ private:
     std::vector<std::pair<u64, u64>> pending_inval_;
     u64 submissions_ = 0, cp_errors_ = 0;
     std::string first_cp_error_;
+    // the GPU thread's running totals for the frame log (P4.6): busy (rounds, polls, flushes); idle by what it waited for
+    u64 tot_busy_ns_ = 0, tot_blocked_label_ns_ = 0, tot_blocked_other_ns_ = 0, tot_empty_ns_ = 0;
+    std::chrono::steady_clock::time_point round_t0_{}; ///< the current round's start (OnFlip runs inside it)
+    u64 label_base_ = 0;                               ///< VideoOut's buffer labels (a wait on them waits for a flip)
 };
 
 bool Backend::Start(const Options& o, std::string& error) {
@@ -351,6 +363,20 @@ bool Backend::Start(const Options& o, std::string& error) {
     cpo.memory = &memory_;
     cpo.work = executor_.get();
     cpo.gds = gds_.mapped;
+    // P4.6: the command processor does not stop for the GPU where the guest's GPU would not - a WAIT_REG_MEM a held
+    // fence will meet passes in the GPU's order (EVENT_WRITE_EOS + a wait for it: ~27 GPU drains a frame before), DMA
+    // with GDS is recorded on the timeline, WRITE_DATA to VideoOut's labels lands at once (docs\PHASE4_P46_PERFORMANCE.md
+    // §6). SSPC_P46_SYNC=0: the P4.5 behaviour (a control for A/B runs, not a configuration).
+    const bool p46_sync = [] {
+        char v[8] = {};
+        return !(GetEnvironmentVariableA("SSPC_P46_SYNC", v, sizeof(v)) == 1 && v[0] == '0');
+    }();
+    if (!p46_sync) {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC CONTROL: SSPC_P46_SYNC=0 - the command processor waits for the GPU as in P4.5");
+    }
+    cpo.waits_by_held_fences = p46_sync;
+    cpo.gds_on_timeline = p46_sync;
+    memory_.unordered_labels = p46_sync;
     // EOP/RELEASE_MEM clocks in the guest's time base (P4.5): data_sel 4 (the GPU counter the game scales with
     // sceGnmGetGpuCoreClockFrequency, 800 MHz) is the TSC the game reads with rdtsc, in GPU core clocks - as the
     // bridge's GetGpuPerfCounter; data_sel 3 (the 64-bit GPU clock) nanoseconds as the bridge's GetGpuClock64. Before,
@@ -415,6 +441,9 @@ bool Backend::Start(const Options& o, std::string& error) {
     memory_.buffers = buffers_.get();
     memory_.executor = executor_.get();
     Gnm::SetSdkVersion(o.sdk_version);
+    VideoOut::BufferLabelAddress(1, label_base_);
+    FrameLog::Start();
+    executor_->SetFlipHook([](void* self, u64 value) { static_cast<Backend*>(self)->OnFlip(value); }, this);
     Gnm::SetHost(this);
     VideoOut::SetLabelCallback([](void* ctx) { static_cast<Backend*>(ctx)->cv_.notify_one(); }, this);
     VideoOut::Start(this);
@@ -521,8 +550,9 @@ void Backend::Loop() {
         }
         // the guest's writes to tracked pages, before the work it submitted after them
         DrainCpuWrites();
-        bool progress = false, blocked = false, pending = false;
+        bool progress = false, blocked = false, pending = false, blocked_label = false;
         const auto cp_t0 = Clock::now();
+        round_t0_ = cp_t0;
         // SSPC_DIAG_QUEUE_ORDER=compute-first: the compute queues stepped before the graphics queue in each round (an
         // experiment on async compute's place relative to the graphics frame's end-of-pipe; P4.5)
         static const bool compute_first = [] {
@@ -547,6 +577,8 @@ void Backend::Loop() {
                 }
                 if (st == Cp::StepStatus::Blocked) {
                     blocked = true;
+                    const u64 poll = cp_->BlockedPoll(q);
+                    blocked_label |= poll >= label_base_ && poll < label_base_ + VideoOut::kMaxBuffers * 8;
                 } else if (st == Cp::StepStatus::Faulted) {
                     if (cp_errors_++ == 0) {
                         first_cp_error_ = cp_->LastError().Text();
@@ -558,10 +590,14 @@ void Backend::Loop() {
             }
             pending |= cp_->PendingSubmissions(q) != 0;
         }
-        prof_cp += ns_since(cp_t0);
+        const u64 round_ns = ns_since(cp_t0);
+        prof_cp += round_ns;
+        tot_busy_ns_ += round_ns;
         const auto poll_t0 = Clock::now();
         executor_->Poll(); // completed batches: the processor writes its held labels now
-        prof_poll += ns_since(poll_t0);
+        const u64 poll_ns = ns_since(poll_t0);
+        prof_poll += poll_ns;
+        tot_busy_ns_ += poll_ns;
         if (executor_->DeviceLost()) {
             // VK_ERROR_DEVICE_LOST: the report is written, nothing more is submitted; the process ends with an
             // explicit status (a run with a lost device is not a successful run)
@@ -674,7 +710,9 @@ void Backend::Loop() {
         if (executor_->WantsFlush() || (!progress && executor_->HasOpenWork())) {
             const auto flush_t0 = Clock::now();
             executor_->Flush();
-            prof_flush += ns_since(flush_t0);
+            const u64 flush_ns = ns_since(flush_t0);
+            prof_flush += flush_ns;
+            tot_busy_ns_ += flush_ns;
         }
         if (progress) {
             continue;
@@ -697,7 +735,25 @@ void Backend::Loop() {
         }
         const auto idle_t0 = Clock::now();
         const bool busy = executor_->Busy();
-        if (busy) {
+        // SSPC_DIAG_BLOCK_SPIN_US=<n>: a WAIT_REG_MEM blocked on memory the game's CPU writes (no notification comes)
+        // is polled again after n us instead of a 1 ms sleep (P4.6 experiment)
+        static const u64 spin_ns = [] {
+            char v[16] = {};
+            const u64 us = GetEnvironmentVariableA("SSPC_DIAG_BLOCK_SPIN_US", v, sizeof(v)) > 0
+                               ? std::strtoull(v, nullptr, 10)
+                               : 0ull;
+            if (us != 0) {
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BLOCK_SPIN_US={} - a blocked memory wait is "
+                                       "polled every {} us", us, us);
+            }
+            return us * 1000;
+        }();
+        if (blocked && !blocked_label && spin_ns != 0) {
+            const auto until = idle_t0 + std::chrono::nanoseconds(spin_ns);
+            while (Clock::now() < until) {
+                YieldProcessor();
+            }
+        } else if (busy) {
             executor_->WaitOldest(1'000'000); // 1 ms: completion unblocks labels
         } else {
             std::unique_lock lock{mutex_};
@@ -707,7 +763,27 @@ void Backend::Loop() {
         prof_idle += idle_ns;
         prof_idle_blocked += blocked ? idle_ns : 0;
         prof_idle_gpu += busy ? idle_ns : 0;
+        (blocked ? (blocked_label ? tot_blocked_label_ns_ : tot_blocked_other_ns_) : tot_empty_ns_) += idle_ns;
     }
+}
+
+void Backend::OnFlip(u64 gpu_value) {
+    const auto& s = executor_->Stats();
+    FrameLog::GpuThreadTotals t;
+    t.cp_ns = tot_busy_ns_ + static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - round_t0_)
+                                                  .count());
+    t.record_ns = s.record_ns;
+    t.sync_ns = s.sync_wait_us * 1000;
+    t.blocked_label_ns = tot_blocked_label_ns_;
+    t.blocked_other_ns = tot_blocked_other_ns_;
+    t.empty_ns = tot_empty_ns_;
+    t.gpu_busy_ns = s.gpu_busy_ns;
+    t.draws = s.draws;
+    t.dispatches = s.dispatches;
+    t.batches = s.batches;
+    t.blocks = cp_->Stats().waits_blocked;
+    FrameLog::CpFlip(gpu_value, t, executor_->LastUnblockTsc());
 }
 
 void Backend::Stop() {
@@ -730,6 +806,7 @@ void Backend::Stop() {
     std::error_code ec;
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
+    FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
     if (sampler_.Running()) {
         std::ofstream(options_.logs_dir / "gpu_cpu_profile.txt", std::ios::trunc) << sampler_.Report(60);
     }
@@ -794,8 +871,9 @@ std::string Backend::Report() {
                            "{}\n",
                            vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
         out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
-        out += fmt::format("memory waits met: {} (had blocked {}), CPU writes applied at them {}\n", s.acquires,
-                           s.acquires_blocked, s.acquires_applied);
+        out += fmt::format("memory waits met: {} (had blocked {}), CPU writes applied at them {}; met in the GPU's "
+                           "order by a held fence {}\n",
+                           s.acquires, s.acquires_blocked, s.acquires_applied, c.waits_met_held);
         out += fmt::format("global barriers by site: other {}, shadows in {}+{}, shadows out {}, timeline write {}, timeline "
                            "copy {}, upload {}, before a draw {}, before a dispatch {}\n",
                            s.gb_sites[0], s.gb_sites[1], s.gb_sites[2], s.gb_sites[3], s.gb_sites[4], s.gb_sites[5],
@@ -817,6 +895,12 @@ std::string Backend::Report() {
                            c.sync_write_data, s.tw_fail_shape, s.tw_fail_import, c.sync_dma[0], c.sync_dma[1],
                            c.sync_dma[2], c.sync_dma[3], c.sync_dma[4], c.sync_dma_m2m_size[0], c.sync_dma_m2m_size[1],
                            c.sync_dma_m2m_size[2], c.sync_dma_m2m_size[3]);
+        out += fmt::format("  their time (ms): WRITE_DATA {}, DMA [m2m {}, data2mem {}, m2gds {}, data2gds {}, gds2mem {}]; "
+                           "WRITE_DATA to VideoOut labels without a wait {}; GDS DMA on the timeline {} (refused {}); "
+                           "fences with GDS data {}\n",
+                           c.sync_write_data_ns / 1'000'000, c.sync_dma_ns[0] / 1'000'000, c.sync_dma_ns[1] / 1'000'000,
+                           c.sync_dma_ns[2] / 1'000'000, c.sync_dma_ns[3] / 1'000'000, c.sync_dma_ns[4] / 1'000'000,
+                           c.unordered_writes, c.timeline_gds, s.gds_refused, c.gds_fences);
     }
     if (buffers_) {
         const auto& b = buffers_->Stats();

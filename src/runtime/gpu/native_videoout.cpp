@@ -17,6 +17,7 @@
 #include "base/abi.h"
 #include "base/log.h"
 #include "runtime/exports.h"
+#include "runtime/gpu/frame_log.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/kernel/event_queues.h"
 
@@ -207,6 +208,9 @@ void PresentThread() {
     const auto present = [](const FlipRequest& r) {
         if (g_sink != nullptr) {
             g_sink->Present(r);
+        }
+        if (r.eop) {
+            FrameLog::Presented();
         }
         CompleteFlip(r);
         std::scoped_lock s{g_stats_mutex};
@@ -708,6 +712,12 @@ bool LabelRead(u64 addr, void* dst, u64 bytes) {
     }
     std::memcpy(dst, tmp + (addr - base), bytes);
     return true;
+}
+
+bool IsLabel(u64 addr, u64 bytes) {
+    const u64 base = reinterpret_cast<u64>(g_labels.data());
+    const u64 size = sizeof(g_labels);
+    return addr >= base && bytes <= size && addr - base <= size - bytes;
 }
 
 bool LabelWrite(u64 addr, const void* src, u64 bytes) {
