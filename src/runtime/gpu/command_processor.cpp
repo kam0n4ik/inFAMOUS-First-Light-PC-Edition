@@ -1364,7 +1364,7 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
     }
     op.written = true;
     ++stats_.fences_written;
-    {
+    if (fence_stats_.size() < 4096 || fence_stats_.contains(op.addr)) { // bounded (review LOW 10)
         FenceStat& fs = fence_stats_[op.addr];
         ++fs.count;
         fs.last = op.data;
@@ -1549,7 +1549,7 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
         q.blocked = true;
         return StepStatus::Blocked;
     }
-    if (q.blocked) {
+    if (q.blocked && (wait_stats_.size() < 4096 || wait_stats_.contains(q.block_poll))) {
         WaitStat& w = wait_stats_[q.block_poll];
         ++w.count;
         w.ns += now_ns() - q.block_t0;

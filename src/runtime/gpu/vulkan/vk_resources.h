@@ -173,7 +173,7 @@ private:
     DeviceContext& ctx_;
     PageTracker* tracker_ = nullptr;
     std::mutex mutex_;
-    std::map<u64, Window> windows_; ///< by base
+    std::multimap<u64, Window> windows_; ///< by base (a larger and a smaller window may share one - review MEDIUM 5)
     std::vector<Window> retired_;
     u64 max_window_ = 0;
     Stats stats_;

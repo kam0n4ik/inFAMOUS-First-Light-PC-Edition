@@ -285,6 +285,24 @@ bool Backend::Start(const Options& o, std::string& error) {
     guest_ = std::make_unique<Vk::GuestBuffers>(*ctx_);
     buffers_ = std::make_unique<Vk::BufferCache>(*ctx_, *guest_, &tracker_, 2560ull << 20, o.validation);
     images_ = std::make_unique<Vk::ImageCache>(*ctx_, *guest_);
+    {
+        // the images' video memory: 40% of the device-local heap, at most 3 GiB (the route keeps ~0.85 GiB);
+        // SSPC_DIAG_IMAGE_BUDGET_MIB tests the eviction with less
+        u64 heap = 0;
+        const auto& mem = ctx_->Memory();
+        for (u32 h = 0; h < mem.memoryHeapCount; ++h) {
+            if (mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                heap = std::max<u64>(heap, mem.memoryHeaps[h].size);
+            }
+        }
+        u64 budget = std::min<u64>(heap / 10 * 4, 3ull << 30);
+        if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_IMAGE_BUDGET_MIB", v, sizeof(v)) > 0) {
+            budget = std::strtoull(v, nullptr, 10) << 20;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_IMAGE_BUDGET_MIB - images kept within {} MiB",
+                     budget >> 20);
+        }
+        images_->SetBudget(budget);
+    }
     pipelines_ = std::make_unique<Vk::PipelineFactory>(*ctx_, profile_);
     presenter_ = Vk::Presenter::Create(*ctx_, *timeline_, o.sdl_window, error);
     if (!presenter_) {
@@ -438,7 +456,7 @@ void Backend::Loop() {
         // the guest's writes to tracked pages, before the work it submitted after them
         tracker_.Drain([&](u64 a, u64 sz) {
             images_->Invalidate(a, sz);
-            buffers_->Invalidate(a, sz);
+            buffers_->InvalidateCoarse(a, sz); // whole 64 KiB blocks: the GPU's pending pages there stay
             frontend_->Invalidate(a, sz);
         });
         bool progress = false, blocked = false, pending = false;
@@ -666,6 +684,7 @@ std::string Backend::Report() {
         out += fmt::format("images {} ({} MiB), uploads {} (detiled {}, linear {}, {} MiB), overlap hits {}, target misses {}, overlap misses {}, unsupported {} {}\n",
                            i.images, i.bytes >> 20, i.uploads, i.detiles, i.linear_uploads, i.upload_bytes >> 20,
                            i.overlap_hits, i.target_misses, i.overlap_misses, i.unsupported, i.first_unsupported);
+        out += fmt::format("images evicted over the budget: {} ({} MiB)\n", i.evicted, i.evicted_bytes >> 20);
     }
     if (guest_) {
         const auto g = guest_->GetStats();

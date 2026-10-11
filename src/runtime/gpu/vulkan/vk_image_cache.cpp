@@ -103,6 +103,54 @@ ImageCache::~ImageCache() {
     }
 }
 
+void ImageCache::Evict(u64 completed) {
+    if (stats_.bytes <= budget_) {
+        return;
+    }
+    // candidates: images uploaded from guest memory (re-uploadable), not used by a batch still in flight
+    std::vector<CachedImage*> cand;
+    for (const auto& img : images_) {
+        if (!img->gpu_written && img->last_seq <= completed) {
+            cand.push_back(img.get());
+        }
+    }
+    std::ranges::sort(cand, [](const CachedImage* a, const CachedImage* b) { return a->last_seq < b->last_seq; });
+    const u64 target = budget_ / 10 * 9;
+    const auto& f = Fn();
+    const VkDevice dev = ctx_.Device();
+    std::vector<CachedImage*> gone;
+    for (CachedImage* img : cand) {
+        if (stats_.bytes <= target) {
+            break;
+        }
+        for (auto& [k, v] : img->views) {
+            f.vkDestroyImageView(dev, v, nullptr);
+        }
+        f.vkDestroyImage(dev, img->image, nullptr);
+        f.vkFreeMemory(dev, img->memory, nullptr);
+        const auto [lo, hi] = by_address_.equal_range(img->layout.guest_address);
+        for (auto it = lo; it != hi; ++it) {
+            if (it->second == img) {
+                by_address_.erase(it);
+                break;
+            }
+        }
+        std::erase_if(meta_owner_, [&](const auto& e) { return e.second == img; });
+        stats_.bytes -= img->bytes;
+        --stats_.images;
+        ++stats_.evicted;
+        stats_.evicted_bytes += img->bytes;
+        gone.push_back(img);
+    }
+    if (gone.empty()) {
+        return;
+    }
+    std::erase_if(images_, [&](const std::unique_ptr<CachedImage>& p) {
+        return std::ranges::find(gone, p.get()) != gone.end();
+    });
+    ++epoch_; // what Find returned (the executor's target cache and texture memo) may be gone
+}
+
 void ImageCache::Invalidate(u64 addr, u64 size) {
     std::scoped_lock lock{inval_mutex_};
     pending_inval_.emplace_back(addr, size);
@@ -722,6 +770,7 @@ void ImageCache::Collect(u64 completed) {
         Fn().vkFreeMemory(ctx_.Device(), temps_.front().memory, nullptr);
         temps_.pop_front();
     }
+    Evict(completed);
 }
 
 } // namespace SecondSon::Gpu::Vk

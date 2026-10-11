@@ -394,7 +394,7 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
             max_window_ = std::max(max_window_, w.size);
             out = {w.buffer, addr - w.base, w.base, w.size, w.backing};
             ++(backed ? stats_.backing_windows : stats_.guest_windows);
-            windows_.emplace(w.base, w); // an equal base (a smaller window there) stays: lookups take either
+            windows_.emplace(w.base, w); // an equal base (a smaller window there) stays too: lookups take either
             return true;
         }
     }

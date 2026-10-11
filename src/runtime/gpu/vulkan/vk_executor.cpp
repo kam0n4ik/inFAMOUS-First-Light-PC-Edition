@@ -847,6 +847,8 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     const u64 cid = diag_ != nullptr && diag_->Enabled()
                         ? DiagBegin(fmt::format("timeline write q{} seq {} {:#x}+{}", queue, seq, dst, bytes))
                         : 0;
+    // this batch's GPU writes there reach the host first and leave the end's write-back (it would undo this write)
+    buffers_.FlushWrittenForHostWrite(dst, bytes, cur_.cb, cur_.value);
     Fn().vkCmdUpdateBuffer(cur_.cb, v.buffer, v.offset, bytes, data);
     DiagEnd(cid);
     buffers_.Invalidate(dst, bytes); // the host's copy is newer: uploaded again (after this write) at the next use
@@ -870,8 +872,6 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     if (!Begin()) {
         return false;
     }
-    Note(queue, seq);
-    ++commands_;
     write_run_ = false;
     // a copy: outside rendering, after the earlier writes (of its source too)
     EndRendering();
@@ -882,8 +882,12 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     u64 soff = 0, doff = 0, savail = 0, davail = 0;
     if (!GuestRange(src, bytes, false, 4, sbuf, soff, savail) || !GuestRange(dst, bytes, true, 4, dbuf, doff, davail)) {
         ++stats_.tc_refused;
-        return false; // nothing recorded yet: the processor copies (after Synchronize)
+        return false; // not noted: the processor copies (after Synchronize) and the sequence number stays its own
     }
+    // noted only when recorded: a refused copy noted here would complete the queue's next work number with this batch
+    // (review MEDIUM 3)
+    Note(queue, seq);
+    ++commands_;
     // the ranges' uploads (if any) ended rendering and ordered themselves; the copy after them
     EndRendering();
     const u64 cid = diag_ != nullptr && diag_->Enabled()
@@ -951,8 +955,14 @@ void Executor::SyncFrom(u32 source) {
         ++stats_.flushes_sync;
         Flush();
     }
-    if (!in_flight_.empty() && !timeline_.Wait(in_flight_.back().value, 5'000'000'000ull) && timeline_.Lost()) {
-        OnDeviceLost("vkWaitSemaphores (Synchronize)", in_flight_.back().value);
+    // until done (a CPU access follows): a timeout without a lost device waits on (review MEDIUM 6)
+    for (u32 round = 0; !in_flight_.empty() && !timeline_.Wait(in_flight_.back().value, 5'000'000'000ull); ++round) {
+        if (timeline_.Lost()) {
+            OnDeviceLost("vkWaitSemaphores (Synchronize)", in_flight_.back().value);
+            break;
+        }
+        SSPC_LOG(GPU, Warning, "native backend: the GPU has not completed submission {} after {} s", in_flight_.back().value,
+                 (round + 1) * 5);
     }
     const u64 us = GS::TicksToNs(GS::Ticks() - t0) / 1000;
     stats_.sync_wait_us += us;

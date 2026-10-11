@@ -113,8 +113,10 @@ void CpuSampler::Run() {
                 continue;
             }
             PWSTR desc = nullptr;
+            // never another sampler: two suspending each other would deadlock (review LOW 9)
             const bool match = SUCCEEDED(GetThreadDescription(h, &desc)) && desc != nullptr &&
-                               std::wstring_view(desc).find(name_part_) != std::wstring_view::npos;
+                               std::wstring_view(desc).find(name_part_) != std::wstring_view::npos &&
+                               !std::wstring_view(desc).starts_with(L"SecondSonPC:CpuSampler");
             if (desc != nullptr) {
                 LocalFree(desc);
             }
@@ -183,7 +185,12 @@ void CpuSampler::Run() {
                         ++n;
                         break;
                     }
-                    ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+                    DWORD64 ret = 0;
+                    if (!SafeRead(ctx.Rsp, &ret, sizeof(ret))) { // a fault here would kill the process (review MEDIUM 8)
+                        ++n;
+                        break;
+                    }
+                    ctx.Rip = ret;
                     ctx.Rsp += 8;
                 } else {
                     PVOID handler_data = nullptr;

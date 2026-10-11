@@ -79,6 +79,15 @@ public:
     Residency Classify(u64 addr, u64 size, Range& out);
     /// The guest wrote or unmapped [addr, addr + size) behind the GPU's back: the pages are uploaded again. Any thread.
     void Invalidate(u64 addr, u64 size);
+    /// The write tracker's report: the CPU wrote some page of each 64 KiB block of [addr, addr + size) (a fault gives
+    /// the whole block back). Pages the GPU wrote in a batch not completed stay valid: their data is the newer one
+    /// and reaches the host at that batch's end - uploading the host's older copy over them would lose it (review
+    /// HIGH 2). Any thread.
+    void InvalidateCoarse(u64 addr, u64 size);
+    /// Before a host-side GPU write of [addr, addr + size) in this batch (WRITE_DATA on the timeline): this batch's
+    /// GPU writes there copied to the host first and dropped from the end's write-back (it would put them back over
+    /// the newer bytes - review HIGH 1).
+    void FlushWrittenForHostWrite(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) { FlushWritten(addr, size, cb, seq); }
     /// The GPU writes [addr, addr + size) of the host's copy in submission `seq` (a range not cached): until `seq`
     /// completes, the host's bytes there are older than the GPU's (no CPU copy may read them).
     void NoteHostWrite(u64 addr, u64 size, u64 seq);
@@ -157,6 +166,16 @@ private:
     std::mutex inval_mutex_;
     std::atomic<bool> has_inval_{false};
     std::vector<std::pair<u64, u64>> pending_inval_;
+    std::vector<std::pair<u64, u64>> pending_coarse_; ///< InvalidateCoarse's (under inval_mutex_)
+    u64 completed_ = 0;                                ///< the last completed submission Collect saw
+    /// Pages a coarse report kept valid (the GPU wrote them in submission `seq`): invalid once it completes (the host
+    /// then has them; their tracking protection is gone, so the next use uploads and protects them again).
+    struct DeferredInval {
+        u64 block;
+        u16 mask;
+        u64 seq;
+    };
+    std::vector<DeferredInval> deferred_inval_;
     bool host_wait_binds_ = false; ///< the binds complete on the host (validation runs; SSPC_DIAG_BIND_HOST_WAIT=1)
     void (*before_upload_)(void*) = nullptr;
     void* before_upload_ctx_ = nullptr;

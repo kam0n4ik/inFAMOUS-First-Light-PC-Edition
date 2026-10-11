@@ -126,20 +126,34 @@ void BufferCache::Invalidate(u64 addr, u64 size) {
     has_inval_.store(true, std::memory_order_release);
 }
 
+void BufferCache::InvalidateCoarse(u64 addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{inval_mutex_};
+    pending_coarse_.emplace_back(addr, size);
+    has_inval_.store(true, std::memory_order_release);
+}
+
 void BufferCache::ApplyInvalidations() {
     if (!has_inval_.load(std::memory_order_acquire)) {
         return;
     }
-    std::vector<std::pair<u64, u64>> ranges;
+    std::vector<std::pair<u64, u64>> ranges, coarse;
     {
         std::scoped_lock lock{inval_mutex_};
         has_inval_.store(false, std::memory_order_relaxed);
-        if (pending_inval_.empty()) {
+        if (pending_inval_.empty() && pending_coarse_.empty()) {
             return;
         }
         ranges.swap(pending_inval_);
+        coarse.swap(pending_coarse_);
     }
-    for (const auto& [addr, size] : ranges) {
+    const size_t exact = ranges.size();
+    ranges.insert(ranges.end(), coarse.begin(), coarse.end());
+    for (size_t r = 0; r < ranges.size(); ++r) {
+        const u64 addr = ranges[r].first, size = ranges[r].second;
+        const bool is_coarse = r >= exact;
         const u64 end = std::min(addr + size, space_);
         if (addr >= end) {
             continue;
@@ -159,7 +173,14 @@ void BufferCache::ApplyInvalidations() {
                 if (blk.valid == 0) {
                     continue;
                 }
-                blk.valid &= static_cast<u16>(~PageMask(b, first_page, last_page));
+                // a coarse report keeps the pages the GPU wrote in a batch not completed (their data is newer)
+                const u16 mask = PageMask(b, first_page, last_page);
+                const u16 keep = is_coarse && blk.pending_seq > completed_ ? static_cast<u16>(blk.gpu_pending & mask)
+                                                                           : u16{0};
+                blk.valid &= static_cast<u16>(~(mask & ~keep));
+                if (keep != 0) {
+                    deferred_inval_.push_back({b, keep, blk.pending_seq});
+                }
                 ++stats_.invalidations;
             }
         }
@@ -384,6 +405,13 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
             const bool uploaded = Upload(b, e - b, cb, seq);
             stats_.t_copy += Gpu::Shader::Ticks() - t0;
             if (!uploaded) {
+                // not current: the pages stay invalid (they were marked valid above, before the copy - review MEDIUM 7)
+                const u64 fp = b >> kPageBits, lp = (e - 1) >> kPageBits;
+                for (u64 blk_i = fp / kPagesPerBlock; blk_i <= lp / kPagesPerBlock; ++blk_i) {
+                    if (Block* blk = FindBlock(blk_i)) {
+                        blk->valid &= static_cast<u16>(~PageMask(blk_i, fp, lp));
+                    }
+                }
                 if (stats_.first_error.empty()) {
                     stats_.first_error = fmt::format("upload of [{:#x}, {:#x}): no host import", b, e);
                 }
@@ -414,7 +442,8 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
 
 void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) {
     // this batch's GPU writes overlapping [addr, addr + size): copied back to the host now (a host import of the range
-    // reads them next); they stay listed for the batch's end
+    // is accessed next) and dropped from the batch end's write-back - the host import may be written next (a shader
+    // through it, WRITE_DATA): the end's copy of the older video memory bytes would undo that (review HIGH 1)
     const u64 end = addr + size;
     bool any = false;
     for (const auto& [b, e] : written_) {
@@ -451,6 +480,21 @@ void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) 
         ++stats_.early_writebacks;
     }
     if (any) {
+        std::vector<std::pair<u64, u64>> rest;
+        rest.reserve(written_.size() + 1);
+        for (const auto& [b, e] : written_) {
+            if (b >= end || e <= addr) {
+                rest.emplace_back(b, e);
+                continue;
+            }
+            if (b < addr) {
+                rest.emplace_back(b, addr);
+            }
+            if (e > end) {
+                rest.emplace_back(end, e);
+            }
+        }
+        written_.swap(rest);
         const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                                   .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                                   .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -497,6 +541,26 @@ bool BufferCache::HostWritePending(u64 addr, u64 size) const {
 }
 
 void BufferCache::Collect(u64 completed) {
+    completed_ = std::max(completed_, completed);
+    if (!deferred_inval_.empty()) {
+        // a coarse report's kept pages: invalid once the GPU's batch completed (written back) - unless the GPU wrote
+        // them again since (then after that batch)
+        std::erase_if(deferred_inval_, [&](DeferredInval& d) {
+            Block* blk = FindBlock(d.block);
+            if (blk == nullptr) {
+                return true;
+            }
+            if (blk->pending_seq > completed_ && (blk->gpu_pending & d.mask) != 0) {
+                d.seq = blk->pending_seq;
+                return false;
+            }
+            if (d.seq > completed_) {
+                return false;
+            }
+            blk->valid &= static_cast<u16>(~d.mask);
+            return true;
+        });
+    }
     if (host_writes_.empty()) {
         return;
     }
@@ -571,6 +635,17 @@ bool BufferCache::SubmitBinds(VkSemaphore& wait, u64& wait_value) {
                               .signalSemaphoreCount = 1,
                               .pSignalSemaphores = &bind_timeline_};
     const VkResult r = f.vkQueueBindSparse(ctx_.Queue(), 1, &bi, VK_NULL_HANDLE);
+    if (r != VK_SUCCESS) {
+        // the blocks are not bound: back to unbound (a later range binds them again or takes the host import) - the
+        // batch's commands that use them read zeros / drop writes (review MEDIUM 4; an error is reported below)
+        for (const VkSparseMemoryBind& bind : pending_binds_) {
+            if (Block* blk = FindBlock(bind.resourceOffset >> kBlockBits)) {
+                blk->bound = false;
+                blk->valid = 0;
+                stats_.resident_bytes -= std::min<u64>(stats_.resident_bytes, bind.size);
+            }
+        }
+    }
     pending_binds_.clear();
     ++stats_.bind_calls;
     if (r != VK_SUCCESS) {

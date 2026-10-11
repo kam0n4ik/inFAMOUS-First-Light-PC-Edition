@@ -65,6 +65,7 @@ struct ImageCacheStats {
     u64 overlap_hits = 0;   ///< the bridge's equal-address rule: another image's texels through a view
     u64 target_misses = 0;  ///< a texture over a GPU-written image none of the rules accepted (uploaded instead)
     u64 overlap_misses = 0; ///< a new texture whose memory overlaps a GPU-written image (any overlap; uploaded)
+    u64 evicted = 0, evicted_bytes = 0; ///< uploaded images freed over the budget (re-uploaded on their next use)
     std::string first_unsupported;
 };
 
@@ -94,6 +95,9 @@ public:
     /// The invalidations queued so far applied now (Find applies them too; a caller that skips Find for a texture it
     /// resolved before calls this first, then checks the image's dirty flag).
     void ApplyPendingInvalidations() { ApplyInvalidations(); }
+    /// Video memory the images may keep: over it, uploaded images (never the GPU-written ones - their texels exist only
+    /// in video memory) whose last use completed are freed, least recently used first, down to 90% of it.
+    void SetBudget(u64 bytes) { budget_ = bytes; }
     /// Called before an upload records its commands (the executor ends rendering and makes earlier writes visible).
     void SetBeforeUpload(void (*hook)(void* ctx), void* ctx) {
         before_upload_ = hook;
@@ -142,6 +146,8 @@ private:
     std::vector<std::unique_ptr<CachedImage>> images_;
     std::multimap<u64, CachedImage*> by_address_;
     u64 max_image_size_ = 0; ///< the largest image's guest size: how far before a range an overlapping image may start
+    u64 budget_ = ~0ull;
+    void Evict(u64 completed);
     u64 epoch_ = 0;
 
 public:
