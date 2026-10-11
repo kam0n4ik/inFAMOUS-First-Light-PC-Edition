@@ -138,6 +138,9 @@ struct FenceOp {
     u64 after_seq = 0;     ///< the queue's work it waits for (0: none outstanding)
     bool deferred = false; ///< Isolated: held until CompleteWork(queue, after_seq)
     bool written = false;  ///< Isolated: the memory write was done
+    /// A held clock fence (data_sel 3/4): how long before its write the GPU passed the fence's place in the stream
+    /// (the executor's timestamp there; P4.6 night, SSPC-020) - the clock written is the sample minus this. ~0: none.
+    u64 clock_age_ns = ~0ull;
 };
 
 /// ACQUIRE_MEM: caches over a range made coherent before what follows (a barrier for the GPU); EVENT_WRITE of a
@@ -354,6 +357,9 @@ public:
 
     /// Isolated: the GPU finished `queue`'s work up to `seq`: held fences up to it are written, in order.
     void CompleteWork(u32 queue, u64 seq);
+    /// The held clock fence of `queue` at `packet_addr` (after work `after_seq`): the GPU passed its place `age_ns` before
+    /// now (called before the CompleteWork that writes it).
+    void SetFenceClockAge(u32 queue, u64 packet_addr, u64 after_seq, u64 age_ns);
     u64 SubmittedWork(u32 queue) const;
     u64 CompletedWork(u32 queue) const;
 

@@ -195,6 +195,20 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         if (Fn().vkCreateQueryPool(ctx_.Device(), &qi, nullptr, &queries_) != VK_SUCCESS) {
             queries_ = VK_NULL_HANDLE;
         }
+        // SSPC_DIAG_CLOCK=place (SSPC-020 experiment, not the default): measured on the beach (logs\p46\f3_*) it did not
+        // reduce the smoke's flicker (107 vs 45 block jumps per 100 frames) and the command processor took 4-6 ms more
+        // a frame with the same draw/dispatch counts - the game reads these clocks (P4.6) and does more with them
+        char cv[16] = {};
+        const bool place = GetEnvironmentVariableA("SSPC_DIAG_CLOCK", cv, sizeof(cv)) > 0 && std::string_view(cv) == "place";
+        const VkQueryPoolCreateInfo ci{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                       .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                       .queryCount = kClockBatches * kClockPerBatch};
+        if (place && queries_ != VK_NULL_HANDLE &&
+            Fn().vkCreateQueryPool(ctx_.Device(), &ci, nullptr, &clock_pool_) == VK_SUCCESS) {
+            clock_at_place_ = true;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_CLOCK=place - GPU clock fences carry the GPU's time "
+                                   "at their place (a timestamp there)");
+        }
     }
 }
 
@@ -206,6 +220,9 @@ Executor::~Executor() {
     }
     if (prof_pool_ != VK_NULL_HANDLE) {
         f.vkDestroyQueryPool(dev, prof_pool_, nullptr);
+    }
+    if (clock_pool_ != VK_NULL_HANDLE) {
+        f.vkDestroyQueryPool(dev, clock_pool_, nullptr);
     }
     DestroyBuffer(ctx_, lds_);
     DestroyBuffer(ctx_, diag_scratch_);
@@ -308,6 +325,12 @@ bool Executor::Begin() {
     cur_.prof_base = ~0u;
     cur_.prof_count = 0;
     cur_.prof_keys.clear();
+    cur_.clock_fences.clear();
+    cur_.clock_base = ~0u;
+    if (clock_at_place_ && cur_.query_slot != ~0u) {
+        cur_.clock_base = (clock_next_++ % kClockBatches) * kClockPerBatch;
+        f.vkCmdResetQueryPool(cur_.cb, clock_pool_, cur_.clock_base, kClockPerBatch);
+    }
     if (prof_) {
         cur_.prof_base = (prof_next_batch_++ % kProfBatches) * kProfPerBatch;
         f.vkCmdResetQueryPool(cur_.cb, prof_pool_, cur_.prof_base, kProfPerBatch);
@@ -378,6 +401,61 @@ void Executor::GlobalBarrier(u32 site) {
     pending_writes_ = false;
     pend_.Clear();
     ++stats_.global_barriers;
+}
+
+void Executor::NoteOrderRange(const void* plan_ptr, u64 shader, u32 queue, bool dispatch) {
+    // SSPC_DIAG_ORDER_RANGE=<hex address>[:<hex size>] (SSPC-020): every draw/dispatch binding that memory, in recording
+    // order with the flip and queue -> logs\p45\order_range.txt (flips 1400..1460)
+    static const std::pair<u64, u64> range = [] {
+        char v[64] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_ORDER_RANGE", v, sizeof(v)) == 0) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* p = v;
+        const u64 a = std::strtoull(p, &p, 16);
+        const u64 s = *p == ':' ? std::strtoull(p + 1, nullptr, 16) : 0x1000;
+        return std::pair<u64, u64>{a, s};
+    }();
+    if (range.second == 0) {
+        return;
+    }
+    const u64 flip = VideoOut::NextFlipId();
+    if (flip < 1400 || flip > 1460) {
+        return;
+    }
+    static std::ofstream out(options_.capture_path.parent_path().parent_path() / "p45" / "order_range.txt",
+                             std::ios::trunc);
+    const auto& plan = *static_cast<const GS::ResourceBindingPlan*>(plan_ptr);
+    for (const auto& b : plan.buffers) {
+        if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.address < range.first + range.second &&
+            range.first < b.address + b.size) {
+            out << fmt::format("flip {} batch {} q{} {} {:#x} {} [{:#x}, +{:#x})\n", flip, cur_.value, queue,
+                               dispatch ? "dispatch" : "draw", shader, b.written ? "WRITES" : "reads", b.address, b.size);
+        }
+    }
+}
+
+void Executor::NoteClockLabelReads(const void* plan_ptr, u64 shader) {
+    // SSPC-020 diagnostics: a shader binding a buffer over an address the guest's EOP/RELEASE_MEM writes a GPU clock to
+    if (clock_labels_.empty()) {
+        return;
+    }
+    const auto& plan = *static_cast<const GS::ResourceBindingPlan*>(plan_ptr);
+    for (const auto& b : plan.buffers) {
+        if (b.kind != GS::BufferKind::Guest || b.status != GS::ResourceStatus::Ok || b.size == 0) {
+            continue;
+        }
+        for (const u64 l : clock_labels_) {
+            if (l >= b.address && l < b.address + b.size) {
+                ++stats_.clock_label_binds;
+                if (clock_label_logged_ < 16) {
+                    ++clock_label_logged_;
+                    SSPC_LOG(GPU, Info, "SSPC-020 diag: shader {:#x} binds [{:#x}, +{:#x}) {} over the GPU clock label {:#x}",
+                             shader, b.address, b.size, b.written ? "(written)" : "(read)", l);
+                }
+            }
+        }
+    }
 }
 
 bool Executor::NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads,
@@ -623,6 +701,24 @@ void Executor::Poll() {
     while (!in_flight_.empty() && in_flight_.front().value <= completed) {
         Batch b = std::move(in_flight_.front());
         in_flight_.pop_front();
+        if (cp_ != nullptr && !b.clock_fences.empty() && b.query_slot != ~0u) {
+            // each clock fence's age: from its timestamp to the batch's last one (taken as now - the completion was
+            // just seen)
+            u64 end_ts[2] = {};
+            if (Fn().vkGetQueryPoolResults(ctx_.Device(), queries_, b.query_slot * 2, 2, sizeof(end_ts), end_ts, 8,
+                                           VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                for (const auto& cf : b.clock_fences) {
+                    u64 ts = 0;
+                    if (Fn().vkGetQueryPoolResults(ctx_.Device(), clock_pool_, cf.query, 1, sizeof(ts), &ts, 8,
+                                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                        end_ts[1] >= ts) {
+                        const u64 age = static_cast<u64>(static_cast<double>(end_ts[1] - ts) *
+                                                         ctx_.Caps().timestamp_period);
+                        cp_->SetFenceClockAge(cf.queue, cf.packet_addr, cf.after_seq, age);
+                    }
+                }
+            }
+        }
         if (cp_ != nullptr) {
             for (const u32 q : b.queues) {
                 cp_->CompleteWork(q, b.work[q]);
@@ -1451,6 +1547,21 @@ void Executor::SyncFrom(u32 source) {
 }
 
 void Executor::Fence(const Cp::FenceOp& op) {
+    if (op.deferred && !op.written && (op.data_sel == 3 || op.data_sel == 4) && op.kind != Cp::FenceKind::EndOfShader) {
+        // a clock the processor writes once this work completed: the GPU's time here, measured by a timestamp
+        if (open_ && cur_.clock_base != ~0u && cur_.clock_fences.size() < kClockPerBatch) {
+            const u32 qi = cur_.clock_base + static_cast<u32>(cur_.clock_fences.size());
+            Fn().vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, clock_pool_, qi);
+            cur_.clock_fences.push_back({op.queue, op.packet_addr, op.after_seq, qi});
+            ++stats_.clock_fences_placed;
+        } else {
+            ++stats_.clock_fences_unplaced;
+        }
+    }
+    if ((op.data_sel == 3 || op.data_sel == 4) && op.addr != 0 && clock_labels_.size() < 64 &&
+        std::ranges::find(clock_labels_, op.addr) == clock_labels_.end()) {
+        clock_labels_.push_back(op.addr); // (diagnostics, SSPC-020: who reads the GPU clock labels)
+    }
     batch_fence_ = true;
     GuestSync(op.queue);
     if (op.queue < guest_flush_.size()) {
@@ -2297,6 +2408,16 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         return;
     }
     stats_.t_bind += GS::FineTicks() - tb0;
+    if (!clock_labels_.empty()) {
+        NoteClockLabelReads(&vs.plan, vs.address);
+        if (has_ps) {
+            NoteClockLabelReads(&ps.plan, ps.address);
+        }
+    }
+    NoteOrderRange(&vs.plan, vs.address, d.queue, false);
+    if (has_ps) {
+        NoteOrderRange(&ps.plan, ps.address, d.queue, false);
+    }
     ts = GS::FineTicks();
     // vertex inputs
     std::vector<VkVertexInputBindingDescription2EXT>& vbind = scratch_.vbind;
@@ -2939,6 +3060,8 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     if (d.indirect) {
         acc_reads_.emplace_back(d.indirect_addr, d.indirect_addr + 12);
     }
+    NoteClockLabelReads(&csv.plan, csv.address);
+    NoteOrderRange(&csv.plan, csv.address, d.queue, true);
     // dispatches of one queue the guest does not order (no sync point between them) need no barrier for their range
     // conflicts (P4.6 night; SSPC_P46_GUEST_ORDER=0: a barrier for every conflict - the earlier behaviour)
     static const bool guest_order = [] {

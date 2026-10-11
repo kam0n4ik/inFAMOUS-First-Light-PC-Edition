@@ -1368,6 +1368,12 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
         case 3:
         case 4:
             op.data = ClockSample(op.data_sel);
+            if (op.clock_age_ns != ~0ull) {
+                // the GPU's time at the fence's place: the sample minus how long ago it passed it (data_sel 4 counts
+                // at the 800 MHz GPU core clock, 3 in ns)
+                const u64 age = op.data_sel == 4 ? op.clock_age_ns * 4 / 5 : op.clock_age_ns;
+                op.data = op.data > age ? op.data - age : 0;
+            }
             [[fallthrough]];
         case 2:
             std::memcpy(buf, &op.data, 8);
@@ -1436,6 +1442,20 @@ StepStatus CommandProcessor::Fence(Queue& q, FenceOp& op) {
     }
     options_.work->Fence(op);
     return StepStatus::Packet;
+}
+
+void CommandProcessor::SetFenceClockAge(u32 queue, u64 packet_addr, u64 after_seq, u64 age_ns) {
+    Queue* qp = Q(queue);
+    if (qp == nullptr) {
+        return;
+    }
+    for (u32 i = 0; i < qp->fence_count; ++i) {
+        FenceOp& f = qp->fences[(qp->fence_head + i) % kMaxFences];
+        if (f.packet_addr == packet_addr && f.after_seq == after_seq && !f.written) {
+            f.clock_age_ns = age_ns;
+            return;
+        }
+    }
 }
 
 void CommandProcessor::CompleteWork(u32 queue, u64 seq) {

@@ -108,6 +108,8 @@ struct ExecutorStats {
     /// dispatches barriered for a range conflict: the guest flushed on that queue since its previous dispatch / did not
     u64 conflict_guest_flushed = 0, conflict_guest_silent = 0;
     u64 barriers_guest_order = 0; ///< conflicts between dispatches the guest does not order (SSPC_P46_GUEST_ORDER)
+    u64 clock_label_binds = 0;    ///< SSPC-020 diagnostics: shader bindings over a GPU clock label
+    u64 clock_fences_placed = 0, clock_fences_unplaced = 0; ///< held clock fences with/without a timestamp at their place
     std::array<u64, 7> unknown_by{}; ///< writes of unknown extent by source (Executor::MarkWrites)
     std::array<u64, 3> wb_bytes_by{}; ///< write-back bytes by batch end: fence/flip/sync/idle, full+fence, full only
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
@@ -205,6 +207,14 @@ private:
         u32 prof_count = 0;
         std::vector<u64> prof_keys; ///< the command key of each timestamp after the first
         std::vector<u32> queues;
+        /// held clock fences (data_sel 3/4) recorded in it: the timestamp query at each one's place (SSPC-020)
+        struct ClockFence {
+            u32 queue = 0;
+            u64 packet_addr = 0, after_seq = 0;
+            u32 query = 0;
+        };
+        std::vector<ClockFence> clock_fences;
+        u32 clock_base = ~0u; ///< its block of clock_pool_ queries
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};
@@ -451,6 +461,10 @@ private:
     }
     PendingRanges pend_;
     std::array<u64, Cp::kNumQueues> guest_flush_{}; ///< diagnostics: event types the guest wrote since the queue's last dispatch
+    std::vector<u64> clock_labels_; ///< SSPC-020 diagnostics: addresses EOP/RELEASE_MEM write a GPU clock to
+    u32 clock_label_logged_ = 0;
+    void NoteClockLabelReads(const void* plan, u64 shader);
+    void NoteOrderRange(const void* plan, u64 shader, u32 queue, bool dispatch);
     static constexpr u64 kGdsRangeBase = 1ull << 48; ///< GDS in the range checks: above every guest address
     /// A write of unknown extent since the last barrier: the next command barriers.
     /// `site` (counted): 0 a draw, 1 a dispatch, 2 a met wait, 3 WRITE_DATA, 4 GDS DMA, 5 an eviction, 6 other
@@ -480,6 +494,12 @@ private:
     Diagnostics* diag_ = nullptr;
     VkQueryPool queries_ = VK_NULL_HANDLE; ///< two timestamps per batch slot
     u32 next_query_slot_ = 0;
+    // SSPC-020 / P4.6 night: the GPU's time at each held clock fence's place (SSPC_DIAG_CLOCK=completion: the time the
+    // completion was seen, the earlier behaviour)
+    static constexpr u32 kClockBatches = 64, kClockPerBatch = 32;
+    VkQueryPool clock_pool_ = VK_NULL_HANDLE;
+    u32 clock_next_ = 0;
+    bool clock_at_place_ = false;
     // SSPC_GPU_PROFILE=1: GPU time per command key (pipeline / compute shader / upload / frame copy)
     struct ProfAcc {
         u64 ns = 0, count = 0;
