@@ -305,6 +305,33 @@ void TestRuntime(TestGroup& g) {
     }
     g.Check("every register the runtime parameters read is in their groups; viewport/scissor are not",
             all && (GS::kRuntimeGroups & (Cp::Bit(Cp::Group::Viewport) | Cp::Bit(Cp::Group::Scissor))) == 0, "");
+
+    // P4.5: the colour write mask in the image's component order (CB_TARGET_MASK enables export components; the
+    // program writes image component i from export component Map(i) of the COMP_SWAP swizzle)
+    const auto info = [](u32 format, u32 swap) { return (format << 2) | (swap << 11); };
+    g.Check("write mask: 16_16_16_16 ALT (the G-buffer normal, CB_COLOR_INFO 0x830) 0x3 -> G and B (0x6), R kept",
+            info(12, 1) == 0x830 && GS::ImageWriteMask(0x830, 0x3) == 0x6, fmt::format("{:#x}", GS::ImageWriteMask(0x830, 0x3)));
+    g.Check("write mask: standard swap unchanged (0x3, 0x5, 0xF), ALT full mask unchanged",
+            GS::ImageWriteMask(info(12, 0), 0x3) == 0x3 && GS::ImageWriteMask(info(10, 0), 0x5) == 0x5 &&
+                GS::ImageWriteMask(info(10, 0), 0xF) == 0xF && GS::ImageWriteMask(info(12, 1), 0xF) == 0xF,
+            "");
+    g.Check("write mask: STD_REV 4 components (A,B,G,R): export R -> image A; ALT_REV (A,R,G,B): export R -> image G",
+            GS::ImageWriteMask(info(12, 2), 0x1) == 0x8 && GS::ImageWriteMask(info(12, 3), 0x1) == 0x2 &&
+                GS::ImageWriteMask(info(12, 3), 0x8) == 0x1,
+            fmt::format("{:#x} {:#x}", GS::ImageWriteMask(info(12, 2), 0x1), GS::ImageWriteMask(info(12, 3), 0x1)));
+    g.Check("write mask: 16_16 ALT (R,A): export R and A -> image R and G (the format has no B, A to write)",
+            (GS::ImageWriteMask(info(5, 1), 0x9) & 0x3) == 0x3 && (GS::ImageWriteMask(info(5, 1), 0x8) & 0x3) == 0x2 &&
+                (GS::ImageWriteMask(info(5, 1), 0x2) & 0x3) == 0,
+            fmt::format("{:#x}", GS::ImageWriteMask(info(5, 1), 0x9)));
+    Cp::RegisterFile cregs;
+    cregs.WriteReg(GS::Reg::CbColorControl, 1u << 4);
+    cregs.WriteReg(GS::Reg::CbTargetMask, 0x3u << 4); // MRT1 exports R, G
+    cregs.WriteReg(GS::Reg::CbColor0Base + GS::Reg::CbColorStride, 0x1000);
+    cregs.WriteReg(GS::Reg::CbColor0Base + GS::Reg::CbColorStride + GS::Reg::CbColorInfoOffset, 0x830);
+    GS::GraphicsPipelineState pst;
+    GS::BuildGraphicsPipelineState(cregs, 1, 2, 0x2, pst);
+    g.Check("pipeline state: an ALT target's partial CB_TARGET_MASK reaches Vulkan in the image's order (0x3 -> 0x6)",
+            pst.targets[1].write_mask == 0x6, fmt::format("{:#x}", pst.targets[1].write_mask));
 }
 
 // ---- Shader(fetch)

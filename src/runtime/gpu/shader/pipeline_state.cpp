@@ -5,6 +5,7 @@
 
 #include <xxhash.h>
 
+#include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/shader/runtime_params.h"
 #include "runtime/gpu/shader/shader_types.h"
 
@@ -22,6 +23,21 @@ constexpr u32 kPaSuScModeCntl = 0xA205;
 constexpr u32 kCbColorAttribOffset = 5;
 
 } // namespace
+
+u32 ImageWriteMask(u32 cb_info, u32 export_mask) {
+    // the translated program writes image component i from export component swizzle.Map(i) (COMP_SWAP; the
+    // recompiler's MRT export), and CB_TARGET_MASK enables export components: image component i is written when its
+    // export component is. For the 4-component swaps but ALT_REV (involutions) this is the bridge's
+    // swizzle.ApplyMask(mask). Raw, an ALT target's mask 0x3 wrote R and G instead of G and B (P4.5: the G-buffer
+    // normal's R zeroed by a later full-screen pass)
+    CompMapping swizzle;
+    ColorTargetSwizzle(cb_info, swizzle);
+    u32 out = 0;
+    for (u32 i = 0; i < 4; ++i) {
+        out |= ((export_mask >> swizzle.Map(i)) & 1) << i;
+    }
+    return out;
+}
 
 void BuildGraphicsPipelineState(const Cp::RegisterFile& regs, u32 vs_module, u32 ps_module, u32 mrt_mask,
                                 GraphicsPipelineState& out) {
@@ -65,7 +81,7 @@ void BuildGraphicsPipelineState(const Cp::RegisterFile& regs, u32 vs_module, u32
         t.export_format = (col_format >> (cb * 4)) & 0xF;
         const u32 blend = regs.Get(Reg::CbBlend0Control + cb);
         t.blend = ((blend >> 30) & 1) != 0 && ((info >> 16) & 1) == 0 ? blend : 0;
-        t.write_mask = write;
+        t.write_mask = ImageWriteMask(info, write);
         t.samples_log2 =
             (regs.Get(Reg::CbColor0Base + cb * Reg::CbColorStride + kCbColorAttribOffset) >> 15) & 3;
     }

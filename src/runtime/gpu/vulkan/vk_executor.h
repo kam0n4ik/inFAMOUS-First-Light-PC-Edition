@@ -329,8 +329,10 @@ private:
     std::vector<Shadow> shadows_;
     std::vector<u32> buf_adjust_; ///< BindStage: each guest buffer's offset from its aligned descriptor offset
     StreamRing* shadow_ring_ = nullptr;
-    void DiagDumpShader(u64 address, const std::vector<u32>* code, const std::vector<u32>& spirv);
-    bool dumped_shader_ = false;
+    void DiagDumpShader(u64 address, const std::vector<u32>* code, const std::vector<u32>& spirv,
+                        const GS::RuntimeParams& runtime, u32 pipeline);
+    std::unordered_set<u64> dumped_shaders_; ///< SSPC_DIAG_DUMP_SHADER: the variants written
+    void DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>& color_img);
     OwnedBuffer diag_scratch_; ///< SSPC_DIAG_DUP_DISPATCH: a dense copy of the dispatch's buffers
     u32 dense_logged_ = 0;
     static constexpr u64 DiagKey(u64 n) { return (0xD1A6ull << 32) | (n << 2) | 2; }

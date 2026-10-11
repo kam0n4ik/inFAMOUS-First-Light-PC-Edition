@@ -671,30 +671,73 @@ void Executor::FinishShadows() {
     pending_writes_ = true; // a later access of the memory waits for the copies
 }
 
-void Executor::DiagDumpShader(u64 address, const std::vector<u32>* code, const std::vector<u32>& spirv) {
-    // SSPC_DIAG_DUMP_SHADER=<hex address>: that program's GCN code and SPIR-V -> logs\p44\shader_<address>.{gcn,spv}
-    static const u64 wanted = [] {
-        char v[32] = {};
-        return GetEnvironmentVariableA("SSPC_DIAG_DUMP_SHADER", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16) : 0ull;
+void Executor::DiagDumpShader(u64 address, const std::vector<u32>* code, const std::vector<u32>& spirv,
+                              const GS::RuntimeParams& runtime, u32 pipeline) {
+    // SSPC_DIAG_DUMP_SHADER=<hex address>[,<hex address>...]: each distinct translation (SPIR-V) of those programs, with
+    // its GCN code and runtime parameters -> logs\p44\shader_<address>_<n>.{gcn,spv,rt,txt} (P4.5: the same variant
+    // compared with the bridge's)
+    static const std::vector<u64> wanted = [] {
+        std::vector<u64> out;
+        char v[512] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_DUMP_SHADER", v, sizeof(v)) > 0) {
+            for (char* p = v; *p != 0;) {
+                char* end = nullptr;
+                const u64 a = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                out.push_back(a);
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return out;
     }();
-    if (wanted == 0 || address != wanted || dumped_shader_) {
+    if (wanted.empty() || std::find(wanted.begin(), wanted.end(), address) == wanted.end() || dumped_shaders_.size() >= 64) {
         return;
     }
-    dumped_shader_ = true;
+    u64 h = 1469598103934665603ull; // FNV-1a over the SPIR-V and the runtime parameters
+    const auto mix = [&h](const void* data, size_t bytes) {
+        for (size_t i = 0; i < bytes; ++i) {
+            h = (h ^ static_cast<const u8*>(data)[i]) * 1099511628211ull;
+        }
+    };
+    mix(spirv.data(), spirv.size() * 4);
+    mix(&runtime, sizeof(runtime));
+    if (!dumped_shaders_.insert(h).second) {
+        return;
+    }
     const auto write = [](const std::filesystem::path& path, const void* data, size_t bytes) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
         return static_cast<bool>(out);
     };
     // next to the frame capture (logs\p44)
-    const std::filesystem::path base = options_.capture_path.parent_path() / fmt::format("shader_{:x}", address);
+    const std::filesystem::path base =
+        options_.capture_path.parent_path() / fmt::format("shader_{:x}_{:016x}", address, h);
     bool ok = true;
     if (code != nullptr) {
         ok &= write(std::filesystem::path(base).replace_extension(".gcn"), code->data(), code->size() * 4);
     }
     ok &= write(std::filesystem::path(base).replace_extension(".spv"), spirv.data(), spirv.size() * 4);
-    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: shader {:#x} dumped to {}.gcn/.spv ({} GCN words, {} SPIR-V words): {}", address,
-             base.string(), code != nullptr ? code->size() : 0, spirv.size(), ok ? "written" : "NOT written");
+    ok &= write(std::filesystem::path(base).replace_extension(".rt"), &runtime, sizeof(runtime));
+    std::string t = fmt::format("address={:#x} pipeline={} hw={} rsrc1={:#x} rsrc2={:#x} ps_input_ena={:#x} "
+                                "ps_input_addr={:#x} num_interp={} col_format={:#x} z_format={} db_shader_control={:#x} "
+                                "aa_samples_log2={} dual_source={}\n",
+                                address, pipeline, static_cast<u32>(runtime.hw), runtime.rsrc1, runtime.rsrc2,
+                                runtime.ps_input_ena, runtime.ps_input_addr, runtime.num_interp, runtime.col_format,
+                                runtime.z_format, runtime.db_shader_control, runtime.aa_samples_log2, runtime.dual_source);
+    for (u32 i = 0; i < runtime.targets.size(); ++i) {
+        const auto& c = runtime.targets[i];
+        if (c.bound != 0) {
+            t += fmt::format("target {}: info={:#x} min_max_self={}\n", i, c.info, c.min_max_self);
+        }
+    }
+    for (u32 i = 0; i < runtime.num_interp && i < runtime.ps_input_cntl.size(); ++i) {
+        t += fmt::format("ps_input_cntl[{}]={:#x}\n", i, runtime.ps_input_cntl[i]);
+    }
+    ok &= write(std::filesystem::path(base).replace_extension(".txt"), t.data(), t.size());
+    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: shader {:#x} variant {:016x} (pipeline {}) dumped to {}.* ({} SPIR-V words): {}",
+             address, h, pipeline, base.string(), spirv.size(), ok ? "written" : "NOT written");
 }
 
 void Executor::ProfDescribe(u64 key, const char* what, const void* stage_view, const std::vector<CachedImage*>& bound) {
@@ -1697,9 +1740,11 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     }
     stage(stats_.t_pipe);
     if (has_ps) { // SSPC_DIAG_DUMP_SHADER: a pixel shader too (P4.5)
-        DiagDumpShader(ps.address, ps.program != nullptr ? &ps.program->code : nullptr, ps.module->result.spirv);
+        DiagDumpShader(ps.address, ps.program != nullptr ? &ps.program->code : nullptr, ps.module->result.spirv,
+                       ps.runtime, prep.pipeline);
     }
-    DiagDumpShader(vs.address, vs.program != nullptr ? &vs.program->code : nullptr, vs.module->result.spirv);
+    DiagDumpShader(vs.address, vs.program != nullptr ? &vs.program->code : nullptr, vs.module->result.spirv, vs.runtime,
+                   prep.pipeline);
     {
         // SSPC_DIAG_SKIP_PIPELINES=<id>,<id>...: those pipelines' draws not executed (which draws make what is seen; P4.5)
         static const std::vector<u64> skip = [] {
@@ -2002,6 +2047,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
             }
         }
     }
+    DiagCaptureBefore(prep.pipeline, color_img);
     // barriers and layouts (outside rendering)
     if (pending_writes_) {
         GlobalBarrier(7);
@@ -2440,7 +2486,8 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     }
     std::string err;
     const PipelineObjects* pipe = pipelines_.Compute(*csv.module, csv.plan, err);
-    DiagDumpShader(csv.address, csv.program != nullptr ? &csv.program->code : nullptr, csv.module->result.spirv);
+    DiagDumpShader(csv.address, csv.program != nullptr ? &csv.program->code : nullptr, csv.module->result.spirv,
+                   csv.runtime, 0);
     if (pipe == nullptr) {
         Skipped(Skip::Pipeline, err);
         return;
@@ -2985,6 +3032,70 @@ void Executor::CaptureImageAt() {
         }
         SSPC_LOG(GPU, Info, "DIAGNOSTIC: image capture img{} {:#x} fmt {} {}x{} layers {} at flip {}", img->id, w.addr,
                  img->layout.pixel_format, img->layout.size.width, img->layout.size.height, img->layout.layers, id);
+    }
+}
+
+void Executor::DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>& color_img) {
+    // SSPC_DIAG_CAPTURE_BEFORE=<hex address>:<flip>:<pipeline>[,...]: the render target at that address as it is before
+    // the first draw of that pipeline (rendering into it) in that flip -> logs\p45\before_<address>_<flip>_p<pipeline>
+    // (P4.5: which draw changes a channel)
+    struct Want {
+        u64 addr, flip;
+        u32 pipeline;
+    };
+    static std::vector<Want> wants = [] {
+        std::vector<Want> v;
+        char s[512] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_BEFORE", s, sizeof(s)) > 0) {
+            for (char* p = s; *p != 0;) {
+                Want w{std::strtoull(p, &p, 16), 0, 0};
+                if (*p == ':') {
+                    w.flip = std::strtoull(p + 1, &p, 10);
+                }
+                if (*p == ':') {
+                    w.pipeline = static_cast<u32>(std::strtoul(p + 1, &p, 10));
+                }
+                v.push_back(w);
+                while (*p == ',' || *p == ' ') {
+                    ++p;
+                }
+            }
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_BEFORE - {} captures before draws", v.size());
+        }
+        return v;
+    }();
+    if (wants.empty()) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId();
+    for (auto it = wants.begin(); it != wants.end();) {
+        CachedImage* img = nullptr;
+        for (CachedImage* c : color_img) {
+            if (c != nullptr && c->layout.guest_address == it->addr) {
+                img = c;
+            }
+        }
+        if (it->flip != id || it->pipeline != pipeline || img == nullptr) {
+            ++it;
+            continue;
+        }
+        EndRendering();
+        if (pending_writes_) {
+            GlobalBarrier();
+        }
+        images_.Transition(cur_.cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT);
+        if (!readback_) {
+            readback_ = std::make_unique<ImageReadback>(ctx_);
+        }
+        readback_->Record(cur_.cb, cur_.value, img->image, img->format, img->aspect, 0, img->layout.size.width,
+                          img->layout.size.height, std::max<u32>(img->layout.num_bits / 8, 1),
+                          options_.capture_path.parent_path().parent_path() / "p45" /
+                              fmt::format("before_{:x}_{}_p{}", it->addr, id, pipeline),
+                          true);
+        SSPC_LOG(GPU, Info, "DIAGNOSTIC: capture of img{} {:#x} before draw {} (pipeline {}) at flip {}", img->id,
+                 it->addr, stats_.draws, pipeline, id);
+        it = wants.erase(it);
     }
 }
 

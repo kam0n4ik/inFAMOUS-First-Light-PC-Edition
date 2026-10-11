@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -441,6 +442,35 @@ int RunShaderVerify(const std::filesystem::path& capture, const std::filesystem:
             continue;
         }
         ++translated;
+        static const std::string want = [] {
+            char* v = nullptr;
+            size_t n = 0;
+            std::string out;
+            if (_dupenv_s(&v, &n, "SSPC_DIAG_VERIFY_DUMP") == 0 && v != nullptr) {
+                out = v;
+                std::free(v);
+            }
+            return out;
+        }();
+        if (!want.empty()) {
+            // SSPC_DIAG_VERIFY_DUMP=<hex address>[,...]: those modules' SPIR-V (the bridge's and SecondSonPC's
+            // translation of the bridge's inputs) and runtime parameters -> logs\p45\verify_<address>_<module>.*
+            // (P4.5: compared with the native backend's variants, SSPC_DIAG_DUMP_SHADER)
+            if (want.find(fmt::format("{:x}", m.address)) != std::string::npos) {
+                const auto dir = logs_dir / "p45";
+                std::filesystem::create_directories(dir);
+                const auto base = dir / fmt::format("verify_{:x}_{}", m.address, i);
+                std::ofstream(std::filesystem::path(base).concat(".bridge.spv"), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(m.spirv.data()), static_cast<std::streamsize>(m.spirv.size() * 4));
+                std::ofstream(std::filesystem::path(base).concat(".ours.spv"), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(res.spirv.data()),
+                           static_cast<std::streamsize>(res.spirv.size() * 4));
+                std::ofstream(std::filesystem::path(base).concat(".rt"), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(&rp), sizeof(rp));
+                std::ofstream(std::filesystem::path(base).concat(".gcn"), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(m.code.data()), static_cast<std::streamsize>(m.code.size() * 4));
+            }
+        }
         translate_us += res.translate_us;
         emit_us += res.emit_us;
         spirv_words += res.spirv.size();

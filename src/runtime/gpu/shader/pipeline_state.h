@@ -29,7 +29,7 @@ struct ColorTargetState {
     u32 info = 0;         ///< CB_COLORn_INFO: FORMAT, NUMBER_TYPE, COMP_SWAP, BLEND_BYPASS
     u32 export_format = 0;///< SPI_SHADER_COL_FORMAT's nibble
     u32 blend = 0;        ///< CB_BLENDn_CONTROL when blending is on for the target (else 0)
-    u32 write_mask = 0;   ///< CB_TARGET_MASK's nibble
+    u32 write_mask = 0;   ///< CB_TARGET_MASK's nibble in the image's component order (COMP_SWAP applied)
     u32 samples_log2 = 0; ///< CB_COLORn_ATTRIB.NUM_FRAGMENTS
 };
 
@@ -56,6 +56,10 @@ static_assert(std::has_unique_object_representations_v<GraphicsPipelineState>, "
 /// The state's fields from the register file (the registers SecondSonPC reads for it).
 void BuildGraphicsPipelineState(const Cp::RegisterFile& regs, u32 vs_module, u32 ps_module, u32 mrt_mask,
                                 GraphicsPipelineState& out);
+
+/// CB_TARGET_MASK's nibble (export components) as the colour write mask of the image (its components), through
+/// the target's COMP_SWAP as the translated program writes them (P4.5).
+u32 ImageWriteMask(u32 cb_info, u32 export_mask);
 
 /// The P4.2 register groups BuildGraphicsPipelineState reads (computed from its registers).
 Cp::GroupMask PipelineStateGroups();
