@@ -342,6 +342,14 @@ void ApplyBridgeSettings(const App::Config& cfg) {
     s.SetVblankFrequency(cfg.vblank_hz);
     s.SetPresentMode(cfg.present_mode);
     s.SetShowFpsCounter(cfg.show_fps);
+    // P4.4 diagnostics: SSPC_DIAG_BRIDGE_READBACKS=1 (relaxed) / 2 (precise) - the bridge's GPU readbacks (shadPS4's
+    // default: none; the native backend writes every GPU write back) for a comparison of the two backends' images
+    if (char rb[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_BRIDGE_READBACKS", rb, sizeof(rb)) > 0 &&
+                         (rb[0] == '1' || rb[0] == '2')) {
+        s.SetReadbacksMode(rb[0] == '1' ? GpuReadbacksMode::Relaxed : GpuReadbacksMode::Precise);
+        SSPC_LOG(Bridge, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BRIDGE_READBACKS={} - the bridge reads GPU writes back",
+                 rb[0]);
+    }
     // [Audio]
     s.SetAudioBackend(AudioBackend::SDL);
     s.SetVolumeSlider(static_cast<int>(cfg.volume));
