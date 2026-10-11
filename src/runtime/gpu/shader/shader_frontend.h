@@ -171,6 +171,14 @@ public:
     void Stop();
 
     const StageView& Stage(HwStage stage) const;
+    /// Translations run so far and their time (any thread: the frame log samples it at each flip).
+    struct TranslationTotals {
+        u64 count = 0, ns = 0, max_ns = 0;
+    };
+    TranslationTotals Translations() const {
+        return {runs_total_.load(std::memory_order_relaxed), run_ns_total_.load(std::memory_order_relaxed),
+                run_ns_max_.load(std::memory_order_relaxed)};
+    }
     const FrontendStats& Stats() const { return stats_; }
     const ProgramCache& Programs() const { return programs_; }
     ProgramCache& MutablePrograms() { return programs_; }
@@ -250,6 +258,7 @@ private:
     // what the worker counts (under mutex_), folded into stats_ by the owner
     u64 w_translations_ = 0, w_failures_ = 0, w_translate_us_ = 0, w_emit_us_ = 0, w_spirv_bytes_ = 0;
     Histogram w_translate_;
+    std::atomic<u64> runs_total_{0}, run_ns_total_{0}, run_ns_max_{0}; ///< Translations()
 };
 
 /// Guest memory through the GPU memory contract (CopySparse: never faults), for the frontend in the game.

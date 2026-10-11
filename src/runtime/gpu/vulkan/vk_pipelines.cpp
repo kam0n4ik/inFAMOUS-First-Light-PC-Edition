@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -30,6 +31,27 @@ u64 Mix(u64 h, u64 v) {
 }
 
 constexpr VkShaderStageFlags kAllGraphics = VK_SHADER_STAGE_ALL_GRAPHICS;
+
+u64 NowNs() {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+/// A pipeline the driver created in `ns`: totals, histogram, the slowest (`name()` only then).
+template <typename Name>
+void CountCreation(PipelineStats& s, u64 ns, Name&& name) {
+    s.create_ns += ns;
+    static constexpr u64 kEdges[] = {1'000'000, 5'000'000, 20'000'000, 50'000'000, 100'000'000};
+    size_t b = 0;
+    while (b < std::size(kEdges) && ns >= kEdges[b]) {
+        ++b;
+    }
+    ++s.create_hist[b];
+    if (ns > s.slowest_ns) {
+        s.slowest_ns = ns;
+        s.slowest = name();
+    }
+}
 
 } // namespace
 
@@ -105,7 +127,10 @@ VkShaderModule PipelineFactory::Module(const GS::Module& module, std::string& er
                                       .codeSize = spirv.size() * 4,
                                       .pCode = spirv.data()};
     VkShaderModule m = VK_NULL_HANDLE;
-    if (Fn().vkCreateShaderModule(ctx_.Device(), &ci, nullptr, &m) != VK_SUCCESS) {
+    const u64 t0 = NowNs();
+    const VkResult r = Fn().vkCreateShaderModule(ctx_.Device(), &ci, nullptr, &m);
+    stats_.module_ns += NowNs() - t0;
+    if (r != VK_SUCCESS) {
         error = fmt::format("vkCreateShaderModule refused module {}", module.id);
         return VK_NULL_HANDLE;
     }
@@ -132,15 +157,19 @@ VkShaderModule PipelineFactory::Aux(u32 which, const GS::RuntimeParams* fragment
         error = "no shader translator for the auxiliary stages";
         return VK_NULL_HANDLE;
     }
+    const u64 t0 = NowNs();
     const auto spirv = t->EmitAuxStage(static_cast<GS::AuxStage>(which), fragment, profile_, error);
     if (spirv.empty()) {
+        stats_.module_ns += NowNs() - t0;
         return VK_NULL_HANDLE;
     }
     const VkShaderModuleCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                       .codeSize = spirv.size() * 4,
                                       .pCode = spirv.data()};
     VkShaderModule m = VK_NULL_HANDLE;
-    if (Fn().vkCreateShaderModule(ctx_.Device(), &ci, nullptr, &m) != VK_SUCCESS) {
+    const VkResult r = Fn().vkCreateShaderModule(ctx_.Device(), &ci, nullptr, &m);
+    stats_.module_ns += NowNs() - t0;
+    if (r != VK_SUCCESS) {
         error = "the auxiliary stage's module was refused";
         return VK_NULL_HANDLE;
     }
@@ -426,7 +455,11 @@ const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::Grap
                                           .pColorBlendState = &blend,
                                           .pDynamicState = &dynamic,
                                           .layout = obj->layout};
+    const u64 t0 = NowNs();
     const VkResult r = f.vkCreateGraphicsPipelines(ctx_.Device(), VK_NULL_HANDLE, 1, &ci, nullptr, &obj->pipeline);
+    CountCreation(stats_, NowNs() - t0, [&] {
+        return fmt::format("graphics p{} (vs module {}, ps module {})", pipeline_id, vs->id, ps != nullptr ? ps->id : 0);
+    });
     if (r != VK_SUCCESS) {
         if (!obj->shared_layout) {
             f.vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
@@ -469,7 +502,9 @@ const PipelineObjects* PipelineFactory::Compute(const GS::Module& cs, const GS::
                                                    .module = m,
                                                    .pName = "main"},
                                          .layout = obj->layout};
+    const u64 t0 = NowNs();
     const VkResult r = Fn().vkCreateComputePipelines(ctx_.Device(), VK_NULL_HANDLE, 1, &ci, nullptr, &obj->pipeline);
+    CountCreation(stats_, NowNs() - t0, [&] { return fmt::format("compute (cs module {})", cs.id); });
     if (r != VK_SUCCESS) {
         error = fmt::format("vkCreateComputePipelines failed ({})", static_cast<int>(r));
         ++stats_.failures;

@@ -43,6 +43,11 @@ struct PipelineObjects {
 struct PipelineStats {
     u64 graphics = 0, compute = 0, modules = 0, failures = 0, lookups = 0, aux_stages = 0;
     std::string first_failure;
+    // the time it cost (docs/SHADER_PRECOMPILATION.md): vkCreate*Pipelines, vkCreateShaderModule + auxiliary stages
+    u64 create_ns = 0, module_ns = 0;
+    u64 slowest_ns = 0;  ///< the slowest single pipeline
+    std::string slowest; ///< ... which one
+    std::array<u64, 6> create_hist{}; ///< pipelines by creation time: <1, <5, <20, <50, <100, >=100 ms
 };
 
 class PipelineFactory {

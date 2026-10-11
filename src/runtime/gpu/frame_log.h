@@ -24,6 +24,11 @@ struct GpuThreadTotals {
     u64 empty_ns = 0;         ///< idle with nothing to process (waiting for the game's submissions)
     u64 gpu_busy_ns = 0;      ///< the GPU executing batches (timestamps of the completed ones)
     u64 draws = 0, dispatches = 0, batches = 0, blocks = 0; ///< blocks: WAIT_REG_MEM that blocked
+    // shader preparation (docs/SHADER_PRECOMPILATION.md): what a frame waited for before its draws could be recorded
+    u64 shaders = 0, shader_ns = 0;     ///< translations made (GCN -> SPIR-V) and their time
+    u64 shader_disk = 0;                ///< translations taken from the disk cache instead
+    u64 pipelines = 0, pipeline_ns = 0; ///< pipelines created (graphics + compute) and the driver's time for them
+    u64 module_ns = 0;                  ///< vkCreateShaderModule and the auxiliary stages' emission
 };
 
 /// The backend starts: time zero and the rows' storage.

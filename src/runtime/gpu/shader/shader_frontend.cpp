@@ -331,6 +331,11 @@ void ShaderFrontend::Run(Job& job) {
     }
     const u64 ns = TicksToNs(Ticks() - t0);
     const bool ok = result.Ok();
+    runs_total_.fetch_add(1, std::memory_order_relaxed);
+    run_ns_total_.fetch_add(ns, std::memory_order_relaxed);
+    if (ns > run_ns_max_.load(std::memory_order_relaxed)) {
+        run_ns_max_.store(ns, std::memory_order_relaxed); // (one writer at a time in the native backend: synchronous)
+    }
     {
         std::scoped_lock lock{mutex_};
         ++w_translations_;

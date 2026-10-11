@@ -173,7 +173,8 @@ bool Write(const std::filesystem::path& file) {
     }
     out << "n,game_submit_ms,flip_enter_ms,game_flip_ms,done_enter_ms,done_exit_ms,submits,cp_flip_ms,last_unblock_ms,"
            "gpu_done_ms,present_ms,game_idle_wait_ms,game_idle_waits,cp_ms,record_ms,sync_ms,blocked_label_ms,"
-           "blocked_other_ms,empty_ms,gpu_busy_ms,draws,dispatches,batches,blocks\n";
+           "blocked_other_ms,empty_ms,gpu_busy_ms,draws,dispatches,batches,blocks,shaders,shader_ms,shader_disk,"
+           "pipelines,pipeline_ms,module_ms\n";
     const u32 rows = std::min(kCap, std::max({g_state.game_n.load(), g_state.cp_n, g_state.present_n.load()}));
     const Row* prev = nullptr;
     for (u32 i = 0; i < rows; ++i) {
@@ -185,16 +186,20 @@ bool Write(const std::filesystem::path& file) {
             const Row p = prev != nullptr ? *prev : Row{};
             const GpuThreadTotals& t = r.totals;
             const GpuThreadTotals& pt = p.totals;
-            out << fmt::format(",{:.3f},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{}\n",
+            out << fmt::format(",{:.3f},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{}",
                                dms(r.idle_wait_ns, p.idle_wait_ns), dn(r.idle_waits, p.idle_waits),
                                dms(t.cp_ns, pt.cp_ns), dms(t.record_ns, pt.record_ns), dms(t.sync_ns, pt.sync_ns),
                                dms(t.blocked_label_ns, pt.blocked_label_ns),
                                dms(t.blocked_other_ns, pt.blocked_other_ns), dms(t.empty_ns, pt.empty_ns),
                                dms(t.gpu_busy_ns, pt.gpu_busy_ns), dn(t.draws, pt.draws),
                                dn(t.dispatches, pt.dispatches), dn(t.batches, pt.batches), dn(t.blocks, pt.blocks));
+            out << fmt::format(",{},{:.3f},{},{},{:.3f},{:.3f}\n", dn(t.shaders, pt.shaders),
+                               dms(t.shader_ns, pt.shader_ns), dn(t.shader_disk, pt.shader_disk),
+                               dn(t.pipelines, pt.pipelines), dms(t.pipeline_ns, pt.pipeline_ns),
+                               dms(t.module_ns, pt.module_ns));
             prev = &r;
         } else {
-            out << ",,,,,,,,,,,,,\n";
+            out << ",,,,,,,,,,,,,,,,,,,\n";
         }
     }
     return static_cast<bool>(out);

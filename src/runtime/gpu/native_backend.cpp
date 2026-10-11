@@ -856,6 +856,13 @@ void Backend::OnFlip(u64 gpu_value) {
     t.dispatches = s.dispatches;
     t.batches = s.batches;
     t.blocks = cp_->Stats().waits_blocked;
+    const auto tr = frontend_->Translations();
+    t.shaders = tr.count;
+    t.shader_ns = tr.ns;
+    const auto& p = pipelines_->Stats();
+    t.pipelines = p.graphics + p.compute;
+    t.pipeline_ns = p.create_ns;
+    t.module_ns = p.module_ns;
     FrameLog::CpFlip(gpu_value, t, executor_->LastUnblockTsc());
 }
 
@@ -1070,6 +1077,16 @@ std::string Backend::Report() {
         const auto& p = pipelines_->Stats();
         out += fmt::format("pipelines: graphics {}, compute {}, modules {}, failures {} {}\n", p.graphics, p.compute,
                            p.modules, p.failures, p.first_failure);
+        const auto& h = p.create_hist;
+        out += fmt::format("pipeline creation (driver): {:.1f} ms in all; by time <1 ms {}, 1-5 {}, 5-20 {}, 20-50 {}, "
+                           "50-100 {}, >=100 {}; slowest {:.1f} ms ({}); shader modules + auxiliary stages {:.1f} ms\n",
+                           p.create_ns / 1e6, h[0], h[1], h[2], h[3], h[4], h[5], p.slowest_ns / 1e6, p.slowest,
+                           p.module_ns / 1e6);
+    }
+    if (frontend_) {
+        const auto tr = frontend_->Translations();
+        out += fmt::format("shader translations (GCN -> SPIR-V): {}, {:.1f} ms in all, slowest {:.1f} ms\n", tr.count,
+                           tr.ns / 1e6, tr.max_ns / 1e6);
     }
     if (frontend_) {
         const auto& fs = frontend_->Stats();
