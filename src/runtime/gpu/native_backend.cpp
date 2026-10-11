@@ -406,6 +406,7 @@ void Backend::Loop() {
     u64 rate_ring_waits = 0, rate_classify = 0, rate_hostptr = 0, rate_alloc = 0, rate_copy = 0, rate_prepare = 0;
     u64 rate_nprep = 0, rate_tl = 0, rate_tb = 0, rate_ts = 0, rate_th = 0, rate_ta = 0, rate_tc = 0, rate_nu = 0;
     u64 prof_cp = 0, prof_poll = 0, prof_flush = 0, prof_idle = 0; // ns since the last rate line
+    u64 prof_idle_blocked = 0, prof_idle_gpu = 0; // of the idle time: a WAIT_REG_MEM blocked; waiting for the GPU
     using Clock = std::chrono::steady_clock;
     const auto ns_since = [](Clock::time_point t) {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count());
@@ -559,6 +560,12 @@ void Backend::Loop() {
             rate_streamed = s.streamed;
             rate_gpu = s.gpu_busy_ns;
             rate_submit = s.submit_ns;
+            SSPC_LOG(GPU, Info,
+                     "native backend: idle per frame (ms): with a WAIT_REG_MEM blocked {:.1f}, while the GPU had work "
+                     "{:.1f} (WAIT_REG_MEM blocks so far {})",
+                     per_frame(static_cast<double>(prof_idle_blocked)), per_frame(static_cast<double>(prof_idle_gpu)),
+                     cp_->Stats().waits_blocked);
+            prof_idle_blocked = prof_idle_gpu = 0;
             prof_cp = prof_poll = prof_flush = prof_idle = 0;
             rate_record = s.record_ns;
             rate_wait = s.sync_wait_us;
@@ -586,13 +593,17 @@ void Backend::Loop() {
             Gnm::RaiseInterrupt(Gnm::Interrupt::GpuIdle);
         }
         const auto idle_t0 = Clock::now();
-        if (executor_->Busy()) {
+        const bool busy = executor_->Busy();
+        if (busy) {
             executor_->WaitOldest(1'000'000); // 1 ms: completion unblocks labels
         } else {
             std::unique_lock lock{mutex_};
             cv_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !queue_.empty() || stop_.load(); });
         }
-        prof_idle += ns_since(idle_t0);
+        const u64 idle_ns = ns_since(idle_t0);
+        prof_idle += idle_ns;
+        prof_idle_blocked += blocked ? idle_ns : 0;
+        prof_idle_gpu += busy ? idle_ns : 0;
     }
 }
 
@@ -656,6 +667,12 @@ std::string Backend::Report() {
         const auto& c = cp_->Stats();
         const auto& s = executor_->Stats();
         out += fmt::format("target cache: hits {}, misses {}\n", s.target_cache_hits, s.target_cache_misses);
+        out += cp_->WaitReport();
+        const VideoOut::Stats vo = VideoOut::GetStats();
+        out += fmt::format("videoout: flips requested {}, presented {}, vblanks {}, vblanks a flip waited for its GPU work "
+                           "{}\n",
+                           vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
+        out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
         out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
                            "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
                            s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,

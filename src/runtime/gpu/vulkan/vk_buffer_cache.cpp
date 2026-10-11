@@ -396,6 +396,11 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         f.vkCmdPipelineBarrier2(cb, &dep);
     }
     if (write) {
+        for (u64 b = first_block; b <= last_block; ++b) {
+            Block& blk = GetBlock(b);
+            blk.gpu_pending |= PageMask(b, first_page, last_page);
+            blk.pending_seq = seq;
+        }
         if (!written_.empty() && written_.back().second >= addr && written_.back().first <= addr + size) {
             written_.back().first = std::min(written_.back().first, addr);
             written_.back().second = std::max(written_.back().second, addr + size);
@@ -461,6 +466,27 @@ void BufferCache::NoteHostWrite(u64 addr, u64 size, u64 seq) {
     host_writes_.push_back({addr, addr + size, seq});
     hw_lo_ = std::min(hw_lo_, addr);
     hw_hi_ = std::max(hw_hi_, addr + size);
+}
+
+bool BufferCache::GpuWritePending(u64 addr, u64 size, u64 completed) {
+    if (!Ok() || size == 0 || addr + size > space_) {
+        return false;
+    }
+    const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
+    for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
+        Block* blk = FindBlock(b);
+        if (blk == nullptr || blk->gpu_pending == 0) {
+            continue;
+        }
+        if (blk->pending_seq <= completed) {
+            blk->gpu_pending = 0; // written back: the host has it
+            continue;
+        }
+        if ((blk->gpu_pending & PageMask(b, first_page, last_page)) != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool BufferCache::HostWritePending(u64 addr, u64 size) const {

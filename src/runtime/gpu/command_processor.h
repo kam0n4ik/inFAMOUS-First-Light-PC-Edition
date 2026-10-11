@@ -26,6 +26,7 @@
 
 #include <array>
 #include <memory>
+#include <unordered_map>
 #include <span>
 #include <string>
 #include <string_view>
@@ -380,6 +381,19 @@ private:
     enum class NextResult : u8 { Ok, None, Fault };
 
     Queue* Q(u32 queue) const;
+    /// Isolated (diagnostics): a fence held for the GPU (any queue) will write `poll` with a value meeting the wait.
+    bool HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref) const;
+    /// Isolated (diagnostics): the WAIT_REG_MEM addresses the queues blocked on, the time they blocked.
+    struct WaitStat {
+        u64 count = 0, ns = 0, held = 0;
+        u32 queues = 0, function = 0, ref = 0, mask = 0, last = 0;
+    };
+    std::unordered_map<u64, WaitStat> wait_stats_;
+
+public:
+    std::string WaitReport() const;
+
+private:
     NextResult Next(Queue& q, u64& addr, std::span<const u32>& packet, Pm4::Packet& pk);
     void UpdateReadPointer(Queue& q);
     StepStatus Fail(Queue& q, CpErrorKind kind, u64 addr, u8 opcode, u32 dwords, std::string detail);

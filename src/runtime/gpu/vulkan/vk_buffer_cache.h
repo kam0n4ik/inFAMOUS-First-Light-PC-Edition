@@ -83,6 +83,9 @@ public:
     /// completes, the host's bytes there are older than the GPU's (no CPU copy may read them).
     void NoteHostWrite(u64 addr, u64 size, u64 seq);
     bool HostWritePending(u64 addr, u64 size) const;
+    /// The GPU writes some page of [addr, addr + size) in a submission after `completed` (the video memory copy, written
+    /// back to the host when that submission completes): a CPU read of the host's copy must wait.
+    bool GpuWritePending(u64 addr, u64 size, u64 completed);
     void Collect(u64 completed);
     /// The end of a batch: the copies of its GPU writes back to the host (`cb` outside rendering).
     void RecordWriteBack(VkCommandBuffer cb, u64 seq);
@@ -104,6 +107,8 @@ private:
     struct Block {
         u16 valid = 0; ///< pages whose video memory copy is current
         bool bound = false;
+        u16 gpu_pending = 0; ///< pages the GPU writes in submission `pending_seq` (the host's copy is older until then)
+        u64 pending_seq = 0;
     };
     /// The block table: leaves of 4096 blocks (256 MiB of addresses) made when first touched - a lookup is two array
     /// indexings (it was a hash map: binding checks and scans 5.6 ms a frame for ~6200 ranges, e1).

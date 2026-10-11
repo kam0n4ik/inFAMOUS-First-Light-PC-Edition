@@ -204,6 +204,15 @@ void PresentThread() {
     // 59.94 Hz, as the PS4's output (and the bridge's vblank)
     const double period_ticks = static_cast<double>(freq.QuadPart) * 1001.0 / 60000.0;
     double next = static_cast<double>(now.QuadPart) + period_ticks;
+    const auto present = [](const FlipRequest& r) {
+        if (g_sink != nullptr) {
+            g_sink->Present(r);
+        }
+        CompleteFlip(r);
+        std::scoped_lock s{g_stats_mutex};
+        ++g_stats.flips_presented;
+        g_stats.blank += r.index < 0 ? 1 : 0;
+    };
     while (!g_stop.load(std::memory_order_acquire)) {
         QueryPerformanceCounter(&now);
         const double wait = next - static_cast<double>(now.QuadPart);
@@ -245,13 +254,7 @@ void PresentThread() {
             }
         }
         if (take) {
-            if (g_sink != nullptr) {
-                g_sink->Present(req);
-            }
-            CompleteFlip(req);
-            std::scoped_lock s{g_stats_mutex};
-            ++g_stats.flips_presented;
-            g_stats.blank += req.index < 0 ? 1 : 0;
+            present(req);
         }
         std::vector<Kernel::EventQueues::QueueId> vblank_events;
         {

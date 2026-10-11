@@ -801,6 +801,11 @@ bool Executor::TimelineReader::Read(u64 addr, void* dst, u64 bytes) {
     if (e_.TimelineWritePending(addr, bytes)) {
         ++e_.stats_.timeline_read_syncs;
         e_.SyncFrom(1);
+    } else if (e_.buffers_.GpuWritePending(addr, bytes, e_.timeline_.CompletedCached()) ||
+               e_.buffers_.HostWritePending(addr, bytes)) {
+        // a shader's write the host does not have yet (its batch has not completed): the frontend reads after it
+        ++e_.stats_.gpu_write_read_syncs;
+        e_.SyncFrom(1);
     }
     return GS::GameMemory().Read(addr, dst, bytes);
 }

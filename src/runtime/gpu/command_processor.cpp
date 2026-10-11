@@ -125,6 +125,8 @@ struct CommandProcessor::Queue {
     bool started_mid_packet = false; ///< the current submission began by completing a packet carried from the last
     bool faulted = false;
     bool blocked = false;
+    u64 block_t0 = 0, block_poll = 0; ///< diagnostics: when and on what the queue blocked
+    bool block_held = false;          ///< a held fence would meet the wait when it blocked
 };
 
 std::string_view DrawKindName(DrawKind kind) {
@@ -1413,6 +1415,56 @@ void CommandProcessor::CompleteWork(u32 queue, u64 seq) {
     }
 }
 
+namespace {
+bool WaitHolds(u32 function, u32 v, u32 ref) {
+    switch (function) {
+    case 0:
+        return true;
+    case 1:
+        return v < ref;
+    case 2:
+        return v <= ref;
+    case 3:
+        return v == ref;
+    case 4:
+        return v != ref;
+    case 5:
+        return v >= ref;
+    case 6:
+        return v > ref;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref) const {
+    for (u32 id = 0; id < kNumQueues; ++id) {
+        const Queue* qp = Q(id);
+        if (qp == nullptr || qp->fence_count == 0) {
+            continue;
+        }
+        for (u32 i = 0; i < qp->fence_count; ++i) {
+            const FenceOp& f = qp->fences[(qp->fence_head + i) % kMaxFences];
+            if (f.data_sel != 1 && f.data_sel != 2) {
+                continue; // no data, a clock or a counter (its value is not known), GDS
+            }
+            u32 v = 0;
+            if (f.addr == poll) {
+                v = static_cast<u32>(f.data);
+            } else if (f.data_sel == 2 && f.addr + 4 == poll) {
+                v = static_cast<u32>(f.data >> 32);
+            } else {
+                continue;
+            }
+            if (WaitHolds(function, v & mask, ref)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32> p) {
     const u8 op = static_cast<u8>(p[0] >> 8);
     const u32 n = static_cast<u32>(p.size());
@@ -1473,15 +1525,49 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
     default:
         break;
     }
+    const u64 key = memory ? ((u64{b[2]} << 32) | (b[1] & ~3u)) : (u64{1} << 63) | (b[1] & 0xFFFF);
+    const auto now_ns = [] {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    };
     if (!ok) {
         if (!q.blocked) {
             ++stats_.waits_blocked;
+            q.block_t0 = now_ns();
+            q.block_poll = key;
+            q.block_held = memory && HeldFenceSatisfies(key, function, b[4], ref);
         }
         q.blocked = true;
         return StepStatus::Blocked;
     }
+    if (q.blocked) {
+        WaitStat& w = wait_stats_[q.block_poll];
+        ++w.count;
+        w.ns += now_ns() - q.block_t0;
+        w.held += q.block_held ? 1 : 0;
+        w.queues |= 1u << std::min<u32>(q.id, 31);
+        w.function = function;
+        w.ref = ref;
+        w.mask = b[4];
+        w.last = value;
+    }
     q.blocked = false;
     return StepStatus::Packet;
+}
+
+std::string CommandProcessor::WaitReport() const {
+    std::vector<std::pair<u64, WaitStat>> v(wait_stats_.begin(), wait_stats_.end());
+    std::ranges::sort(v, [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    std::string out = "WAIT_REG_MEM blocks by address (time blocked; held: a held GPU fence would have met it):\n";
+    for (size_t i = 0; i < v.size() && i < 24; ++i) {
+        const auto& [k, w] = v[i];
+        out += fmt::format("  {} {:#x}: {} blocks, {} ms, held {}, queues {:#x}, function {} ref {:#x} mask {:#x}, "
+                           "last value {:#x}\n",
+                           (k >> 63) ? "register" : "memory", k & ~(u64{1} << 63), w.count, w.ns / 1'000'000, w.held,
+                           w.queues, w.function, w.ref, w.mask, w.last);
+    }
+    return out;
 }
 
 StepStatus CommandProcessor::IndirectBuffer(Queue& q, u64 addr, std::span<const u32> p) {

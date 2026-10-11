@@ -80,6 +80,7 @@ struct ExecutorStats {
     u64 timeline_copies = 0, timeline_copy_bytes = 0, tc_refused = 0;
     u64 shadows = 0, shadow_bytes = 0, shadow_overlaps = 0, shadow_no_room = 0, shadow_too_large = 0;
     u64 target_cache_hits = 0, target_cache_misses = 0;
+    u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
     std::string first_skip[static_cast<size_t>(Skip::Count)];
