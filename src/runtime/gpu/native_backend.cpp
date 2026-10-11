@@ -76,9 +76,28 @@ public:
         if (gm == nullptr || !GuestMemory::IsValidGpuMapping(addr, bytes)) {
             return false;
         }
+        // P4.6 night sprint: the backing's host view of runs written before (the compute rings' read pointers are
+        // written after every packet; TryWriteBacking copies the VMAs with their maps each call - 7% of the GPU
+        // thread on the beach). A run is cached only after TryWriteBacking wrote there (the same memory it writes);
+        // a map or unmap anywhere drops them all (the generation).
+        const u64 gen = map_gen.load(std::memory_order_acquire);
+        for (const Run& r : runs) {
+            if (r.host != nullptr && r.gen == gen && addr >= r.begin && addr + bytes <= r.end) {
+                std::memcpy(r.host + (addr - r.begin), src, bytes);
+                if (buffers != nullptr) {
+                    buffers->Invalidate(addr, bytes);
+                }
+                return true;
+            }
+        }
         if (gm->TryWriteBacking(reinterpret_cast<void*>(addr), src, bytes)) {
             if (buffers != nullptr) {
                 buffers->Invalidate(addr, bytes); // written past the tracker: the video memory copy is older
+            }
+            u8* host = nullptr;
+            u64 rb = 0, rs = 0;
+            if (gm->BackingRun(addr, &host, &rb, &rs) && host != nullptr && addr >= rb && addr + bytes <= rb + rs) {
+                runs[next_run++ % runs.size()] = {rb, rb + rs, host, gen};
             }
             return true;
         }
@@ -99,6 +118,14 @@ public:
         }
         return true;
     }
+    struct Run {
+        u64 begin = 0, end = 0;
+        u8* host = nullptr;
+        u64 gen = 0;
+    };
+    std::array<Run, 4> runs{};
+    u32 next_run = 0;
+    std::atomic<u64> map_gen{1}; ///< bumped by every guest map/unmap (the listener's threads)
 };
 
 struct Submission {
@@ -151,6 +178,7 @@ public:
 
     // ---- MemoryListener (the guest memory manager's threads)
     void OnUnmap(u64 addr, u64 size) override {
+        memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (guest_) {
             guest_->Drop(addr, size);
@@ -162,6 +190,7 @@ public:
     }
     void OnRegister(u64, u64) override {}
     void OnMap(u64 addr, u64 size) override {
+        memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (images_) {
             images_->Unmap(addr, size); // new memory there: what the images held is gone (P4.5)
