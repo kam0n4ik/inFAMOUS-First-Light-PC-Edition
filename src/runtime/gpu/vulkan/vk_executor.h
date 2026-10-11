@@ -80,7 +80,9 @@ struct ExecutorStats {
     u64 timeline_copies = 0, timeline_copy_bytes = 0, tc_refused = 0;
     u64 shadows = 0, shadow_bytes = 0, shadow_overlaps = 0, shadow_no_room = 0, shadow_too_large = 0;
     u64 target_cache_hits = 0, target_cache_misses = 0;
+    u64 tex_memo_hits = 0, tex_memo_misses = 0;
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
+    std::array<u64, 9> gb_sites{}; ///< global barriers by GlobalBarrier site
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
     std::string first_skip[static_cast<size_t>(Skip::Count)];
@@ -228,13 +230,26 @@ private:
         std::vector<VkVertexInputAttributeDescription2EXT> vattr;
     };
     DynShadow dyn_;
+    /// A texture's T# (with the binding's depth/array/storage) resolved before: its image and view, while the image
+    /// cache's epoch is the same and the image needs no upload - LayoutFromTSharp, Find and View for the same textures
+    /// draw after draw were ~4.5% of the GPU thread's samples (i1).
+    struct TexMemo {
+        std::array<u32, 8> raw{};
+        u32 flags = 0;
+        u64 epoch = ~0ull;
+        CachedImage* img = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+    };
+    std::unordered_map<u64, TexMemo> tex_memo_;
     bool dyn_vertex_valid_ = false;
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
 
     bool Begin();
     void Note(u32 queue, u64 seq);
     void EndRendering();
-    void GlobalBarrier();
+    /// `site`: who asked (counted): 0 other, 1/2 shadows in, 3 shadows out, 4 timeline write, 5 timeline copy, 6 upload,
+    /// 7 before a draw, 8 before a dispatch
+    void GlobalBarrier(u32 site = 0);
     void Skipped(Skip why, const std::string& detail);
     bool BindStage(const void* stage_view, bool compute, PushData& push, std::vector<VkWriteDescriptorSet>& writes,
                    std::vector<VkDescriptorBufferInfo>& buffers, std::vector<VkDescriptorImageInfo>& images,
@@ -247,7 +262,7 @@ private:
     void SyncFrom(u32 source);
     /// A dispatch's written guest buffers moved to dense shadows: their contents copied in (recorded now, outside
     /// rendering, after the earlier writes); `infos` point at the shadows. FinishShadows copies them back after it.
-    void PrepareShadows(const void* plan, std::vector<VkDescriptorBufferInfo>& infos);
+    void PrepareShadows(const void* plan, std::vector<VkDescriptorBufferInfo>& infos, u64 workgroups);
     void FinishShadows();
     struct Shadow {
         VkBuffer home, shadow;

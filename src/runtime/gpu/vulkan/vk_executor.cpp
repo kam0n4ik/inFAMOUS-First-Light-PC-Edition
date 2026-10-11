@@ -282,7 +282,8 @@ void Executor::EndRendering() {
     }
 }
 
-void Executor::GlobalBarrier() {
+void Executor::GlobalBarrier(u32 site) {
+    ++stats_.gb_sites[site < stats_.gb_sites.size() ? site : 0];
     EndRendering();
     const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -503,7 +504,7 @@ void Executor::ProfCollect(Batch& b) {
     b.prof_keys.clear();
 }
 
-void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBufferInfo>& infos) {
+void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBufferInfo>& infos, u64 workgroups) {
     // Measured (logs\p44\diag c17-c20): a shader's stores into the sparse mirror are ~150x slower than into a dense
     // buffer on NVIDIA (the skinning dispatch 1196 us vs 7.7 us with only its outputs dense), its loads are not; a copy
     // into the mirror costs 12 us for its 420 KiB. So a dispatch writes dense shadows, copied back after it.
@@ -515,8 +516,15 @@ void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBuff
         }
         return o;
     }();
+    // a small dispatch writes little: its stores into the mirror cost less than the shadows' two barriers and copies
+    // (j1: ~3 global barriers a dispatch, two of them the shadows', ~350 dispatches a frame, most of them 1x1x1)
+    static const u64 kMinGroups = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_SHADOW_MIN_GROUPS", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10)
+                                                                                        : 8ull;
+    }();
     shadows_.clear();
-    if (shadow_ring_ == nullptr || off) {
+    if (shadow_ring_ == nullptr || off || workgroups < kMinGroups) {
         return;
     }
     const auto& plan = *static_cast<const GS::ResourceBindingPlan*>(plan_ptr);
@@ -582,7 +590,7 @@ void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBuff
     // the current contents in (the shader may read what it does not overwrite); the caller ordered the earlier writes
     EndRendering();
     if (pending_writes_) {
-        GlobalBarrier();
+        GlobalBarrier(1);
     }
     for (const Shadow& s : shadows_) {
         const VkBufferCopy c{.srcOffset = s.home_offset, .dstOffset = s.shadow_offset, .size = s.size};
@@ -590,14 +598,14 @@ void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBuff
         ++stats_.shadows;
         stats_.shadow_bytes += s.size;
     }
-    GlobalBarrier();
+    GlobalBarrier(2);
 }
 
 void Executor::FinishShadows() {
     if (shadows_.empty()) {
         return;
     }
-    GlobalBarrier(); // the dispatch's writes before the copies
+    GlobalBarrier(3); // the dispatch's writes before the copies
     for (const Shadow& s : shadows_) {
         const VkBufferCopy c{.srcOffset = s.shadow_offset, .dstOffset = s.home_offset, .size = s.size};
         Fn().vkCmdCopyBuffer(cur_.cb, s.shadow, s.home, 1, &c);
@@ -833,7 +841,7 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
         return dst < r.second && r.first < dst + bytes;
     });
     if (!write_run_ || overlap) {
-        GlobalBarrier();
+        GlobalBarrier(4);
         run_ranges_.clear();
     }
     const u64 cid = diag_ != nullptr && diag_->Enabled()
@@ -868,7 +876,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     // a copy: outside rendering, after the earlier writes (of its source too)
     EndRendering();
     if (pending_writes_) {
-        GlobalBarrier();
+        GlobalBarrier(5);
     }
     VkBuffer sbuf = VK_NULL_HANDLE, dbuf = VK_NULL_HANDLE;
     u64 soff = 0, doff = 0, savail = 0, davail = 0;
@@ -909,7 +917,7 @@ void Executor::BeforeUpload() {
     }
     EndRendering();
     if (pending_writes_) {
-        GlobalBarrier();
+        GlobalBarrier(6);
     }
 }
 
@@ -1144,11 +1152,52 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     }
     // images
     const VkPipelineStageFlags2 shader_stage = compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : kGraphicsShaders;
+    images_.ApplyPendingInvalidations(); // before the memo's dirty checks below
     for (const auto& im : plan.images) {
         const u32 count = std::max<u32>(im.count, 1);
         const size_t first = image_infos.size();
         bool null_image = im.status != GS::ResourceStatus::Ok;
         CachedImage* img = nullptr;
+        // the memo: one view (a dynamic mip index binds every level: not memoized), the same T# and binding flags
+        const bool memo_able = !null_image && count == 1 && !im.fmask;
+        const u32 flags = (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
+        u64 memo_key = 0;
+        TexMemo* memo = nullptr;
+        if (memo_able) {
+            memo_key = flags;
+            for (const u32 w : im.desc.raw) {
+                memo_key = (memo_key ^ w) * 0x100000001B3ull;
+            }
+            memo = &tex_memo_[memo_key];
+            CachedImage* m = memo->img;
+            if (m != nullptr && memo->epoch == images_.Epoch() && memo->raw == im.desc.raw && memo->flags == flags &&
+                (m->gpu_written || (m->uploaded && !m->dirty))) {
+                ++stats_.tex_memo_hits;
+                m->last_seq = cur_.value; // what Find records
+                if (im.storage) {
+                    m->gpu_written = true;
+                }
+                VkDescriptorImageInfo ii{VK_NULL_HANDLE, memo->view, VK_IMAGE_LAYOUT_GENERAL};
+                const bool feedback = std::ranges::find(targets, m) != targets.end();
+                ii.imageLayout = (im.storage || feedback) ? VK_IMAGE_LAYOUT_GENERAL
+                                 : m->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                image_infos.push_back(ii);
+                info_images_.push_back(m);
+                bound.push_back(m);
+                if (im.storage) {
+                    writes_memory = true;
+                }
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstBinding = im.binding,
+                                  .descriptorCount = 1,
+                                  .descriptorType = im.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                               : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                  .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+                continue;
+            }
+            ++stats_.tex_memo_misses;
+        }
         if (!null_image) {
             const ImageLayout layout = LayoutFromTSharp(im.desc, im.depth);
             std::string err;
@@ -1174,6 +1223,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                     vd.levels = 1;
                 }
                 ii.imageView = images_.View(*img, vd, im.storage);
+                if (memo != nullptr && ii.imageView != VK_NULL_HANDLE) {
+                    *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView};
+                }
                 const bool feedback = std::ranges::find(targets, img) != targets.end();
                 ii.imageLayout = (im.storage || feedback) ? VK_IMAGE_LAYOUT_GENERAL
                                  : img->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
@@ -1763,7 +1815,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     stage(stats_.t_vertex);
     // barriers and layouts (outside rendering)
     if (pending_writes_) {
-        GlobalBarrier();
+        GlobalBarrier(7);
     }
     const bool feedback_any = std::ranges::any_of(bound, [&](CachedImage* b) {
         return std::ranges::find(targets, b) != targets.end();
@@ -2127,7 +2179,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     }
     EndRendering();
     if (pending_writes_) {
-        GlobalBarrier();
+        GlobalBarrier(8);
     }
     for (CachedImage* img : bound) {
         const bool storage = (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) && img->gpu_written;
@@ -2156,7 +2208,9 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
             img_infos[i].imageLayout = info_images_[i]->current;
         }
     }
-    PrepareShadows(&csv.plan, buf_infos);
+    // an indirect dispatch's size is on the GPU: taken as large
+    PrepareShadows(&csv.plan, buf_infos,
+                   d.indirect ? ~0ull : u64{d.groups[0]} * std::max<u32>(d.groups[1], 1) * std::max<u32>(d.groups[2], 1));
     f.vkCmdBindPipeline(cur_.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
     if (!PushDescriptors(*pipe, VK_PIPELINE_BIND_POINT_COMPUTE, writes)) {
         FinishShadows();

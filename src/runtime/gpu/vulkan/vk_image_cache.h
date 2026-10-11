@@ -10,6 +10,7 @@
 // caller binds a null descriptor and counts the draw as incomplete.
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <map>
 #include <memory>
@@ -90,6 +91,9 @@ public:
     /// The guest wrote or unmapped [addr, addr + size): textures there are uploaded again at their next use. Any
     /// thread.
     void Invalidate(u64 addr, u64 size);
+    /// The invalidations queued so far applied now (Find applies them too; a caller that skips Find for a texture it
+    /// resolved before calls this first, then checks the image's dirty flag).
+    void ApplyPendingInvalidations() { ApplyInvalidations(); }
     /// Called before an upload records its commands (the executor ends rendering and makes earlier writes visible).
     void SetBeforeUpload(void (*hook)(void* ctx), void* ctx) {
         before_upload_ = hook;
@@ -155,6 +159,7 @@ private:
     std::unordered_map<u64, VkPipeline> detile_pipelines_;
     // invalidations from other threads
     std::mutex inval_mutex_;
+    std::atomic<bool> has_inval_{false};
     std::vector<std::pair<u64, u64>> pending_inval_;
     ImageCacheStats stats_;
 };

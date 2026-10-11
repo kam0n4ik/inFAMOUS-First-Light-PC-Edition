@@ -106,12 +106,17 @@ ImageCache::~ImageCache() {
 void ImageCache::Invalidate(u64 addr, u64 size) {
     std::scoped_lock lock{inval_mutex_};
     pending_inval_.emplace_back(addr, size);
+    has_inval_.store(true, std::memory_order_release);
 }
 
 void ImageCache::ApplyInvalidations() {
+    if (!has_inval_.load(std::memory_order_acquire)) {
+        return; // the common case: no lock taken
+    }
     std::vector<std::pair<u64, u64>> ranges;
     {
         std::scoped_lock lock{inval_mutex_};
+        has_inval_.store(false, std::memory_order_relaxed);
         if (pending_inval_.empty()) {
             return;
         }

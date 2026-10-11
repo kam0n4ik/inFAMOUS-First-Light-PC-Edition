@@ -666,13 +666,18 @@ std::string Backend::Report() {
     if (cp_ && executor_) {
         const auto& c = cp_->Stats();
         const auto& s = executor_->Stats();
-        out += fmt::format("target cache: hits {}, misses {}\n", s.target_cache_hits, s.target_cache_misses);
+        out += fmt::format("target cache: hits {}, misses {}; texture memo: hits {}, misses {}\n",
+                           s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses);
         out += cp_->WaitReport();
         const VideoOut::Stats vo = VideoOut::GetStats();
         out += fmt::format("videoout: flips requested {}, presented {}, vblanks {}, vblanks a flip waited for its GPU work "
                            "{}\n",
                            vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
         out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
+        out += fmt::format("global barriers by site: other {}, shadows in {}+{}, shadows out {}, timeline write {}, timeline "
+                           "copy {}, upload {}, before a draw {}, before a dispatch {}\n",
+                           s.gb_sites[0], s.gb_sites[1], s.gb_sites[2], s.gb_sites[3], s.gb_sites[4], s.gb_sites[5],
+                           s.gb_sites[6], s.gb_sites[7], s.gb_sites[8]);
         out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
                            "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
                            s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,
