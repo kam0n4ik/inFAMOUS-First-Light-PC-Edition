@@ -280,19 +280,42 @@ bool Backend::Start(const Options& o, std::string& error) {
     timeline_ = std::make_unique<Vk::Timeline>(*ctx_);
     // the stream ring: small read-only ranges and user data each command (~35 MiB a frame measured): room for 4 frames
     // in the BAR heap, so recording never waits for the GPU to free it
+    // By default hybrid: the CPU copies into cached system memory, one copy per submission puts the bytes into a
+    // device-local mirror the GPU reads (P4.6: shaders reading the ring over PCIe cost the village ~14 ms of GPU a
+    // frame; the BAR instead slowed the CPU's ~33 MiB of small writes a frame). SSPC_DIAG_RING=system - no mirror (the
+    // GPU reads system memory); =bar - the ring in the BAR.
     Vk::HostPlacement ring_place = Vk::HostPlacement::Cached;
     u64 ring_size = 160ull << 20;
-    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_RING", v, sizeof(v)) > 0 && std::string_view(v) == "bar") {
-        ring_place = Vk::HostPlacement::Bar;
-        ring_size = 128ull << 20;
-        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_RING=bar - the stream ring ({} MiB) in device-local "
-                               "host-visible memory (BAR) instead of cached system memory",
-                 ring_size >> 20);
+    bool ring_mirror = true;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_RING", v, sizeof(v)) > 0) {
+        if (std::string_view(v) == "bar") {
+            ring_place = Vk::HostPlacement::Bar;
+            ring_size = 128ull << 20;
+            ring_mirror = false;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_RING=bar - the stream ring ({} MiB) in device-local "
+                                   "host-visible memory (BAR) instead of cached system memory",
+                     ring_size >> 20);
+        } else if (std::string_view(v) == "system") {
+            ring_mirror = false;
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_RING=system - no video memory mirror of the stream "
+                                   "ring (the GPU reads cached system memory)");
+        }
     }
     ring_ = std::make_unique<Vk::StreamRing>(*ctx_, *timeline_, ring_size, ring_place);
     if (!timeline_->Ok() || !ring_->Ok()) {
         error = "the timeline or the stream ring could not be created";
         return false;
+    }
+    if (ring_mirror) {
+        if (std::string merr; !ring_->CreateMirror(merr)) {
+            SSPC_LOG(GPU, Warning, "native backend: no video memory mirror of the stream ring ({}): the GPU reads it "
+                                   "from system memory",
+                     merr);
+        } else {
+            SSPC_LOG(GPU, Info, "native backend: the stream ring is hybrid: a {} MiB device-local mirror, one copy per "
+                                "submission",
+                     ring_size >> 20);
+        }
     }
     // written buffers of dispatches: ~10 MiB a frame measured (the skinning's 21 x 420 KiB first)
     shadow_ring_ = std::make_unique<Vk::StreamRing>(*ctx_, *timeline_, 128ull << 20, Vk::HostPlacement::Device);
@@ -521,6 +544,7 @@ void Backend::Loop() {
     u64 rate_flips = 0, rate_draws = 0, rate_record = 0, rate_wait = 0, rate_tw = 0, rate_gpu = 0, rate_submit = 0;
     u64 rate_front = 0, rate_bind = 0, rate_range = 0, rate_image = 0, rate_streamed = 0, rate_streamed_bytes = 0;
     u64 rate_pipe = 0, rate_targets = 0, rate_vertex = 0, rate_layout = 0, rate_emit = 0, rate_dispatch = 0;
+    u64 rate_mirrored = 0;
     u64 rate_ring_waits = 0, rate_classify = 0, rate_hostptr = 0, rate_alloc = 0, rate_copy = 0, rate_prepare = 0;
     u64 rate_nprep = 0, rate_tl = 0, rate_tb = 0, rate_ts = 0, rate_th = 0, rate_ta = 0, rate_tc = 0, rate_nu = 0;
     u64 prof_cp = 0, prof_poll = 0, prof_flush = 0, prof_idle = 0; // ns since the last rate line
@@ -628,56 +652,62 @@ void Backend::Loop() {
                      per_frame(static_cast<double>(s.gpu_busy_ns - rate_gpu)));
             SSPC_LOG(GPU, Info,
                      "native backend: recording per frame (ms): frontend {:.1f}, binding {:.1f} (buffers {:.1f}, images "
-                     "{:.1f}); streamed {:.0f} small ranges ({:.1f} MiB) per frame; stream ring waits {}",
+                     "{:.1f}); streamed {:.0f} small ranges ({:.1f} MiB) per frame; stream ring waits {}, mirrored "
+                     "{:.1f} MiB per frame",
                      per_frame(static_cast<double>(GS::TicksToNs(s.t_front - rate_front))),
                      per_frame(static_cast<double>(GS::TicksToNs(s.t_bind - rate_bind))),
                      per_frame(static_cast<double>(GS::TicksToNs(s.t_range - rate_range))),
                      per_frame(static_cast<double>(GS::TicksToNs(s.t_image - rate_image))),
                      static_cast<double>(s.streamed - rate_streamed) / frames,
                      static_cast<double>(s.streamed_bytes - rate_streamed_bytes) / 1048576.0 / frames,
-                     ring_->Waits() - rate_ring_waits);
+                     ring_->Waits() - rate_ring_waits,
+                     static_cast<double>(ring_->MirroredBytes() - rate_mirrored) / 1048576.0 / frames);
             rate_ring_waits = ring_->Waits();
-            SSPC_LOG(GPU, Info,
-                     "native backend: draw stages per frame (ms): pipeline {:.1f}, targets {:.1f}, vertex/index {:.1f}, "
-                     "barriers/layouts {:.1f}, commands {:.1f}; dispatches whole {:.1f}",
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_pipe - rate_pipe))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_targets - rate_targets))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_vertex - rate_vertex))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_layout - rate_layout))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_emit - rate_emit))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_dispatch - rate_dispatch))));
-            rate_pipe = s.t_pipe;
-            rate_targets = s.t_targets;
-            rate_vertex = s.t_vertex;
-            rate_layout = s.t_layout;
-            rate_emit = s.t_emit;
-            rate_dispatch = s.t_dispatch;
-            SSPC_LOG(GPU, Info,
-                     "native backend: buffers per frame (ms): classify {:.1f}, host pointer {:.1f}, ring {:.1f}, copy {:.1f}, "
-                     "cache prepare {:.1f} ({:.0f} calls)",
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_classify - rate_classify))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_hostptr - rate_hostptr))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_alloc - rate_alloc))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_copy - rate_copy))),
-                     per_frame(static_cast<double>(GS::TicksToNs(s.t_prepare - rate_prepare))),
-                     static_cast<double>(s.n_prepare - rate_nprep) / frames);
-            rate_classify = s.t_classify;
-            rate_hostptr = s.t_hostptr;
-            rate_alloc = s.t_alloc;
-            rate_copy = s.t_copy;
-            rate_prepare = s.t_prepare;
-            rate_nprep = s.n_prepare;
+            rate_mirrored = ring_->MirroredBytes();
+            if (GS::g_fine_timing) { // (the stages are timed with SSPC_GPU_TIMINGS=1 only)
+                SSPC_LOG(GPU, Info,
+                         "native backend: draw stages per frame (ms): pipeline {:.1f}, targets {:.1f}, vertex/index {:.1f}, "
+                         "barriers/layouts {:.1f}, commands {:.1f}; dispatches whole {:.1f}",
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_pipe - rate_pipe))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_targets - rate_targets))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_vertex - rate_vertex))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_layout - rate_layout))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_emit - rate_emit))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_dispatch - rate_dispatch))));
+                rate_pipe = s.t_pipe;
+                rate_targets = s.t_targets;
+                rate_vertex = s.t_vertex;
+                rate_layout = s.t_layout;
+                rate_emit = s.t_emit;
+                rate_dispatch = s.t_dispatch;
+                SSPC_LOG(GPU, Info,
+                         "native backend: buffers per frame (ms): classify {:.1f}, host pointer {:.1f}, ring {:.1f}, copy {:.1f}, "
+                         "cache prepare {:.1f} ({:.0f} calls)",
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_classify - rate_classify))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_hostptr - rate_hostptr))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_alloc - rate_alloc))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_copy - rate_copy))),
+                         per_frame(static_cast<double>(GS::TicksToNs(s.t_prepare - rate_prepare))),
+                         static_cast<double>(s.n_prepare - rate_nprep) / frames);
+                rate_classify = s.t_classify;
+                rate_hostptr = s.t_hostptr;
+                rate_alloc = s.t_alloc;
+                rate_copy = s.t_copy;
+                rate_prepare = s.t_prepare;
+                rate_nprep = s.n_prepare;
+                const auto& bc = buffers_->Stats();
+                SSPC_LOG(GPU, Info,
+                         "native backend: cache prepare per frame (ms): large ranges {:.1f}, bind {:.1f}, scan {:.1f}, upload "
+                         "hook {:.1f}, write-protect {:.1f}, copies {:.1f} ({:.0f} uploading calls)",
+                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_large - rate_tl))),
+                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_bound - rate_tb))),
+                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_scan - rate_ts))),
+                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_hook - rate_th))),
+                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_arm - rate_ta))),
+                         per_frame(static_cast<double>(GS::TicksToNs(bc.t_copy - rate_tc))),
+                         static_cast<double>(bc.n_upload_calls - rate_nu) / frames);
+            }
             const auto& bc = buffers_->Stats();
-            SSPC_LOG(GPU, Info,
-                     "native backend: cache prepare per frame (ms): large ranges {:.1f}, bind {:.1f}, scan {:.1f}, upload "
-                     "hook {:.1f}, write-protect {:.1f}, copies {:.1f} ({:.0f} uploading calls)",
-                     per_frame(static_cast<double>(GS::TicksToNs(bc.t_large - rate_tl))),
-                     per_frame(static_cast<double>(GS::TicksToNs(bc.t_bound - rate_tb))),
-                     per_frame(static_cast<double>(GS::TicksToNs(bc.t_scan - rate_ts))),
-                     per_frame(static_cast<double>(GS::TicksToNs(bc.t_hook - rate_th))),
-                     per_frame(static_cast<double>(GS::TicksToNs(bc.t_arm - rate_ta))),
-                     per_frame(static_cast<double>(GS::TicksToNs(bc.t_copy - rate_tc))),
-                     static_cast<double>(bc.n_upload_calls - rate_nu) / frames);
             rate_tl = bc.t_large;
             rate_tb = bc.t_bound;
             rate_ts = bc.t_scan;

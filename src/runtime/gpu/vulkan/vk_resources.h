@@ -83,6 +83,20 @@ public:
     ~StreamRing();
     bool Ok() const { return buf_.buffer != VK_NULL_HANDLE; }
 
+    /// The hybrid ring (P4.6 night sprint): the CPU writes the cached system memory (`Slice::data`, memory speed), the
+    /// GPU reads a device-local mirror of the same size at the same offsets (`Slice::buffer`, video memory speed, no
+    /// PCIe read per shader access). The bytes handed out since the last TakeDirty() must be copied into the mirror
+    /// before the work that reads them: the executor copies them at the head of each submission (every slice is
+    /// written by the CPU while that submission is recorded and never again, so one copy before its first command
+    /// is exact). Regions are reused only behind the timeline, as the ring's own. false: no mirror (out of memory).
+    bool CreateMirror(std::string& error);
+    bool Mirrored() const { return mirror_.buffer != VK_NULL_HANDLE; }
+    VkBuffer HostBuffer() const { return buf_.buffer; }
+    VkBuffer MirrorBuffer() const { return mirror_.buffer; }
+    /// The ring regions handed out since the last call, as host -> mirror copies (at most two: the ring wrapped).
+    u32 TakeDirty(VkBufferCopy (&out)[2]);
+    u64 MirroredBytes() const { return mirrored_bytes_; }
+
     struct Slice {
         VkBuffer buffer = VK_NULL_HANDLE;
         u64 offset = 0;
@@ -112,6 +126,9 @@ private:
     DeviceContext& ctx_;
     Timeline& timeline_;
     OwnedBuffer buf_;
+    OwnedBuffer mirror_;   ///< hybrid: the device-local copy the GPU reads
+    u64 dirty_begin_ = 0;  ///< hybrid: the first position not yet copied into the mirror
+    u64 mirrored_bytes_ = 0;
     // positions grow without bound (bytes ever handed out, with padding); the ring offset is position % size
     u64 head_ = 0; ///< next free position
     u64 tail_ = 0; ///< oldest position still in use

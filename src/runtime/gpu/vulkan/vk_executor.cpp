@@ -272,8 +272,11 @@ bool Executor::Begin() {
         const VkCommandBufferAllocateInfo ai{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                              .commandPool = cur_.pool,
                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                             .commandBufferCount = 1};
-        f.vkAllocateCommandBuffers(ctx_.Device(), &ai, &cur_.cb);
+                                             .commandBufferCount = 2};
+        VkCommandBuffer cbs[2] = {};
+        f.vkAllocateCommandBuffers(ctx_.Device(), &ai, cbs);
+        cur_.cb = cbs[0];
+        cur_.pre = cbs[1];
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192},
                                               {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024},
@@ -297,8 +300,10 @@ bool Executor::Begin() {
     f.vkBeginCommandBuffer(cur_.cb, &bi);
     if (queries_ != VK_NULL_HANDLE) {
         cur_.query_slot = next_query_slot_++ % kQuerySlots;
-        f.vkCmdResetQueryPool(cur_.cb, queries_, cur_.query_slot * 2, 2);
-        f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queries_, cur_.query_slot * 2);
+        if (!ring_.Mirrored()) { // (hybrid ring: the batch's first timestamp is written by its head, before the copies)
+            f.vkCmdResetQueryPool(cur_.cb, queries_, cur_.query_slot * 2, 2);
+            f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queries_, cur_.query_slot * 2);
+        }
     }
     cur_.prof_base = ~0u;
     cur_.prof_count = 0;
@@ -417,7 +422,39 @@ void Executor::Flush() {
         f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries_, cur_.query_slot * 2 + 1);
     }
     f.vkEndCommandBuffer(cur_.cb);
-    const VkCommandBufferSubmitInfo cbi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cur_.cb};
+    // hybrid stream ring: the bytes the CPU put into the ring for this batch, copied into the video memory mirror its
+    // commands read - before the first of them (one or two copies; the previous batch ended with a full barrier, so
+    // the regions' earlier readers are done)
+    VkCommandBufferSubmitInfo cbis[2] = {};
+    u32 n_cb = 0;
+    if (ring_.Mirrored()) {
+        VkBufferCopy copies[2];
+        const u32 n = ring_.TakeDirty(copies);
+        if (n > 0 || cur_.query_slot != ~0u) {
+            const VkCommandBufferBeginInfo bi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                              .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            f.vkBeginCommandBuffer(cur_.pre, &bi);
+            if (cur_.query_slot != ~0u) {
+                f.vkCmdResetQueryPool(cur_.pre, queries_, cur_.query_slot * 2, 2);
+                f.vkCmdWriteTimestamp2(cur_.pre, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queries_, cur_.query_slot * 2);
+            }
+            if (n > 0) {
+                f.vkCmdCopyBuffer(cur_.pre, ring_.HostBuffer(), ring_.MirrorBuffer(), n, copies);
+                const VkMemoryBarrier2 cmb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                           .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT};
+                const VkDependencyInfo cdep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                            .pMemoryBarriers = &cmb};
+                f.vkCmdPipelineBarrier2(cur_.pre, &cdep);
+                stats_.ring_mirror_copies += n;
+            }
+            f.vkEndCommandBuffer(cur_.pre);
+            cbis[n_cb++] = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cur_.pre};
+        }
+    }
+    cbis[n_cb++] = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cur_.cb};
     const VkSemaphoreSubmitInfo signal{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                        .semaphore = timeline_.Handle(),
                                        .value = cur_.value,
@@ -438,8 +475,8 @@ void Executor::Flush() {
         const VkSubmitInfo2 si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
                                .waitSemaphoreInfoCount = bind_sem != VK_NULL_HANDLE ? 1u : 0u,
                                .pWaitSemaphoreInfos = &wait,
-                               .commandBufferInfoCount = 1,
-                               .pCommandBufferInfos = &cbi,
+                               .commandBufferInfoCount = n_cb,
+                               .pCommandBufferInfos = cbis,
                                .signalSemaphoreInfoCount = 1,
                                .pSignalSemaphoreInfos = &signal};
         r = f.vkQueueSubmit2(ctx_.Queue(), 1, &si, VK_NULL_HANDLE);

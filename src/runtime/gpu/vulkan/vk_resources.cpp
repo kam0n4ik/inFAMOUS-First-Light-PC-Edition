@@ -176,7 +176,43 @@ StreamRing::StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, HostPla
 }
 
 StreamRing::~StreamRing() {
+    DestroyBuffer(ctx_, mirror_);
     DestroyBuffer(ctx_, buf_);
+}
+
+bool StreamRing::CreateMirror(std::string& error) {
+    if (buf_.mapped == nullptr) {
+        error = "the ring is not host-visible";
+        return false;
+    }
+    return CreateBuffer(ctx_, buf_.size,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                        false, mirror_, error);
+}
+
+u32 StreamRing::TakeDirty(VkBufferCopy (&out)[2]) {
+    const u64 begin = dirty_begin_, end = head_;
+    dirty_begin_ = head_;
+    if (mirror_.buffer == VK_NULL_HANDLE || end <= begin) {
+        return 0;
+    }
+    const u64 size = buf_.size;
+    mirrored_bytes_ += end - begin;
+    if (end - begin >= size) { // (never: one submission holds less than the ring)
+        out[0] = {0, 0, size};
+        return 1;
+    }
+    const u64 b = begin % size, e = end % size;
+    if (e == 0 || b < e) { // no wrap inside (or it ends exactly at the ring's end)
+        out[0] = {b, b, (e == 0 ? size : e) - b};
+        return 1;
+    }
+    out[0] = {b, b, size - b}; // up to the end (the skipped tail before a wrap is free: copying it is harmless)
+    out[1] = {0, 0, e};
+    return 2;
 }
 
 StreamRing::Status StreamRing::Allocate(u64 bytes, u64 align, u64 seq, Slice& out) {
@@ -200,7 +236,7 @@ StreamRing::Status StreamRing::Allocate(u64 bytes, u64 align, u64 seq, Slice& ou
             used_ = head_ - tail_;
             peak_ = std::max(peak_, used_);
             allocated_ += bytes;
-            out.buffer = buf_.buffer;
+            out.buffer = mirror_.buffer != VK_NULL_HANDLE ? mirror_.buffer : buf_.buffer;
             out.offset = start % size;
             out.data = buf_.mapped != nullptr ? buf_.mapped + out.offset : nullptr;
             return Status::Ok;

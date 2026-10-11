@@ -74,6 +74,7 @@ struct ExecutorStats {
     u64 submit_ns = 0;                          ///< CPU time in vkQueueSubmit2
     u64 lds_dispatches = 0, lds_max_bytes = 0;  ///< dispatches with the emulated LDS buffer
     u64 streamed = 0, streamed_bytes = 0; ///< small read-only ranges the CPU rewrote, copied into the stream ring
+    u64 ring_mirror_copies = 0;           ///< hybrid ring: host -> video memory copies at the head of submissions
     u64 t_front = 0, t_bind = 0, t_range = 0, t_image = 0; ///< TSC ticks: frontend, resource binding (of it buffers, images)
     /// TSC ticks of a draw's other stages: pipeline lookup, targets, vertex/index/indirect ranges, barriers and layouts,
     /// the commands (rendering, state, descriptors, the draw); the dispatches' whole recording
@@ -177,6 +178,7 @@ private:
     struct Batch {
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkCommandBuffer pre = VK_NULL_HANDLE; ///< recorded at submission, runs first: the stream ring's mirror copies
         VkDescriptorPool descriptors = VK_NULL_HANDLE;
         u64 value = 0;
         std::array<u64, Cp::kNumQueues> work{};
