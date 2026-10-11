@@ -199,6 +199,36 @@ private:
         std::vector<VkDeviceSize> voffs;
     };
     Scratch scratch_; ///< one command's lists (Draw/Dispatch do not nest)
+    /// The dynamic state set in the batch's command buffer so far: a draw sets only what changed (every graphics
+    /// pipeline has the same dynamic states, so binding one keeps them; a new command buffer starts undefined).
+    /// ~25 vkCmdSet* a draw were 4.7% of the GPU thread's samples (f2).
+    struct DynShadow {
+        bool valid = false;
+        u32 vp_count = 0;
+        std::array<VkViewport, 16> vps{};
+        std::array<VkRect2D, 16> scs{};
+        VkBool32 depth_test = 0, depth_write = 0, bounds_test = 0, bias_enable = 0, stencil_test = 0, restart = 0,
+                 discard = 0;
+        VkCompareOp depth_op = VK_COMPARE_OP_NEVER;
+        float bounds[2] = {}, bias[3] = {}, blend[4] = {}, line_width = 0.0f;
+        bool bias_set = false;
+        struct Face {
+            VkStencilOp fail = VK_STENCIL_OP_KEEP, pass = VK_STENCIL_OP_KEEP, depth_fail = VK_STENCIL_OP_KEEP;
+            VkCompareOp compare = VK_COMPARE_OP_NEVER;
+            u32 reference = 0, write_mask = 0, compare_mask = 0;
+            bool operator==(const Face&) const = default;
+        };
+        Face front, back;
+        VkCullModeFlags cull = 0;
+        VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        u32 color_masks_count = 0;
+        std::array<VkColorComponentFlags, 8> color_masks{};
+        std::vector<VkVertexInputBindingDescription2EXT> vbind;
+        std::vector<VkVertexInputAttributeDescription2EXT> vattr;
+    };
+    DynShadow dyn_;
+    bool dyn_vertex_valid_ = false;
+    u64 dyn_skipped_ = 0, dyn_set_ = 0;
 
     bool Begin();
     void Note(u32 queue, u64 seq);

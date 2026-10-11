@@ -254,6 +254,12 @@ bool Executor::Begin() {
     open_ = true;
     commands_ = 0;
     rendering_ = false;
+    // a new command buffer: no dynamic state set yet - also what a draw sets only conditionally (the depth bias values
+    // with bias on, the colour write masks with colour targets): not "already set" from the last buffer (validation f3)
+    dyn_.valid = false;
+    dyn_.bias_set = false;
+    dyn_.color_masks_count = ~0u;
+    dyn_vertex_valid_ = false;
     ++stats_.batches;
     return true;
 }
@@ -1287,31 +1293,80 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
         scs[0] = {{0, 0}, {1, 1}};
         n = 1;
     }
-    f.vkCmdSetViewportWithCount(cb, n, vps.data());
-    f.vkCmdSetScissorWithCount(cb, n, scs.data());
+    DynShadow& sh = dyn_;
+    const bool all = !sh.valid;
+    sh.valid = true;
+    const auto changed = [&](bool differs) {
+        if (all || differs) {
+            ++dyn_set_;
+            return true;
+        }
+        ++dyn_skipped_;
+        return false;
+    };
+    if (changed(n != sh.vp_count || std::memcmp(vps.data(), sh.vps.data(), n * sizeof(VkViewport)) != 0 ||
+                std::memcmp(scs.data(), sh.scs.data(), n * sizeof(VkRect2D)) != 0)) {
+        f.vkCmdSetViewportWithCount(cb, n, vps.data());
+        f.vkCmdSetScissorWithCount(cb, n, scs.data());
+        sh.vp_count = n;
+        std::memcpy(sh.vps.data(), vps.data(), n * sizeof(VkViewport));
+        std::memcpy(sh.scs.data(), scs.data(), n * sizeof(VkRect2D));
+    }
 
     // depth / stencil
     const u32 dc = r.Get(kDbDepthControl);
     const u32 rc = r.Get(kDbRenderControl);
     const bool depth_valid = (r.Get(kDbZInfo) & 3) != 0, stencil_valid = (r.Get(kDbStencilInfo) & 1) != 0;
-    const bool depth_test = ((dc >> 1) & 1) && depth_valid;
-    f.vkCmdSetDepthTestEnable(cb, depth_test);
-    f.vkCmdSetDepthWriteEnable(cb, depth_test && ((dc >> 2) & 1) && (rc & 1) == 0);
-    f.vkCmdSetDepthCompareOp(cb, CompareOp((dc >> 4) & 7).value);
-    const bool bounds = (dc >> 3) & 1;
-    f.vkCmdSetDepthBoundsTestEnable(cb, bounds);
-    f.vkCmdSetDepthBounds(cb, std::clamp(F(r, kDbDepthBoundsMin), 0.0f, 1.0f), std::clamp(F(r, kDbDepthBoundsMax), 0.0f, 1.0f));
+    const VkBool32 depth_test = ((dc >> 1) & 1) && depth_valid;
+    const VkBool32 depth_write = depth_test && ((dc >> 2) & 1) && (rc & 1) == 0;
+    const VkCompareOp depth_op = CompareOp((dc >> 4) & 7).value;
+    if (changed(depth_test != sh.depth_test)) {
+        f.vkCmdSetDepthTestEnable(cb, depth_test);
+        sh.depth_test = depth_test;
+    }
+    if (changed(depth_write != sh.depth_write)) {
+        f.vkCmdSetDepthWriteEnable(cb, depth_write);
+        sh.depth_write = depth_write;
+    }
+    if (changed(depth_op != sh.depth_op)) {
+        f.vkCmdSetDepthCompareOp(cb, depth_op);
+        sh.depth_op = depth_op;
+    }
+    const VkBool32 bounds = (dc >> 3) & 1;
+    if (changed(bounds != sh.bounds_test)) {
+        f.vkCmdSetDepthBoundsTestEnable(cb, bounds);
+        sh.bounds_test = bounds;
+    }
+    const float bmin = std::clamp(F(r, kDbDepthBoundsMin), 0.0f, 1.0f), bmax = std::clamp(F(r, kDbDepthBoundsMax), 0.0f, 1.0f);
+    if (changed(bmin != sh.bounds[0] || bmax != sh.bounds[1])) {
+        f.vkCmdSetDepthBounds(cb, bmin, bmax);
+        sh.bounds[0] = bmin;
+        sh.bounds[1] = bmax;
+    }
     const u32 pc = r.Get(kPaSuScModeCntl);
-    const bool bias = ((pc >> 11) & 7) != 0;
-    f.vkCmdSetDepthBiasEnable(cb, bias);
+    const VkBool32 bias = ((pc >> 11) & 7) != 0;
+    if (changed(bias != sh.bias_enable)) {
+        f.vkCmdSetDepthBiasEnable(cb, bias);
+        sh.bias_enable = bias;
+    }
     if (bias) {
         const bool front = (pc >> 11) & 1;
         const float offset = F(r, kPolyOffsetClamp + (front ? 2 : 4));
         const float scale = F(r, kPolyOffsetClamp + (front ? 1 : 3));
-        f.vkCmdSetDepthBias(cb, offset, F(r, kPolyOffsetClamp), scale / 16.0f);
+        const float b3[3] = {offset, F(r, kPolyOffsetClamp), scale / 16.0f};
+        if (changed(!sh.bias_set || std::memcmp(b3, sh.bias, sizeof(b3)) != 0)) {
+            f.vkCmdSetDepthBias(cb, b3[0], b3[1], b3[2]);
+            std::memcpy(sh.bias, b3, sizeof(b3));
+            sh.bias_set = true;
+        }
     }
-    const bool stencil = (dc & 1) && stencil_valid;
-    f.vkCmdSetStencilTestEnable(cb, stencil);
+    const VkBool32 stencil = (dc & 1) && stencil_valid;
+    if (changed(stencil != sh.stencil_test)) {
+        f.vkCmdSetStencilTestEnable(cb, stencil);
+        sh.stencil_test = stencil;
+    }
+    // the stencil faces as this draw wants them, set where they differ
+    DynShadow::Face want_front{}, want_back{};
     if (stencil) {
         const u32 sc = r.Get(kDbStencilControl);
         const bool backface = (dc >> 7) & 1;
@@ -1323,8 +1378,8 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
         const auto bo = backface ? ops(12) : fo;
         const VkCompareOp ffunc = CompareOp((dc >> 8) & 7).value;
         const VkCompareOp bfunc = backface ? CompareOp((dc >> 20) & 7).value : ffunc;
-        f.vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, fo[0], fo[1], fo[2], ffunc);
-        f.vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, bo[0], bo[1], bo[2], bfunc);
+        want_front = {fo[0], fo[1], fo[2], ffunc};
+        want_back = {bo[0], bo[1], bo[2], bfunc};
         const u32 front_ref = r.Get(kDbStencilRefMask), back_ref = backface ? r.Get(kDbStencilRefMaskBf) : front_ref;
         const auto uses_op_val = [&](u32 shift) {
             for (u32 k = 0; k < 3; ++k) {
@@ -1336,19 +1391,34 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
         };
         const bool fop = uses_op_val(0), bop = backface ? uses_op_val(12) : fop;
         const bool clear = (rc >> 1) & 1;
-        f.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, fop ? (front_ref >> 24) : (front_ref & 0xFF));
-        f.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, bop ? (back_ref >> 24) : (back_ref & 0xFF));
-        f.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, clear ? 0 : (front_ref >> 16) & 0xFF);
-        f.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, clear ? 0 : (back_ref >> 16) & 0xFF);
-        f.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, (front_ref >> 8) & 0xFF);
-        f.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, (back_ref >> 8) & 0xFF);
+        want_front.reference = fop ? (front_ref >> 24) : (front_ref & 0xFF);
+        want_back.reference = bop ? (back_ref >> 24) : (back_ref & 0xFF);
+        want_front.write_mask = clear ? 0 : (front_ref >> 16) & 0xFF;
+        want_back.write_mask = clear ? 0 : (back_ref >> 16) & 0xFF;
+        want_front.compare_mask = (front_ref >> 8) & 0xFF;
+        want_back.compare_mask = (back_ref >> 8) & 0xFF;
     } else {
-        f.vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
-                            VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
-        f.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
-        f.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
-        f.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        want_front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0, 0, 0};
+        want_back = want_front;
     }
+    const auto set_face = [&](VkStencilFaceFlags face, const DynShadow::Face& w, DynShadow::Face& have) {
+        if (changed(w.fail != have.fail || w.pass != have.pass || w.depth_fail != have.depth_fail ||
+                    w.compare != have.compare)) {
+            f.vkCmdSetStencilOp(cb, face, w.fail, w.pass, w.depth_fail, w.compare);
+        }
+        if (changed(w.reference != have.reference)) {
+            f.vkCmdSetStencilReference(cb, face, w.reference);
+        }
+        if (changed(w.write_mask != have.write_mask)) {
+            f.vkCmdSetStencilWriteMask(cb, face, w.write_mask);
+        }
+        if (changed(w.compare_mask != have.compare_mask)) {
+            f.vkCmdSetStencilCompareMask(cb, face, w.compare_mask);
+        }
+        have = w;
+    };
+    set_face(VK_STENCIL_FACE_FRONT_BIT, want_front, sh.front);
+    set_face(VK_STENCIL_FACE_BACK_BIT, want_back, sh.back);
     // primitive state
     const bool rect_quad = st.prim_type == 17 || st.prim_type == 19;
     const auto topo = PrimitiveType(st.prim_type).value;
@@ -1358,14 +1428,35 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
                       topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     const bool restart = (r.Get(kVgtMultiPrimIbResetEn) & 1) && indexed &&
                          (ctx_.Caps().list_restart || !list) && (ctx_.Caps().patch_list_restart || !rect_quad);
-    f.vkCmdSetPrimitiveRestartEnable(cb, restart);
-    f.vkCmdSetRasterizerDiscardEnable(cb, (clip >> 22) & 1);
+    if (changed(static_cast<VkBool32>(restart) != sh.restart)) {
+        f.vkCmdSetPrimitiveRestartEnable(cb, restart);
+        sh.restart = restart;
+    }
+    const VkBool32 discard = (clip >> 22) & 1;
+    if (changed(discard != sh.discard)) {
+        f.vkCmdSetRasterizerDiscardEnable(cb, discard);
+        sh.discard = discard;
+    }
     const auto culled = IsPrimitiveCulled(st.prim_type);
-    f.vkCmdSetCullMode(cb, culled.value ? CullMode(pc & 3).value : VK_CULL_MODE_NONE);
-    f.vkCmdSetFrontFace(cb, FrontFace((pc >> 2) & 1).value);
-    f.vkCmdSetLineWidth(cb, 1.0f);
+    const VkCullModeFlags cull = culled.value ? CullMode(pc & 3).value : VK_CULL_MODE_NONE;
+    if (changed(cull != sh.cull)) {
+        f.vkCmdSetCullMode(cb, cull);
+        sh.cull = cull;
+    }
+    const VkFrontFace front_face = FrontFace((pc >> 2) & 1).value;
+    if (changed(front_face != sh.front_face)) {
+        f.vkCmdSetFrontFace(cb, front_face);
+        sh.front_face = front_face;
+    }
+    if (changed(sh.line_width != 1.0f)) {
+        f.vkCmdSetLineWidth(cb, 1.0f);
+        sh.line_width = 1.0f;
+    }
     const float bc[4] = {F(r, kCbBlendRed), F(r, kCbBlendRed + 1), F(r, kCbBlendRed + 2), F(r, kCbBlendRed + 3)};
-    f.vkCmdSetBlendConstants(cb, bc);
+    if (changed(std::memcmp(bc, sh.blend, sizeof(bc)) != 0)) {
+        f.vkCmdSetBlendConstants(cb, bc);
+        std::memcpy(sh.blend, bc, sizeof(bc));
+    }
     if (ctx_.Caps().color_write_mask_dynamic) {
         const u32 num_color = static_cast<u32>(std::bit_width(st.mrt_mask & 0xFFu));
         if (num_color > 0) {
@@ -1373,7 +1464,11 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
             for (u32 i = 0; i < num_color; ++i) {
                 masks[i] = st.targets[i].write_mask & 0xF;
             }
-            f.vkCmdSetColorWriteMaskEXT(cb, 0, num_color, masks.data());
+            if (changed(num_color != sh.color_masks_count || masks != sh.color_masks)) {
+                f.vkCmdSetColorWriteMaskEXT(cb, 0, num_color, masks.data());
+                sh.color_masks_count = num_color;
+                sh.color_masks = masks;
+            }
         }
     }
 }
@@ -1808,8 +1903,19 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     }
     f.vkCmdPushConstants(cur_.cb, pipe->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
     SetDynamicState(regs, *st, d.indexed);
-    f.vkCmdSetVertexInputEXT(cur_.cb, static_cast<u32>(vbind.size()), vbind.data(), static_cast<u32>(vattr.size()),
-                             vattr.data());
+    const auto same_input = [](const auto& a, const auto& b) {
+        return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+    };
+    if (!dyn_vertex_valid_ || !same_input(vbind, dyn_.vbind) || !same_input(vattr, dyn_.vattr)) {
+        f.vkCmdSetVertexInputEXT(cur_.cb, static_cast<u32>(vbind.size()), vbind.data(), static_cast<u32>(vattr.size()),
+                                 vattr.data());
+        dyn_.vbind = vbind;
+        dyn_.vattr = vattr;
+        dyn_vertex_valid_ = true;
+        ++dyn_set_;
+    } else {
+        ++dyn_skipped_;
+    }
     if (!vbufs.empty()) {
         f.vkCmdBindVertexBuffers(cur_.cb, 0, static_cast<u32>(vbufs.size()), vbufs.data(), voffs.data());
         stats_.vertex_bindings += vbufs.size();
