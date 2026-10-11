@@ -381,7 +381,7 @@ void Executor::GlobalBarrier(u32 site) {
 }
 
 bool Executor::NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads,
-                            const std::vector<std::pair<u64, u64>>& writes, bool unknown) {
+                            const std::vector<std::pair<u64, u64>>& writes, bool unknown, u64 tag) {
     static const bool off = [] {
         char v[8] = {};
         const bool o = GetEnvironmentVariableA("SSPC_DIAG_BARRIER_RANGES", v, sizeof(v)) == 3 && std::string_view(v) == "off";
@@ -391,10 +391,18 @@ bool Executor::NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads,
         }
         return o;
     }();
-    const auto overlaps = [](const std::vector<std::pair<u64, u64>>& a, const std::vector<std::pair<u64, u64>>& b) {
+    // a conflict between two dispatches of one queue with no guest synchronization between them (equal tags) does not
+    // count: the guest does not order them (counted)
+    bool guest_unordered = false;
+    const auto overlaps = [&](const std::vector<std::pair<u64, u64>>& a, const std::vector<std::pair<u64, u64>>& b,
+                              const std::vector<u64>& btags) {
         for (const auto& [ab, ae] : a) {
-            for (const auto& [bb, be] : b) {
-                if (ab < be && bb < ae) {
+            for (size_t i = 0; i < b.size(); ++i) {
+                if (ab < b[i].second && b[i].first < ae) {
+                    if (tag != 0 && i < btags.size() && btags[i] == tag) {
+                        guest_unordered = true;
+                        continue;
+                    }
                     return true;
                 }
             }
@@ -404,7 +412,7 @@ bool Executor::NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads,
     if (!pending_writes_) {
         // nothing written since the last barrier: no read-after-write; a write over what an earlier command since then
         // still reads (write-after-read) is ordered too
-        if (!off && !writes.empty() && overlaps(writes, pend_.reads)) {
+        if (!off && !writes.empty() && overlaps(writes, pend_.reads, pend_.rtags)) {
             ++stats_.barriers_war;
             return true;
         }
@@ -416,22 +424,41 @@ bool Executor::NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads,
                     : pend_.unknown                                       ? 1
                     : unknown                                             ? 2
                     : pend_.writes.size() + pend_.reads.size() > 256      ? 3
-                    : overlaps(reads, pend_.writes)                       ? 4
-                    : overlaps(writes, pend_.writes)                      ? 5
-                    : overlaps(writes, pend_.reads)                       ? 6
+                    : overlaps(reads, pend_.writes, pend_.wtags)          ? 4
+                    : overlaps(writes, pend_.writes, pend_.wtags)         ? 5
+                    : overlaps(writes, pend_.reads, pend_.rtags)          ? 6
                                                                           : 7;
     if (why != 7) {
         ++stats_.barrier_why[why];
+        const auto gds = [](const std::pair<u64, u64>& r) { return r.first >= kGdsRangeBase; };
+        if (why == 5 && std::ranges::any_of(writes, gds) && std::ranges::any_of(pend_.writes, gds)) {
+            ++stats_.barrier_waw_gds;
+        }
         return true;
     }
     ++stats_.barriers_elided;
+    stats_.barriers_guest_order += guest_unordered ? 1 : 0;
     return false;
 }
 
 void Executor::NoteAccesses(const std::vector<std::pair<u64, u64>>& reads,
-                            const std::vector<std::pair<u64, u64>>& writes, bool unknown) {
-    pend_.reads.insert(pend_.reads.end(), reads.begin(), reads.end());
-    pend_.writes.insert(pend_.writes.end(), writes.begin(), writes.end());
+                            const std::vector<std::pair<u64, u64>>& writes, bool unknown, u64 tag) {
+    // (a range already noted with the same tag is not noted again: a chain of dispatches over one pool stays short)
+    const auto note = [&](std::vector<std::pair<u64, u64>>& list, std::vector<u64>& tags, const std::pair<u64, u64>& r) {
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (list[i] == r && tags[i] == tag) {
+                return;
+            }
+        }
+        list.push_back(r);
+        tags.push_back(tag);
+    };
+    for (const auto& r : reads) {
+        note(pend_.reads, pend_.rtags, r);
+    }
+    for (const auto& r : writes) {
+        note(pend_.writes, pend_.wtags, r);
+    }
     if (unknown) {
         pend_.unknown = true;
     }
@@ -1334,7 +1361,8 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
     return true;
 }
 
-void Executor::MemoryAcquired(u32, bool blocked, u64 poll_address) {
+void Executor::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
+    GuestSync(queue); // (a met WAIT_REG_MEM: the guest's own ordering point)
     ++stats_.acquires;
     if (blocked) {
         last_unblock_tsc_ = __rdtsc();
@@ -1359,7 +1387,8 @@ void Executor::MemoryAcquired(u32, bool blocked, u64 poll_address) {
     }
 }
 
-void Executor::WaitMetByHeldFence(u32) {
+void Executor::WaitMetByHeldFence(u32 queue) {
+    GuestSync(queue);
     // the guest's GPU waits for its earlier work here (EVENT_WRITE_EOS + WAIT_REG_MEM): everything recorded after it
     // waits for everything before it - the next command's global barrier (the batch-end barrier covers later batches)
     ++stats_.waits_by_held;
@@ -1423,6 +1452,10 @@ void Executor::SyncFrom(u32 source) {
 
 void Executor::Fence(const Cp::FenceOp& op) {
     batch_fence_ = true;
+    GuestSync(op.queue);
+    if (op.queue < guest_flush_.size()) {
+        guest_flush_[op.queue] |= 1ull << 62; // (diagnostics: an end-of-shader/pipe event: counted as a flush too)
+    }
     if (op.deferred && !op.written) {
         want_flush_ = true; // the processor holds it until the GPU completes the work before it
     }
@@ -1448,7 +1481,14 @@ void Executor::Dma(const Cp::DmaOp& op) {
     }
 }
 
-void Executor::CacheAction(const Cp::CacheActionOp&) {
+void Executor::CacheAction(const Cp::CacheActionOp& op) {
+    GuestSync(op.queue);
+    // (diagnostics: the guest's own flush between two of its dispatches - per queue, by event type; 63: ACQUIRE_MEM)
+    const u32 type = op.event == 0 ? 63u : (op.event & 0x3F);
+    ++stats_.guest_events[type];
+    if (op.queue < guest_flush_.size()) {
+        guest_flush_[op.queue] |= 1ull << type;
+    }
     // the guest's cache flushes/invalidations (EVENT_WRITE, ACQUIRE_MEM): no barrier of their own, as the bridge (it
     // ignores them too). The hazards they order are ordered here per resource: a buffer write -> a barrier before the
     // next command (pending_writes_), an image -> its tracked access, a CPU side effect -> Synchronize, the host's
@@ -1525,8 +1565,8 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             break;
         }
         case GS::BufferKind::Flatbuf: {
-            StreamRing::Slice sl{};
             const u64 bytes = plan.flat.size() * 4;
+            StreamRing::Slice sl{};
             if (bytes == 0 || ring_.Allocate(bytes, align, cur_.value, sl) != StreamRing::Status::Ok) {
                 Skipped(Skip::Ring, "flattened user data");
                 return false;
@@ -2899,8 +2939,35 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     if (d.indirect) {
         acc_reads_.emplace_back(d.indirect_addr, d.indirect_addr + 12);
     }
-    if (NeedsBarrier(acc_reads_, acc_writes_, acc_unknown)) {
+    // dispatches of one queue the guest does not order (no sync point between them) need no barrier for their range
+    // conflicts (P4.6 night; SSPC_P46_GUEST_ORDER=0: a barrier for every conflict - the earlier behaviour)
+    static const bool guest_order = [] {
+        char v[4] = {};
+        const bool off = GetEnvironmentVariableA("SSPC_P46_GUEST_ORDER", v, sizeof(v)) == 1 && v[0] == '0';
+        if (off) {
+            SSPC_LOG(GPU, Warning, "native backend: SSPC_P46_GUEST_ORDER=0 - a barrier for every range conflict between "
+                                   "dispatches");
+        } else {
+            SSPC_LOG(GPU, Info, "native backend: dispatches of one queue without a guest synchronization between them "
+                                "are not ordered by a barrier (SSPC_P46_GUEST_ORDER=0: they are)");
+        }
+        return !off;
+    }();
+    const u64 tag = guest_order && d.queue < guest_epoch_.size()
+                        ? ((u64{d.queue} + 1) << 32) | guest_epoch_[d.queue]
+                        : 0;
+    const u64 why_before = stats_.barrier_why[4] + stats_.barrier_why[5] + stats_.barrier_why[6];
+    if (NeedsBarrier(acc_reads_, acc_writes_, acc_unknown, tag)) {
         GlobalBarrier(8);
+        // diagnostics: a range conflict with the commands since the last barrier - did the guest flush (CS partial
+        // flush, ACQUIRE_MEM, ...) on this queue since its previous dispatch?
+        if (stats_.barrier_why[4] + stats_.barrier_why[5] + stats_.barrier_why[6] != why_before &&
+            d.queue < guest_flush_.size()) {
+            ++(guest_flush_[d.queue] != 0 ? stats_.conflict_guest_flushed : stats_.conflict_guest_silent);
+        }
+    }
+    if (d.queue < guest_flush_.size()) {
+        guest_flush_[d.queue] = 0;
     }
     for (CachedImage* img : bound) {
         const bool storage = (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) && img->gpu_written;
@@ -2955,7 +3022,21 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
-    if (d.indirect) {
+    // SSPC_DIAG_MEASURE=skip_q1small: MEASUREMENT ONLY (wrong output) - the compute queues' dispatches of < 8 groups
+    // are not executed: what they cost the GPU without the profiler's serialization (never a configuration)
+    static const bool skip_small = [] {
+        char v[32] = {};
+        const bool s = GetEnvironmentVariableA("SSPC_DIAG_MEASURE", v, sizeof(v)) > 0 &&
+                       std::string_view(v) == "skip_q1small";
+        if (s) {
+            SSPC_LOG(GPU, Warning, "MEASUREMENT ONLY: SSPC_DIAG_MEASURE=skip_q1small - small compute-queue dispatches are "
+                                   "not executed (the output is wrong)");
+        }
+        return s;
+    }();
+    if (skip_small && d.queue != 0 && !d.indirect && u64{d.groups[0]} * d.groups[1] * d.groups[2] < 8) {
+        // nothing recorded
+    } else if (d.indirect) {
         f.vkCmdDispatchIndirect(cur_.cb, argbuf, argoff);
     } else {
         f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
@@ -3100,7 +3181,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     if (acc_unknown) {
         ++stats_.unknown_by[1];
     }
-    NoteAccesses(acc_reads_, acc_writes_, acc_unknown);
+    NoteAccesses(acc_reads_, acc_writes_, acc_unknown, tag);
     stats_.t_dispatch += GS::Ticks() - t0;
     stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
 }

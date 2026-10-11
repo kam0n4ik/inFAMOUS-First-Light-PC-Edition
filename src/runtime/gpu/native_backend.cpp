@@ -950,6 +950,17 @@ std::string Backend::Report() {
                            "ranges {}, read-after-write {}, write-after-write {}, write-after-read {}\n",
                            s.barrier_why[0], s.barrier_why[1], s.barrier_why[2], s.barrier_why[3], s.barrier_why[4],
                            s.barrier_why[5], s.barrier_why[6]);
+        out += fmt::format("write-after-write barriers where both write GDS: {}\n", s.barrier_waw_gds);
+        out += fmt::format("dispatches barriered for a range conflict: the guest flushed on the queue since its last "
+                           "dispatch {}, did not {}; guest events:",
+                           s.conflict_guest_flushed, s.conflict_guest_silent);
+        out += fmt::format(" (barriers left out for dispatches the guest does not order: {})", s.barriers_guest_order);
+        for (u32 t = 0; t < 64; ++t) {
+            if (s.guest_events[t] != 0) {
+                out += fmt::format(" {:#x}={}", t, s.guest_events[t]);
+            }
+        }
+        out += "\n";
         out += fmt::format("writes of unknown extent: draws {}, dispatches {}, met waits {}, WRITE_DATA {}, GDS DMA {}, "
                            "evictions {}, other {}\n",
                            s.unknown_by[0], s.unknown_by[1], s.unknown_by[2], s.unknown_by[3], s.unknown_by[4],

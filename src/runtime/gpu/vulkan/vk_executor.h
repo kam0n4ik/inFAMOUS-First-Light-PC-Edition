@@ -103,6 +103,11 @@ struct ExecutorStats {
     /// barriers kept by NeedsBarrier, why: off, an unknown write pending, the command's own unknown accesses, too many
     /// ranges, read-after-write, write-after-write, write-after-read
     std::array<u64, 7> barrier_why{};
+    u64 barrier_waw_gds = 0; ///< of the write-after-write ones: both write GDS
+    std::array<u64, 64> guest_events{}; ///< the guest's EVENT_WRITE by event type (63: ACQUIRE_MEM)
+    /// dispatches barriered for a range conflict: the guest flushed on that queue since its previous dispatch / did not
+    u64 conflict_guest_flushed = 0, conflict_guest_silent = 0;
+    u64 barriers_guest_order = 0; ///< conflicts between dispatches the guest does not order (SSPC_P46_GUEST_ORDER)
     std::array<u64, 7> unknown_by{}; ///< writes of unknown extent by source (Executor::MarkWrites)
     std::array<u64, 3> wb_bytes_by{}; ///< write-back bytes by batch end: fence/flip/sync/idle, full+fence, full only
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
@@ -422,14 +427,30 @@ private:
     /// barriers as before. SSPC_DIAG_BARRIER_RANGES=off: always a barrier (the P4.6 behaviour).
     struct PendingRanges {
         std::vector<std::pair<u64, u64>> writes, reads;
+        /// per range: the dispatch's guest order tag (queue + 1 << 32 | the queue's guest sync epoch), 0 for others
+        std::vector<u64> wtags, rtags;
         bool unknown = false;
         void Clear() {
             writes.clear();
             reads.clear();
+            wtags.clear();
+            rtags.clear();
             unknown = false;
         }
     };
+    /// P4.6 night (SSPC_P46_GUEST_ORDER): the guest's own synchronization points per queue (an EVENT_WRITE/ACQUIRE_MEM,
+    /// a fence, a met wait). Two dispatches of one queue with none between them are not ordered on the PS4 either (the
+    /// CP launches the next one while the previous runs - the guest separates dependent dispatches with a CS partial
+    /// flush): a range conflict between such dispatches needs no barrier here. Measured in the village: 99% of the
+    /// dispatches barriered for a conflict had no guest synchronization since the queue's previous dispatch.
+    std::array<u32, Cp::kNumQueues> guest_epoch_{};
+    void GuestSync(u32 queue) {
+        if (queue < guest_epoch_.size()) {
+            ++guest_epoch_[queue];
+        }
+    }
     PendingRanges pend_;
+    std::array<u64, Cp::kNumQueues> guest_flush_{}; ///< diagnostics: event types the guest wrote since the queue's last dispatch
     static constexpr u64 kGdsRangeBase = 1ull << 48; ///< GDS in the range checks: above every guest address
     /// A write of unknown extent since the last barrier: the next command barriers.
     /// `site` (counted): 0 a draw, 1 a dispatch, 2 a met wait, 3 WRITE_DATA, 4 GDS DMA, 5 an eviction, 6 other
@@ -440,10 +461,10 @@ private:
     }
     /// The barrier a dispatch or a timeline copy needs before it: false when its ranges touch nothing pending.
     bool NeedsBarrier(const std::vector<std::pair<u64, u64>>& reads, const std::vector<std::pair<u64, u64>>& writes,
-                      bool unknown);
+                      bool unknown, u64 tag = 0);
     /// Its accesses noted for the next commands' decisions (after it was recorded).
     void NoteAccesses(const std::vector<std::pair<u64, u64>>& reads, const std::vector<std::pair<u64, u64>>& writes,
-                      bool unknown);
+                      bool unknown, u64 tag = 0);
     std::vector<std::pair<u64, u64>> acc_reads_, acc_writes_; ///< the command's own ranges (capacity reused)
     bool want_flush_ = false;
     bool flush_full_ = false;  ///< the flush in progress ends a full batch (max_draws_per_batch)
