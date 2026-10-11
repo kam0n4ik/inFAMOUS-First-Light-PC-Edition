@@ -45,6 +45,8 @@ void CpFlip(u64 gpu_value, const GpuThreadTotals& totals, u64 last_unblock_tsc);
 void GpuCompleted(u64 completed);
 /// The present thread showed the next EOP flip.
 void Presented();
+/// Seconds since the log started (the origin of the CSV's times); -1 before it started.
+double Seconds();
 /// The CSV (once the backend's threads stopped). false: not started or not written.
 bool Write(const std::filesystem::path& file);
 

@@ -151,6 +151,14 @@ void Presented() {
     }
 }
 
+double Seconds() {
+    if (!On()) {
+        return -1.0;
+    }
+    const double freq = static_cast<double>(std::max<u64>(Kernel::Clock::TscFrequency(), 1));
+    return static_cast<double>(Kernel::Clock::ReadTsc() - g_state.start) / freq;
+}
+
 bool Write(const std::filesystem::path& file) {
     if (!On()) {
         return false;

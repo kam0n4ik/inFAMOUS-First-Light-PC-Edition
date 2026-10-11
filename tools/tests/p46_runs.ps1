@@ -1,7 +1,7 @@
 # SecondSonPC P4.6: a measurement series of the native backend (or the bridge) over game scenes, repeated.
 #   powershell -ExecutionPolicy Bypass -File E:\SecondSonPC\tools\tests\p46_runs.ps1 -Tag <name>
 #       [-Scenes beach,early,user1022] [-Repeats 3] [-Seconds 90] [-Backend sspc|bridge] [-Validate] [-Env "A=b;C=d"]
-#       [-Exe <path to SecondSonPC.exe>]
+#       [-Exe <path to SecondSonPC.exe>] [-OutRoot <dir instead of logs\p46>]
 # Scenes (each run from a fresh copy of the save; the originals are never written):
 #   beach    logs\performance\p43_ab\snapshot\home   the P4.3-P4.5 reference route (beach, heavy foliage after the turn)
 #   early    userdata\savedata_backups\2026-10-10_03-44-58_before_manual_sspc   the harbour (the user's earliest save)
@@ -18,7 +18,8 @@ param(
     [ValidateSet("sspc", "bridge")][string]$Backend = "sspc",
     [switch]$Validate,
     [string]$Env = "",
-    [string]$Exe = ""
+    [string]$Exe = "",
+    [string]$OutRoot = ""
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -27,7 +28,7 @@ $sources = @{
     early    = "$root\userdata\savedata_backups\2026-10-10_03-44-58_before_manual_sspc"
     user1022 = "$root\logs\p32\scene_user_1022\home"
 }
-$outRoot = "$root\logs\p46\$Tag"
+$outRoot = if ($OutRoot) { "$OutRoot\$Tag" } else { "$root\logs\p46\$Tag" }
 New-Item -ItemType Directory -Force $outRoot | Out-Null
 $summary = "$outRoot\summary.txt"
 "p46 series '$Tag': backend $Backend, validate $($Validate.IsPresent), $Seconds s, repeats $Repeats, env '$Env', exe '$Exe'" |

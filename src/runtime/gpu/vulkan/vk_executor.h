@@ -27,6 +27,7 @@
 
 namespace SecondSon::Gpu::Shader {
 class ShaderFrontend;
+struct StageView;
 }
 
 namespace SecondSon::Gpu::Vk {
@@ -73,6 +74,7 @@ struct ExecutorStats {
     u64 gpu_busy_ns = 0, gpu_batches_timed = 0; ///< the GPU's time executing batches (timestamps)
     u64 submit_ns = 0;                          ///< CPU time in vkQueueSubmit2
     u64 lds_dispatches = 0, lds_max_bytes = 0;  ///< dispatches with the emulated LDS buffer
+    u64 diag_skipped_draws = 0, diag_skipped_dispatches = 0; ///< SSPC_DIAG_SKIP_DRAWS / _DISPATCHES (diagnostic)
     u64 streamed = 0, streamed_bytes = 0; ///< small read-only ranges the CPU rewrote, copied into the stream ring
     u64 ring_mirror_copies = 0;           ///< hybrid ring: host -> video memory copies at the head of submissions
     u64 stream_promotions = 0;            ///< small read-only ranges cached instead of streamed (BufferCache::Promotable)
@@ -343,6 +345,21 @@ private:
         OwnedBuffer buffer;
     };
     std::deque<ArgsReadback> args_rb_;
+    /// SSPC_DIAG_PROBE=<vs|ps hex address or hash>:<first flip>:<flips>:<bindings>[:<max bytes>] (smoke research): at the
+    /// matching draw, the listed guest buffer bindings of its VS ('+'-separated indices in the order of the command
+    /// trace's R0 ranges; 'a': the indirect arguments) read back as the draw reads them ->
+    /// logs\smoke_research\probe\f<flip>_<binding>_<address>.bin
+    struct ProbeReadback {
+        u64 value, size;
+        std::string name;
+        OwnedBuffer buffer;
+    };
+    std::deque<ProbeReadback> probe_rb_;
+    void Probe(const Cp::DrawDescriptor& d, const GS::StageView& vs, const GS::StageView* ps);
+    /// SSPC_DIAG_PROBE_CS (same form): the bindings of a matching dispatch before and after it.
+    void ProbeDispatch(const Cp::DispatchDescriptor& d, const GS::StageView& cs, bool after);
+    void ProbeCopies(const std::string& prefix, const GS::StageView& stage, const std::vector<s32>& bindings,
+                     u64 max_bytes, u64 args_addr, u64 args_size);
     Histo histo_;
     /// SSPC_DIAG_RACE: streamed ranges re-read at the flip (P4.5)
     void RaceCheck();
@@ -383,6 +400,55 @@ private:
     std::unordered_set<u64> dumped_shaders_; ///< SSPC_DIAG_DUMP_SHADER: the variants written
     void DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>& color_img);
     void DiagCaptureDraw(u32 pipeline, const std::array<CachedImage*, 8>& color_img, bool after);
+    /// Smoke research (docs/PHASE4_SMOKE_PIPELINE.md): SSPC_DIAG_CMD_TRACE=<first flip | t<seconds>>:<flips> - every
+    /// draw and dispatch of those flips, and every one not executed, in recording order with the programs' stable
+    /// identities (PGM address, footer hash, content hash), targets, states, textures and guest ranges, kept in memory
+    /// and written once after the last flip -> logs\smoke_research\cmd_trace.txt. SSPC_DIAG_SKIP_DRAWS /
+    /// SSPC_DIAG_SKIP_DISPATCHES=<spec>[,<spec>...] (vs:|ps:|cs:<hex address or hash>, p:<pipeline>, rt:<hex target>,
+    /// n:<first>-<last> ordinal in the frame): those commands not executed - only the draw/dispatch command itself, after
+    /// its render pass, barriers, clears, state and uploads were recorded (diagnostic only; never a configuration).
+    struct CmdTraceEntry {
+        u64 frame = 0, seq = 0, packet = 0, batch = 0, barriers = 0;
+        u64 address[2]{}, footer[2]{}, content[2]{}; ///< VS/PS (CS in [0])
+        u64 args = 0, depth = 0;
+        std::array<u64, 8> rt{};
+        std::array<u32, 8> rt_fmt{};
+        u32 ordinal = 0, pipeline = 0, prim = 0, count = 0, instances = 0, blend0 = 0, depth_control = 0;
+        u32 groups[3]{};
+        u32 ranges_begin = 0, ranges_count = 0, images_begin = 0, images_count = 0, skip_text = 0;
+        u8 queue = 0;
+        char kind = 'D';   ///< D draw, X dispatch, S not executed (skip_text: why)
+        u8 skip = 0;       ///< S: the Skip; D/X: 1 when SSPC_DIAG_SKIP_* left the command out
+        bool indexed = false, indirect = false;
+    };
+    struct CmdTraceRange {
+        u64 address, size;
+        u8 stage;          ///< 0 VS/CS, 1 PS, 2 vertex buffer, 3 index buffer, 4 indirect arguments
+        bool written;
+    };
+    struct CmdTraceState {
+        bool on = false, by_time = false, written = false;
+        u64 first = 0, flips = 0, frame = 0;
+        u32 ordinal = 0;
+        std::vector<CmdTraceEntry> entries;
+        std::vector<CmdTraceRange> ranges;
+        std::vector<u64> images; ///< textures (guest address << 8 | pixel format low bits)
+        std::vector<std::string> skip_texts;
+        bool Active() const { return on && !by_time && frame >= first && frame < first + flips; }
+    };
+    struct CmdFilter {
+        char what;         ///< v, p (PS), c, P (pipeline), r (target), n (ordinal range)
+        u64 value, last;
+    };
+    CmdTraceState trace_;
+    std::vector<CmdFilter> skip_draws_, skip_dispatches_;
+    void CmdTraceInit();
+    void CmdTraceFlip();
+    void CmdTraceWrite();
+    static bool StageMatches(const GS::StageView& s, u64 value);
+    /// The command's entry (kind D or X) with its identities; the caller adds ranges/images.
+    CmdTraceEntry& CmdTraceAdd(char kind, u32 queue, u64 seq, u64 packet);
+    void CmdTraceRanges(const GS::ResourceBindingPlan& plan, u8 stage);
     /// Over the image budget: GPU-written images written back to their memory and freed (P4.5, R7).
     void EvictGpuImages();
     OwnedBuffer diag_scratch_; ///< SSPC_DIAG_DUP_DISPATCH: a dense copy of the dispatch's buffers

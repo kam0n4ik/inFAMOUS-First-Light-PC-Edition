@@ -211,9 +211,13 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                                    "at their place (a timestamp there)");
         }
     }
+    CmdTraceInit();
 }
 
 Executor::~Executor() {
+    if (trace_.on && !trace_.written && !trace_.entries.empty()) {
+        CmdTraceWrite(); // the run ended inside the traced flips
+    }
     const auto& f = Fn();
     const VkDevice dev = ctx_.Device();
     if (queries_ != VK_NULL_HANDLE) {
@@ -257,6 +261,12 @@ void Executor::SetQueuePipe(u32 queue, u32 pipe) {
 }
 
 void Executor::Skipped(Skip why, const std::string& detail) {
+    if (trace_.Active()) {
+        CmdTraceEntry& e = CmdTraceAdd('S', 0, 0, 0);
+        e.skip = static_cast<u8>(why);
+        e.skip_text = static_cast<u32>(trace_.skip_texts.size());
+        trace_.skip_texts.push_back(detail);
+    }
     const auto i = static_cast<size_t>(why);
     if (stats_.skipped[i]++ == 0) {
         stats_.first_skip[i] = detail;
@@ -758,6 +768,16 @@ void Executor::Poll() {
         histo_.args.flush();
         DestroyBuffer(ctx_, a.buffer);
         args_rb_.pop_front();
+    }
+    while (!probe_rb_.empty() && probe_rb_.front().value <= completed) {
+        auto& p = probe_rb_.front();
+        const auto dir = options_.capture_path.parent_path().parent_path() / "smoke_research" / "probe";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream(dir / (p.name + ".bin"), std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(p.buffer.mapped), static_cast<std::streamsize>(p.size));
+        DestroyBuffer(ctx_, p.buffer);
+        probe_rb_.pop_front();
     }
     buffers_.Collect(completed);
     std::erase_if(lds_retired_, [&](auto& e) {
@@ -2150,6 +2170,7 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
 void Executor::Draw(const Cp::DrawDescriptor& d) {
     const u64 t0 = GS::Ticks();
     ++stats_.draws;
+    ++trace_.ordinal;
     const auto& f = Fn();
     const Cp::RegisterFile& regs = cp_->Registers();
     const u32 mode = (regs.Get(kCbColorControl) >> 4) & 7;
@@ -2526,6 +2547,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
             }
         }
     }
+    Probe(d, vs, has_ps ? &ps : nullptr);
     // once per pipeline and target images (the register versions in the label's key change almost every draw:
     // g2_village_markers wrote 141 MB keyed by them)
     if (markers_ && label_open_ &&
@@ -2795,6 +2817,72 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
+    // smoke research: SSPC_DIAG_SKIP_DRAWS leaves out only the draw command (its render pass, barriers, clears, state
+    // and uploads above are recorded as for any draw); SSPC_DIAG_CMD_TRACE keeps the command's identities
+    bool diag_skip = false;
+    for (const CmdFilter& c : skip_draws_) {
+        diag_skip = diag_skip || (c.what == 'v' && StageMatches(vs, c.value)) ||
+                    (c.what == 'p' && has_ps && StageMatches(ps, c.value)) || (c.what == 'P' && prep.pipeline == c.value) ||
+                    (c.what == 'n' && trace_.ordinal >= c.value && trace_.ordinal <= c.last) ||
+                    (c.what == 'r' && std::ranges::any_of(color_img, [&](const CachedImage* i) {
+                         return i != nullptr && i->layout.guest_address == c.value;
+                     }));
+    }
+    if (trace_.Active()) {
+        CmdTraceEntry& e = CmdTraceAdd('D', d.queue, d.seq, d.packet_addr);
+        e.skip = diag_skip ? 1 : 0;
+        e.pipeline = prep.pipeline;
+        e.address[0] = vs.address;
+        e.footer[0] = vs.footer_hash;
+        e.content[0] = vs.program != nullptr ? vs.program->id.hash.lo : 0;
+        if (has_ps) {
+            e.address[1] = ps.address;
+            e.footer[1] = ps.footer_hash;
+            e.content[1] = ps.program != nullptr ? ps.program->id.hash.lo : 0;
+        }
+        e.prim = d.primitive_type;
+        e.count = d.index_count;
+        e.instances = d.instance_count;
+        e.indexed = d.indexed;
+        e.indirect = d.indirect;
+        e.args = d.indirect ? d.args_addr : 0;
+        for (u32 i = 0; i < 8; ++i) {
+            if (color_img[i] != nullptr) {
+                e.rt[i] = color_img[i]->layout.guest_address;
+                e.rt_fmt[i] = color_img[i]->layout.pixel_format;
+            }
+        }
+        e.depth = depth_img != nullptr ? depth_img->layout.guest_address : 0;
+        e.blend0 = regs.Get(0xA1E0);
+        e.depth_control = dc;
+        CmdTraceRanges(vs.plan, 0);
+        if (has_ps) {
+            CmdTraceRanges(ps.plan, 1);
+        }
+        for (const auto& v : vs.plan.vertices) {
+            if (v.address != 0 && v.size != 0) {
+                trace_.ranges.push_back({v.address, v.size, 2, false});
+            }
+        }
+        if (d.indexed) {
+            const u32 isize = idx32 ? 4 : 2;
+            trace_.ranges.push_back({d.index_base + u64{d.index_offset} * isize,
+                                     (d.indirect ? d.max_index_size : std::min(d.index_count, d.max_index_size)) * u64{isize},
+                                     3, false});
+        }
+        if (d.indirect) {
+            trace_.ranges.push_back({d.args_addr, d.indexed ? 20u : 16u, 4, false});
+        }
+        e.ranges_count = static_cast<u32>(trace_.ranges.size()) - e.ranges_begin;
+        for (const CachedImage* img : bound) {
+            trace_.images.push_back(img->layout.guest_address | (u64{img->layout.pixel_format & 0x7FFFFF} << 40) |
+                                    (img->gpu_written && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) ? 1ull << 63 : 0));
+        }
+        e.images_count = static_cast<u32>(trace_.images.size()) - e.images_begin;
+    }
+    if (diag_skip) {
+        ++stats_.diag_skipped_draws;
+    } else {
     if (d.indexed) {
         if (ibuf != VK_NULL_HANDLE) {
             f.vkCmdBindIndexBuffer(cur_.cb, ibuf, ioff, idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
@@ -2817,6 +2905,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
     } else {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
+    }
     }
     DiagEnd(cid);
     DiagCaptureDraw(prep.pipeline, color_img, true);
@@ -2919,6 +3008,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
 void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     const u64 t0 = GS::Ticks();
     ++stats_.dispatches;
+    ++trace_.ordinal;
     const auto& f = Fn();
     const Cp::ComputeRegisters* cs = cp_->Compute(d.queue);
     const u64 tf0 = GS::FineTicks();
@@ -3158,7 +3248,40 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         }
         return s;
     }();
-    if (skip_small && d.queue != 0 && !d.indirect && u64{d.groups[0]} * d.groups[1] * d.groups[2] < 8) {
+    ProbeDispatch(d, csv, false);
+    // smoke research: SSPC_DIAG_SKIP_DISPATCHES leaves out only the dispatch command (its barrier, shadows and noted
+    // accesses stay); SSPC_DIAG_CMD_TRACE keeps the command's identities
+    bool diag_skip = false;
+    for (const CmdFilter& c : skip_dispatches_) {
+        diag_skip = diag_skip || (c.what == 'c' && StageMatches(csv, c.value)) ||
+                    (c.what == 'n' && trace_.ordinal >= c.value && trace_.ordinal <= c.last);
+    }
+    if (trace_.Active()) {
+        CmdTraceEntry& e = CmdTraceAdd('X', d.queue, d.seq, d.packet_addr);
+        e.skip = diag_skip ? 1 : 0;
+        e.pipeline = prep.pipeline;
+        e.address[0] = csv.address;
+        e.footer[0] = csv.footer_hash;
+        e.content[0] = csv.program != nullptr ? csv.program->id.hash.lo : 0;
+        e.groups[0] = d.groups[0];
+        e.groups[1] = d.groups[1];
+        e.groups[2] = d.groups[2];
+        e.indirect = d.indirect;
+        e.args = d.indirect ? d.indirect_addr : 0;
+        CmdTraceRanges(csv.plan, 0);
+        if (d.indirect) {
+            trace_.ranges.push_back({d.indirect_addr, 12, 4, false});
+        }
+        e.ranges_count = static_cast<u32>(trace_.ranges.size()) - e.ranges_begin;
+        for (const CachedImage* img : bound) {
+            trace_.images.push_back(img->layout.guest_address | (u64{img->layout.pixel_format & 0x7FFFFF} << 40) |
+                                    (img->gpu_written && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) ? 1ull << 63 : 0));
+        }
+        e.images_count = static_cast<u32>(trace_.images.size()) - e.images_begin;
+    }
+    if (diag_skip) {
+        ++stats_.diag_skipped_dispatches;
+    } else if (skip_small && d.queue != 0 && !d.indirect && u64{d.groups[0]} * d.groups[1] * d.groups[2] < 8) {
         // nothing recorded
     } else if (d.indirect) {
         f.vkCmdDispatchIndirect(cur_.cb, argbuf, argoff);
@@ -3275,6 +3398,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         }
     }
     FinishShadows();
+    ProbeDispatch(d, csv, true);
     ++stats_.dispatches_executed;
     if (histo_.active) {
         auto& e = histo_.dispatches[csv.address];
@@ -3312,12 +3436,19 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
 
 void Executor::CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h) {
     // SSPC_DIAG_CAPTURE_FRAMES=<first flip>:<count>[:<step>[:<downsample>]]: a series of presented frames ->
-    // logs\p45\frames\flip_N.png (consecutive frames: flicker, frame-to-frame differences; P4.5)
-    static const std::array<u64, 4> series = [] {
+    // logs\p45\frames\flip_N.png (consecutive frames: flicker, frame-to-frame differences; P4.5). `t<seconds>` as the
+    // first: the first flip at or after that time of the frame log (the smoke benchmark: a place on the route, not a
+    // flip number that depends on the frame rate)
+    static bool by_time = false;
+    static std::array<u64, 4> series = [] {
         std::array<u64, 4> v{0, 0, 1, 1};
         char s[64] = {};
         if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_FRAMES", s, sizeof(s)) > 0) {
             char* p = s;
+            if (*p == 't') {
+                by_time = true;
+                ++p;
+            }
             for (u64& x : v) {
                 x = std::strtoull(p, &p, 10);
                 if (*p != ':') {
@@ -3326,8 +3457,8 @@ void Executor::CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 
                 ++p;
             }
             v[2] = std::max<u64>(v[2], 1);
-            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_FRAMES - flips {} .. {} (step {}) captured to PNG (slower)",
-                     v[0], v[0] + v[1] * v[2], v[2]);
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_FRAMES - {} {} + {} flips (step {}) captured to PNG (slower)",
+                     by_time ? "from second" : "from flip", v[0], v[1] * v[2], v[2]);
         }
         return v;
     }();
@@ -3335,6 +3466,14 @@ void Executor::CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 
         return;
     }
     const u64 id = VideoOut::NextFlipId();
+    if (by_time) {
+        if (FrameLog::Seconds() < static_cast<double>(series[0])) {
+            return;
+        }
+        by_time = false;
+        series[0] = id;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_FRAMES - the series starts at flip {}", id);
+    }
     if (id < series[0] || id >= series[0] + series[1] * series[2] || (id - series[0]) % series[2] != 0) {
         return;
     }
@@ -3762,6 +3901,290 @@ void Executor::DiagCaptureBefore(u32 pipeline, const std::array<CachedImage*, 8>
     }
 }
 
+namespace {
+
+/// SSPC_DIAG_PROBE / SSPC_DIAG_PROBE_CS: <hex address or hash>:<first flip>:<flips>:<bindings>[:<max bytes>]
+struct ProbeSpec {
+    u64 shader = 0, first = 0, flips = 0, max_bytes = 1ull << 20;
+    std::vector<s32> bindings; ///< -1: the indirect arguments
+};
+
+ProbeSpec ParseProbeSpec(const char* name) {
+    ProbeSpec v;
+    char s[256] = {};
+    if (GetEnvironmentVariableA(name, s, sizeof(s)) == 0) {
+        return v;
+    }
+    char* p = s;
+    v.shader = std::strtoull(p, &p, 16);
+    v.first = *p == ':' ? std::strtoull(p + 1, &p, 10) : 0;
+    v.flips = *p == ':' ? std::strtoull(p + 1, &p, 10) : 0;
+    if (*p == ':') {
+        ++p;
+        while (*p != 0 && *p != ':') {
+            if (*p == 'a') {
+                v.bindings.push_back(-1);
+                ++p;
+            } else {
+                v.bindings.push_back(static_cast<s32>(std::strtol(p, &p, 10)));
+            }
+            if (*p == '+') {
+                ++p;
+            }
+        }
+    }
+    if (*p == ':') {
+        v.max_bytes = std::strtoull(p + 1, &p, 10);
+    }
+    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: {} - shader {:#x}, flips {} .. {}, {} bindings read back (up to {} bytes each)",
+             name, v.shader, v.first, v.first + v.flips, v.bindings.size(), v.max_bytes);
+    return v;
+}
+
+} // namespace
+
+void Executor::ProbeCopies(const std::string& prefix, const GS::StageView& stage, const std::vector<s32>& bindings,
+                           u64 max_bytes, u64 args_addr, u64 args_size) {
+    std::vector<std::pair<u64, u64>> guest; // the stage's guest buffers, as the command trace lists them (R0)
+    for (const auto& b : stage.plan.buffers) {
+        if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.address != 0 && b.size != 0) {
+            guest.emplace_back(b.address, b.size);
+        }
+    }
+    EndRendering();
+    GlobalBarrier(); // always: after a dispatch its writes are not noted yet
+    for (const s32 k : bindings) {
+        u64 addr = 0, size = 0, off = 0, avail = 0;
+        if (k < 0) {
+            if (args_addr == 0) {
+                continue;
+            }
+            addr = args_addr;
+            size = args_size;
+        } else {
+            if (static_cast<size_t>(k) >= guest.size()) {
+                continue;
+            }
+            addr = guest[k].first;
+            size = std::min(guest[k].second, max_bytes);
+        }
+        VkBuffer src = VK_NULL_HANDLE;
+        if (!GuestRange(addr, size, false, 4, src, off, avail)) {
+            continue;
+        }
+        size = std::min(size, avail);
+        OwnedBuffer rb;
+        std::string err;
+        if (!CreateBuffer(ctx_, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, rb, err, true, HostPlacement::Cached)) {
+            continue;
+        }
+        const VkBufferCopy c{.srcOffset = off, .dstOffset = 0, .size = size};
+        Fn().vkCmdCopyBuffer(cur_.cb, src, rb.buffer, 1, &c);
+        probe_rb_.push_back({cur_.value, size,
+                             fmt::format("{}_{}_{:x}", prefix, k < 0 ? std::string("a") : std::to_string(k), addr),
+                             std::move(rb)});
+    }
+    // the copies' reads before any later write of those buffers; their writes visible to the host
+    const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                              .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                              .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                              .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                              .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                               .pMemoryBarriers = &mb};
+    Fn().vkCmdPipelineBarrier2(cur_.cb, &dep);
+}
+
+void Executor::Probe(const Cp::DrawDescriptor& d, const GS::StageView& vs, const GS::StageView* ps) {
+    static const ProbeSpec spec = ParseProbeSpec("SSPC_DIAG_PROBE");
+    if (spec.flips == 0 || (!StageMatches(vs, spec.shader) && (ps == nullptr || !StageMatches(*ps, spec.shader)))) {
+        return;
+    }
+    const u64 flip = VideoOut::NextFlipId();
+    if (flip >= spec.first && flip < spec.first + spec.flips) {
+        ProbeCopies(fmt::format("f{}", flip), vs, spec.bindings, spec.max_bytes, d.indirect ? d.args_addr : 0,
+                    d.indexed ? 20 : 16);
+    }
+}
+
+void Executor::ProbeDispatch(const Cp::DispatchDescriptor& d, const GS::StageView& cs, bool after) {
+    // SSPC_DIAG_PROBE_CS: the bindings before and after every matching dispatch of those flips -> f<flip>_<ordinal in the
+    // frame>_<pre|post>_<binding>_<address>.bin (which pass of a chain changes what)
+    static const ProbeSpec spec = ParseProbeSpec("SSPC_DIAG_PROBE_CS");
+    if (spec.flips == 0 || !StageMatches(cs, spec.shader)) {
+        return;
+    }
+    const u64 flip = VideoOut::NextFlipId();
+    if (flip >= spec.first && flip < spec.first + spec.flips) {
+        ProbeCopies(fmt::format("f{}_{}_{}", flip, trace_.ordinal, after ? "post" : "pre"), cs, spec.bindings,
+                    spec.max_bytes, d.indirect ? d.indirect_addr : 0, 12);
+    }
+}
+
+void Executor::CmdTraceInit() {
+    char s[512] = {};
+    if (GetEnvironmentVariableA("SSPC_DIAG_CMD_TRACE", s, sizeof(s)) > 0) {
+        char* p = s;
+        if (*p == 't') {
+            trace_.by_time = true;
+            ++p;
+        }
+        trace_.first = std::strtoull(p, &p, 10);
+        trace_.flips = *p == ':' ? std::strtoull(p + 1, &p, 10) : 1;
+        trace_.on = trace_.flips != 0;
+        trace_.entries.reserve(8192);
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CMD_TRACE - every command of {} flips from {} {} kept and written "
+                               "to smoke_research\\cmd_trace.txt",
+                 trace_.flips, trace_.by_time ? "second" : "flip", trace_.first);
+    }
+    const auto filters = [](const char* name, std::vector<CmdFilter>& out) {
+        char v[512] = {};
+        if (GetEnvironmentVariableA(name, v, sizeof(v)) == 0) {
+            return;
+        }
+        for (char* p = v; *p != 0;) {
+            CmdFilter c{0, 0, 0};
+            const std::string_view rest(p);
+            const auto take = [&](std::string_view prefix, char what) {
+                if (c.what == 0 && rest.starts_with(prefix)) {
+                    c.what = what;
+                    p += prefix.size();
+                }
+            };
+            take("vs:", 'v');
+            take("ps:", 'p');
+            take("cs:", 'c');
+            take("rt:", 'r');
+            take("p:", 'P');
+            take("n:", 'n');
+            if (c.what == 0) {
+                SSPC_LOG(GPU, Error, "{}: '{}' is not vs:|ps:|cs:|rt:<hex>, p:<pipeline> or n:<first>-<last>", name, rest);
+                return;
+            }
+            c.value = std::strtoull(p, &p, c.what == 'P' || c.what == 'n' ? 10 : 16);
+            c.last = c.value;
+            if (c.what == 'n' && *p == '-') {
+                c.last = std::strtoull(p + 1, &p, 10);
+            }
+            out.push_back(c);
+            while (*p == ',' || *p == ' ') {
+                ++p;
+            }
+        }
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: {}={} - {} filters; the matching commands are not executed", name,
+                 v, out.size());
+    };
+    filters("SSPC_DIAG_SKIP_DRAWS", skip_draws_);
+    filters("SSPC_DIAG_SKIP_DISPATCHES", skip_dispatches_);
+}
+
+bool Executor::StageMatches(const GS::StageView& s, u64 value) {
+    return value != 0 && (s.address == value || s.footer_hash == value ||
+                          (s.program != nullptr && s.program->id.hash.lo == value));
+}
+
+Executor::CmdTraceEntry& Executor::CmdTraceAdd(char kind, u32 queue, u64 seq, u64 packet) {
+    CmdTraceEntry& e = trace_.entries.emplace_back();
+    e.kind = kind;
+    e.frame = trace_.frame;
+    e.ordinal = trace_.ordinal;
+    e.queue = static_cast<u8>(queue);
+    e.seq = seq;
+    e.packet = packet;
+    e.batch = cur_.value;
+    e.barriers = stats_.global_barriers;
+    e.ranges_begin = static_cast<u32>(trace_.ranges.size());
+    e.images_begin = static_cast<u32>(trace_.images.size());
+    return e;
+}
+
+void Executor::CmdTraceRanges(const GS::ResourceBindingPlan& plan, u8 stage) {
+    for (const auto& b : plan.buffers) {
+        if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.address != 0 && b.size != 0) {
+            trace_.ranges.push_back({b.address, b.size, stage, b.written});
+        } else if (b.kind == GS::BufferKind::GdsBuffer) {
+            trace_.ranges.push_back({0, gds_.size, stage, b.written}); // address 0: GDS
+        }
+    }
+}
+
+void Executor::CmdTraceFlip() {
+    trace_.ordinal = 0;
+    if (!trace_.on) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId(); // this flip ends the frame recorded so far
+    trace_.frame = id + 1;
+    if (trace_.by_time && FrameLog::Seconds() >= static_cast<double>(trace_.first)) {
+        trace_.by_time = false;
+        trace_.first = id + 1;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CMD_TRACE - flips {} .. {}", trace_.first,
+                 trace_.first + trace_.flips - 1);
+    }
+    if (!trace_.by_time && !trace_.written && id + 1 >= trace_.first + trace_.flips && !trace_.entries.empty()) {
+        CmdTraceWrite();
+    }
+}
+
+void Executor::CmdTraceWrite() {
+    trace_.written = true;
+    const auto dir = options_.capture_path.parent_path().parent_path() / "smoke_research";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream out(dir / "cmd_trace.txt", std::ios::trunc);
+    out << "# SSPC_DIAG_CMD_TRACE: commands in recording order. f<flip> #<ordinal in the frame> D|X|S q<guest queue> seq "
+           "<queue's work seq> @<PM4 packet> b<batch (timeline value)> gb<global barriers so far>\n"
+           "# D: p<pipeline> vs/ps <PGM address>/<footer hash>/<content hash lo> prim count inst [idx] [ind <args>] "
+           "rt<i> <addr>:<VkFormat> depth blend0 dc [SKIPPED]\n"
+           "# X: cs <address>/<footer>/<content> groups [ind <args>]; S: not executed (why: detail)\n"
+           "# | R<stage: 0 VS/CS 1 PS 2 vertex 3 index 4 args>[W] <addr>+<size> (addr 0: GDS) | T <texture addr>:<fmt>[ S] "
+           "(S: storage, GPU-written)\n";
+    for (const CmdTraceEntry& e : trace_.entries) {
+        std::string line = fmt::format("f{} #{} {} q{} seq {} @{:x} b{} gb{}", e.frame, e.ordinal, e.kind, e.queue, e.seq,
+                                       e.packet, e.batch, e.barriers);
+        if (e.kind == 'S') {
+            line += fmt::format(" ({}: {})", SkipName(static_cast<Skip>(e.skip)),
+                                e.skip_text < trace_.skip_texts.size() ? trace_.skip_texts[e.skip_text] : "");
+        } else if (e.kind == 'D') {
+            line += fmt::format(" p{} vs {:x}/{:x}/{:x} ps {:x}/{:x}/{:x} prim {} count {} inst {}{}", e.pipeline,
+                                e.address[0], e.footer[0], e.content[0], e.address[1], e.footer[1], e.content[1], e.prim,
+                                e.count, e.instances, e.indexed ? " idx" : "");
+            if (e.indirect) {
+                line += fmt::format(" ind {:x}", e.args);
+            }
+            for (u32 i = 0; i < 8; ++i) {
+                if (e.rt[i] != 0) {
+                    line += fmt::format(" rt{} {:x}:{}", i, e.rt[i], e.rt_fmt[i]);
+                }
+            }
+            line += fmt::format(" depth {:x} blend0 {:x} dc {:x}", e.depth, e.blend0, e.depth_control);
+        } else {
+            line += fmt::format(" cs {:x}/{:x}/{:x} groups {}x{}x{}", e.address[0], e.footer[0], e.content[0], e.groups[0],
+                                e.groups[1], e.groups[2]);
+            if (e.indirect) {
+                line += fmt::format(" ind {:x}", e.args);
+            }
+        }
+        if (e.skip != 0 && e.kind != 'S') {
+            line += " SKIPPED";
+        }
+        for (u32 i = 0; i < e.ranges_count; ++i) {
+            const CmdTraceRange& r = trace_.ranges[e.ranges_begin + i];
+            line += fmt::format(" | R{}{} {:x}+{:x}", r.stage, r.written ? "W" : "", r.address, r.size);
+        }
+        for (u32 i = 0; i < e.images_count; ++i) {
+            const u64 t = trace_.images[e.images_begin + i];
+            line += fmt::format(" | T {:x}:{}{}", t & 0xFF'FFFF'FFFFull, (t >> 40) & 0x7FFFFF, (t >> 63) ? " S" : "");
+        }
+        out << line << '\n';
+    }
+    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CMD_TRACE - {} commands written", trace_.entries.size());
+    trace_.entries = {};
+    trace_.ranges = {};
+    trace_.images = {};
+    trace_.skip_texts = {};
+}
+
 void Executor::EvictGpuImages() {
     // over the image budget after the uploaded images went (P4.5, R7): the GPU-written ones the cache gives back are
     // copied to their guest memory in this batch - through GuestRange's write path, as a DMA copy on the timeline (the
@@ -3807,6 +4230,7 @@ void Executor::Flip(const Cp::FlipMarker&) {
     CaptureImageAt();
     DrawHistogram();
     RaceCheck();
+    CmdTraceFlip();
     ++stats_.flips;
     if (prof_ && ++prof_frames_ >= 300) {
         ProfReport();

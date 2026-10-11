@@ -896,6 +896,11 @@ std::string Backend::Report() {
                                    s.skipped[i], s.first_skip[i]);
             }
         }
+        if (s.diag_skipped_draws + s.diag_skipped_dispatches != 0) {
+            out += fmt::format("  DIAGNOSTIC: left out by SSPC_DIAG_SKIP_DRAWS {} draws, SSPC_DIAG_SKIP_DISPATCHES {} "
+                               "dispatches\n",
+                               s.diag_skipped_draws, s.diag_skipped_dispatches);
+        }
     }
     if (images_) {
         const auto i = images_->Stats();

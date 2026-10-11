@@ -350,6 +350,13 @@ void ApplyBridgeSettings(const App::Config& cfg) {
         SSPC_LOG(Bridge, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BRIDGE_READBACKS={} - the bridge reads GPU writes back",
                  rb[0]);
     }
+    // smoke research: SSPC_DIAG_BRIDGE_DUMP_SHADERS=1 - the recompiler's dumps of every shader it translates (the IR after
+    // its passes, among them the wave64 lowering) -> the bridge's shader directory\dumps
+    if (char dv[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_BRIDGE_DUMP_SHADERS", dv, sizeof(dv)) == 1 && dv[0] == '1') {
+        s.SetDumpShaders(true);
+        SSPC_LOG(Bridge, Warning, "DIAGNOSTIC: SSPC_DIAG_BRIDGE_DUMP_SHADERS=1 - every translated shader dumped to {}",
+                 (Common::FS::GetUserPath(Common::FS::PathType::ShaderDir) / "dumps").string());
+    }
     // [Audio]
     s.SetAudioBackend(AudioBackend::SDL);
     s.SetVolumeSlider(static_cast<int>(cfg.volume));
