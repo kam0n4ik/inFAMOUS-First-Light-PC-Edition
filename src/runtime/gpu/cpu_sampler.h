@@ -21,6 +21,10 @@ public:
     ~CpuSampler();
     /// Samples `thread` (suspend and context rights) every `period_us` once `delay_s` seconds have passed.
     bool Start(HANDLE thread, u32 period_us, u32 delay_s);
+    /// Samples every thread of the process whose description contains `name_part` (found once `delay_s` have passed),
+    /// without the unwinder (a game thread may be inside exception dispatch, holding what RtlLookupFunctionEntry
+    /// takes): the instruction pointer and the nearest return address into the executable found on the stack.
+    bool StartByName(const std::wstring& name_part, u32 period_us, u32 delay_s);
     /// Stops sampling (before the target thread ends).
     void Stop();
     bool Running() const { return started_; }
@@ -40,6 +44,16 @@ private:
     void Count(u64 pc, bool leaf, bool own);
 
     HANDLE thread_ = nullptr;
+    std::wstring name_part_;          ///< StartByName: the threads to find
+    std::vector<HANDLE> threads_;     ///< StartByName: the threads found (owned)
+    bool unwind_ = true;
+    alignas(16) CONTEXT last_ctx_{}; ///< StartByName: the registers of a sample at the hottest address (at report)
+    bool have_ctx_ = false;
+    struct PcContext {
+        u64 pc = 0;
+        alignas(16) CONTEXT ctx{};
+    };
+    std::vector<PcContext> ctx_by_pc_; ///< StartByName: the latest registers at each of the first 256 addresses
     u32 period_us_ = 1000;
     u32 delay_s_ = 0;
     std::thread sampler_;

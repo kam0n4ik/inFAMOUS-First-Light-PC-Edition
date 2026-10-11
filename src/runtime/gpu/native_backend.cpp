@@ -215,6 +215,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> device_lost_{false};
     std::thread thread_;
+    CpuSampler game_sampler_; ///< SSPC_DIAG_SAMPLE_GAME=<name part>: the game's threads (gpu_cpu_profile_game.txt)
     CpuSampler sampler_; ///< SSPC_DIAG_SAMPLE=1: where the GPU thread's CPU time goes (logs\gpu_cpu_profile.txt)
     bool submit_done_ = false;
     std::array<bool, Cp::kNumQueues> mapped_{};
@@ -358,6 +359,10 @@ bool Backend::Start(const Options& o, std::string& error) {
         const u32 after = GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_AFTER", delay, sizeof(delay)) > 0
                               ? static_cast<u32>(std::strtoul(delay, nullptr, 10))
                               : 30;
+        char game[64] = {};
+        if (const DWORD gn = GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_GAME", game, sizeof(game)); gn > 0) {
+            game_sampler_.StartByName(std::wstring(game, game + gn), 1000, after);
+        }
         if (sampler_.Start(reinterpret_cast<HANDLE>(thread_.native_handle()), 1000, after)) {
             SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SAMPLE=1 - the GPU thread is sampled every 1 ms from {} s "
                                    "(logs\\gpu_cpu_profile.txt at the end)", after);
@@ -609,6 +614,7 @@ void Backend::Loop() {
 
 void Backend::Stop() {
     sampler_.Stop(); // while the sampled thread still exists
+    game_sampler_.Stop();
     stop_.store(true, std::memory_order_release);
     cv_.notify_all();
     if (thread_.joinable()) {
@@ -628,6 +634,9 @@ void Backend::Stop() {
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
     if (sampler_.Running()) {
         std::ofstream(options_.logs_dir / "gpu_cpu_profile.txt", std::ios::trunc) << sampler_.Report(60);
+    }
+    if (game_sampler_.Running()) {
+        std::ofstream(options_.logs_dir / "gpu_cpu_profile_game.txt", std::ios::trunc) << game_sampler_.Report(60);
     }
 }
 
@@ -669,6 +678,7 @@ std::string Backend::Report() {
         out += fmt::format("target cache: hits {}, misses {}; texture memo: hits {}, misses {}\n",
                            s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses);
         out += cp_->WaitReport();
+        out += cp_->FenceReport();
         const VideoOut::Stats vo = VideoOut::GetStats();
         out += fmt::format("videoout: flips requested {}, presented {}, vblanks {}, vblanks a flip waited for its GPU work "
                            "{}\n",

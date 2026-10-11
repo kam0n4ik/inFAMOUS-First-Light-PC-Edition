@@ -389,9 +389,15 @@ private:
         u32 queues = 0, function = 0, ref = 0, mask = 0, last = 0;
     };
     std::unordered_map<u64, WaitStat> wait_stats_;
+    struct FenceStat {
+        u64 count = 0, last = 0;
+        u32 queues = 0, kind = 0, data_sel = 0;
+    };
+    std::unordered_map<u64, FenceStat> fence_stats_; ///< diagnostics: where fences write, how often, the last value
 
 public:
     std::string WaitReport() const;
+    std::string FenceReport() const;
 
 private:
     NextResult Next(Queue& q, u64& addr, std::span<const u32>& packet, Pm4::Packet& pk);

@@ -1364,6 +1364,14 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
     }
     op.written = true;
     ++stats_.fences_written;
+    {
+        FenceStat& fs = fence_stats_[op.addr];
+        ++fs.count;
+        fs.last = op.data;
+        fs.queues |= 1u << std::min<u32>(q.id, 31);
+        fs.kind = static_cast<u32>(op.kind);
+        fs.data_sel = op.data_sel;
+    }
     const bool irq = op.kind == FenceKind::EndOfPipe ? (op.int_sel == 1 || op.int_sel == 2)
                                                      : (op.kind == FenceKind::Release && op.int_sel >= 1);
     if (irq) {
@@ -1554,6 +1562,18 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
     }
     q.blocked = false;
     return StepStatus::Packet;
+}
+
+std::string CommandProcessor::FenceReport() const {
+    std::vector<std::pair<u64, FenceStat>> v(fence_stats_.begin(), fence_stats_.end());
+    std::ranges::sort(v, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    std::string out = "fences written by address:\n";
+    for (size_t i = 0; i < v.size() && i < 24; ++i) {
+        const auto& [a, f] = v[i];
+        out += fmt::format("  {:#x}: {} writes, last {:#x}, kind {}, data_sel {}, queues {:#x}\n", a, f.count, f.last,
+                           f.kind, f.data_sel, f.queues);
+    }
+    return out;
 }
 
 std::string CommandProcessor::WaitReport() const {
