@@ -431,6 +431,11 @@ void GamepadChecks(const CheckFn& check) {
     y = 10;
     Input::TuneRightStick(x, y, inv);
     check(g, "invert Y: mirrored, X unchanged", x == 40 && y == 245, fmt::format("{} {}", x, y));
+    x = 128;
+    y = 128;
+    inv.invert_camera_x = true;
+    Input::TuneRightStick(x, y, inv);
+    check(g, "inverted resting stick stays at the centre (128, 128)", x == 128 && y == 128, fmt::format("{} {}", x, y));
     check(g, "vibration 50 %: half, 0 %: off, 100 %: unchanged",
           Input::ScaleMotor(255, 50) == 127 && Input::ScaleMotor(200, 0) == 0 && Input::ScaleMotor(77, 100) == 77,
           "");

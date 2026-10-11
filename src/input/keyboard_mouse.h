@@ -126,7 +126,6 @@ private:
     u32 mouse_down_ = 0; // bit = SDL mouse button
     u32 wheel_pending_ = 0; // bit = wheel direction: notches since the last reading
     u32 wheel_latched_ = 0; // the notches this reading presses (one reading each)
-    bool menu_open_ = false;
     std::array<u64, kActionCount> action_seq_{}; // order of presses (last of opposite keys wins)
     u64 seq_ = 0;
 

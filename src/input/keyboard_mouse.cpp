@@ -120,7 +120,11 @@ void KeyboardMouse::SetMenuOpen(bool open) {
     {
         std::scoped_lock lock{mutex_};
         ClearInputs();
-        menu_open_ = open;
+        if (open && motion_mode_) {
+            // the controller is not left held sideways: after the menu the mouse turns the camera again
+            motion_mode_ = false;
+            motion_.SetSideways(false, settings_.sideways_right_up);
+        }
         capture = !open && !test_mode_ && want_capture_ && settings_.capture_mouse;
     }
     if (open) {
@@ -364,6 +368,11 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         dirs |= wy < 0.0f ? 1u << 1 : 0u;
         dirs |= wx < 0.0f ? 1u << 2 : 0u;
         dirs |= wx > 0.0f ? 1u << 3 : 0u;
+        for (size_t w = 0; w < wheel_actions_.size(); ++w) {
+            if (wheel_actions_[w] == 0) {
+                dirs &= ~(1u << w); // an unbound direction is not kept for a later reading
+            }
+        }
         wheel_pending_ |= dirs;
         for (size_t w = 0; w < wheel_actions_.size(); ++w) {
             if ((dirs & (1u << w)) == 0) {

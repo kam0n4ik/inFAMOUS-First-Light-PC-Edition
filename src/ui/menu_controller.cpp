@@ -51,16 +51,51 @@ struct State {
     u32 chord_event = 0;     // SDL user event type of the chord timer
     std::optional<Nav> held_nav;
     bool held_from_stick = false;
+    u8 held_nav_button = 0xFF; // the controller button repeating held_nav
     u64 next_repeat_ns = 0;
     float stick_x = 0, stick_y = 0;
     bool dirty = false;
     u64 last_render_ns = 0;
+    u64 closed_ns = 0;
+    bool busy = false;             // inside an event/open/close: SDL calls may pump messages (the timer must wait)
+    bool exclusive_lifted = false; // exclusive full screen turned borderless while the menu is shown
     std::vector<std::string> displays, audio_devices;
+    std::vector<std::pair<u32, u32>> window_sizes;
 };
+
+/// Marks the main thread busy in the menu for a scope: WM_TIMER dispatched by SDL calls inside it only sets `dirty`.
+struct BusyScope {
+    bool was;
+    BusyScope();
+    ~BusyScope();
+};
+
+constexpr u64 kReleaseGuardNs = 2'000'000'000; // a held controller button keeps the game's pad blocked at most this long
 
 State& S() {
     static State state;
     return state;
+}
+
+BusyScope::BusyScope() : was{S().busy} {
+    S().busy = true;
+}
+BusyScope::~BusyScope() {
+    S().busy = was;
+}
+
+/// The controller state the menu keeps is dropped (unplugged, focus lost, a missed button release).
+void ForgetPadState() {
+    auto& st = S();
+    st.pad_held = 0;
+    st.held_nav.reset();
+    st.held_from_stick = false;
+    st.held_nav_button = 0xFF;
+    st.stick_x = st.stick_y = 0;
+    if (st.block_until_release && !(st.menu && st.menu->IsOpen())) {
+        st.block_until_release = false;
+        Pad::SetMenuBlocksInput(false);
+    }
 }
 
 u64 NowNs() {
@@ -179,22 +214,57 @@ MenuEnv BuildEnv() {
                                                     : "SecondSonPC's own (experimental)");
     env.displays = st.displays;
     env.audio_devices = st.audio_devices;
-    SDL_Rect usable{0, 0, 7680, 4320};
-    if (st.opt.window != nullptr) {
-        SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(st.opt.window), &usable);
-    }
-    constexpr std::pair<u32, u32> kSizes[] = {{1280, 720},  {1366, 768},  {1600, 900},  {1920, 1080},
-                                              {2560, 1440}, {3200, 1800}, {3840, 2160}};
-    for (const auto& sz : kSizes) {
-        if (static_cast<int>(sz.first) <= usable.w && static_cast<int>(sz.second) <= usable.h) {
-            env.window_sizes.push_back(sz);
-        }
-    }
-    if (env.window_sizes.empty()) {
-        env.window_sizes.push_back(kSizes[0]);
+    env.window_sizes = st.window_sizes;
+    auto& service = Settings::Instance();
+    if (service.File().empty()) {
+        env.save_note = env.ru ? "Изменения в этом запуске не сохраняются (файл настроек недоступен)."
+                               : "Changes are not saved in this run (the settings file is not available).";
+    } else if (const auto error = service.LastSaveError(); !error.empty()) {
+        env.save_note = (env.ru ? "Не удалось сохранить настройки: " : "Settings not saved: ") + error;
     }
     env.now_ns = NowNs();
     return env;
+}
+
+std::vector<std::pair<u32, u32>> WindowSizes(SDL_Window* window) {
+    SDL_Rect usable{0, 0, 7680, 4320};
+    if (window != nullptr) {
+        SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window), &usable);
+    }
+    constexpr std::pair<u32, u32> kSizes[] = {{1280, 720},  {1366, 768},  {1600, 900},  {1920, 1080},
+                                              {2560, 1440}, {3200, 1800}, {3840, 2160}};
+    std::vector<std::pair<u32, u32>> out;
+    for (const auto& sz : kSizes) {
+        if (static_cast<int>(sz.first) <= usable.w && static_cast<int>(sz.second) <= usable.h) {
+            out.push_back(sz);
+        }
+    }
+    if (out.empty()) {
+        out.push_back(kSizes[0]);
+    }
+    return out;
+}
+
+/// Layered windows are not reliably shown over an exclusive full-screen swapchain: while the menu is open the window
+/// is borderless full screen (the same display mode), and exclusive again when it closes.
+void LiftExclusive(bool lift) {
+    auto& st = S();
+    SDL_Window* w = st.opt.window;
+    if (w == nullptr) {
+        return;
+    }
+    const bool fullscreen = (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0;
+    const auto cfg = Settings::Instance().Current();
+    if (lift && fullscreen && cfg.exclusive_fullscreen && !st.exclusive_lifted) {
+        SDL_SetWindowFullscreenMode(w, nullptr);
+        st.exclusive_lifted = true;
+        SSPC_LOG(App, Info, "settings menu: exclusive full screen shown borderless while the menu is open");
+    } else if (!lift && st.exclusive_lifted) {
+        st.exclusive_lifted = false;
+        if (fullscreen && cfg.fullscreen && cfg.exclusive_fullscreen) {
+            SDL_SetWindowFullscreenMode(w, SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(w)));
+        }
+    }
 }
 
 void Render(bool force) {
@@ -210,7 +280,12 @@ void Render(bool force) {
     st.menu->SetEnv(BuildEnv());
     DrawList list;
     st.menu->Build(st.overlay.Measure(), list);
-    st.overlay.Present(st.hwnd, list);
+    if (!st.overlay.Present(st.hwnd, list)) {
+        // an open menu nobody can see would hold the game's input: closed, the game gets it back
+        SSPC_LOG(App, Error, "settings menu: drawing failed - closed");
+        Menu().Close();
+        return;
+    }
     st.last_render_ns = NowNs();
     st.dirty = false;
 }
@@ -235,6 +310,11 @@ void OnTimer(void*) {
     if (!st.menu || !st.menu->IsOpen()) {
         return;
     }
+    if (st.busy) {
+        st.dirty = true; // dispatched from inside an SDL call of the menu's own handling: later
+        return;
+    }
+    const BusyScope busy;
     const u64 now = NowNs();
     st.menu->Tick(now);
     if (st.held_nav && now >= st.next_repeat_ns) {
@@ -414,6 +494,10 @@ void MenuController::Install(const Options& options) {
         }
         if (display) {
             ApplyDisplay(S().opt.window, c, monitor);
+            if (Menu().IsOpen()) {
+                S().exclusive_lifted = false; // a mode chosen in the menu: borderless again until it closes
+                LiftExclusive(true);
+            }
         }
     });
     const auto cfg = service.Current();
@@ -450,16 +534,21 @@ void MenuController::Open() {
         }
         return;
     }
+    const BusyScope busy;
     st.displays = DisplayNames();
     st.audio_devices = AudioDeviceNames();
+    st.window_sizes = WindowSizes(st.opt.window);
     st.held_nav.reset();
     st.menu->SetEnv(BuildEnv());
     st.menu->Open();
     Input::Player1().SetMenuOpen(true);
     st.block_until_release = false;
     Pad::SetMenuBlocksInput(true);
+    LiftExclusive(true);
     Render(true);
-    SSPC_LOG(App, Info, "settings menu open (overlay render {:.1f} ms)", st.overlay.GetStats().last_ms);
+    if (IsOpen()) {
+        SSPC_LOG(App, Info, "settings menu open (overlay render {:.1f} ms)", st.overlay.GetStats().last_ms);
+    }
 }
 
 void MenuController::Close() {
@@ -467,12 +556,16 @@ void MenuController::Close() {
     if (!IsOpen()) {
         return;
     }
+    const BusyScope busy;
     st.menu->Close();
     st.overlay.Hide();
     st.held_nav.reset();
+    st.held_nav_button = 0xFF;
+    LiftExclusive(false);
     Input::Player1().SetMenuOpen(false);
+    st.closed_ns = NowNs();
     if (st.pad_held != 0) {
-        st.block_until_release = true; // until the controller button that closed it is up
+        st.block_until_release = true; // until the controller button that closed it is up (at most kReleaseGuardNs)
     } else {
         Pad::SetMenuBlocksInput(false);
     }
@@ -487,8 +580,12 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         return EventRoute::Normal;
     }
     auto& st = S();
+    const BusyScope busy;
     const u64 now = NowNs();
     const bool open = IsOpen();
+    if (st.block_until_release && !open && now - st.closed_ns > kReleaseGuardNs) {
+        ForgetPadState(); // a release that never came (unplugged, missed event): the game gets the pad back
+    }
 
     // ---- the chord timer (L3 + R3)
     if (st.chord_event != 0 && e.type == st.chord_event) {
@@ -585,17 +682,26 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
             return EventRoute::Normal;
         }
         st.menu->SetEnv(BuildEnv());
-        if (st.menu->Capturing()) {
+        {
             const float flip = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f;
             const float wy = e.wheel.y * flip, wx = e.wheel.x * flip;
-            const u16 dir = wy > 0 ? 0 : wy < 0 ? 1 : wx < 0 ? 2 : 3;
-            st.menu->OnCaptureInput({Input::InputCode::Kind::MouseWheel, dir});
-        } else {
-            st.menu->OnWheel(e.wheel.y);
+            if (wy == 0.0f && wx == 0.0f) {
+                return EventRoute::Consumed;
+            }
+            if (st.menu->Capturing()) {
+                const u16 dir = wy > 0 ? 0 : wy < 0 ? 1 : wx < 0 ? 2 : 3;
+                st.menu->OnCaptureInput({Input::InputCode::Kind::MouseWheel, dir});
+            } else {
+                st.menu->OnWheel(wy);
+            }
         }
         AfterInput();
         return EventRoute::Consumed;
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        ForgetPadState(); // its held buttons will never be released
+        return EventRoute::Normal;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
+        ForgetPadState(); // controller events stop in the background: a release would be missed
         if (open && st.menu->Capturing()) {
             st.menu->OnNav(Nav::Back); // a key capture does not survive Alt+Tab
             Render(true);
@@ -641,6 +747,7 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
             if (Repeatable(*nav)) {
                 st.held_nav = *nav;
                 st.held_from_stick = false;
+                st.held_nav_button = b;
                 st.next_repeat_ns = now + kRepeatDelayNs;
             }
         }
@@ -649,8 +756,9 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
     }
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
         TrackPad(e, false);
-        if (open && st.held_nav && !st.held_from_stick) {
-            st.held_nav.reset();
+        if (open && st.held_nav && !st.held_from_stick && e.gbutton.button == st.held_nav_button) {
+            st.held_nav.reset(); // only the button that repeats stops the repeat
+            st.held_nav_button = 0xFF;
         }
         return open ? EventRoute::BridgeOnly : EventRoute::Normal;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {

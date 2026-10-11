@@ -56,7 +56,8 @@ public:
     AsyncWriter& operator=(const AsyncWriter&) = delete;
 
     void Save(std::string text);
-    /// true: nothing is pending (written, or failed - see LastError).
+    /// true: everything handed over is on disk; false: still pending after the timeout, or the last write failed
+    /// (LastError).
     bool Flush(u32 timeout_ms);
     u64 Writes() const;
     std::string LastError() const;

@@ -23,17 +23,14 @@ void TuneRightStick(u8& x, u8& y, const GamepadTuning& tuning) {
             vy /= over;
         }
     }
+    // mirrored about the centre (a resting 128 stays 128)
+    vx = tuning.invert_camera_x ? -vx : vx;
+    vy = tuning.invert_camera_y ? -vy : vy;
     const auto axis = [](double v) {
         return static_cast<u8>(std::clamp(std::lround(128.0 + v * (v >= 0 ? 127.0 : 128.0)), 0L, 255L));
     };
     x = axis(vx);
     y = axis(vy);
-    if (tuning.invert_camera_x) {
-        x = static_cast<u8>(255 - x);
-    }
-    if (tuning.invert_camera_y) {
-        y = static_cast<u8>(255 - y);
-    }
 }
 
 u8 ScaleMotor(u8 strength, u32 percent) {

@@ -399,11 +399,11 @@ void Win32Overlay::SetTimer(void (*callback)(void*), void* context, unsigned per
     }
 }
 
-void Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
+bool Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
     auto& m = *impl_;
     const auto owner = static_cast<HWND>(owner_hwnd);
     if (!m.ok || owner == nullptr || !m.EnsureWindows(owner)) {
-        return;
+        return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
     POINT origin{0, 0};
@@ -419,15 +419,23 @@ void Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
     const Rect s = list.Surface();
     const int sx = static_cast<int>(std::floor(s.x)), sy = static_cast<int>(std::floor(s.y));
     const int sw = std::max(1, static_cast<int>(std::ceil(s.w))), sh = std::max(1, static_cast<int>(std::ceil(s.h)));
-    if (m.EnsureDib(sw, sh) && m.Draw(list, m.mem_dc, sw, sh)) {
+    bool drawn = m.EnsureDib(sw, sh) && m.Draw(list, m.mem_dc, sw, sh);
+    if (!drawn) {
+        drawn = m.EnsureDib(sw, sh) && m.Draw(list, m.mem_dc, sw, sh); // a recreated render target, once
+    }
+    if (drawn) {
         POINT dst{origin.x + sx, origin.y + sy};
         SIZE size{sw, sh};
         POINT src{0, 0};
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
         HDC screen = GetDC(nullptr);
-        UpdateLayeredWindow(m.panel, screen, &dst, &size, m.mem_dc, &src, 0, &blend, ULW_ALPHA);
+        drawn = UpdateLayeredWindow(m.panel, screen, &dst, &size, m.mem_dc, &src, 0, &blend, ULW_ALPHA) != FALSE;
         ReleaseDC(nullptr, screen);
         SetWindowPos(m.panel, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    if (!drawn) {
+        Hide(); // never a dimmed screen without the menu on it
+        return false;
     }
     if (!m.visible && m.timer_cb != nullptr) {
         ::SetTimer(m.panel, 1, m.timer_ms, nullptr);
@@ -437,6 +445,7 @@ void Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
     ++m.stats.frames;
     m.stats.last_ms = ms;
     m.stats.max_ms = std::max(m.stats.max_ms, ms);
+    return true;
 }
 
 void Win32Overlay::Hide() {

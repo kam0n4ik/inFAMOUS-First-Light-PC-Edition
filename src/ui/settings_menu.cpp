@@ -461,7 +461,7 @@ void SettingsMenu::Adjust(int dir) {
     }
     case Type::Float: {
         double x = std::get<double>(v) + dir * d.step;
-        x = std::round(x / d.step) * d.step;
+        x = std::round(std::round(x / d.step) * d.step * 1e6) / 1e6; // 0.35, not 0.35000000000000003
         SetValue(d, Value{std::clamp(x, d.ui_min, d.ui_max)});
         break;
     }
@@ -718,7 +718,7 @@ void SettingsMenu::SetSliderFromX(size_t row, float x) {
         if (h.kind == Hit::Kind::Row && h.index == static_cast<int>(row) && h.part == Hit::Part::Track) {
             const double f = std::clamp((x - h.rect.x) / std::max(1.0f, h.rect.w), 0.0f, 1.0f);
             double v = d.ui_min + f * (d.ui_max - d.ui_min);
-            v = std::round(v / d.step) * d.step;
+            v = std::round(std::round(v / d.step) * d.step * 1e6) / 1e6;
             v = std::clamp(v, d.ui_min, d.ui_max);
             if (d.type == Type::Int) {
                 SetValue(d, Value{static_cast<s64>(std::lround(v))});
@@ -1177,8 +1177,10 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
                 }
                 if (row.desc->type == Type::Binding) {
                     help += fmt::format("{}{}", help.empty() ? "" : " ",
-                                        T("Enter: assign · Backspace: clear the slot · Del: default.",
-                                          "Enter — назначить · Backspace — очистить ячейку · Del — по умолчанию."));
+                                        T("Enter: assign · Backspace: clear the slot · Del: default (the way back to "
+                                          "Esc, which cancels an assignment).",
+                                          "Enter — назначить · Backspace — очистить ячейку · Del — по умолчанию (так "
+                                          "возвращается Esc: при назначении он отменяет)."));
                 }
             }
         } else if (row.kind == Row::Kind::WindowSize) {
@@ -1224,7 +1226,10 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
     }
     std::string note = status_;
     Color note_color = kText2;
-    if (note.empty() && !conflicts.empty()) {
+    if (note.empty() && !env_.save_note.empty()) {
+        note = env_.save_note;
+        note_color = kWarn;
+    } else if (note.empty() && !conflicts.empty()) {
         note = fmt::format("{}: {}", T("Key conflicts", "Конфликтов назначений"), conflicts.size());
         note_color = kWarn;
     } else if (note.empty() && service_.AnyNeedsRestart()) {

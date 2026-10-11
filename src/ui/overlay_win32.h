@@ -25,8 +25,9 @@ public:
     bool Init(std::string& error);
     bool Ok() const;
 
-    /// Shows `list` over `owner_hwnd`'s client area (creates/moves/resizes the windows as needed).
-    void Present(void* owner_hwnd, const DrawList& list);
+    /// Shows `list` over `owner_hwnd`'s client area (creates/moves/resizes the windows as needed). false: nothing could
+    /// be drawn (the windows are hidden again) - the caller must not leave the menu open and invisible.
+    bool Present(void* owner_hwnd, const DrawList& list);
     void Hide();
     bool Visible() const;
 

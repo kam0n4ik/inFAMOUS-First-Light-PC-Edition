@@ -45,6 +45,7 @@ struct MenuEnv {
     std::vector<std::string> displays;      // display names
     std::vector<std::string> audio_devices; // playback device names
     std::vector<std::pair<u32, u32>> window_sizes;
+    std::string save_note; // changes are not saved / the last save failed (shown in the footer)
     u64 now_ns = 0;
 };
 
@@ -161,8 +162,6 @@ private:
     std::vector<std::pair<const Settings::Desc*, Settings::Value>> pending_display_;
     std::string status_;
     std::vector<Hit> hits_;
-    Rect slider_track_; // the dragged slider's track (from the last Build)
-    float track_x_ = 0, track_w_ = 1;
 };
 
 } // namespace SecondSon::Ui

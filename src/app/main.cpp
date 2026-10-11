@@ -425,11 +425,15 @@ int main(int argc, char* argv[]) {
     } else {
         SSPC_LOG(App, Info, "user settings: not used in this run (SecondSonPC.toml alone, changes not saved)");
     }
+    // A user file that exists but cannot be read is never overwritten by this run's changes (they stay unsaved).
+    const bool save_settings = user_settings && user_report.status != Settings::LoadReport::Status::Unreadable;
     Settings::Instance().Init(toml_defaults, user_overrides, *config,
-                              user_settings ? user_settings_file : std::filesystem::path{}, 0);
+                              save_settings ? user_settings_file : std::filesystem::path{}, 0);
     Lifecycle::AddExitStep(Lifecycle::Stage::Storage, "user settings", [] {
         if (!Settings::Instance().Flush(3000)) {
-            SSPC_LOG(App, Warning, "user settings: the last change was not written in 3 s");
+            SSPC_LOG(App, Warning, "user settings: the last change was not written ({})",
+                     Settings::Instance().LastSaveError().empty() ? std::string("3 s passed")
+                                                                  : Settings::Instance().LastSaveError());
         }
     });
     // P3.4: SecondSonPC's exception dispatcher records execute faults itself; the first-chance recorder's

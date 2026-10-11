@@ -197,7 +197,13 @@ LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out) {
     LoadReport report;
     out.clear();
     std::error_code ec;
-    if (file.empty() || !std::filesystem::exists(file, ec)) {
+    const bool exists = !file.empty() && std::filesystem::exists(file, ec);
+    if (ec) {
+        report.status = LoadReport::Status::Unreadable; // not "missing": a save must not overwrite it
+        report.error = ec.message();
+        return report;
+    }
+    if (!exists) {
         return report; // Missing: SecondSonPC.toml alone
     }
     std::ifstream in(file, std::ios::binary);
@@ -309,7 +315,9 @@ void AsyncWriter::Save(std::string text) {
 
 bool AsyncWriter::Flush(u32 timeout_ms) {
     std::unique_lock lock{mutex_};
-    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] { return done_ == requested_; });
+    const bool done =
+        cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] { return done_ == requested_; });
+    return done && last_error_.empty();
 }
 
 u64 AsyncWriter::Writes() const {
