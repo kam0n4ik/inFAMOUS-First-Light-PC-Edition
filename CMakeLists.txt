@@ -67,6 +67,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/vulkan/vk_diagnostics.cpp
     src/runtime/gpu/vulkan/vk_executor.cpp
     src/runtime/gpu/vulkan/vk_formats.cpp
+    src/runtime/gpu/vulkan/vk_capture.cpp
     src/runtime/gpu/vulkan/vk_image_cache.cpp
     src/runtime/gpu/vulkan/vk_pipelines.cpp
     src/runtime/gpu/vulkan/vk_presenter.cpp

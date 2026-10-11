@@ -1560,6 +1560,10 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
         w.mask = b[4];
         w.last = value;
     }
+    if (memory && options_.work != nullptr) {
+        // the CPU writes before the awaited value (published data) apply to the work after the wait (P4.5)
+        options_.work->MemoryAcquired(q.id, q.blocked, (u64{b[2]} << 32) | (b[1] & ~3u));
+    }
     q.blocked = false;
     return StepStatus::Packet;
 }

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 #include <fmt/format.h>
 
@@ -20,6 +21,7 @@
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/shader/shader_frontend.h"
+#include "runtime/gpu/vulkan/vk_capture.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 #include "runtime/gpu/vulkan/vk_formats.h"
@@ -99,6 +101,48 @@ VkFormat DisplayFormat(u32 pixel_format, VkFormat image_format) {
     default:
         return image_format;
     }
+}
+
+// SSPC_DIAG_WATCH=<hex address>: the CPU writes of that guest page, caught by write protection (P4.5 race diagnosis)
+std::atomic<u64> g_watch_page{0};
+struct WatchHit {
+    u64 tsc, rip, addr;
+    u32 tid;
+};
+std::array<WatchHit, 512> g_watch_hits;
+std::atomic<u32> g_watch_n{0};
+
+thread_local bool t_watch_rearm = false;
+
+LONG CALLBACK WatchFilter(EXCEPTION_POINTERS* e) {
+    const EXCEPTION_RECORD* r = e->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watch_rearm) {
+        // the write went through: the page protected again for the next one
+        t_watch_rearm = false;
+        e->ContextRecord->EFlags &= ~0x100u;
+        DWORD old = 0;
+        if (const u64 page = g_watch_page.load(std::memory_order_acquire); page != 0) {
+            VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &old);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const u64 page = g_watch_page.load(std::memory_order_acquire);
+    const u64 a = r->ExceptionInformation[1];
+    if (page == 0 || (a & ~0xFFFull) != page) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const u32 n = g_watch_n.fetch_add(1, std::memory_order_acq_rel);
+    if (n < g_watch_hits.size()) {
+        g_watch_hits[n] = {__rdtsc(), e->ContextRecord->Rip, a, GetCurrentThreadId()};
+    }
+    DWORD old = 0;
+    VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
+    t_watch_rearm = true;
+    e->ContextRecord->EFlags |= 0x100u; // one instruction, then protected again (EXCEPTION_SINGLE_STEP above)
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 } // namespace
@@ -423,6 +467,18 @@ void Executor::Poll() {
     }
     guest_.Collect(completed);
     images_.Collect(completed);
+    if (readback_) {
+        readback_->Collect(completed);
+    }
+    while (!args_rb_.empty() && args_rb_.front().value <= completed) {
+        auto& a = args_rb_.front();
+        u32 v[5] = {};
+        std::memcpy(v, a.buffer.mapped, sizeof(v));
+        histo_.args << fmt::format("flip {} args {:#x}: {} {} {} {} {}\n", a.flip, a.addr, v[0], v[1], v[2], v[3], v[4]);
+        histo_.args.flush();
+        DestroyBuffer(ctx_, a.buffer);
+        args_rb_.pop_front();
+    }
     buffers_.Collect(completed);
     std::erase_if(lds_retired_, [&](auto& e) {
         if (e.first > completed) {
@@ -625,13 +681,9 @@ void Executor::DiagDumpShader(u64 address, const std::vector<u32>* code, const s
     }
     dumped_shader_ = true;
     const auto write = [](const std::filesystem::path& path, const void* data, size_t bytes) {
-        std::FILE* fp = _wfopen(path.c_str(), L"wb");
-        if (fp == nullptr) {
-            return false;
-        }
-        const bool ok = std::fwrite(data, 1, bytes, fp) == bytes;
-        std::fclose(fp);
-        return ok;
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        return static_cast<bool>(out);
     };
     // next to the frame capture (logs\p44)
     const std::filesystem::path base = options_.capture_path.parent_path() / fmt::format("shader_{:x}", address);
@@ -779,6 +831,37 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                 avail = size;
                 ++stats_.streamed;
                 stats_.streamed_bytes += size;
+                // SSPC_DIAG_WATCH_DUMP=<hex address>: the bytes copied for a range starting there, per copy ->
+                // logs\p45\watch_dump.bin (flip id, size, bytes)
+                static const u64 dump_addr = [] {
+                    char v[32] = {};
+                    return GetEnvironmentVariableA("SSPC_DIAG_WATCH_DUMP", v, sizeof(v)) > 0
+                               ? std::strtoull(v, nullptr, 16)
+                               : 0ull;
+                }();
+                if (dump_addr != 0 && addr == dump_addr) {
+                    static std::ofstream dump(options_.capture_path.parent_path().parent_path() / "p45" / "watch_dump.bin",
+                                              std::ios::binary | std::ios::trunc);
+                    const u64 hdr[2] = {VideoOut::NextFlipId(), size};
+                    dump.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+                    dump.write(reinterpret_cast<const char*>(sl.data), static_cast<std::streamsize>(size));
+                    dump.flush();
+                }
+                if (const u64 wp = g_watch_page.load(std::memory_order_relaxed);
+                    wp != 0 && addr < wp + 4096 && wp < addr + size) {
+                    race_.watch_copy_tsc = __rdtsc(); // this frame's copy of the watched page
+                    race_.watch_copy_hits = g_watch_n.load(std::memory_order_acquire);
+                }
+                if (race_.on) {
+                    const u64 h = RaceHash(sl.data, size);
+                    race_.copies.push_back({addr, size, h});
+                    // a range that changed after last frame's copy: is this frame's copy what the flip saw then
+                    // (the next frame's data written early) or yet another value (written late in each frame)?
+                    if (const auto it = race_.post.find(addr); it != race_.post.end()) {
+                        ++(it->second == h ? race_.next_equal : race_.next_differ);
+                        race_.post.erase(it);
+                    }
+                }
                 return true;
             }
         }
@@ -912,6 +995,28 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     ++stats_.timeline_copies;
     stats_.timeline_copy_bytes += bytes;
     return true;
+}
+
+void Executor::MemoryAcquired(u32, bool blocked, u64 poll_address) {
+    ++stats_.acquires;
+    if (g_watch_page.load(std::memory_order_relaxed) != 0 && race_.acquires.size() < 64) {
+        race_.acquires.emplace_back(__rdtsc(), poll_address);
+    }
+    stats_.acquires_blocked += blocked ? 1 : 0;
+    // SSPC_DIAG_ACQUIRE_DRAIN=off: the P4.4 behaviour (CPU writes applied only between the backend's loop rounds) - a
+    // control run for the A/B, not a configuration
+    static const bool off = [] {
+        char v[8] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_DIAG_ACQUIRE_DRAIN", v, sizeof(v)) == 3 && std::string_view(v) == "off";
+        if (o) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_ACQUIRE_DRAIN=off - CPU writes before a met "
+                                   "WAIT_REG_MEM are not applied before the work after it");
+        }
+        return o;
+    }();
+    if (!off && acquire_hook_ != nullptr && acquire_hook_(acquire_ctx_)) {
+        ++stats_.acquires_applied;
+    }
 }
 
 void Executor::BeforeUpload() {
@@ -1065,7 +1170,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             info = {vb, aligned, std::min<u64>(b.size + adjust, vavail + adjust)};
             if (b.written) {
                 writes_memory = true;
-                images_.Invalidate(b.address, b.size);
+                images_.InvalidateFromBufferWrite(b.address, b.size);
             }
             break;
         }
@@ -1181,9 +1286,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             memo = &tex_memo_[memo_key];
             CachedImage* m = memo->img;
             if (m != nullptr && memo->epoch == images_.Epoch() && memo->raw == im.desc.raw && memo->flags == flags &&
-                (m->gpu_written || (m->uploaded && !m->dirty))) {
+                ((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written))) {
                 ++stats_.tex_memo_hits;
-                m->last_seq = cur_.value; // what Find records
+                images_.Touch(*m, cur_.value); // what Find records
                 if (im.storage) {
                     m->gpu_written = true;
                 }
@@ -1590,6 +1695,28 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         return;
     }
     stage(stats_.t_pipe);
+    {
+        // SSPC_DIAG_SKIP_PIPELINES=<id>,<id>...: those pipelines' draws not executed (which draws make what is seen; P4.5)
+        static const std::vector<u64> skip = [] {
+            std::vector<u64> v;
+            char s[256] = {};
+            if (GetEnvironmentVariableA("SSPC_DIAG_SKIP_PIPELINES", s, sizeof(s)) > 0) {
+                for (char* p = s; *p != 0;) {
+                    v.push_back(std::strtoull(p, &p, 10));
+                    while (*p == ',' || *p == ' ') {
+                        ++p;
+                    }
+                }
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_SKIP_PIPELINES - {} pipelines' draws skipped",
+                         v.size());
+            }
+            return v;
+        }();
+        if (!skip.empty() && std::ranges::find(skip, u64{prep.pipeline}) != skip.end()) {
+            Skipped(Skip::FilteredMode, fmt::format("SSPC_DIAG_SKIP_PIPELINES: pipeline {}", prep.pipeline));
+            return;
+        }
+    }
 
     // targets
     std::vector<CachedImage*>& targets = scratch_.targets;
@@ -1612,29 +1739,29 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     tin.mrt_mask = st->mrt_mask;
     tin.cb_extent = d.cb_extent;
     tin.db_extent = d.db_extent;
+    images_.ApplyPendingInvalidations(); // a target whose memory was written since is found (uploaded) again
     tin.epoch = images_.Epoch();
-    if (target_cache_.valid && target_cache_.in == tin) {
+    if (target_cache_.valid && target_cache_.in == tin &&
+        std::ranges::none_of(target_cache_.targets, [](const CachedImage* t) { return t->memory_newer; })) {
         ++stats_.target_cache_hits;
         targets = target_cache_.targets;
         key = target_cache_.key;
         color_img = target_cache_.color_img;
         depth_img = target_cache_.depth_img;
         for (CachedImage* img : targets) {
-            img->last_seq = cur_.value; // what Find records for a target
+            images_.Touch(*img, cur_.value); // what Find records for a target
         }
         if (!pending_meta_clear_.empty()) {
-            const auto take = [&](u64 meta) {
-                auto it = meta != 0 ? pending_meta_clear_.find(meta) : pending_meta_clear_.end();
-                if (it == pending_meta_clear_.end() || !it->second) {
-                    return false;
-                }
-                it->second = false;
-                return true;
+            // a pending clear is only looked at here: it is taken when the render pass that clears begins (a draw
+            // that returns before that leaves it for the next one; P4.5, the review's LOW)
+            const auto pending = [&](u64 meta) {
+                const auto it = meta != 0 ? pending_meta_clear_.find(meta) : pending_meta_clear_.end();
+                return it != pending_meta_clear_.end() && it->second;
             };
             for (u32 i = 0; i < 8; ++i) {
-                color_clear[i] = color_img[i] != nullptr && take(target_cache_.cmask[i]);
+                color_clear[i] = color_img[i] != nullptr && pending(target_cache_.cmask[i]);
             }
-            depth_clear = depth_img != nullptr && take(target_cache_.htile);
+            depth_clear = depth_img != nullptr && pending(target_cache_.htile);
         }
     } else {
     ++stats_.target_cache_misses;
@@ -1673,8 +1800,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         target_cache_.cmask[i] = cmask;
         if (cmask != 0) {
             if (auto it = pending_meta_clear_.find(cmask); it != pending_meta_clear_.end() && it->second) {
-                color_clear[i] = true;
-                it->second = false;
+                color_clear[i] = true; // taken when the clearing render pass begins
             }
         }
     }
@@ -1697,8 +1823,7 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         target_cache_.htile = htile;
         if (htile != 0) {
             if (auto it = pending_meta_clear_.find(htile); it != pending_meta_clear_.end() && it->second) {
-                depth_clear = true;
-                it->second = false;
+                depth_clear = true; // taken when the clearing render pass begins
             }
         }
     }
@@ -1823,6 +1948,35 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
     }
 
     stage(stats_.t_vertex);
+    if (histo_.active && d.indirect && argbuf != VK_NULL_HANDLE) {
+        static const u64 detail_p = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_DRAW_HISTO_P", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10)
+                                                                                    : ~0ull;
+        }();
+        if (prep.pipeline == detail_p) {
+            // SSPC_DIAG_DRAW_HISTO_P: the indirect arguments this draw takes, read back (P4.5)
+            EndRendering();
+            if (pending_writes_) {
+                GlobalBarrier();
+            }
+            OwnedBuffer rb;
+            std::string rerr;
+            if (CreateBuffer(ctx_, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, rb, rerr, true, HostPlacement::Cached)) {
+                const VkBufferCopy c{.srcOffset = argoff, .dstOffset = 0, .size = d.indexed ? 20u : 16u};
+                Fn().vkCmdCopyBuffer(cur_.cb, argbuf, rb.buffer, 1, &c);
+                const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                          .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                          .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                          .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                                          .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+                const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                           .pMemoryBarriers = &mb};
+                Fn().vkCmdPipelineBarrier2(cur_.cb, &dep);
+                args_rb_.push_back({cur_.value, VideoOut::NextFlipId(), d.args_addr, rb});
+            }
+        }
+    }
     // barriers and layouts (outside rendering)
     if (pending_writes_) {
         GlobalBarrier(7);
@@ -1860,7 +2014,10 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
             break;
         }
     }
-    if (need_transition || !rendering_ || !(key == render_)) {
+    // a pending fast clear needs a render pass of its own (loadOp CLEAR): one already open with the same targets would
+    // never clear them (P4.5)
+    const bool any_clear = depth_clear || std::ranges::any_of(color_clear, [](bool c) { return c; });
+    if (any_clear || need_transition || !rendering_ || !(key == render_)) {
         EndRendering();
         for (u32 i = 0; i < 8; ++i) {
             if (color_img[i] != nullptr) {
@@ -1943,6 +2100,15 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         ++stats_.render_passes;
         if (depth_clear) {
             ++stats_.depth_clears;
+        }
+        // the clears this render pass made are done
+        for (u32 i = 0; i < 8; ++i) {
+            if (color_clear[i] && key.color[i] != VK_NULL_HANDLE && target_cache_.cmask[i] != 0) {
+                pending_meta_clear_[target_cache_.cmask[i]] = false;
+            }
+        }
+        if (depth_clear && target_cache_.htile != 0) {
+            pending_meta_clear_[target_cache_.htile] = false;
         }
     }
     // the hardware's depth/stencil clear: DB_RENDER_CONTROL clear bits clear the drawn area (the scissor)
@@ -2061,6 +2227,45 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         }
     }
     ++stats_.draws_executed;
+    if (histo_.active) {
+        auto& e = histo_.draws[prep.pipeline];
+        ++e.count;
+        e.indirect += d.indirect ? 1 : 0;
+        e.instances += d.indirect ? 0 : instances;
+        e.verts += d.indirect ? 0 : d.index_count;
+        // SSPC_DIAG_DRAW_HISTO_P=<pipeline>: that pipeline's draws in detail (textures, vertex buffers)
+        static const u64 detail = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_DRAW_HISTO_P", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10)
+                                                                                    : ~0ull;
+        }();
+        if (prep.pipeline == detail) {
+            std::string line = fmt::format("    draw verts {} inst {} indirect {} args {:#x}", d.index_count, instances,
+                                           d.indirect, d.indirect ? d.args_addr : 0);
+            for (const auto* sv : {&vs, &ps}) {
+                for (const auto& b : sv->plan.buffers) {
+                    if (b.kind == GS::BufferKind::Guest) {
+                        line += fmt::format(" | buf {:#x}+{:#x}{}", b.address, b.size, b.written ? " W" : "");
+                    }
+                }
+            }
+            for (const CachedImage* img : bound) {
+                line += fmt::format(" | img{} {:#x} fmt {} {}x{}{}{}", img->id, img->layout.guest_address,
+                                    img->layout.pixel_format, img->layout.size.width, img->layout.size.height,
+                                    img->gpu_written ? " gw" : "", img->alias_hits != 0 ? " alias" : "");
+            }
+            for (const auto& v : vs.plan.vertices) {
+                line += fmt::format(" | vb {:#x}+{:#x}", v.address, v.size);
+            }
+            histo_.detail.push_back(std::move(line));
+        }
+        if (e.legend.empty()) {
+            e.legend = fmt::format("vs {:#x} ps {:#x} prim {} rt0 fmt {} {}x{} depth {} blend0 {:#x}", vs.address,
+                                   has_ps ? ps.address : 0, d.primitive_type,
+                                   color_img[0] != nullptr ? color_img[0]->layout.pixel_format : 0, key.width, key.height,
+                                   depth_img != nullptr, regs.Get(0xA1E0));
+        }
+    }
     if (writes_memory) {
         pending_writes_ = true;
     }
@@ -2357,6 +2562,12 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     }
     FinishShadows();
     ++stats_.dispatches_executed;
+    if (histo_.active) {
+        auto& e = histo_.dispatches[csv.address];
+        ++e.count;
+        e.indirect += d.indirect ? 1 : 0;
+        e.instances += d.indirect ? 0 : u64{d.groups[0]} * std::max<u32>(d.groups[1], 1) * std::max<u32>(d.groups[2], 1);
+    }
     if (writes_memory) {
         pending_writes_ = true;
     }
@@ -2364,7 +2575,262 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
     stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
 }
 
+void Executor::CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h) {
+    // SSPC_DIAG_CAPTURE_FRAMES=<first flip>:<count>[:<step>[:<downsample>]]: a series of presented frames ->
+    // logs\p45\frames\flip_N.png (consecutive frames: flicker, frame-to-frame differences; P4.5)
+    static const std::array<u64, 4> series = [] {
+        std::array<u64, 4> v{0, 0, 1, 1};
+        char s[64] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_FRAMES", s, sizeof(s)) > 0) {
+            char* p = s;
+            for (u64& x : v) {
+                x = std::strtoull(p, &p, 10);
+                if (*p != ':') {
+                    break;
+                }
+                ++p;
+            }
+            v[2] = std::max<u64>(v[2], 1);
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_CAPTURE_FRAMES - flips {} .. {} (step {}) captured to PNG (slower)",
+                     v[0], v[0] + v[1] * v[2], v[2]);
+        }
+        return v;
+    }();
+    if (series[1] == 0) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId();
+    if (id < series[0] || id >= series[0] + series[1] * series[2] || (id - series[0]) % series[2] != 0) {
+        return;
+    }
+    if (!readback_) {
+        readback_ = std::make_unique<ImageReadback>(ctx_);
+    }
+    // the displayed image's texels as the scanout reads them (`shown`), recorded after the frame's work: what it showed
+    readback_->Record(cur_.cb, cur_.value, img.image, shown, VK_IMAGE_ASPECT_COLOR_BIT, 0, w, h,
+                      std::max<u32>(img.layout.num_bits / 8, 1),
+                      options_.capture_path.parent_path().parent_path() / "p45" / "frames" / fmt::format("flip_{:06}", id),
+                      false, static_cast<u32>(std::clamp<u64>(series[3], 1, 16)));
+}
+
+u64 Executor::RaceHash(const u8* p, u64 n) {
+    u64 h = 0xCBF29CE484222325ull;
+    for (u64 i = 0; i < n; ++i) {
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    }
+    return h;
+}
+
+void Executor::RaceCheck() {
+    // SSPC_DIAG_RACE=1: the small ranges this frame copied from guest memory when its draws were recorded, compared at
+    // the flip with guest memory now - a range the game rewrote while the backend still recorded the frame (P4.5)
+    static const bool on = [] {
+        char v[4] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_DIAG_RACE", v, sizeof(v)) == 1 && v[0] == '1';
+        if (o) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_RACE=1 - streamed ranges re-read at each flip (slower)");
+        }
+        return o;
+    }();
+    race_.on = on;
+    static const u64 watch = [] {
+        char v[32] = {};
+        const u64 w = GetEnvironmentVariableA("SSPC_DIAG_WATCH", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 16) : 0ull;
+        if (w != 0) {
+            AddVectoredExceptionHandler(1, &WatchFilter);
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_WATCH={:#x} - CPU writes of its page logged per flip", w);
+        }
+        return w;
+    }();
+    if (watch != 0) {
+        // the writes since the last flip (the page was protected then), the value now, protection again
+        const u32 n = std::min<u32>(g_watch_n.exchange(0, std::memory_order_acq_rel), g_watch_hits.size());
+        u64 value[2] = {};
+        GS::GameMemory().Read(watch, value, 16);
+        static const u64 watch_from = [] {
+            char v[32] = {};
+            GetEnvironmentVariableA("SSPC_DIAG_WATCH_FROM", v, sizeof(v));
+            return std::strtoull(v, nullptr, 10);
+        }();
+        if (race_.watch_logged < 400 && VideoOut::NextFlipId() >= watch_from) {
+            ++race_.watch_logged;
+            const u64 sub = Gnm::LastSubmitTsc(), now = __rdtsc();
+            const auto rel = [&](u64 t) {
+                return t == 0 ? 0.0
+                       : t >= sub ? static_cast<double>(GS::TicksToNs(t - sub)) / 1e6
+                                  : -static_cast<double>(GS::TicksToNs(sub - t)) / 1e6;
+            };
+            std::string out = fmt::format("watch flip {} value {:#x} {:#x}: {} CPU writes; ms since the last submit: "
+                                          "now {:.1f}, copy {:.1f} (after {} writes)",
+                                          VideoOut::NextFlipId(), value[0], value[1], n, rel(now),
+                                          rel(race_.watch_copy_tsc), race_.watch_copy_hits);
+            race_.watch_copy_tsc = 0;
+            // the writes' times, coalesced into bursts (writes within 0.2 ms), with their code addresses
+            for (u32 i = 0; i < n;) {
+                u32 j = i + 1;
+                while (j < n && rel(g_watch_hits[j].tsc) - rel(g_watch_hits[j - 1].tsc) < 0.2) {
+                    ++j;
+                }
+                out += fmt::format(" | {} writes at {:.1f}..{:.1f} rip {:#x} [{:#x}..]", j - i, rel(g_watch_hits[i].tsc),
+                                   rel(g_watch_hits[j - 1].tsc), g_watch_hits[i].rip, g_watch_hits[i].addr);
+                if (j - i <= 32) { // a short burst: every address
+                    out += " at";
+                    for (u32 k = i; k < j; ++k) {
+                        out += fmt::format(" {:x}", g_watch_hits[k].addr & 0xFFF);
+                    }
+                }
+                i = j;
+            }
+            for (const auto& [t, a] : race_.acquires) {
+                out += fmt::format(" | wait met {:#x} at {:.1f}", a, rel(t));
+            }
+            race_.acquires.clear();
+            for (u32 i = 0; i < n && i < 1; ++i) {
+                wchar_t* name = nullptr;
+                std::string tname;
+                if (HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, g_watch_hits[i].tid)) {
+                    if (SUCCEEDED(GetThreadDescription(th, &name)) && name != nullptr) {
+                        for (const wchar_t* c = name; *c != 0; ++c) {
+                            tname.push_back(static_cast<char>(*c));
+                        }
+                        LocalFree(name);
+                    }
+                    CloseHandle(th);
+                }
+                out += fmt::format(" | tid {} {} rip {:#x} at {:#x}", g_watch_hits[i].tid, tname, g_watch_hits[i].rip,
+                                   g_watch_hits[i].addr);
+            }
+            SSPC_LOG(GPU, Info, "{}", out);
+        }
+        const u64 page = watch & ~0xFFFull;
+        DWORD old = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &old)) {
+            g_watch_page.store(page, std::memory_order_release);
+        }
+    }
+    if (!on || race_.copies.empty()) {
+        return;
+    }
+    u64 changed = 0;
+    std::vector<u8> buf;
+    for (const auto& c : race_.copies) {
+        buf.resize(c.size);
+        const u8* host = guest_.BackingPointer(c.addr, c.size);
+        if (host != nullptr) {
+            std::memcpy(buf.data(), host, c.size);
+        } else if (!GS::GameMemory().Read(c.addr, buf.data(), c.size)) {
+            continue;
+        }
+        if (const u64 now = RaceHash(buf.data(), c.size); now != c.hash) {
+            race_.post[c.addr] = now;
+            ++changed;
+            auto& r = race_.by_range[c.addr];
+            ++r.count;
+            r.size = c.size;
+        }
+    }
+    race_.total += race_.copies.size();
+    race_.changed += changed;
+    ++race_.frames;
+    if (changed != 0) {
+        ++race_.frames_changed;
+    }
+    race_.copies.clear();
+    if (race_.frames % 300 == 0) {
+        std::vector<std::pair<u64, RaceRange>> v(race_.by_range.begin(), race_.by_range.end());
+        std::ranges::sort(v, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+        std::string out = fmt::format("race check over {} frames: {} of {} streamed ranges changed before the flip "
+                                      "({} frames with changes; the next frame copied the flip's value {} times, another "
+                                      "value {} times); top ranges:",
+                                      race_.frames, race_.changed, race_.total, race_.frames_changed, race_.next_equal,
+                                      race_.next_differ);
+        for (size_t i = 0; i < v.size() && i < 16; ++i) {
+            out += fmt::format(" {:#x}+{:#x} x{};", v[i].first, v[i].second.size, v[i].second.count);
+        }
+        SSPC_LOG(GPU, Info, "{}", out);
+    }
+}
+
+void Executor::DrawHistogram() {
+    // SSPC_DIAG_DRAW_HISTO=<first flip>:<count>: per frame, the draws by pipeline and the dispatches by program ->
+    // logs\p45\draw_histo.txt (what is drawn frame to frame: content that toggles - lights, particles; P4.5)
+    static const std::array<u64, 2> range = [] {
+        std::array<u64, 2> v{0, 0};
+        char s[64] = {};
+        if (GetEnvironmentVariableA("SSPC_DIAG_DRAW_HISTO", s, sizeof(s)) > 0) {
+            char* p = s;
+            v[0] = std::strtoull(p, &p, 10);
+            if (*p == ':') {
+                v[1] = std::strtoull(p + 1, nullptr, 10);
+            }
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_DRAW_HISTO - draws per pipeline of flips {} .. {}", v[0],
+                     v[0] + v[1]);
+        }
+        return v;
+    }();
+    if (range[1] == 0) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId();
+    if (histo_.active) {
+        if (!histo_.out.is_open()) {
+            histo_.out.open(options_.capture_path.parent_path().parent_path() / "p45" / "draw_histo.txt",
+                            std::ios::trunc);
+            histo_.args.open(options_.capture_path.parent_path().parent_path() / "p45" / "draw_args.txt",
+                             std::ios::trunc);
+        }
+        u64 draws = 0, disp = 0;
+        for (const auto& [k, e] : histo_.draws) {
+            draws += e.count;
+        }
+        for (const auto& [k, e] : histo_.dispatches) {
+            disp += e.count;
+        }
+        // the frame's timing: since the previous flip marker (the backend's frame) and between the game's submissions
+        const u64 now = __rdtsc(), sub = Gnm::LastSubmitTsc();
+        const double flip_ms = histo_.last_flip_tsc != 0 ? static_cast<double>(GS::TicksToNs(now - histo_.last_flip_tsc)) / 1e6 : 0.0;
+        const double sub_ms = histo_.last_submit_tsc != 0 && sub > histo_.last_submit_tsc
+                                  ? static_cast<double>(GS::TicksToNs(sub - histo_.last_submit_tsc)) / 1e6
+                                  : 0.0;
+        histo_.last_flip_tsc = now;
+        histo_.last_submit_tsc = sub;
+        histo_.out << fmt::format("flip {} draws {} dispatches {} flip_ms {:.1f} submit_ms {:.1f}\n", id, draws, disp,
+                                  flip_ms, sub_ms);
+        std::vector<std::pair<u64, const HistoEntry*>> v;
+        for (const auto& [k, e] : histo_.draws) {
+            v.push_back({k, &e});
+        }
+        std::ranges::sort(v, [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [k, e] : v) {
+            histo_.out << fmt::format("  p {} n {} ind {} inst {} verts {}{}\n", k, e->count, e->indirect, e->instances,
+                                      e->verts, histo_.legend_done.insert(k).second ? " | " + e->legend : "");
+        }
+        v.clear();
+        for (const auto& [k, e] : histo_.dispatches) {
+            v.push_back({k, &e});
+        }
+        std::ranges::sort(v, [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [k, e] : v) {
+            histo_.out << fmt::format("  cs {:#x} n {} ind {} groups {}\n", k, e->count, e->indirect, e->instances);
+        }
+        for (const auto& line : histo_.detail) {
+            histo_.out << line << '\n';
+        }
+        histo_.detail.clear();
+        histo_.out.flush();
+        for (auto& [k, e] : histo_.draws) {
+            e.count = e.indirect = e.instances = e.verts = 0;
+        }
+        histo_.dispatches.clear();
+        std::erase_if(histo_.draws, [](const auto& kv) { return kv.second.legend.empty(); });
+    }
+    histo_.active = id + 1 >= range[0] && id + 1 < range[0] + range[1];
+}
+
 void Executor::Flip(const Cp::FlipMarker&) {
+    images_.NewFrame();
+    DrawHistogram();
+    RaceCheck();
     ++stats_.flips;
     if (prof_ && ++prof_frames_ >= 300) {
         ProfReport();
@@ -2402,6 +2868,8 @@ void Executor::Flip(const Cp::FlipMarker&) {
                 if (!presenter_->RecordCopy(cur_.cb, frame, img->image, shown, w, h)) {
                     presenter_->ReleaseFrame(frame);
                     frame = -1;
+                } else {
+                    CaptureSeries(*img, shown, w, h);
                 }
                 DiagEnd(cid);
                 ProfMark(2, "flip copy (frame to the presenter)");

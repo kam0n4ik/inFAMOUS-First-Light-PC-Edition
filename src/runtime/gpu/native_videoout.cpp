@@ -242,11 +242,27 @@ void PresentThread() {
         bool take = false;
         {
             std::scoped_lock lock{g_port.mutex};
-            if (g_port.open && !g_port.requests.empty() && vcount % static_cast<u64>(g_port.flip_rate + 1) == 0) {
+            // SSPC_DIAG_FLIP_INTERVAL=<n>: a flip at least n vblanks after the last one (a steady frame cadence: the
+            // game's timestep follows the flips; an experiment, P4.5)
+            static const u64 min_interval = [] {
+                char v[8] = {};
+                const u64 n = GetEnvironmentVariableA("SSPC_DIAG_FLIP_INTERVAL", v, sizeof(v)) > 0
+                                  ? std::strtoull(v, nullptr, 10)
+                                  : 0ull;
+                if (n != 0) {
+                    SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_FLIP_INTERVAL={} - a flip every {}+ vblanks",
+                             n, n);
+                }
+                return n;
+            }();
+            static u64 last_flip_vcount = 0;
+            if (g_port.open && !g_port.requests.empty() && vcount % static_cast<u64>(g_port.flip_rate + 1) == 0 &&
+                (min_interval == 0 || vcount >= last_flip_vcount + min_interval)) {
                 if (g_sink == nullptr || g_sink->Ready(g_port.requests.front().gpu_value)) {
                     req = g_port.requests.front();
                     g_port.requests.pop_front();
                     take = true;
+                    last_flip_vcount = vcount;
                 } else {
                     std::scoped_lock s{g_stats_mutex};
                     ++g_stats.waited_vblanks;

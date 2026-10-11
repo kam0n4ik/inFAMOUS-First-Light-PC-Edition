@@ -34,6 +34,8 @@
 // host is read and used under g_submit_mutex, g_queue_mutex or g_label_mutex, so SetHost(nullptr) — after it released
 // the submission lock — waits for every call still using the previous host. A backend calls SetHost(nullptr) before it
 // stops its GPU thread and not from that thread (a submission may be waiting for the GPU thread inside the host).
+#include <windows.h>
+
 #include "runtime/gpu/gnm/gnm_driver.h"
 
 #include <algorithm>
@@ -550,6 +552,16 @@ SSPC_SYSV_ABI s32 SubmitCommandBuffers(u32 count, const u32* dcbs[], u32* dcb_si
     return SubmitCommandBuffersForWorkload(count, count, dcbs, dcb_sizes, ccbs, ccb_sizes);
 }
 
+std::atomic<u64> g_last_submit_tsc{0};
+
+} // namespace
+
+u64 LastSubmitTsc() {
+    return g_last_submit_tsc.load(std::memory_order_acquire);
+}
+
+namespace {
+
 SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 count, u32* dcbs[], u32* dcb_sizes,
                                                          u32* ccbs[], u32* ccb_sizes, u32 vo_handle, u32 buffer_index,
                                                          u32 flip_mode, s64 flip_arg) {
@@ -593,13 +605,47 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
     if (host == nullptr) {
         return kErrSubmitInvalidArgument;
     }
+    // SSPC_DIAG_SYNC_SUBMIT=3: before handing on this frame, the frames before it were processed and recorded (the game
+    // stays at most one frame ahead of the backend's recording; P4.5 experiment)
+    static const bool sync_before = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_SYNC_SUBMIT", v, sizeof(v)) == 1 && v[0] == '3';
+    }();
+    if (sync_before) {
+        for (u32 i = 0; i < 300 && !host->IsRecorded(); ++i) {
+            Sleep(1);
+        }
+    }
     const s32 patched = PatchFlipRequest(*host, flip_dcb, flip_dcb_dwords, vo_handle, buffer_index, flip_mode, flip_arg);
     if (patched != kOk) {
         return patched;
     }
     const s32 submitted = PerformSubmit(*host, count, dcbs, dcb_sizes);
+    g_last_submit_tsc.store(__rdtsc(), std::memory_order_release);
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::Submitted);
+    }
+    // SSPC_DIAG_SYNC_SUBMIT=1: the game's thread waits (up to 300 ms) until the frame it submitted executed - the GPU
+    // consumes the frame before the game writes more (an experiment on the backend's latency; P4.5)
+    // (=2: only until the frame was processed and recorded - its commands may still execute)
+    static const int sync_submit = [] {
+        char v[4] = {};
+        const int mode = GetEnvironmentVariableA("SSPC_DIAG_SYNC_SUBMIT", v, sizeof(v)) == 1 ? v[0] - '0' : 0;
+        if (mode == 3) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_SYNC_SUBMIT=3 - each frame waits for the earlier "
+                                   "frames' recording before it is handed on");
+        }
+        if (mode == 1 || mode == 2) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_SYNC_SUBMIT={} - the game waits for each frame ({})",
+                     mode, mode == 1 ? "executed" : "recorded");
+            return mode;
+        }
+        return 0;
+    }();
+    if (sync_submit != 0 && submitted == kOk) {
+        for (u32 i = 0; i < 300 && !(sync_submit == 1 ? host->IsQuiet() : host->IsRecorded()); ++i) {
+            Sleep(1);
+        }
     }
     return submitted;
 }

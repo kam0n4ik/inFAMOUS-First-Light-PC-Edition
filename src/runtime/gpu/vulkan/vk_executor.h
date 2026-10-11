@@ -10,6 +10,8 @@
 #include <array>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,6 +39,7 @@ class StreamRing;
 class GuestBuffers;
 class ImageCache;
 class Presenter;
+class ImageReadback;
 struct CachedImage;
 struct OwnedBuffer;
 
@@ -82,6 +85,9 @@ struct ExecutorStats {
     u64 target_cache_hits = 0, target_cache_misses = 0;
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
+    /// met WAIT_REG_MEM on memory (of them: had blocked; the CPU had written tracked memory since the last drain - before
+    /// P4.5 the work after the wait read the older copies)
+    u64 acquires = 0, acquires_blocked = 0, acquires_applied = 0;
     std::array<u64, 9> gb_sites{}; ///< global barriers by GlobalBarrier site
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
@@ -125,6 +131,12 @@ public:
     void Synchronize(u32 queue) override;
     bool WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) override;
     bool CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) override;
+    void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
+    /// What MemoryAcquired runs: the backend applies the guest's CPU writes seen so far to the caches (true: some).
+    void SetAcquireHook(bool (*hook)(void*), void* ctx) {
+        acquire_hook_ = hook;
+        acquire_ctx_ = ctx;
+    }
     /// Dense video memory for the written buffers of dispatches (see PrepareShadows); null: they write in place.
     void SetWriteShadowRing(StreamRing* ring) { shadow_ring_ = ring; }
     /// Synchronize for a CPU read of guest memory by the command processor (its own memory reads).
@@ -257,6 +269,49 @@ private:
     bool PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bind, std::vector<VkWriteDescriptorSet>& writes);
     void SetDynamicState(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
     void RecordFrameCopy();
+    /// SSPC_DIAG_CAPTURE_FRAMES: the displayed image of this flip read back (recorded after its copy; P4.5).
+    void CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h);
+    std::unique_ptr<ImageReadback> readback_;
+    /// SSPC_DIAG_DRAW_HISTO: the frame's draws by pipeline / dispatches by program, written at the flip (P4.5)
+    void DrawHistogram();
+    struct HistoEntry {
+        u64 count = 0, indirect = 0, instances = 0, verts = 0;
+        std::string legend;
+    };
+    struct Histo {
+        bool active = false;
+        std::unordered_map<u64, HistoEntry> draws, dispatches;
+        std::unordered_set<u64> legend_done;
+        std::vector<std::string> detail;
+        std::ofstream out, args;
+        u64 last_flip_tsc = 0, last_submit_tsc = 0;
+    };
+    struct ArgsReadback {
+        u64 value, flip, addr;
+        OwnedBuffer buffer;
+    };
+    std::deque<ArgsReadback> args_rb_;
+    Histo histo_;
+    /// SSPC_DIAG_RACE: streamed ranges re-read at the flip (P4.5)
+    void RaceCheck();
+    static u64 RaceHash(const u8* p, u64 n);
+    struct RaceCopy {
+        u64 addr, size, hash;
+    };
+    struct RaceRange {
+        u64 count = 0, size = 0;
+    };
+    struct Race {
+        bool on = false;
+        std::vector<RaceCopy> copies;
+        std::unordered_map<u64, RaceRange> by_range;
+        std::unordered_map<u64, u64> post; ///< a changed range's value at the flip
+        u64 total = 0, changed = 0, frames = 0, frames_changed = 0, next_equal = 0, next_differ = 0;
+        u64 watch_logged = 0, watch_copy_tsc = 0;
+        std::vector<std::pair<u64, u64>> acquires; ///< (TSC, poll address) of this frame's met memory waits
+        u32 watch_copy_hits = 0;
+    };
+    Race race_;
     void BeforeUpload();
     void OnDeviceLost(const char* where, u64 value);
     void SyncFrom(u32 source);
@@ -356,6 +411,8 @@ private:
     u64 lds_logged_ = 0;
     std::vector<CachedImage*> info_images_; ///< the image of each image descriptor info of the draw (nullptr: none)
     bool device_lost_ = false;
+    bool (*acquire_hook_)(void*) = nullptr;
+    void* acquire_ctx_ = nullptr;
     u64 batch_first_cmd_ = 0, batch_last_cmd_ = 0;
 };
 

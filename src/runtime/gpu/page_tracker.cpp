@@ -186,6 +186,10 @@ bool PageTracker::OnFault(u64 address, bool is_write) {
     Lock lock;
     if (Armed(page) && Release(first, first + per_block, true) != 0) {
         faults_.fetch_add(1, std::memory_order_relaxed);
+        fault_addr_[fault_head_++ % kFaultRing] = address; // no allocation: a fixed ring under the lock
+        if (fault_head_ - fault_tail_ > kFaultRing) {
+            fault_tail_ = fault_head_ - kFaultRing;
+        }
         return true;
     }
     // given back by another thread between the fault and this check: the write retries
@@ -196,6 +200,13 @@ bool PageTracker::OnFault(u64 address, bool is_write) {
         return true;
     }
     return false;
+}
+
+void PageTracker::TakeFaultAddresses(std::vector<u64>& out) {
+    Lock lock;
+    for (; fault_tail_ < fault_head_; ++fault_tail_) {
+        out.push_back(fault_addr_[fault_tail_ % kFaultRing]);
+    }
 }
 
 PageTracker::Stats PageTracker::GetStats() const {

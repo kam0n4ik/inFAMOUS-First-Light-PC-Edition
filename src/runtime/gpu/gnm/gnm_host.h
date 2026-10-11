@@ -37,6 +37,10 @@ public:
     virtual void SubmitDone() = 0;
     /// Every submission processed and every GPU work item complete.
     virtual bool IsGpuIdle() = 0;
+    /// Diagnostics (SSPC_DIAG_SYNC_SUBMIT): nothing handed on is waiting, blocked or executing (without SubmitDone).
+    virtual bool IsQuiet() { return IsGpuIdle(); }
+    /// Diagnostics (SSPC_DIAG_SYNC_SUBMIT=2): everything handed on was processed and recorded (it may still execute).
+    virtual bool IsRecorded() { return IsQuiet(); }
 
     /// VideoOut (SecondSonPC's): a flip of `buffer_index` requested by a submission's flip marker; it happens once the
     /// GPU work before the marker is complete. 0 or the VideoOut error (0x80290012: the flip queue is full).
@@ -52,6 +56,9 @@ Host* GetHost();
 /// The backend raises an interrupt (its GPU thread): the driver wakes the event queues registered for it with
 /// sceGnmAddEqEvent and its own waiters (GpuIdle releases a submission lock taken by SubmitDone).
 void RaiseInterrupt(Interrupt id);
+
+/// Diagnostics (P4.5): the TSC when the game's last SubmitAndFlip handed its frame on (0: none yet).
+u64 LastSubmitTsc();
 
 /// The game's SDK version as the driver uses it to choose its initialisation sequence (sceKernelGetCompiledSdkVersion).
 void SetSdkVersion(s32 version);

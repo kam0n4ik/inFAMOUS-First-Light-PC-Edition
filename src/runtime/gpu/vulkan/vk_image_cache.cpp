@@ -78,6 +78,9 @@ ImageCache::ImageCache(DeviceContext& ctx, GuestBuffers& guest) : ctx_(ctx), gue
 ImageCache::~ImageCache() {
     const auto& f = Fn();
     const VkDevice dev = ctx_.Device();
+    for (auto& img : retired_) {
+        images_.push_back(std::move(img));
+    }
     for (auto& img : images_) {
         for (auto& [k, v] : img->views) {
             f.vkDestroyImageView(dev, v, nullptr);
@@ -151,17 +154,66 @@ void ImageCache::Evict(u64 completed) {
     ++epoch_; // what Find returned (the executor's target cache and texture memo) may be gone
 }
 
-void ImageCache::Invalidate(u64 addr, u64 size) {
+void ImageCache::Queue(u64 addr, u64 size, InvalKind kind) {
     std::scoped_lock lock{inval_mutex_};
-    pending_inval_.emplace_back(addr, size);
+    pending_inval_.push_back({addr, size, kind});
     has_inval_.store(true, std::memory_order_release);
+}
+
+void ImageCache::Invalidate(u64 addr, u64 size) {
+    Queue(addr, size, InvalKind::Exact);
+}
+
+void ImageCache::InvalidateFromBufferWrite(u64 addr, u64 size) {
+    Queue(addr, size, InvalKind::BufferWrite);
+}
+
+void ImageCache::InvalidateCoarse(u64 addr, u64 size) {
+    Queue(addr, size, InvalKind::Coarse);
+}
+
+void ImageCache::Unmap(u64 addr, u64 size) {
+    Queue(addr, size, InvalKind::Unmap);
+}
+
+void ImageCache::Retire(CachedImage* img) {
+    const auto [lo, hi] = by_address_.equal_range(img->layout.guest_address);
+    for (auto it = lo; it != hi; ++it) {
+        if (it->second == img) {
+            by_address_.erase(it);
+            break;
+        }
+    }
+    std::erase_if(meta_owner_, [&](const auto& e) { return e.second == img; });
+    const auto it = std::ranges::find_if(images_, [&](const std::unique_ptr<CachedImage>& p) { return p.get() == img; });
+    if (it == images_.end()) {
+        return;
+    }
+    stats_.bytes -= img->bytes;
+    --stats_.images;
+    ++stats_.retired;
+    stats_.retired_bytes += img->bytes;
+    retired_.push_back(std::move(*it));
+    images_.erase(it);
+    ++epoch_; // what Find returned for it (the executor's target cache and texture memo) is gone
+}
+
+void ImageCache::TrackGpuWritten(CachedImage& img) {
+    // its pages protected: the CPU's writes there reach ApplyInvalidations as coarse reports (interior blocks count)
+    const ImageLayout& l = img.layout;
+    if (tracker_ != nullptr && l.guest_size != 0 && tracker_->CanArm(l.guest_address, l.guest_size)) {
+        tracker_->Arm(l.guest_address, l.guest_size);
+        ++stats_.gpu_tracked;
+    } else {
+        ++stats_.gpu_untracked; // the CPU's writes there are not seen (memory imported through the guest's pages)
+    }
 }
 
 void ImageCache::ApplyInvalidations() {
     if (!has_inval_.load(std::memory_order_acquire)) {
         return; // the common case: no lock taken
     }
-    std::vector<std::pair<u64, u64>> ranges;
+    std::vector<PendingInval> ranges;
     {
         std::scoped_lock lock{inval_mutex_};
         has_inval_.store(false, std::memory_order_relaxed);
@@ -172,17 +224,69 @@ void ImageCache::ApplyInvalidations() {
     }
     // only the images that can overlap each range (by address; it walked every image for every range: 7.8% of the GPU
     // thread's samples, f1)
-    for (const auto& [addr, size] : ranges) {
+    constexpr u64 kBlock = 64 * 1024; // the tracker's report granularity
+    std::vector<CachedImage*> unmapped;
+    for (const auto& [addr, size, kind] : ranges) {
         const u64 end = addr + size;
         auto it = by_address_.lower_bound(addr > max_image_size_ ? addr - max_image_size_ : 0);
         for (; it != by_address_.end() && it->first < end; ++it) {
             CachedImage* img = it->second;
             const u64 b = img->layout.guest_address, e = b + img->layout.guest_size;
-            if (b < end && addr < e && img->uploaded && !img->gpu_written) {
-                img->dirty = true;
-                ++stats_.invalidations;
+            if (!(b < end && addr < e)) {
+                continue;
+            }
+            if (kind == InvalKind::Unmap) {
+                unmapped.push_back(img);
+                continue;
+            }
+            if (!img->gpu_written) {
+                if (img->uploaded) {
+                    img->dirty = true;
+                    ++stats_.invalidations;
+                }
+                continue;
+            }
+            // a GPU-written image: memory holds its texels again only if this write was surely into it (P4.5)
+            bool hit = false;
+            switch (kind) {
+            case InvalKind::Exact:
+                hit = true;
+                break;
+            case InvalKind::BufferWrite:
+                hit = b == addr;
+                break;
+            case InvalKind::Coarse: {
+                const u64 ib = (b + kBlock - 1) & ~(kBlock - 1), ie = e & ~(kBlock - 1); // blocks wholly inside
+                hit = ib < ie && addr < ie && ib < end;
+                if (!hit) {
+                    img->maybe_newer = true; // a block it shares: the write may be its neighbour's
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            if (hit && !img->memory_newer) {
+                img->memory_newer = true;
+                ++stats_.memory_newer;
+                ++stats_.memory_newer_by[static_cast<u32>(kind)];
+                if (stats_.memory_newer <= 16) {
+                    SSPC_LOG(GPU, Info,
+                             "native backend: GPU-written img{} {:#x}+{:#x} fmt {} {}x{}: its memory was written ({} "
+                             "{:#x}+{:#x}) - uploaded before its next use",
+                             img->id, b, img->layout.guest_size, img->layout.pixel_format, img->layout.size.width,
+                             img->layout.size.height,
+                             kind == InvalKind::Exact ? "exact" : kind == InvalKind::BufferWrite ? "buffer write" : "CPU",
+                             addr, size);
+                }
             }
         }
+    }
+    std::ranges::sort(unmapped);
+    unmapped.erase(std::unique(unmapped.begin(), unmapped.end()), unmapped.end());
+    for (CachedImage* img : unmapped) {
+        ++stats_.memory_newer_by[static_cast<u32>(InvalKind::Unmap)];
+        Retire(img);
     }
 }
 
@@ -443,6 +547,77 @@ bool ImageCache::Upload(CachedImage& img, VkCommandBuffer cb, u64 seq, std::stri
     return true;
 }
 
+CachedImage* ImageCache::ExpandSource(const ImageLayout& want, std::multimap<u64, CachedImage*>::iterator lo,
+                                      std::multimap<u64, CachedImage*>::iterator hi) {
+    // the bridge's ExpandImage (texture_cache.cpp ResolveOverlap): a texture at the address of an image the GPU wrote,
+    // asking for more of it (levels, layers) or for a block-compressed view of its uncompressed texels (the same bits
+    // a texel and a block). No Vulkan view covers that: a new image, guest memory uploaded (the parts the GPU never
+    // wrote), the GPU-written texels copied over it (vkCmdCopyImage: size-compatible formats, the extent in the
+    // source's texels). An image whose memory was written since (memory_newer: the address reused) is not a source.
+    for (auto it = lo; it != hi; ++it) {
+        CachedImage* have_img = it->second;
+        const ImageLayout& have = have_img->layout;
+        if (!have_img->gpu_written || have_img->memory_newer || have_img->maybe_newer || have.num_samples != 1 ||
+            want.num_samples != 1 ||
+            have.num_bits != want.num_bits || have.props.is_depth != want.props.is_depth ||
+            (have.type == ImageType::Color3D) != (want.type == ImageType::Color3D)) {
+            continue;
+        }
+        if (want.props.is_block && !have.props.is_block) {
+            // texels of the uncompressed image = blocks of the compressed one
+            if (have.BlockDim() == want.BlockDim() && have.layers <= want.layers && have.size.depth == want.size.depth) {
+                return have_img;
+            }
+            continue;
+        }
+        if (want.props.is_block != have.props.is_block || have.size != want.size || have.tile_mode != want.tile_mode) {
+            continue;
+        }
+        if (have.levels < want.levels || have.layers < want.layers) {
+            return have_img;
+        }
+    }
+    return nullptr;
+}
+
+void ImageCache::CopyImage(CachedImage& src, CachedImage& dst, VkCommandBuffer cb) {
+    Transition(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_READ_BIT);
+    Transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const ImageLayout& s = src.layout;
+    const ImageLayout& d = dst.layout;
+    const bool is3d = s.type == ImageType::Color3D;
+    const u32 levels = std::min<u32>(std::max<u32>(s.levels, 1), std::max<u32>(d.levels, 1));
+    const u32 layers = is3d ? 1u : std::min<u32>(std::max<u32>(s.layers, 1), std::max<u32>(d.layers, 1));
+    const auto strip = [](VkImageAspectFlags a) {
+        return a == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT}
+                                                                              : a;
+    };
+    std::vector<VkImageCopy> regions;
+    for (u32 m = 0; m < levels; ++m) {
+        // the extent in the source's texels (an uncompressed source of a compressed destination: one texel a block)
+        const VkExtent3D ext{std::max(s.size.width >> m, 1u), std::max(s.size.height >> m, 1u),
+                             is3d ? std::max(s.size.depth >> m, 1u) : 1u};
+        if (d.props.is_block && !s.props.is_block) {
+            // the destination's level must hold that many whole blocks
+            const u32 bw = (std::max(d.size.width >> m, 1u) + 3) / 4, bh = (std::max(d.size.height >> m, 1u) + 3) / 4;
+            if (ext.width > bw || ext.height > bh) {
+                break;
+            }
+        }
+        regions.push_back(VkImageCopy{.srcSubresource = {strip(src.aspect), m, 0, layers},
+                                      .srcOffset = {0, 0, 0},
+                                      .dstSubresource = {strip(dst.aspect), m, 0, layers},
+                                      .dstOffset = {0, 0, 0},
+                                      .extent = ext});
+    }
+    if (!regions.empty()) {
+        Fn().vkCmdCopyImage(cb, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<u32>(regions.size()), regions.data());
+    }
+}
+
 CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffer cb, u64 seq, std::string& error) {
     ApplyInvalidations();
     CachedImage* match = nullptr;
@@ -535,7 +710,10 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
             }
         }
     }
-    if (match == nullptr && use == Use::Texture) {
+    // P4.5: a texture that needs more of a GPU-written image than a view gives (ExpandImage)
+    CachedImage* expand_src =
+        match == nullptr && use == Use::Texture && alias_rule_ ? ExpandSource(layout, lo, hi) : nullptr;
+    if (match == nullptr && use == Use::Texture && expand_src == nullptr) {
         // diagnostics: a new texture over memory the GPU rendered into (any overlap): those texels exist only in video
         // memory, the upload reads guest memory the GPU never wrote
         const u64 a = layout.guest_address, e = a + layout.guest_size;
@@ -589,8 +767,33 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
         ++stats_.hits;
     }
     match->last_seq = seq;
+    match->last_frame = frame_;
     const bool target = use == Use::ColorTarget || use == Use::DepthTarget;
-    if (!target && !match->gpu_written && (!match->uploaded || match->dirty)) {
+    if (expand_src != nullptr) {
+        // guest memory first (what the GPU never wrote there), then the GPU-written texels over it (ExpandImage)
+        if (before_upload_ != nullptr) {
+            before_upload_(before_upload_ctx_);
+        }
+        if (!Upload(*match, cb, seq, error)) {
+            return nullptr;
+        }
+        CopyImage(*expand_src, *match, cb);
+        const bool block = layout.props.is_block && !expand_src->layout.props.is_block;
+        ++(block ? stats_.block_copies : stats_.expanded);
+        if (stats_.expanded + stats_.block_copies <= 16) {
+            SSPC_LOG(GPU, Info,
+                     "native backend: img{} {:#x} fmt {} {}x{} lv {} ly {} made from GPU-written img{} fmt {} {}x{} lv "
+                     "{} ly {} ({})",
+                     match->id, layout.guest_address, layout.pixel_format, layout.size.width, layout.size.height,
+                     layout.levels, layout.layers, expand_src->id, expand_src->layout.pixel_format,
+                     expand_src->layout.size.width, expand_src->layout.size.height, expand_src->layout.levels,
+                     expand_src->layout.layers, block ? "block-compressed view" : "expanded");
+        }
+        match->gpu_written = true;
+        expand_src->last_seq = std::max(expand_src->last_seq, seq); // the copy reads it: destroyed after this batch
+        Retire(expand_src);
+        TrackGpuWritten(*match);
+    } else if (!target && !match->gpu_written && (!match->uploaded || match->dirty)) {
         stats_.reuploads += match->uploaded ? 1 : 0;
         if (before_upload_ != nullptr) {
             before_upload_(before_upload_ctx_);
@@ -598,9 +801,44 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
         if (!Upload(*match, cb, seq, error)) {
             return nullptr;
         }
+    } else if (match->gpu_written && match->memory_newer) {
+        // memory was written after the GPU wrote this image (the CPU, a DMA, a shader's buffer write at its base): its
+        // texels are memory's - uploaded before this use (a target too: a draw covering part of it keeps the rest).
+        // A multisampled image cannot take a buffer copy: it keeps its texels (as the bridge's RefreshImage).
+        match->memory_newer = false;
+        if (layout.num_samples <= 1 && match->layout.num_samples <= 1) {
+            if (before_upload_ != nullptr) {
+                before_upload_(before_upload_ctx_);
+            }
+            if (!Upload(*match, cb, seq, error)) {
+                return nullptr;
+            }
+            stats_.target_uploads += target ? 1 : 0;
+            if (!target && use != Use::Storage) {
+                match->gpu_written = false; // a texture of memory's texels now (uploaded, tracked)
+            }
+        }
     }
     if (target || use == Use::Storage) {
+        match->maybe_newer = false; // what the GPU writes now is its latest
+    }
+    if ((target || use == Use::Storage) && !match->gpu_written) {
         match->gpu_written = true;
+        match->superseded = false;
+        TrackGpuWritten(*match);
+        // other GPU-written images over this memory hold what was there before: retired once unused for a while
+        const u64 a = layout.guest_address, e = a + layout.guest_size;
+        auto it = by_address_.lower_bound(a > max_image_size_ ? a - max_image_size_ : 0);
+        for (; it != by_address_.end() && it->first < e; ++it) {
+            CachedImage* o = it->second;
+            if (o != match && o->gpu_written && !o->superseded && o->layout.guest_address < e &&
+                a < o->layout.guest_address + o->layout.guest_size) {
+                o->superseded = true;
+                ++stats_.superseded;
+            }
+        }
+    } else if (target || use == Use::Storage) {
+        match->superseded = false;
     }
     if (target) {
         for (const u64 meta : {layout.meta.cmask_addr, layout.meta.fmask_addr, layout.meta.htile_addr}) {
@@ -769,6 +1007,34 @@ void ImageCache::Collect(u64 completed) {
         Fn().vkDestroyBuffer(ctx_.Device(), temps_.front().buffer, nullptr);
         Fn().vkFreeMemory(ctx_.Device(), temps_.front().memory, nullptr);
         temps_.pop_front();
+    }
+    // taken-out images whose last use completed: destroyed (P4.5)
+    const auto& f = Fn();
+    const VkDevice dev = ctx_.Device();
+    std::erase_if(retired_, [&](const std::unique_ptr<CachedImage>& img) {
+        if (img->last_seq > completed) {
+            return false;
+        }
+        for (auto& [k, v] : img->views) {
+            f.vkDestroyImageView(dev, v, nullptr);
+        }
+        f.vkDestroyImage(dev, img->image, nullptr);
+        f.vkFreeMemory(dev, img->memory, nullptr);
+        return true;
+    });
+    // superseded GPU-written images unused for kRetireFrames frames: their memory belongs to another image now
+    constexpr u64 kRetireFrames = 120;
+    if (stats_.superseded != 0 && (frame_ & 15) == 0 && frame_ != last_retire_scan_) {
+        last_retire_scan_ = frame_;
+        std::vector<CachedImage*> old;
+        for (const auto& img : images_) {
+            if (img->superseded && img->last_seq <= completed && img->last_frame + kRetireFrames < frame_) {
+                old.push_back(img.get());
+            }
+        }
+        for (CachedImage* img : old) {
+            Retire(img);
+        }
     }
     Evict(completed);
 }

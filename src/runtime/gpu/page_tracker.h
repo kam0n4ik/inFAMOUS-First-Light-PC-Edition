@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <string>
+#include <vector>
 
 #include "base/abi.h"
 
@@ -77,6 +78,11 @@ public:
         }
     }
 
+    /// The faulting addresses since the last call - each the first write into a block given back - appended to `out`;
+    /// at most kFaultRing kept (older ones dropped: the blocks are still reported by Drain). GPU thread (P4.5: a write
+    /// surely inside a small GPU-written image, where a whole block says nothing).
+    void TakeFaultAddresses(std::vector<u64>& out);
+
     struct Stats {
         u64 armed_pages = 0;  ///< currently write-protected
         u64 arms = 0, disarms = 0, faults = 0, faults_raced = 0, forgotten = 0, never_armed_blocks = 0;
@@ -105,6 +111,9 @@ private:
     std::atomic<bool> any_{false};
     std::atomic<u64> armed_pages_{0}, arms_{0}, disarms_{0}, faults_{0}, faults_raced_{0}, forgotten_{0};
     std::atomic<u64> never_blocks_{0};
+    static constexpr u64 kFaultRing = 4096;
+    u64 fault_addr_[kFaultRing] = {}; ///< under the lock
+    u64 fault_head_ = 0, fault_tail_ = 0;
 };
 
 } // namespace SecondSon::Gpu

@@ -195,6 +195,10 @@ public:
     /// Isolated: a DMA_DATA memory-to-memory copy recorded on the GPU's timeline after the GPU work before it, instead
     /// of Synchronize + a CPU copy (P4.4). true: recorded - the processor copies nothing itself.
     virtual bool CopyOnTimeline(u32 /*queue*/, u64 /*seq*/, u64 /*src*/, u64 /*dst*/, u64 /*bytes*/) { return false; }
+    /// Isolated: a WAIT_REG_MEM on memory was met (`blocked`: it had blocked before). The guest's CPU writes that came
+    /// before the value it waited for (data published with a flag) belong to the work after it: an executor holding
+    /// copies of guest memory applies the CPU writes seen so far before recording more (P4.5).
+    virtual void MemoryAcquired(u32 /*queue*/, bool /*blocked*/, u64 /*poll_address*/) {}
 };
 
 /// Before/after every packet (validation; nullptr: none).

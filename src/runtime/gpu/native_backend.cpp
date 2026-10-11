@@ -26,6 +26,7 @@
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/cpu_sampler.h"
 #include "runtime/gpu/page_tracker.h"
+#include "runtime/kernel/clock.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
@@ -129,6 +130,12 @@ public:
     bool IsGpuIdle() override {
         return idle_.load(std::memory_order_acquire);
     }
+    bool IsQuiet() override {
+        return quiet_.load(std::memory_order_acquire);
+    }
+    bool IsRecorded() override {
+        return recorded_.load(std::memory_order_acquire);
+    }
     s32 SubmitEopFlip(s32 handle, u32 index, u32 mode, s64 arg) override {
         return VideoOut::SubmitEopFlip(handle, index, mode, arg);
     }
@@ -142,11 +149,17 @@ public:
         if (guest_) {
             guest_->Drop(addr, size);
         }
+        if (images_) {
+            images_->Unmap(addr, size); // the images there are taken out (P4.5)
+        }
         Invalidate(addr, size);
     }
     void OnRegister(u64, u64) override {}
     void OnMap(u64 addr, u64 size) override {
         tracker_.Forget(addr, size);
+        if (images_) {
+            images_->Unmap(addr, size); // new memory there: what the images held is gone (P4.5)
+        }
         Invalidate(addr, size);
     }
     void OnGuestWrite(u64 addr, u64 size) override {
@@ -173,6 +186,8 @@ private:
             std::scoped_lock lock{mutex_};
             queue_.push_back(s);
             idle_.store(false, std::memory_order_release);
+            quiet_.store(false, std::memory_order_release);
+            recorded_.store(false, std::memory_order_release);
         }
         cv_.notify_one();
     }
@@ -188,6 +203,10 @@ private:
     }
     void Loop();
     void Apply(const Submission& s);
+    /// The guest's CPU writes the tracker caught so far applied to the caches (textures and buffers uploaded again at
+    /// their next use): before the work the guest submitted after them, and at each met WAIT_REG_MEM on memory (data a
+    /// CPU thread published with a flag; P4.5). true: there were some. GPU thread.
+    bool DrainCpuWrites();
 
     Options options_;
     std::unique_ptr<Vk::DeviceContext> ctx_;
@@ -207,11 +226,14 @@ private:
     GS::DeviceProfile profile_;
     Memory memory_;
     PageTracker tracker_;
+    std::vector<u64> fault_addrs_; ///< DrainCpuWrites' scratch
 
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Submission> queue_;
     std::atomic<bool> idle_{true};
+    std::atomic<bool> quiet_{true};    ///< IsQuiet (diagnostics)
+    std::atomic<bool> recorded_{true}; ///< IsRecorded (diagnostics)
     std::atomic<bool> stop_{false};
     std::atomic<bool> device_lost_{false};
     std::thread thread_;
@@ -329,11 +351,37 @@ bool Backend::Start(const Options& o, std::string& error) {
     cpo.memory = &memory_;
     cpo.work = executor_.get();
     cpo.gds = gds_.mapped;
+    // EOP/RELEASE_MEM clocks in the guest's time base (P4.5): data_sel 4 (the GPU counter the game scales with
+    // sceGnmGetGpuCoreClockFrequency, 800 MHz) is the TSC the game reads with rdtsc, in GPU core clocks - as the
+    // bridge's GetGpuPerfCounter; data_sel 3 (the 64-bit GPU clock) nanoseconds as the bridge's GetGpuClock64. Before,
+    // both were the host's steady clock in ns: another base and rate than every other time the game sees.
+    // SSPC_DIAG_GPU_COUNTER=ns: the old clocks (a control run, not a configuration).
+    static const bool counter_ns = [] {
+        char v[8] = {};
+        const bool ns = GetEnvironmentVariableA("SSPC_DIAG_GPU_COUNTER", v, sizeof(v)) == 2 && std::string_view(v) == "ns";
+        if (ns) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_GPU_COUNTER=ns - GPU counter fences in host ns");
+        }
+        return ns;
+    }();
+    if (!counter_ns) {
+        cpo.clock = [](void*, u32 data_sel) -> u64 {
+            if (data_sel == 4) {
+                constexpr u64 kGpuCoreClock = 800'000'000; // sceGnmGetGpuCoreClockFrequency (base PS4)
+                const u64 tsc = Kernel::Clock::ReadTsc(), freq = std::max<u64>(Kernel::Clock::TscFrequency(), 1);
+                return tsc / freq * kGpuCoreClock + tsc % freq * kGpuCoreClock / freq;
+            }
+            return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::high_resolution_clock::now().time_since_epoch())
+                                        .count());
+        };
+    }
     cp_ = std::make_unique<Cp::CommandProcessor>(cpo);
     executor_->Attach(cp_.get());
     executor_->SetWriteShadowRing(shadow_ring_.get());
     diag_ = std::make_unique<Vk::Diagnostics>(*ctx_, o.diagnostics, o.logs_dir);
     executor_->SetDiagnostics(diag_.get());
+    executor_->SetAcquireHook([](void* self) { return static_cast<Backend*>(self)->DrainCpuWrites(); }, this);
     images_->SetDiagnostics(diag_.get());
     // one owner of the guest GPU: every resource, or none
     for (u8 r = 0; r < static_cast<u8>(Resource::Count); ++r) {
@@ -419,6 +467,24 @@ void Backend::Apply(const Submission& s) {
     }
 }
 
+bool Backend::DrainCpuWrites() {
+    bool any = false;
+    // the exact first write of each block given back: surely a write at that address (a small GPU-written image has no
+    // whole block a coarse report could name; P4.5)
+    fault_addrs_.clear();
+    tracker_.TakeFaultAddresses(fault_addrs_);
+    for (const u64 a : fault_addrs_) {
+        images_->Invalidate(a, 1);
+    }
+    tracker_.Drain([&](u64 a, u64 sz) {
+        any = true;
+        images_->InvalidateCoarse(a, sz); // whole 64 KiB blocks: a GPU-written image counts only its interior ones
+        buffers_->InvalidateCoarse(a, sz); // whole 64 KiB blocks: the GPU's pending pages there stay
+        frontend_->Invalidate(a, sz);
+    });
+    return any;
+}
+
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
     std::deque<Submission> local;
@@ -454,14 +520,22 @@ void Backend::Loop() {
             }
         }
         // the guest's writes to tracked pages, before the work it submitted after them
-        tracker_.Drain([&](u64 a, u64 sz) {
-            images_->Invalidate(a, sz);
-            buffers_->InvalidateCoarse(a, sz); // whole 64 KiB blocks: the GPU's pending pages there stay
-            frontend_->Invalidate(a, sz);
-        });
+        DrainCpuWrites();
         bool progress = false, blocked = false, pending = false;
         const auto cp_t0 = Clock::now();
-        for (u32 q = 0; q < Cp::kNumQueues; ++q) {
+        // SSPC_DIAG_QUEUE_ORDER=compute-first: the compute queues stepped before the graphics queue in each round (an
+        // experiment on async compute's place relative to the graphics frame's end-of-pipe; P4.5)
+        static const bool compute_first = [] {
+            char v[16] = {};
+            const bool c = GetEnvironmentVariableA("SSPC_DIAG_QUEUE_ORDER", v, sizeof(v)) > 0 &&
+                           std::string_view(v) == "compute-first";
+            if (c) {
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_QUEUE_ORDER=compute-first");
+            }
+            return c;
+        }();
+        for (u32 k = 0; k < Cp::kNumQueues; ++k) {
+            const u32 q = compute_first ? (k + 1) % Cp::kNumQueues : k;
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
                 continue;
             }
@@ -609,6 +683,12 @@ void Backend::Loop() {
             std::scoped_lock lock{mutex_};
             return queue_.empty();
         }();
+        if (queue_empty && !pending && !blocked) {
+            recorded_.store(true, std::memory_order_release);
+        }
+        if (queue_empty && !pending && !blocked && !executor_->Busy() && !executor_->HasOpenWork()) {
+            quiet_.store(true, std::memory_order_release);
+        }
         if (submit_done_ && queue_empty && !pending && !blocked && !executor_->Busy() &&
             !executor_->HasOpenWork()) {
             submit_done_ = false;
@@ -685,6 +765,12 @@ std::string Backend::Report() {
                            i.images, i.bytes >> 20, i.uploads, i.detiles, i.linear_uploads, i.upload_bytes >> 20,
                            i.overlap_hits, i.target_misses, i.overlap_misses, i.unsupported, i.first_unsupported);
         out += fmt::format("images evicted over the budget: {} ({} MiB)\n", i.evicted, i.evicted_bytes >> 20);
+        out += fmt::format("GPU-written images whose memory was written since: {} (exact {}, buffer write at the base {}, "
+                           "CPU {}, unmapped {}), targets uploaded first {}; expanded {}, block-compressed copies {}; "
+                           "superseded {}; retired {} ({} MiB); write-tracked {}, not trackable {}\n",
+                           i.memory_newer, i.memory_newer_by[0], i.memory_newer_by[1], i.memory_newer_by[2],
+                           i.memory_newer_by[3], i.target_uploads, i.expanded, i.block_copies, i.superseded, i.retired,
+                           i.retired_bytes >> 20, i.gpu_tracked, i.gpu_untracked);
     }
     if (guest_) {
         const auto g = guest_->GetStats();
@@ -703,6 +789,8 @@ std::string Backend::Report() {
                            "{}\n",
                            vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
         out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
+        out += fmt::format("memory waits met: {} (had blocked {}), CPU writes applied at them {}\n", s.acquires,
+                           s.acquires_blocked, s.acquires_applied);
         out += fmt::format("global barriers by site: other {}, shadows in {}+{}, shadows out {}, timeline write {}, timeline "
                            "copy {}, upload {}, before a draw {}, before a dispatch {}\n",
                            s.gb_sites[0], s.gb_sites[1], s.gb_sites[2], s.gb_sites[3], s.gb_sites[4], s.gb_sites[5],

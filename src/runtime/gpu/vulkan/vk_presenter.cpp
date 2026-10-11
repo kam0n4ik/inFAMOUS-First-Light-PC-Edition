@@ -4,6 +4,7 @@
 #include "runtime/gpu/vulkan/vk_presenter.h"
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -91,8 +92,7 @@ struct Presenter::Impl {
     std::mutex frames_mutex;
 
     std::mutex capture_mutex;
-    u64 capture_flip = 0;
-    std::filesystem::path capture_path;
+    std::deque<std::pair<u64, std::filesystem::path>> captures; ///< requested flips (ascending) and their PNGs
 
     std::mutex stats_mutex;
     Stats stats;
@@ -696,9 +696,10 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     std::filesystem::path capture;
     {
         std::scoped_lock lock{m.capture_mutex};
-        if (m.capture_flip != 0 && flip_id >= m.capture_flip && show) {
-            capture = m.capture_path;
-            m.capture_flip = 0;
+        // the first shown flip at or after each request (a request whose flip was not shown takes the next one)
+        while (show && !m.captures.empty() && m.captures.front().first <= flip_id) {
+            capture = std::move(m.captures.front().second);
+            m.captures.pop_front();
         }
     }
     if (!capture.empty() && fr != nullptr) {
@@ -708,8 +709,7 @@ void Presenter::Present(s32 frame, u64 flip_id) {
 
 void Presenter::RequestCapture(u64 flip_id, const std::filesystem::path& png) {
     std::scoped_lock lock{impl_->capture_mutex};
-    impl_->capture_flip = flip_id;
-    impl_->capture_path = png;
+    impl_->captures.emplace_back(flip_id, png);
 }
 
 Presenter::Stats Presenter::GetStats() {
