@@ -1,0 +1,82 @@
+diff --git a/src/core/gpu_memory.h b/src/core/gpu_memory.h
+index d6c69f5e44..099ed88be0 100644
+--- a/src/core/gpu_memory.h
++++ b/src/core/gpu_memory.h
+@@ -69,6 +69,14 @@ public:
+     /// End of the system reserved part of the guest address space (constant).
+     virtual VAddr SystemReservedEnd() = 0;
+ 
++    /// SecondSonPC P4.4: the physical backing's own host view of the guest memory around addr: the run
++    /// [run_begin, run_begin + run_size) that is linear there (one area, one physical piece) starts at
++    /// host. false: no backing. A GPU backend imports this view into Vulkan, so the tracking
++    /// protection of the guest's view never reaches its imports.
++    virtual bool BackingRun(VAddr addr, u8** host, VAddr* run_begin, u64* run_size) {
++        return false;
++    }
++
+ protected:
+     virtual u64 ClampLargeRange(VAddr addr, u64 size) = 0;
+ };
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 291f8c8276..d5234ae10f 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -218,6 +218,33 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+     return true;
+ }
+ 
++// SecondSonPC P4.4: the backing's view of the run of guest memory around addr (see GpuMemory::BackingRun).
++bool MemoryManager::BackingRun(VAddr addr, u8** host, VAddr* run_begin, u64* run_size) {
++    std::shared_lock lk{mutex};
++    if (vma_map.empty() || !IsValidMapping(addr)) {
++        return false;
++    }
++    const auto& vma = FindVMA(addr)->second;
++    const bool backed = vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
++                        vma.type == VMAType::Pooled;
++    if (!backed || !vma.Contains(addr, 1) || vma.phys_areas.empty()) {
++        return false;
++    }
++    const u64 in_vma = addr - vma.base;
++    auto phys = vma.phys_areas.upper_bound(in_vma);
++    if (phys == vma.phys_areas.begin()) {
++        return false;
++    }
++    --phys;
++    if (in_vma >= phys->first + phys->second.size) {
++        return false;
++    }
++    *host = impl.BackingBase() + phys->second.base;
++    *run_begin = vma.base + phys->first;
++    *run_size = std::min<u64>(phys->second.size, vma.size - phys->first);
++    return true;
++}
++
+ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
+     if (dmem_backend != nullptr) {
+         LOG_CRITICAL(Kernel_Vmm, "memory pools are not available with SecondSonPC's direct memory");
+@@ -1822,6 +1849,10 @@ public:
+         return Memory::Instance()->TryWriteBacking(address, data, size);
+     }
+ 
++    bool BackingRun(VAddr addr, u8** host, VAddr* run_begin, u64* run_size) override {
++        return Memory::Instance()->BackingRun(addr, host, run_begin, run_size);
++    }
++
+     void ProtectTracking(VAddr addr, u64 size, MemoryPermission perms) override {
+         Memory::Instance()->GetAddressSpace().Protect(addr, size, perms);
+     }
+diff --git a/src/core/memory.h b/src/core/memory.h
+index 5096974e87..49e6244fcb 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -248,6 +248,9 @@ public:
+ 
+     bool TryWriteBacking(void* address, const void* data, u64 size);
+ 
++    /// SecondSonPC P4.4: see GpuMemory::BackingRun.
++    bool BackingRun(VAddr addr, u8** host, VAddr* run_begin, u64* run_size);
++
+     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
+ 
+     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);

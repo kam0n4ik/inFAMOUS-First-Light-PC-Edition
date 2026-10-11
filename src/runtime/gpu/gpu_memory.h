@@ -70,6 +70,13 @@ public:
     virtual void ProtectTracking(u64 addr, u64 size, TrackingProtection protection) = 0;
     /// End of the system reserved part of the guest address space (constant).
     virtual u64 SystemReservedEnd() = 0;
+    /// P4.4: the physical backing's own host view of the guest memory around addr: the run [run_begin, run_begin +
+    /// run_size) that is linear there starts at host. false: no backing. A backend imports this view into Vulkan, so
+    /// its tracking protection of the guest's view never reaches the imports (NVIDIA loses the device on any access
+    /// to imported host memory whose protection changed after the import).
+    virtual bool BackingRun(u64 /*addr*/, u8** /*host*/, u64* /*run_begin*/, u64* /*run_size*/) {
+        return false;
+    }
 
 protected:
     virtual u64 ClampLargeRange(u64 addr, u64 size) = 0;
@@ -79,5 +86,12 @@ protected:
 /// manager is selected; nullptr before. Valid for the process lifetime.
 GuestMemory* GetGuestMemory();
 void InstallGuestMemory(GuestMemory* memory);
+
+/// A backend's handler of access violations on its tracking-protected pages (P4.4): true when it resolved the fault
+/// (the faulting access retries). Runs on the faulting thread inside exception dispatch: no allocation, no logging.
+using TrackingFaultHandler = bool (*)(u64 fault_address, bool is_write);
+/// Registers it first among the access violation handlers (the bridge's dispatcher; SecondSonPC's own dispatcher,
+/// --native exceptions, forwards access violations to it). Once, at start-up; implemented by the adapter layer.
+void InstallTrackingFaultHandler(TrackingFaultHandler handler);
 
 } // namespace SecondSon::Gpu

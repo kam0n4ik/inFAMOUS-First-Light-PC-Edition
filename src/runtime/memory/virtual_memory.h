@@ -236,6 +236,9 @@ public:
     /// each piece its own part of the data (D11); false when addr has no physical memory or is invalid. No
     /// allocation (H4).
     bool TryWriteBacking(u64 addr, const void* data, u64 size);
+    /// P4.4: the backing's view of the run of guest memory around addr that is linear there (one area, one physical
+    /// piece): [run_begin, run_begin + run_size) at host. false: no backing (see Core::GpuMemory::BackingRun).
+    bool BackingRun(u64 addr, u8** host, u64* run_begin, u64* run_size);
     /// Host protection of the mapped pages (GPU page tracking); the guest's protection stays. VEH-safe.
     bool ProtectTracking(u64 addr, u64 size, HostAccess access);
     /// size, or less: the rest of addr's area plus the adjacent mapped areas that follow (a snapshot).

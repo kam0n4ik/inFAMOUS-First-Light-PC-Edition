@@ -193,6 +193,15 @@ int main(int argc, char* argv[]) {
             } else {
                 return Fail("--gpu-backend must be bridge|sspc");
             }
+        } else if (arg == "--gpu-native-validate") {
+            config->gpu_native_validate = true;
+        } else if (arg == "--gpu-native-diag") {
+            config->gpu_native_diag = true;
+        } else if (arg == "--gpu-capture-native-frame" && has_value) {
+            config->gpu_capture_flip = std::strtoull(argv[++i], nullptr, 10);
+            if (config->gpu_capture_flip == 0) {
+                return Fail("--gpu-capture-native-frame <flip>: a flip number from 1");
+            }
         } else if (arg == "--gpu-probe") {
             config->gpu_probe = true;
         } else if (arg == "--gpu-probe-window" && has_value) {
@@ -334,11 +343,20 @@ int main(int argc, char* argv[]) {
     if (config->cpu_emulate_sse4a && !native("cpu") && !native("fs-patch")) {
         return Fail("--cpu-emulate sse4a is a mode of SecondSonPC's CPU patcher: it needs --native cpu");
     }
-    if (config->gpu_backend == App::Config::GpuBackend::Sspc && !config->gpu_probe && !config->selftest) {
-        // P4.1: no silent switch to the bridge either — the game runs on the backend asked for or not at all.
-        return Fail("--gpu-backend sspc: SecondSonPC's own GPU backend is a foundation in P4.1 (a Vulkan device and a "
-                    "test window, --gpu-probe); it executes none of the game's GPU commands yet. Run the game with the "
-                    "bridge's renderer (the default, --gpu-backend bridge).");
+    if (config->gpu_backend == App::Config::GpuBackend::Sspc) {
+        // P4.4: SecondSonPC's GnmDriver and VideoOut switch together with the backend (one owner of the GPU); the
+        // bridge's shadow diagnostics need the bridge's renderer. No silent switch back to the bridge, ever.
+        if (config->gpu_shadow || config->gpu_shaders) {
+            return Fail("--gpu-shadow / --gpu-shaders compare with the bridge's renderer: not with --gpu-backend sspc");
+        }
+        for (const char* g : {"gnm", "videoout"}) {
+            if (!native(g)) {
+                config->native_groups.emplace_back(g);
+            }
+        }
+    } else if (native("gnm") || native("videoout")) {
+        return Fail("--native gnm/videoout: SecondSonPC's GnmDriver and VideoOut belong to its own GPU backend: use "
+                    "--gpu-backend sspc (they switch together)");
     }
     if (native("exceptions") && config->fault_test) {
         return Fail("--fault-test checks the first-chance recorder's own handlers, which --native exceptions replaces; "

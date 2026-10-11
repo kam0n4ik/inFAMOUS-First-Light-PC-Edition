@@ -51,6 +51,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/cp_shadow.cpp
     src/runtime/gpu/cp_validation.cpp
     src/runtime/gpu/frame_pacing.cpp
+    src/runtime/gpu/gnm/gnm_driver.cpp
     src/runtime/gpu/pm4.cpp
     src/runtime/gpu/pm4_stats.cpp
     src/runtime/gpu/shader/gcn_program.cpp
@@ -61,6 +62,21 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/shader/shader_frontend.cpp
     src/runtime/gpu/shader/shader_resources.cpp
     src/runtime/gpu/shader/shader_translator.cpp
+    src/runtime/gpu/vulkan/vk_buffer_cache.cpp
+    src/runtime/gpu/vulkan/vk_device_context.cpp
+    src/runtime/gpu/vulkan/vk_diagnostics.cpp
+    src/runtime/gpu/vulkan/vk_executor.cpp
+    src/runtime/gpu/vulkan/vk_formats.cpp
+    src/runtime/gpu/vulkan/vk_image_cache.cpp
+    src/runtime/gpu/vulkan/vk_pipelines.cpp
+    src/runtime/gpu/vulkan/vk_presenter.cpp
+    src/runtime/gpu/vulkan/vk_resources.cpp
+    src/runtime/gpu/host_shaders.cpp
+    src/runtime/gpu/image_layout.cpp
+    src/runtime/gpu/native_backend.cpp
+    src/runtime/gpu/native_videoout.cpp
+    src/runtime/gpu/page_tracker.cpp
+    src/runtime/gpu/png_writer.cpp
     src/runtime/gpu/vulkan/vk_foundation.cpp
     src/runtime/kernel/clock.cpp
     src/runtime/kernel/condvar.cpp

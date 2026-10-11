@@ -876,6 +876,28 @@ void VirtualMemory::CopySparse(u64 addr, u8* dest, u64 size) const {
     }
 }
 
+bool VirtualMemory::BackingRun(u64 addr, u8** host, u64* run_begin, u64* run_size) {
+    std::shared_lock lock{mutex_};
+    if (!areas_.Contains(addr, 1)) {
+        return false;
+    }
+    auto it = areas_.Find(addr);
+    if (it == areas_.end() || !it->second.HasBacking()) {
+        return false;
+    }
+    const Vma& v = it->second;
+    const u64 offset = addr - v.base;
+    for (const auto& p : v.phys) {
+        if (offset >= p.offset && offset < p.offset + p.size) {
+            *host = BackingBase() + p.base;
+            *run_begin = v.base + p.offset;
+            *run_size = p.size;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool VirtualMemory::TryWriteBacking(u64 addr, const void* data, u64 size) {
     std::shared_lock lock{mutex_};
     if (!areas_.Contains(addr, size)) {

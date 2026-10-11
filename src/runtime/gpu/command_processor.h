@@ -166,6 +166,7 @@ struct DmaOp {
     u32 bytes = 0;
     bool command_patch = false; ///< the destination is a packet of the stream not yet processed
     bool executed = false;      ///< Isolated: done
+    bool timeline = false;      ///< Isolated: recorded on the GPU's timeline by the executor (not copied by the CPU)
 };
 
 /// The GPU side: what the command processor hands on, in stream order (the owner's thread).
@@ -179,6 +180,20 @@ public:
     virtual void Fence(const FenceOp&) {} ///< Shadow: what would be written; Isolated: when held, and when written
     virtual void Dma(const DmaOp&) {}     ///< Shadow: what would be copied; Isolated: what was copied
     virtual void Interrupt(u32 /*queue*/, FenceKind) {}
+    /// Isolated: called before the processor makes a CPU-side memory effect of a packet (DMA_DATA other than the
+    /// prefetch, WRITE_DATA). An executor that defers GPU work (records it, submits later) completes everything handed
+    /// on so far here, so the effect lands after the earlier work in stream order, as on the hardware (P4.4). It must
+    /// not call back into the processor.
+    virtual void Synchronize(u32 /*queue*/) {}
+    /// Isolated: a packet's memory write with known bytes (WRITE_DATA, DMA_DATA fill) recorded on the GPU's timeline,
+    /// after the GPU work before it, instead of Synchronize + a CPU write (P4.4). `seq` is the queue's work number the
+    /// write takes when accepted (fences after it wait for it). true: recorded — the processor writes nothing itself.
+    virtual bool WriteOnTimeline(u32 /*queue*/, u64 /*seq*/, u64 /*dst*/, const void* /*data*/, u64 /*bytes*/) {
+        return false;
+    }
+    /// Isolated: a DMA_DATA memory-to-memory copy recorded on the GPU's timeline after the GPU work before it, instead
+    /// of Synchronize + a CPU copy (P4.4). true: recorded - the processor copies nothing itself.
+    virtual bool CopyOnTimeline(u32 /*queue*/, u64 /*seq*/, u64 /*src*/, u64 /*dst*/, u64 /*bytes*/) { return false; }
 };
 
 /// Before/after every packet (validation; nullptr: none).
@@ -237,6 +252,11 @@ struct Counters {
     u64 draws = 0, dispatches = 0, dispatches_disabled = 0, flips = 0;
     u64 fences = 0, fences_deferred = 0, fences_written = 0, fences_dropped = 0;
     u64 waits = 0, waits_blocked = 0, cache_actions = 0;
+    u64 timeline_writes = 0; ///< Isolated: WRITE_DATA / DMA fills the executor recorded on the GPU's timeline
+    u64 timeline_copies = 0; ///< Isolated: DMA_DATA memory-to-memory copies the executor recorded on the timeline
+    u64 sync_write_data = 0;                 ///< Isolated: WRITE_DATA waits for the GPU (not on the timeline)
+    std::array<u64, 8> sync_dma{};           ///< Isolated: DMA_DATA waits for the GPU, by DmaKind
+    std::array<u64, 4> sync_dma_m2m_size{};  ///< memory-to-memory sizes: <=256 B, <=4 KiB, <=64 KiB, larger
     u64 dma = 0, dma_bytes = 0, dma_command_patches = 0, dma_prefetch = 0;
     u64 writes = 0, write_bytes = 0;
     u64 indirect_buffers = 0, submissions = 0, ring_carries = 0;
@@ -258,6 +278,9 @@ struct Options {
     /// GPU clocks for EOP/RELEASE_MEM data (3: 64-bit GPU clock, 4: GPU counter); nullptr: the host's steady clock (ns)
     u64 (*clock)(void* ctx, u32 data_sel) = nullptr;
     void* clock_ctx = nullptr;
+    /// GDS (kGdsBytes) the processor's DMA and fences use; nullptr: its own. An executor whose shaders bind GDS passes
+    /// its host-visible GDS buffer, so the CP side and the shaders see one GDS.
+    u8* gds = nullptr;
 };
 
 class CommandProcessor {
@@ -329,8 +352,8 @@ public:
     void SetDrawIndirectBase(u64 addr) {
         set_base_[1] = addr;
     }
-    const std::array<u8, kGdsBytes>& Gds() const {
-        return gds_;
+    std::span<const u8, kGdsBytes> Gds() const {
+        return std::span<const u8, kGdsBytes>(gds_ptr_, kGdsBytes);
     }
     bool QueueFaulted(u32 queue) const;
     bool QueueBlocked(u32 queue) const;
@@ -372,6 +395,8 @@ private:
     void ExtentHint(const Frame& f, u32 reg, u32 count);
     void BuildDraw(DrawDescriptor& d);
     u32 PatchCommands(Queue& q, u64 dst, const u8* bytes_known, u32 bytes, u64 src_addr);
+    /// [dst, dst + bytes) holds packets of this queue not processed yet.
+    bool OverlapsPendingCommands(const Queue& q, u64 dst, u32 bytes) const;
     bool Fetch(std::vector<u32>& buffer, u64 addr, u32 dwords);
     u64 ClockSample(u32 data_sel);
 
@@ -382,7 +407,8 @@ private:
     std::array<u32, 8> cb_extent_{};
     u32 db_extent_ = 0;
     std::array<u8, kGdsBytes> gds_{};
-    std::vector<u8> scratch_; ///< DMA staging
+    u8* gds_ptr_ = gds_.data(); ///< Options::gds or gds_
+    std::vector<u8> scratch_;   ///< DMA staging
     // draw state built incrementally
     u64 pipeline_key_ = 0;
     u32 pipeline_version_ = 0, dynamic_version_ = 0, targets_version_ = 0;

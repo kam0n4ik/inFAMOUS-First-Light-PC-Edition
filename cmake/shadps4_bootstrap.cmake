@@ -113,6 +113,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_gpu_cp.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/selftest_shader.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/shader_translator_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/host_shaders_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp
     )
     target_link_libraries(shadps4 PRIVATE ${runtime_target})

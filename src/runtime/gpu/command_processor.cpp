@@ -192,6 +192,9 @@ std::string CpError::Text() const {
 
 CommandProcessor::CommandProcessor(const Options& options) : options_(options) {
     options_.max_ib_depth = std::min(options_.max_ib_depth, kMaxFrames - 2); // frames: submission, carry, IBs
+    if (options_.gds != nullptr) {
+        gds_ptr_ = options_.gds;
+    }
     queues_[kGraphicsQueue] = std::make_unique<Queue>();
     queues_[kGraphicsQueue]->id = kGraphicsQueue;
 }
@@ -759,9 +762,16 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
                 .dst = dst,
                 .bytes = static_cast<u32>(data.size_bytes())};
         if (options_.mode == Mode::Isolated && !data.empty()) {
-            if (!options_.memory->Write(dst, data.data(), data.size_bytes())) {
-                return Fail(q, CpErrorKind::MemoryWriteFailed, addr, op, n,
-                            fmt::format("{} bytes at {:#x}", data.size_bytes(), dst));
+            if (options_.work->WriteOnTimeline(q.id, q.work_seq + 1, dst, data.data(), data.size_bytes())) {
+                ++q.work_seq; // on the GPU's timeline: fences after it wait for it
+                ++stats_.timeline_writes;
+            } else {
+                ++stats_.sync_write_data;
+                options_.work->Synchronize(q.id);
+                if (!options_.memory->Write(dst, data.data(), data.size_bytes())) {
+                    return Fail(q, CpErrorKind::MemoryWriteFailed, addr, op, n,
+                                fmt::format("{} bytes at {:#x}", data.size_bytes(), dst));
+                }
             }
             w.executed = true;
         }
@@ -1101,6 +1111,17 @@ StepStatus CommandProcessor::Dispatch(Queue& q, u64 addr, std::span<const u32> p
     return StepStatus::Packet;
 }
 
+bool CommandProcessor::OverlapsPendingCommands(const Queue& q, u64 dst, u32 bytes) const {
+    for (u32 i = 0; i < q.depth; ++i) {
+        const Frame& f = q.frames[i];
+        const u64 lo = f.addr + u64{f.pos} * 4, hi = f.addr + u64{f.size} * 4;
+        if (std::max(dst, lo) < std::min(dst + bytes, hi)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 u32 CommandProcessor::PatchCommands(Queue& q, u64 dst, const u8* bytes_known, u32 bytes, u64 src_addr) {
     // A write into packets of this queue not processed yet: the processor reads them later, so it must see it. With
     // the bytes known (WRITE_DATA, a fill, Isolated's DMA) the processor's copy takes them; otherwise (Shadow's DMA from
@@ -1221,11 +1242,39 @@ StepStatus CommandProcessor::DmaData(Queue& q, u64 addr, std::span<const u32> p)
         return StepStatus::Packet;
     }
     u8* tmp = staging();
-    // Isolated: the CP's DMA engine copies now (stream order; the stream orders it against GPU work with fences).
+    if (d.kind == DmaKind::MemoryToMemory && !OverlapsPendingCommands(q, dst, bytes) &&
+        options_.work->CopyOnTimeline(q.id, q.work_seq + 1, src, dst, bytes)) {
+        // on the GPU's timeline: fences after it wait for it; the processor reads the destination only after it
+        ++q.work_seq;
+        ++stats_.timeline_copies;
+        d.executed = true;
+        d.timeline = true;
+        options_.work->Dma(d);
+        return StepStatus::Packet;
+    }
+    if (d.kind == DmaKind::DataToMemory) {
+        // a fill: known bytes, written on the GPU's timeline when the executor can (no wait for the earlier work)
+        fill(tmp);
+        if (options_.work->WriteOnTimeline(q.id, q.work_seq + 1, dst, tmp, bytes)) {
+            ++q.work_seq;
+            ++stats_.timeline_writes;
+            d.command_patch = PatchCommands(q, dst, tmp, bytes, 0) > 0;
+            d.executed = true;
+            options_.work->Dma(d);
+            return StepStatus::Packet;
+        }
+    }
+    // Isolated: the CP's DMA engine copies now (stream order; the stream orders it against GPU work with fences). An
+    // executor deferring GPU work completes the earlier work first.
+    ++stats_.sync_dma[static_cast<size_t>(d.kind) & 7];
+    if (d.kind == DmaKind::MemoryToMemory) {
+        ++stats_.sync_dma_m2m_size[bytes <= 256 ? 0 : bytes <= 4096 ? 1 : bytes <= 65536 ? 2 : 3];
+    }
+    options_.work->Synchronize(q.id);
     switch (d.kind) {
     case DmaKind::MemoryToMemory:
     case DmaKind::MemoryToGds:
-        if (!options_.memory->Read(src, d.kind == DmaKind::MemoryToGds ? gds_.data() + gds_off : tmp, bytes)) {
+        if (!options_.memory->Read(src, d.kind == DmaKind::MemoryToGds ? gds_ptr_ + gds_off : tmp, bytes)) {
             return Fail(q, CpErrorKind::MemoryUnreadable, addr, op, n, fmt::format("{} bytes at {:#x}", bytes, src));
         }
         break;
@@ -1233,10 +1282,10 @@ StepStatus CommandProcessor::DmaData(Queue& q, u64 addr, std::span<const u32> p)
         fill(tmp);
         break;
     case DmaKind::DataToGds:
-        fill(gds_.data() + gds_off);
+        fill(gds_ptr_ + gds_off);
         break;
     case DmaKind::GdsToMemory:
-        std::memcpy(tmp, gds_.data() + gds_off, bytes);
+        std::memcpy(tmp, gds_ptr_ + gds_off, bytes);
         break;
     case DmaKind::ReadTagsPrefetch:
         break;
@@ -1304,7 +1353,7 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
                  fmt::format("fence of {} bytes from GDS {:#x}", bytes, op.gds_offset));
             return false;
         }
-        src = gds_.data() + op.gds_offset;
+        src = gds_ptr_ + op.gds_offset;
     }
     if (bytes != 0 && !options_.memory->Write(op.addr, src, bytes)) {
         Fail(q, CpErrorKind::MemoryWriteFailed, op.packet_addr, 0, 0,
@@ -1528,7 +1577,7 @@ void CommandProcessor::Reset() {
     set_base_ = {};
     cb_extent_ = {};
     db_extent_ = 0;
-    gds_.fill(0);
+    std::memset(gds_ptr_, 0, kGdsBytes);
     pipeline_key_ = 0;
     inline_marker_ = 0;
     inline_sharps_ = {};

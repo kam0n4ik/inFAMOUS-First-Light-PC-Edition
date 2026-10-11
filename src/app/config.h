@@ -97,7 +97,10 @@ struct Config {
     // P4.1 (docs/PHASE4_P41_GPU_FOUNDATION.md): the game's GPU backend, chosen once at start. Only the bridge's
     // (shadPS4's Vulkan renderer) runs the game; SecondSonPC's Vulkan foundation is checked on its own (--gpu-probe).
     enum class GpuBackend : u8 { Bridge, Sspc };
-    GpuBackend gpu_backend = GpuBackend::Bridge; // --gpu-backend bridge|sspc (sspc: refused for the game in P4.1)
+    GpuBackend gpu_backend = GpuBackend::Bridge; // --gpu-backend bridge|sspc (P4.4: sspc = SecondSonPC's own backend)
+    bool gpu_native_validate = false;        // --gpu-native-validate: the Vulkan validation layer on the native backend
+    bool gpu_native_diag = false;            // --gpu-native-diag: command journal, checkpoints, markers (device loss)
+    u64 gpu_capture_flip = 0;                // --gpu-capture-native-frame <flip>: that flip's frame -> logs\p44\native_frame.png
     bool gpu_probe = false;                  // --gpu-probe: SecondSonPC's Vulkan foundation, no game -> logs\gpu_probe.txt
     u32 gpu_probe_window_s = 0;              // --gpu-probe-window <s>: and a test window cleared to a diagnostic colour
     s32 gpu_device = -1;                     // --gpu-device <index>: the probe's physical device (-1: its own choice)

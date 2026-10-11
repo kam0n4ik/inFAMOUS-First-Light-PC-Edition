@@ -65,6 +65,7 @@
 #include "runtime/gpu/backend.h"
 #include "runtime/gpu/cp_shadow.h"
 #include "runtime/gpu/frame_pacing.h"
+#include "runtime/gpu/native_backend.h"
 #include "runtime/gpu/pm4_stats.h"
 #include "runtime/gpu/shader/shader_capture.h"
 #include "bridge/shadps4/shader_bridge_hooks.h"
@@ -681,10 +682,14 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // P4.3: SecondSonPC's translator interface over the bridge's recompiler (used only by SecondSonPC's frontend:
     // --gpu-shaders, --gpu-shader-verify, the self-test)
     InstallShaderTranslatorAdapter();
+    InstallHostShaders(); // P4.4: SecondSonPC's backend's tiling kernels (data only)
+    const bool native_gpu = cfg.gpu_backend == App::Config::GpuBackend::Sspc;
     if (!cfg.selftest) {
+        // one owner of the guest GPU, chosen once: the bridge's renderer, or SecondSonPC's backend (it claims every
+        // resource itself when it starts, below); never both, never a switch while the game runs
         std::string gpu_error;
-        bool gpu_ok = Gpu::SelectBackend(Gpu::BackendKind::Bridge, &gpu_error);
-        for (u8 r = 0; gpu_ok && r < static_cast<u8>(Gpu::Resource::Count); ++r) {
+        bool gpu_ok = Gpu::SelectBackend(native_gpu ? Gpu::BackendKind::Sspc : Gpu::BackendKind::Bridge, &gpu_error);
+        for (u8 r = 0; gpu_ok && !native_gpu && r < static_cast<u8>(Gpu::Resource::Count); ++r) {
             gpu_ok = Gpu::Claim(static_cast<Gpu::Resource>(r), Gpu::BackendKind::Bridge, &gpu_error);
         }
         if (!gpu_ok) {
@@ -700,6 +705,26 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         SSPC_LOG(Bridge, Warning, "libScePad is BRIDGE: shadPS4's keyboard layout and controllers");
     }
     SetupFilesystem(cfg, serial);
+    if (native_gpu && !cfg.selftest && cfg.gpu_shader_verify.empty()) {
+        // P4.4: SecondSonPC's own GPU backend (its GnmDriver and VideoOut are NATIVE: the bridge's renderer, presenter
+        // and VideoOut were not started above)
+        if (HasBridgeImport(bindings, "libSceGnmDriver") || HasBridgeImport(bindings, "libSceVideoOut")) {
+            Fatal("--gpu-backend sspc: GnmDriver/VideoOut still have BRIDGE imports (they switch together)");
+        }
+        Gpu::Native::Options no;
+        no.sdl_window = g_window->GetSDLWindow();
+        no.device_index = cfg.gpu_device;
+        no.validation = cfg.gpu_native_validate;
+        no.diagnostics = cfg.gpu_native_diag;
+        no.sdk_version = Core::ReadCompiledSdkVersion(guest_eboot_path);
+        no.capture_flip = cfg.gpu_capture_flip;
+        no.logs_dir = cfg.logs_dir;
+        std::string gpu_error;
+        if (!Gpu::Native::Start(no, gpu_error)) {
+            Fatal("--gpu-backend sspc: SecondSonPC's GPU backend did not start: " + gpu_error);
+        }
+        Lifecycle::AddExitStep(Lifecycle::Stage::Devices, "native GPU backend", [] { Gpu::Native::Stop(); });
+    }
     bindings.LogSummary(); // also for --selftest: the NATIVE/BRIDGE split without running the game
     if (!cfg.gpu_shader_verify.empty()) {
         // P4.3: a capture of the bridge's translations through SecondSonPC's frontend parts and translator interface

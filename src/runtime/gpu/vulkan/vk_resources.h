@@ -1,0 +1,175 @@
+// SecondSonPC — the memory side of SecondSonPC's Vulkan backend (Phase 4, P4.4; docs/PHASE4_P44_NATIVE_VULKAN_RENDERING.md
+// §C): the GPU timeline, the bounded stream ring, the guest's memory as GPU buffers, GDS.
+//
+// Guest buffers are the guest's own memory imported into Vulkan (VK_EXT_external_memory_host): the GPU reads and
+// writes the game's pages themselves (host-visible, coherent), so a CPU write before a submission is seen by it and a
+// GPU write is seen by the CPU once the submission completed — no copy, no second image of guest memory, no page
+// tracking for buffers. Windows of imported memory are made on demand (16 MiB aligned, 32 MiB long when the guest
+// mapping allows, else exactly the range) and dropped when the guest unmaps them (the memory listener), destroyed only
+// after the GPU finished the work that used them. Pages that cannot be imported (reserved but not committed, read-only)
+// are reported, never silently replaced.
+//
+// The stream ring holds what a draw needs that is not guest memory (flattened user data, clip planes, LDS, upload
+// copies): 64 MiB, host-visible, reused behind the timeline (a region is free again once the submission that used it
+// completed — never vkDeviceWaitIdle per chunk).
+#pragma once
+
+#include <deque>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "base/abi.h"
+#include "runtime/gpu/vulkan/vk_api.h"
+
+namespace SecondSon::Gpu {
+class PageTracker;
+}
+
+namespace SecondSon::Gpu::Vk {
+
+class DeviceContext;
+
+/// One timeline semaphore: value N signalled by the N-th submission.
+class Timeline {
+public:
+    explicit Timeline(DeviceContext& ctx);
+    ~Timeline();
+    Timeline(const Timeline&) = delete;
+    Timeline& operator=(const Timeline&) = delete;
+
+    VkSemaphore Handle() const { return semaphore_; }
+    u64 Next() { return ++last_; }            ///< the value the next submission signals
+    u64 LastSubmitted() const { return last_; }
+    u64 Completed();                           ///< the GPU's value now
+    /// Waits until `value` (or `timeout_ns`); true when reached.
+    bool Wait(u64 value, u64 timeout_ns);
+    bool Ok() const { return semaphore_ != VK_NULL_HANDLE; }
+    /// A query or a wait returned VK_ERROR_DEVICE_LOST.
+    bool Lost() const { return last_error_ == VK_ERROR_DEVICE_LOST; }
+    u64 CompletedCached() const { return completed_; } ///< the last value seen (no query)
+
+private:
+    DeviceContext& ctx_;
+    VkSemaphore semaphore_ = VK_NULL_HANDLE;
+    u64 last_ = 0;
+    u64 completed_ = 0;
+    VkResult last_error_ = VK_SUCCESS;
+};
+
+/// A buffer with its own memory (device-local or host-visible), destroyed with it.
+struct OwnedBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    u8* mapped = nullptr;
+    u64 size = 0;
+};
+bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool host_visible, OwnedBuffer& out,
+                  std::string& error, bool host_cached = false);
+void DestroyBuffer(DeviceContext& ctx, OwnedBuffer& buffer);
+
+class StreamRing {
+public:
+    /// `host_cached`: in cached system memory (the CPU's many small copies at memory speed; the GPU reads over PCIe)
+    StreamRing(DeviceContext& ctx, Timeline& timeline, u64 size, bool host_cached = false);
+    ~StreamRing();
+    bool Ok() const { return buf_.buffer != VK_NULL_HANDLE; }
+
+    struct Slice {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        u64 offset = 0;
+        u8* data = nullptr;
+    };
+    enum class Status : u8 {
+        Ok,
+        NeedFlush, ///< only the submission being recorded holds the ring: submit it, then allocate again
+        TooLarge,  ///< more than half the ring
+    };
+    /// `bytes` aligned to `align` for the submission being recorded (`seq`, the timeline value it will signal). When
+    /// the ring is full of regions of submitted work, waits for the oldest (counted).
+    Status Allocate(u64 bytes, u64 align, u64 seq, Slice& out);
+    /// Regions of completed submissions become free.
+    void Collect(u64 completed);
+
+    u64 Size() const { return buf_.size; }
+    u64 PeakUsed() const { return peak_; }
+    u64 Waits() const { return waits_; }
+    u64 BytesAllocated() const { return allocated_; }
+
+private:
+    struct Fence {
+        u64 seq = 0;
+        u64 end = 0; ///< the ring position after the submission's last region
+    };
+    DeviceContext& ctx_;
+    Timeline& timeline_;
+    OwnedBuffer buf_;
+    // positions grow without bound (bytes ever handed out, with padding); the ring offset is position % size
+    u64 head_ = 0; ///< next free position
+    u64 tail_ = 0; ///< oldest position still in use
+    u64 used_ = 0;
+    u64 peak_ = 0, waits_ = 0, allocated_ = 0;
+    std::deque<Fence> fences_;
+};
+
+/// The guest's memory as Vulkan buffers. Thread-safe (the GPU thread looks up; the memory listener drops windows).
+class GuestBuffers {
+public:
+    GuestBuffers(DeviceContext& ctx);
+    ~GuestBuffers(); ///< destroys every window (call once the device is idle)
+
+    struct View {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        u64 offset = 0; ///< of the guest address in the buffer
+        u64 base = 0;   ///< the window's guest address
+        u64 size = 0;   ///< the window's size
+        bool backing = false; ///< imported through the physical backing's view (not the guest's pages)
+    };
+    enum class Failure : u8 { None, Range, NotImportable, NoExtension };
+
+    /// A buffer covering guest [addr, addr + size) for work of submission `seq`. false: `failure` says why (the
+    /// caller reports the resource; nothing is substituted).
+    bool Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure);
+    /// The guest is about to unmap or replace [addr, addr + size): windows overlapping it leave the lookup now and are
+    /// destroyed once the work that used them completed.
+    void Drop(u64 addr, u64 size);
+    /// Destroys dropped windows whose last use completed.
+    void Collect(u64 completed);
+    /// The physical backing's host view of [addr, addr + size) when an existing window imported through it covers the
+    /// range (mapped for the process's life: a CPU read there never faults), nullptr otherwise.
+    const u8* BackingPointer(u64 addr, u64 size);
+    /// Write tracking: a window is imported only over writable pages, so armed pages there are given back first.
+    void SetTracker(PageTracker* tracker) { tracker_ = tracker; }
+
+    struct Stats {
+        u64 windows = 0, bytes = 0, imports = 0, import_failures = 0, drops = 0, destroyed = 0, lookups = 0;
+        u64 exact_windows = 0;
+        u64 backing_windows = 0, guest_windows = 0; ///< imported through the backing's view / the guest's pages
+        std::string first_failure;
+    };
+    Stats GetStats();
+
+private:
+    struct Window {
+        u64 base = 0, size = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        u64 last_seq = 0;
+        bool backing = false;
+        u8* host = nullptr; ///< the host view the window was imported from
+    };
+    /// Imports guest [base, base + size) through `host`: the backing's view of it, or the guest's pages themselves.
+    bool Import(u64 base, u64 size, u8* host, Window& out, std::string& error);
+    void Destroy(Window& w);
+
+    DeviceContext& ctx_;
+    PageTracker* tracker_ = nullptr;
+    std::mutex mutex_;
+    std::map<u64, Window> windows_; ///< by base
+    std::vector<Window> retired_;
+    u64 max_window_ = 0;
+    Stats stats_;
+};
+
+} // namespace SecondSon::Gpu::Vk

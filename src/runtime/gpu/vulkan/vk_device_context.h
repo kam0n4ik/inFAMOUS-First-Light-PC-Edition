@@ -1,0 +1,129 @@
+// SecondSonPC — the Vulkan device of SecondSonPC's own backend inside the game process (Phase 4, P4.4;
+// docs/PHASE4_P44_NATIVE_VULKAN_RENDERING.md §B). The P4.1 foundation (vk_foundation.h) stays the probe's and the
+// self-test's; this is the device the game's work runs on with --gpu-backend sspc.
+//
+// What it enables is what the translated SPIR-V needs (the same modules as the bridge's renderer: the same features and
+// extensions, enabled when the device has them) plus what the backend uses: dynamic rendering, synchronization2,
+// timeline semaphores, push descriptors, vertex input dynamic state, external host memory (the guest's memory imported
+// for buffers, docs §C). One queue (graphics + compute + present) — the backend serializes the guest's queues onto it
+// (correctness first, docs §E). Created once, destroyed after the device is idle; nothing else owns these objects.
+#pragma once
+
+#include <filesystem>
+
+#include <memory>
+#include <mutex>
+#include <string>
+
+#include "base/abi.h"
+#include "runtime/gpu/vulkan/vk_api.h"
+
+namespace SecondSon::Gpu::Shader {
+struct DeviceProfile;
+}
+
+namespace SecondSon::Gpu::Vk {
+
+struct ContextOptions {
+    s32 device_index = -1;     ///< -1: the first discrete device that has everything, else the policy's choice
+    bool validation = false;   ///< VK_LAYER_KHRONOS_validation (+ synchronization validation) when installed
+    bool presentation = true;  ///< the surface extensions and the swapchain
+    /// --gpu-native-diag: NVIDIA checkpoints and diagnostics config, buffer markers, object names (VK_EXT_device_fault
+    /// is enabled whenever the device has it: it costs nothing until a device loss)
+    bool diagnostics = false;
+    std::filesystem::path validation_log; ///< the validation layer's messages (with --gpu-native-validate)
+};
+
+/// What the device has beyond the core the backend requires.
+struct DeviceCaps {
+    bool external_memory_host = false;
+    u64 min_imported_host_alignment = 0;
+    bool color_write_mask_dynamic = false;  ///< VK_EXT_extended_dynamic_state3's colour write mask
+    bool vertex_input_dynamic = false;      ///< VK_EXT_vertex_input_dynamic_state
+    bool depth_clip_control = false;
+    bool depth_clip_enable = false;
+    bool provoking_vertex = false;
+    bool custom_border_color = false;
+    bool memory_budget = false;
+    bool list_restart = false, patch_list_restart = false;
+    bool attachment_feedback_loop = false;
+    bool image_view_min_lod = false;
+    bool maintenance5 = false;
+    bool debug_utils = false;
+    bool device_fault = false;      ///< VK_EXT_device_fault
+    bool sparse_buffer = false;     ///< sparseBinding + sparseResidencyBuffer on the queue (the buffer cache)
+    bool checkpoints = false;       ///< VK_NV_device_diagnostic_checkpoints (diagnostics)
+    bool buffer_markers = false;    ///< VK_AMD_buffer_marker (diagnostics)
+    bool diagnostics_config = false; ///< VK_NV_device_diagnostics_config (diagnostics)
+    bool validation = false; ///< the validation layer is on
+    u32 subgroup_size = 0;
+    u32 max_push_descriptors = 0;
+    u64 min_storage_buffer_alignment = 256;
+    u64 min_uniform_buffer_alignment = 256;
+    u32 max_viewport_width = 0, max_viewport_height = 0;
+    u32 max_framebuffer_width = 0, max_framebuffer_height = 0;
+    u32 color_sample_counts = 1, depth_sample_counts = 1;
+    float timestamp_period = 1.0f;
+};
+
+class DeviceContext {
+public:
+    /// The instance, the device and its queue. nullptr and `error` on any failure (nothing left alive then).
+    static std::unique_ptr<DeviceContext> Create(const ContextOptions& options, std::string& error);
+    ~DeviceContext(); ///< waits for the device, then destroys it, the instance, unloads the loader
+
+    DeviceContext(const DeviceContext&) = delete;
+    DeviceContext& operator=(const DeviceContext&) = delete;
+
+    VkInstance Instance() const { return instance_; }
+    VkPhysicalDevice Physical() const { return physical_; }
+    VkDevice Device() const { return device_; }
+    VkQueue Queue() const { return queue_; }
+    u32 QueueFamily() const { return family_; }
+    const DeviceCaps& Caps() const { return caps_; }
+    const VkPhysicalDeviceMemoryProperties& Memory() const { return memory_; }
+    const std::string& Name() const { return name_; }
+    u32 DriverVersion() const { return driver_version_; }
+
+    /// A memory type in `bits` with every flag of `want` and none of `avoid`; -1: none.
+    s32 FindMemoryType(u32 bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid = 0) const;
+
+    /// What the device supports that a shader translation depends on (the bridge's profile rules, as P4.3's).
+    void QueryProfile(Gpu::Shader::DeviceProfile& out) const;
+
+    struct Budget {
+        u64 device_local_budget = 0, device_local_usage = 0; ///< VK_EXT_memory_budget's heap (0 without it)
+        u64 host_budget = 0, host_usage = 0;
+    };
+    Budget QueryBudget() const;
+
+    /// The one queue is used by the GPU thread and the presenter: every vkQueueSubmit2 / vkQueuePresentKHR under it.
+    std::mutex& QueueMutex() { return queue_mutex_; }
+
+    /// Debug name of an object (only with VK_EXT_debug_utils, i.e. validation runs); cheap no-op otherwise.
+    void Name(VkObjectType type, u64 handle, const char* name) const;
+
+    /// Validation messages counted (validation runs): errors, warnings; the first error's text.
+    u64 ValidationErrors() const;
+    u64 ValidationWarnings() const;
+    std::string FirstValidationError() const;
+
+    struct Impl;
+
+private:
+    DeviceContext() = default;
+    void* module_ = nullptr; ///< HMODULE of vulkan-1.dll
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_ = VK_NULL_HANDLE;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueue queue_ = VK_NULL_HANDLE;
+    u32 family_ = ~0u;
+    DeviceCaps caps_;
+    VkPhysicalDeviceMemoryProperties memory_{};
+    std::string name_;
+    u32 driver_version_ = 0;
+    std::mutex queue_mutex_;
+};
+
+} // namespace SecondSon::Gpu::Vk

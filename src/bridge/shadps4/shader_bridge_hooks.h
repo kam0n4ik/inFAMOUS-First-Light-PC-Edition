@@ -21,6 +21,8 @@
 namespace SecondSon::Bridge {
 /// The adapter over the bridge's recompiler as the process's ShaderTranslator (start-up, before any frontend).
 void InstallShaderTranslatorAdapter();
+/// P4.4: the bridge's built tiling kernels for SecondSonPC's backend (host_shaders_host.cpp).
+void InstallHostShaders();
 } // namespace SecondSon::Bridge
 
 namespace SecondSon::Bridge::ShaderHooks {

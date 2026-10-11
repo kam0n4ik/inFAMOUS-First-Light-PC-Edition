@@ -10,6 +10,7 @@
 // manager's notifications are not synchronized with SetListener), so a listener must stay alive while guest memory
 // can still change (P4.1: the owner registers at start-up and keeps it).
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -17,7 +18,9 @@
 
 #include "bridge/shadps4/gpu_memory_host.h"
 #include "core/address_space.h"
+#include "common/signal_context.h"
 #include "core/gpu_memory.h"
+#include "core/signals.h"
 #include "runtime/gpu/gpu_memory.h"
 
 namespace SecondSon::Bridge {
@@ -120,6 +123,12 @@ public:
     u64 SystemReservedEnd() override {
         return Core::GetGpuMemory().SystemReservedEnd();
     }
+    bool BackingRun(u64 addr, u8** host, u64* run_begin, u64* run_size) override {
+        VAddr begin = 0;
+        const bool ok = Core::GetGpuMemory().BackingRun(addr, host, &begin, run_size);
+        *run_begin = begin;
+        return ok;
+    }
 
 protected:
     u64 ClampLargeRange(u64 addr, u64 size) override {
@@ -142,3 +151,24 @@ void InstallGpuGuestMemory() {
 }
 
 } // namespace SecondSon::Bridge
+
+namespace SecondSon::Gpu {
+
+namespace {
+std::atomic<TrackingFaultHandler> g_tracking_handler{nullptr};
+
+bool TrackingFault(void* context, void* fault_address) {
+    const TrackingFaultHandler h = g_tracking_handler.load(std::memory_order_acquire);
+    return h != nullptr && h(reinterpret_cast<u64>(fault_address), Common::IsWriteError(context));
+}
+} // namespace
+
+// P4.4: SecondSonPC's backend's write tracking, first in the bridge's access violation dispatch (where SecondSonPC's
+// own exception dispatcher sends access violations too); the bridge's page manager is not running in that mode.
+void InstallTrackingFaultHandler(TrackingFaultHandler handler) {
+    if (g_tracking_handler.exchange(handler, std::memory_order_acq_rel) == nullptr) {
+        Core::Signals::Instance()->RegisterAccessViolationHandler(&TrackingFault, std::numeric_limits<u32>::min());
+    }
+}
+
+} // namespace SecondSon::Gpu

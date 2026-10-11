@@ -26,6 +26,7 @@
 #include "runtime/gpu/shader/shader_resources.h"
 #include "runtime/gpu/shader/shader_translator.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/program.h"
@@ -618,6 +619,27 @@ public:
             res.fetch_code.assign(code.begin(), code.end());
         }
         return res;
+    }
+
+    std::vector<u32> EmitAuxStage(GS::AuxStage stage, const GS::RuntimeParams* fragment, const GS::DeviceProfile& profile,
+                                  std::string& error) override {
+        using Shader::Backend::SPIRV::AuxShaderType;
+        std::scoped_lock lock{mutex_};
+        // the fragment stage's hardware information decides the patch outputs, as in the bridge's graphics pipeline
+        Shader::RuntimeInfo rt{};
+        if (fragment != nullptr) {
+            rt = ToRuntime(*fragment, profile);
+        } else {
+            rt.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
+        }
+        const AuxShaderType type = stage == GS::AuxStage::RectListTcs   ? AuxShaderType::RectListTCS
+                                   : stage == GS::AuxStage::QuadListTcs ? AuxShaderType::QuadListTCS
+                                                                        : AuxShaderType::PassthroughTES;
+        std::vector<u32> spirv = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, rt.hw.fs);
+        if (spirv.empty()) {
+            error = "the emitter produced no SPIR-V";
+        }
+        return spirv;
     }
 
     bool CompareRuntime(const GS::RuntimeParams& ours, const GS::DeviceProfile& profile, std::span<const u8> reference,

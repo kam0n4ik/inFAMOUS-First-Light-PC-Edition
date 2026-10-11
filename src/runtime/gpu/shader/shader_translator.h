@@ -69,11 +69,23 @@ struct TranslationResult {
     }
 };
 
+/// Pipeline stages that are not the game's programs but the translator's convention needs (P4.4): rect and quad
+/// lists are drawn as patches (VS output arranged by the translator for it), their tessellation stages generated.
+enum class AuxStage : u8 { RectListTcs, QuadListTcs, PassthroughTes };
+
 class ShaderTranslator {
 public:
     virtual ~ShaderTranslator() = default;
     virtual std::string_view Name() const = 0;
     virtual TranslationResult Translate(const TranslationRequest& request) = 0;
+    /// The SPIR-V of an auxiliary stage for a pipeline whose fragment stage has `fragment` runtime parameters (nullptr:
+    /// no fragment stage). Empty with `error`: the translator does not provide it.
+    virtual std::vector<u32> EmitAuxStage(AuxStage stage, const RuntimeParams* fragment, const DeviceProfile& profile,
+                                          std::string& error) {
+        (void)stage, (void)fragment, (void)profile;
+        error = "the translator has no auxiliary stages";
+        return {};
+    }
     /// Compares `ours` — as the translator's own runtime information with `profile` — with `reference` (that
     /// information's bytes from the translator's owner, e.g. the bridge's at a capture or a draw). true: equal; false
     /// with `diff` naming the fields.

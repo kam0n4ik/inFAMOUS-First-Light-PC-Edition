@@ -354,6 +354,10 @@ bool NativeGpuMemory::TryWriteBacking(void* address, const void* data, u64 size)
     return vm_.TryWriteBacking(reinterpret_cast<u64>(address), data, size);
 }
 
+bool NativeGpuMemory::BackingRun(VAddr addr, u8** host, VAddr* run_begin, u64* run_size) {
+    return vm_.BackingRun(addr, host, run_begin, run_size);
+}
+
 void NativeGpuMemory::ProtectTracking(VAddr addr, u64 size, Core::MemoryPermission perms) {
     // As the bridge's AddressSpace::Protect: no result (this runs in the access violation handler).
     (void)vm_.ProtectTracking(addr, size, TrackingAccess(perms));

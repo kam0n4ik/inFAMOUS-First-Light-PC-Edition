@@ -1,0 +1,24 @@
+diff --git a/src/imgui/renderer/imgui_core.cpp b/src/imgui/renderer/imgui_core.cpp
+index 720b1d8aa9..932a2f5da6 100644
+--- a/src/imgui/renderer/imgui_core.cpp
++++ b/src/imgui/renderer/imgui_core.cpp
+@@ -149,6 +149,9 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
+ }
+ 
+ void OnResize() {
++    if (GetCurrentContext() == nullptr) {
++        return; // SecondSonPC (--gpu-backend sspc): the bridge's presenter, which creates the context, is not started
++    }
+     Sdl::OnResize();
+ }
+ 
+@@ -178,6 +181,9 @@ void Shutdown(const vk::Device& device) {
+ }
+ 
+ bool ProcessEvent(SDL_Event* event) {
++    if (GetCurrentContext() == nullptr) {
++        return false; // SecondSonPC (--gpu-backend sspc): no overlay, the events go to the game
++    }
+     Sdl::ProcessEvent(event);
+     switch (event->type) {
+     // Don't block release/up events

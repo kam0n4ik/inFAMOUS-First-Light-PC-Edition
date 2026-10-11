@@ -77,6 +77,7 @@ public:
     Core::GpuMemoryListener* SetListener(Core::GpuMemoryListener* listener) override;
     void CopySparseMemory(VAddr addr, u8* dest, u64 size) override;
     bool TryWriteBacking(void* address, const void* data, u64 size) override;
+    bool BackingRun(VAddr addr, u8** host, VAddr* run_begin, u64* run_size) override;
     void ProtectTracking(VAddr addr, u64 size, Core::MemoryPermission perms) override;
     VAddr SystemReservedEnd() override;
 
