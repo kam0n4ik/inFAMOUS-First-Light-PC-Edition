@@ -200,6 +200,7 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         // a frame with the same draw/dispatch counts - the game reads these clocks (P4.6) and does more with them
         char cv[16] = {};
         const bool place = GetEnvironmentVariableA("SSPC_DIAG_CLOCK", cv, sizeof(cv)) > 0 && std::string_view(cv) == "place";
+        clock_label_diag_ = place || std::string_view(cv) == "labels"; // (every draw's bindings against the labels)
         const VkQueryPoolCreateInfo ci{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                                        .queryType = VK_QUERY_TYPE_TIMESTAMP,
                                        .queryCount = kClockBatches * kClockPerBatch};
@@ -1558,7 +1559,7 @@ void Executor::Fence(const Cp::FenceOp& op) {
             ++stats_.clock_fences_unplaced;
         }
     }
-    if ((op.data_sel == 3 || op.data_sel == 4) && op.addr != 0 && clock_labels_.size() < 64 &&
+    if (clock_label_diag_ && (op.data_sel == 3 || op.data_sel == 4) && op.addr != 0 && clock_labels_.size() < 64 &&
         std::ranges::find(clock_labels_, op.addr) == clock_labels_.end()) {
         clock_labels_.push_back(op.addr); // (diagnostics, SSPC-020: who reads the GPU clock labels)
     }

@@ -951,8 +951,8 @@ std::string Backend::Report() {
                            s.barrier_why[0], s.barrier_why[1], s.barrier_why[2], s.barrier_why[3], s.barrier_why[4],
                            s.barrier_why[5], s.barrier_why[6]);
         out += fmt::format("write-after-write barriers where both write GDS: {}\n", s.barrier_waw_gds);
-        out += fmt::format("SSPC-020 diagnostics: shader bindings over a GPU clock label (EOP/RELEASE_MEM data_sel 3/4): "
-                           "{}\n",
+        out += fmt::format("SSPC-020 diagnostics (SSPC_DIAG_CLOCK=labels): shader bindings over a GPU clock label "
+                           "(EOP/RELEASE_MEM data_sel 3/4): {}\n",
                            s.clock_label_binds);
         out += fmt::format("held GPU clock fences with a timestamp at their place {}, without {}\n",
                            s.clock_fences_placed, s.clock_fences_unplaced);

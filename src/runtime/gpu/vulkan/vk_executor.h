@@ -500,6 +500,7 @@ private:
     VkQueryPool clock_pool_ = VK_NULL_HANDLE;
     u32 clock_next_ = 0;
     bool clock_at_place_ = false;
+    bool clock_label_diag_ = false; ///< SSPC_DIAG_CLOCK=labels|place: clock_labels_ and the bindings over them
     // SSPC_GPU_PROFILE=1: GPU time per command key (pipeline / compute shader / upload / frame copy)
     struct ProfAcc {
         u64 ns = 0, count = 0;
