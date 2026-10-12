@@ -101,6 +101,21 @@ public:
         if (VideoOut::LabelWrite(addr, src, bytes)) {
             return true;
         }
+        if (parallel != nullptr) {
+            // P4.11 (review): a queued timeline copy to this memory - its CPU fallback on the recording thread would
+            // land after this later write - executes first (the GPU-recorded copy as with one thread)
+            if (parallel->CopyQueuedOver(addr, bytes)) {
+                parallel->Drain(DrainReason::MemoryWrite);
+            }
+            // and the memory changes again once written: the recording thread's streamed copies (memoized by the
+            // generation) taken between the change above and the write hold the older bytes
+            const bool ok = WriteGuest(addr, src, bytes);
+            parallel->MemoryChanged();
+            return ok;
+        }
+        return WriteGuest(addr, src, bytes);
+    }
+    bool WriteGuest(u64 addr, const void* src, u64 bytes) {
         GuestMemory* gm = GetGuestMemory();
         if (gm == nullptr || !GuestMemory::IsValidGpuMapping(addr, bytes)) {
             return false;
@@ -480,6 +495,12 @@ bool Backend::Start(const Options& o, std::string& error) {
         po.spin_us = spin_us;
         po.async = async;
         po.async_copies = async_copies;
+        // P4.11: SSPC_P411_ASYNC_ACQUIRE=1 - a met WAIT_REG_MEM on memory does not drain the queue (its CPU writes
+        // applied on the processor's thread; parallel_cp.h, Options::async_acquire); off by default
+        po.async_acquire = [] {
+            char e[8] = {};
+            return GetEnvironmentVariableA("SSPC_P411_ASYNC_ACQUIRE", e, sizeof(e)) == 1 && e[0] == '1';
+        }();
         if (frontend_ahead) {
             po.frontend = frontend_.get();
             po.map_gen = &memory_.map_gen;
@@ -491,9 +512,10 @@ bool Backend::Start(const Options& o, std::string& error) {
             this);
         SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P410_PARALLEL_CP=1 - draws and dispatches are recorded on a second "
                                "thread behind the command processor (spin {} us before a blocking wait; other calls {}, "
-                               "timeline copies {}; the shader frontend on the {} thread)",
+                               "timeline copies {}; the shader frontend on the {} thread; met memory waits {})",
                  spin_us, async ? "queued" : "drained", async && async_copies ? "queued" : "drained",
-                 frontend_ahead ? "processor's" : "recording");
+                 frontend_ahead ? "processor's" : "recording",
+                 po.async_acquire && async && frontend_ahead ? "queued (SSPC_P411_ASYNC_ACQUIRE=1)" : "drained");
     }
     Cp::Options cpo;
     cpo.mode = Cp::Mode::Isolated;
@@ -705,6 +727,8 @@ void Backend::Loop() {
     u64 rate_nprep = 0, rate_tl = 0, rate_tb = 0, rate_ts = 0, rate_th = 0, rate_ta = 0, rate_tc = 0, rate_nu = 0;
     u64 prof_cp = 0, prof_poll = 0, prof_flush = 0, prof_idle = 0; // ns since the last rate line
     u64 prof_idle_blocked = 0, prof_idle_gpu = 0; // of the idle time: a WAIT_REG_MEM blocked; waiting for the GPU
+    ParallelTotals rate_pt{}; // (P4.11 soak telemetry: the parallel processor's totals at the last rate line)
+    u64 rate_t1_cpu = 0, rate_t2_cpu = 0, rate_proc_cpu = 0; // (... and the threads' CPU time, ns)
     using Clock = std::chrono::steady_clock;
     const auto ns_since = [](Clock::time_point t) {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count());
@@ -902,6 +926,56 @@ void Backend::Loop() {
                      "{:.1f} (WAIT_REG_MEM blocks so far {})",
                      per_frame(static_cast<double>(prof_idle_blocked)), per_frame(static_cast<double>(prof_idle_gpu)),
                      cp_->Stats().waits_blocked);
+            {
+                // P4.11 soak telemetry: what could grow over a long session - handles, Vulkan objects, the caches, the
+                // parallel processor's queue (the process's memory and VRAM: --vram-log's samples)
+                DWORD handles = 0;
+                GetProcessHandleCount(GetCurrentProcess(), &handles);
+                // the threads' CPU over the interval (% of one core): this GPU thread, the recording thread, the process
+                const auto ft = [](const FILETIME& f) { return (u64{f.dwHighDateTime} << 32 | f.dwLowDateTime) * 100; };
+                FILETIME c{}, e{}, k{}, u{};
+                const u64 t1_cpu = GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u) ? ft(k) + ft(u) : 0;
+                const u64 proc_cpu = GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) ? ft(k) + ft(u) : 0;
+                const u64 t2_cpu = parallel_ ? parallel_->RecordingThreadCpuNs() : 0;
+                const double wall_ns = secs * 1e9;
+                const std::string cpu = fmt::format(
+                    "; cpu (% of a core): GPU thread {:.0f}, recording thread {:.0f}, process {:.0f}",
+                    static_cast<double>(t1_cpu - rate_t1_cpu) * 100.0 / wall_ns,
+                    static_cast<double>(t2_cpu - rate_t2_cpu) * 100.0 / wall_ns,
+                    static_cast<double>(proc_cpu - rate_proc_cpu) * 100.0 / wall_ns);
+                rate_t1_cpu = t1_cpu;
+                rate_t2_cpu = t2_cpu;
+                rate_proc_cpu = proc_cpu;
+                const auto is = images_->Stats();
+                const auto gs = guest_->GetStats();
+                const auto& ps = pipelines_->Stats();
+                std::string par;
+                if (parallel_) {
+                    const ParallelTotals pt = parallel_->Totals();
+                    const u64 recs = pt.records - rate_pt.records;
+                    par = fmt::format("; queue: depth mean {:.1f} (max ever {}), drains that waited {:.1f}/frame, thread 1 "
+                                      "waited {:.2f} ms/frame, thread 2 executing {:.2f} ms/frame, GPU write ranges {} "
+                                      "(max {}), copies by the CPU {} (failed {}), async acquires {:.1f}/frame",
+                                      recs != 0 ? static_cast<double>(pt.depth_sum - rate_pt.depth_sum) /
+                                                      static_cast<double>(recs)
+                                                : 0.0,
+                                      pt.depth_max, static_cast<double>(pt.drains - rate_pt.drains) / frames,
+                                      per_frame(static_cast<double>(GS::TicksToNs(pt.t1_drain_ticks + pt.t1_full_ticks -
+                                                                                  rate_pt.t1_drain_ticks -
+                                                                                  rate_pt.t1_full_ticks))),
+                                      per_frame(static_cast<double>(GS::TicksToNs(pt.t2_busy_ticks - rate_pt.t2_busy_ticks))),
+                                      pt.gw_now, pt.gw_max, pt.copy_fallbacks, pt.copy_failures,
+                                      static_cast<double>(pt.async_acquires - rate_pt.async_acquires) / frames);
+                    rate_pt = pt;
+                }
+                SSPC_LOG(GPU, Info,
+                         "soak: handles {}; batches {}, images {} ({} MiB, created {}), buffers resident {} MiB, guest "
+                         "windows {} ({} MiB), pipelines {} graphics + {} compute, modules {}, frontend {} MiB, timeline "
+                         "writes pending {}{}",
+                         handles, executor_->BatchObjects(), is.images, is.bytes >> 20, is.created,
+                         buffers_->Stats().resident_bytes >> 20, gs.windows, gs.bytes >> 20, ps.graphics, ps.compute,
+                         frontend_->Modules(), frontend_->MemoryBytes() >> 20, executor_->TimelineWritesCount(), par + cpu);
+            }
             prof_idle_blocked = prof_idle_gpu = 0;
             prof_cp = prof_poll = prof_flush = prof_idle = 0;
             rate_record = s.record_ns;

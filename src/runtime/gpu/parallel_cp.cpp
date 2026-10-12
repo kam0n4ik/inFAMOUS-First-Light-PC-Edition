@@ -36,7 +36,11 @@ u64 RegistersHash(const Cp::RegisterFile& regs) {
     return h;
 }
 
-bool Overlaps(const std::vector<std::pair<u64, u64>>& ranges, u64 addr, u64 bytes) {
+/// `lo`/`hi`: the ranges' bounds (P4.11: the processor's reads and writes outside them are answered at once).
+bool Overlaps(const std::vector<std::pair<u64, u64>>& ranges, u64 lo, u64 hi, u64 addr, u64 bytes) {
+    if (ranges.empty() || addr >= hi || addr + bytes <= lo) {
+        return false;
+    }
     return std::ranges::any_of(ranges, [&](const auto& r) { return addr < r.second && r.first < addr + bytes; });
 }
 
@@ -102,6 +106,7 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         gw_bits_ = std::make_unique<u64[]>(kGwWords);
         rec_value_ = std::make_unique<std::atomic<u64>[]>(kRecRing);
     }
+    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
 }
 
 ParallelCp::~ParallelCp() {
@@ -225,6 +230,8 @@ void ParallelCp::ApplyPending() {
         }
     }
     queued_tw_.clear(); // (every queued timeline copy executed: they are the executor's own now)
+    qtw_lo_ = ~0ull;
+    qtw_hi_ = 0;
     SnapshotTimeline();
 }
 
@@ -233,6 +240,12 @@ void ParallelCp::SnapshotTimeline() {
     if (v != tw_version_seen_) {
         exec_.TimelineWriteRanges(exec_tw_);
         tw_version_seen_ = v;
+        etw_lo_ = ~0ull;
+        etw_hi_ = 0;
+        for (const auto& [b, e] : exec_tw_) {
+            etw_lo_ = std::min(etw_lo_, b);
+            etw_hi_ = std::max(etw_hi_, e);
+        }
     }
 }
 
@@ -261,11 +274,15 @@ bool ParallelCp::TimelinePending(u64 addr, u64 bytes) {
         }
         return exec_.TimelineWritePending(addr, bytes); // (exact: nothing executes on thread 2 now)
     }
-    if (Overlaps(queued_tw_, addr, bytes) || Overlaps(exec_tw_, addr, bytes)) {
+    if (Overlaps(queued_tw_, qtw_lo_, qtw_hi_, addr, bytes) || Overlaps(exec_tw_, etw_lo_, etw_hi_, addr, bytes)) {
         ++t1_.timeline_read_drains;
         return true; // the caller drains and asks the executor
     }
     return false;
+}
+
+bool ParallelCp::CopyQueuedOver(u64 addr, u64 bytes) const {
+    return started_ && !Idle() && Overlaps(queued_tw_, qtw_lo_, qtw_hi_, addr, bytes);
 }
 
 void ParallelCp::MemoryChanged() {
@@ -548,8 +565,7 @@ void ParallelCp::ApplyJournal(u64 end) {
             pos += 1 + Cp::kNumRegs;
         } else {
             // never written: a broken journal would make every later draw read wrong registers - stop executing
-            failure_ = fmt::format("parallel command processor: corrupt register journal at {} (word {:#x})", pos, w[0]);
-            failed_.store(true, std::memory_order_release);
+            Fail(fmt::format("parallel command processor: corrupt register journal at {} (word {:#x})", pos, w[0]));
             pos = end;
         }
     }
@@ -629,15 +645,22 @@ void ParallelCp::RunCopy(const Record& r) {
     // batch (its fences wait for it as for a recorded copy)
     exec_.Synchronize(r.queue);
     if (copy_fallback_ == nullptr || !copy_fallback_(copy_ctx_, r.src, r.dst, r.bytes)) {
-        failure_ = fmt::format("parallel command processor: a queued timeline copy {:#x} -> {:#x} ({} bytes) could be "
-                               "neither recorded nor copied by the CPU",
-                               r.src, r.dst, r.bytes);
-        failed_.store(true, std::memory_order_release);
-        return;
+        // P4.11: what the processor does with a DMA it cannot copy (a failed submission: an error, the game goes on) -
+        // here the copy is reported and its work number completed (its fences are not held forever); the rest of the
+        // stream was processed already. Before: the whole backend stopped (exit code 5), a stricter end than the one
+        // thread's.
+        const u64 n = copy_failures_.load(std::memory_order_relaxed) + 1;
+        copy_failures_.store(n, std::memory_order_relaxed);
+        if (n <= 8) {
+            SSPC_LOG(GPU, Error, "parallel command processor: a queued timeline copy {:#x} -> {:#x} ({} bytes) could be "
+                                 "neither recorded nor copied by the CPU (not copied; its work completes)",
+                     r.src, r.dst, r.bytes);
+        }
+    } else {
+        exec_.GuestMemoryChanged();
+        copy_fallbacks_.store(copy_fallbacks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
-    exec_.GuestMemoryChanged();
     exec_.CompleteRefusedWork(r.queue, r.seq);
-    copy_fallbacks_.store(copy_fallbacks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 void ParallelCp::Execute(Record& r, u64 index) {
@@ -697,7 +720,11 @@ void ParallelCp::Execute(Record& r, u64 index) {
             exec_.WaitMetByHeldFence(r.queue);
             break;
         case Kind::MemoryAcquired:
-            exec_.MemoryAcquired(r.queue, r.blocked, r.dst);
+            if (r.hook_done) {
+                exec_.MemoryAcquiredApplied(r.queue, r.blocked, r.dst, r.seq, r.applied);
+            } else {
+                exec_.MemoryAcquired(r.queue, r.blocked, r.dst);
+            }
             break;
         case Kind::Copy:
             RunCopy(r);
@@ -707,10 +734,15 @@ void ParallelCp::Execute(Record& r, u64 index) {
             break;
         }
     } catch (const std::exception& e) {
-        failure_ = fmt::format("parallel command processor: the recording thread threw: {}", e.what());
-        failed_.store(true, std::memory_order_release);
+        Fail(fmt::format("parallel command processor: the recording thread threw: {}", e.what()));
     } catch (...) {
-        failure_ = "parallel command processor: the recording thread threw";
+        Fail("parallel command processor: the recording thread threw");
+    }
+}
+
+void ParallelCp::Fail(std::string text) {
+    if (!failed_.load(std::memory_order_relaxed)) {
+        failure_ = std::move(text);
         failed_.store(true, std::memory_order_release);
     }
 }
@@ -790,6 +822,23 @@ void ParallelCp::WaitMetByHeldFence(u32 queue) {
 
 void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
     if (frontend_ != nullptr) {
+        if (async_acquire_ && !Idle()) {
+            // P4.11 (Options::async_acquire): the CPU writes applied here, the rest in stream order on thread 2
+            const u64 met = blocked ? __rdtsc() : 0;
+            const bool applied = exec_.RunAcquireHook();
+            Record& r = BeginRecord(Kind::MemoryAcquired);
+            r.queue = queue;
+            r.blocked = blocked;
+            r.dst = poll_address;
+            r.seq = met;
+            r.hook_done = true;
+            r.applied = applied;
+            ++t1_.queued_by[kQAcquired];
+            ++t1_.async_acquires;
+            PushRecord();
+            FrontMemoChanged(); // (GuestSync's memo change)
+            return;
+        }
         // the CPU writes it applies invalidate the frontend's programs too: on the frontend's thread, the queue drained
         Drain(DrainReason::MemoryAcquired);
         ++t1_.direct_by[kQAcquired];
@@ -799,7 +848,7 @@ void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
     }
     SSPC_P410_QUEUED_CALL(Kind::MemoryAcquired, kQAcquired, DrainReason::MemoryAcquired,
                           exec_.MemoryAcquired(queue, blocked, poll_address),
-                          (r.queue = queue, r.blocked = blocked, r.dst = poll_address));
+                          (r.queue = queue, r.blocked = blocked, r.dst = poll_address, r.hook_done = false));
 }
 
 bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
@@ -837,6 +886,8 @@ bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes)
     r.bytes = bytes;
     ++t1_.queued_by[kQCopy];
     queued_tw_.emplace_back(dst, dst + bytes);
+    qtw_lo_ = std::min(qtw_lo_, dst);
+    qtw_hi_ = std::max(qtw_hi_, dst + bytes);
     if (frontend_ != nullptr) {
         AddGpuWrite(dst, dst + bytes, next_, kLookup);
     }
@@ -902,6 +953,18 @@ u64 ParallelCp::Depth() const {
     return tail_.load(std::memory_order_relaxed) - head_.load(std::memory_order_relaxed);
 }
 
+u64 ParallelCp::RecordingThreadCpuNs() const {
+    if (!started_ || !thread_.joinable()) {
+        return 0;
+    }
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetThreadTimes(const_cast<std::thread&>(thread_).native_handle(), &c, &e, &k, &u)) {
+        return 0;
+    }
+    const auto ft = [](const FILETIME& f) { return (u64{f.dwHighDateTime} << 32 | f.dwLowDateTime) * 100; };
+    return ft(k) + ft(u);
+}
+
 ParallelTotals ParallelCp::Totals() const {
     ParallelTotals t = t1_;
     t.t2_busy_ticks = t2_busy_.load(std::memory_order_relaxed);
@@ -909,6 +972,8 @@ ParallelTotals ParallelCp::Totals() const {
     t.t2_sleeps = t2_sleeps_.load(std::memory_order_relaxed);
     t.t2_records = t2_records_.load(std::memory_order_relaxed);
     t.copy_fallbacks = copy_fallbacks_.load(std::memory_order_relaxed);
+    t.copy_failures = copy_failures_.load(std::memory_order_relaxed);
+    t.gw_now = gw_.size(); // (thread 1's: Totals is called there)
     return t;
 }
 
@@ -948,6 +1013,11 @@ std::string ParallelCp::Report() const {
         out += fmt::format("  register replica verification (SSPC_P410_VERIFY=1): draws/dispatches compared {}, "
                            "different {}\n",
                            verified_.load(std::memory_order_relaxed), verify_mismatches_.load(std::memory_order_relaxed));
+    }
+    if (async_acquire_ || t.copy_failures != 0) {
+        out += fmt::format("  P4.11: met memory waits queued with their CPU writes applied on the processor's thread "
+                           "(SSPC_P411_ASYNC_ACQUIRE=1) {}; queued copies neither recorded nor copied {}\n",
+                           t.async_acquires, t.copy_failures);
     }
     out += "  drains that waited, by reason:";
     for (size_t i = 0; i < t.drains_by.size(); ++i) {

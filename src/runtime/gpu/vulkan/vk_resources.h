@@ -14,6 +14,7 @@
 // completed — never vkDeviceWaitIdle per chunk).
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -31,7 +32,9 @@ namespace SecondSon::Gpu::Vk {
 
 class DeviceContext;
 
-/// One timeline semaphore: value N signalled by the N-th submission.
+/// One timeline semaphore: value N signalled by the N-th submission. Next() is the recording thread's; the completed
+/// value and the last error are read and advanced by any thread (the recording thread, the backend's GPU thread, the
+/// present thread's Ready - P4.11: atomics, the completed value only grows).
 class Timeline {
 public:
     explicit Timeline(DeviceContext& ctx);
@@ -47,17 +50,24 @@ public:
     bool Wait(u64 value, u64 timeout_ns);
     bool Ok() const { return semaphore_ != VK_NULL_HANDLE; }
     /// A query or a wait returned VK_ERROR_DEVICE_LOST.
-    bool Lost() const { return last_error_ == VK_ERROR_DEVICE_LOST; }
-    u64 CompletedCached() const { return completed_; } ///< the last value seen (no query)
+    bool Lost() const { return last_error_.load(std::memory_order_acquire) == VK_ERROR_DEVICE_LOST; }
+    u64 CompletedCached() const { return completed_.load(std::memory_order_acquire); } ///< the last value seen (no query)
     /// P4.10: the GPU's value now without touching the cached one (any thread; 0 on an error).
     u64 QueryCompleted() const;
 
 private:
     DeviceContext& ctx_;
     VkSemaphore semaphore_ = VK_NULL_HANDLE;
+    /// The completed value raised to `v` (never lowered: two threads may see different values in either order).
+    void Advance(u64 v) {
+        u64 c = completed_.load(std::memory_order_relaxed);
+        while (v > c && !completed_.compare_exchange_weak(c, v, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        }
+    }
+
     u64 last_ = 0;
-    u64 completed_ = 0;
-    VkResult last_error_ = VK_SUCCESS;
+    std::atomic<u64> completed_{0};
+    std::atomic<VkResult> last_error_{VK_SUCCESS};
 };
 
 /// A buffer with its own memory (device-local or host-visible), destroyed with it.

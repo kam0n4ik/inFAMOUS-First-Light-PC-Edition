@@ -54,14 +54,14 @@ Timeline::~Timeline() {
 }
 
 u64 Timeline::Completed() {
-    u64 v = completed_;
+    u64 v = 0;
     const VkResult r = Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v);
     if (r == VK_SUCCESS) {
-        completed_ = std::max(completed_, v);
+        Advance(v);
     } else {
-        last_error_ = r;
+        last_error_.store(r, std::memory_order_release);
     }
-    return completed_;
+    return completed_.load(std::memory_order_acquire);
 }
 
 u64 Timeline::QueryCompleted() const {
@@ -70,7 +70,7 @@ u64 Timeline::QueryCompleted() const {
 }
 
 bool Timeline::Wait(u64 value, u64 timeout_ns) {
-    if (completed_ >= value) {
+    if (completed_.load(std::memory_order_acquire) >= value) {
         return true;
     }
     const VkSemaphoreWaitInfo wi{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
@@ -79,11 +79,11 @@ bool Timeline::Wait(u64 value, u64 timeout_ns) {
                                  .pValues = &value};
     const VkResult r = Fn().vkWaitSemaphores(ctx_.Device(), &wi, timeout_ns);
     if (r == VK_SUCCESS) {
-        completed_ = std::max(completed_, value);
+        Advance(value);
         return true;
     }
     if (r != VK_TIMEOUT) {
-        last_error_ = r;
+        last_error_.store(r, std::memory_order_release);
     }
     return false;
 }

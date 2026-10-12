@@ -105,6 +105,9 @@ struct ParallelTotals {
     u64 front_syncs = 0;          ///< of those: the executor found a pending write (it waited for the GPU)
     u64 gpu_writes = 0, gw_rebuilds = 0, gw_block_hits = 0; ///< GPU write ranges noted; bitmap rebuilds; block hits
     u64 gw_max = 0;               ///< most ranges pending at once
+    u64 gw_now = 0;               ///< ranges pending now (P4.11 soak telemetry)
+    u64 async_acquires = 0;       ///< P4.11: met memory waits queued with their CPU writes applied on thread 1
+    u64 copy_failures = 0;        ///< P4.11: queued copies neither recorded nor copied by the CPU (reported, completed)
 };
 
 /// P4.10.4 diagnostics: every N-th queued timeline copy is refused on thread 2 as if the executor had refused it (its
@@ -125,6 +128,14 @@ public:
         /// SSPC_P410_VERIFY=1: every draw/dispatch record carries the processor's register file hash at its packet
         /// (all groups' hashes) and thread 2 compares its replica's (the counts in the report)
         bool verify = false;
+        /// P4.11 (SSPC_P411_ASYNC_ACQUIRE=1; with the frontend on thread 1 only): a met WAIT_REG_MEM on memory does
+        /// not drain - the guest's CPU writes caught so far are applied on thread 1 (Executor::RunAcquireHook: the
+        /// frontend's invalidations here, in stream order; the caches' invalidations into their locked queues, taken by
+        /// thread 2 at its next command), the rest of MemoryAcquired is a record. Thread 2 may take those invalidations
+        /// before records queued earlier: they then read CPU writes the guest made before it published them - work the
+        /// guest's GPU runs unsynchronized with those writes too (a CPU write after a wait for that work completing is
+        /// made only after thread 2 executed it: its label is written after that).
+        bool async_acquire = false;
     };
     /// `buffers`: the executor's buffer cache (the processor's writes invalidate it on thread 2).
     ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options);
@@ -152,6 +163,10 @@ public:
     /// Thread 1: a write on the GPU's timeline may be pending over [addr, addr + bytes) - one queued and not executed
     /// yet, or one the executor held at the last point the queue was empty (the processor's reads drain then).
     bool TimelinePending(u64 addr, u64 bytes);
+    /// P4.11 (review): thread 1 is about to write [addr, addr + bytes) itself - a timeline copy queued and not executed
+    /// yet writes there (its CPU fallback would land after this write: the caller drains first). Cheap: the compute
+    /// rings' read pointers are written after every packet.
+    bool CopyQueuedOver(u64 addr, u64 bytes) const;
     /// Thread 1: guest memory changed (a write of the processor): the frontend does not take a memoized stage
     /// preparation past it (handed on with the next record; at once when the queue is drained or the frontend is here).
     void MemoryChanged();
@@ -169,6 +184,8 @@ public:
     ParallelTotals Totals() const;
     /// Records queued now (approximate, any thread).
     u64 Depth() const;
+    /// P4.11 telemetry: thread 2's CPU time so far (user + kernel, ns; 0 when not running). Thread 1.
+    u64 RecordingThreadCpuNs() const;
     std::string Report() const;
 
     // Cp::GpuWork (thread 1, inside CommandProcessor::Step)
@@ -199,6 +216,7 @@ private:
         bool memory_changed = false; ///< a guest memory change reported before it
         bool has_cs = false;
         bool blocked = false;  ///< MemoryAcquired
+        bool hook_done = false, applied = false; ///< MemoryAcquired with P4.11's async_acquire (applied: writes found)
         bool prepared = false; ///< stage 2: the frontend's preparation below (a filtered draw has none)
         u64 journal_end = 0;   ///< the journal applied up to here before it executes
         u64 reg_hash = 0;      ///< Options::verify: the processor's registers at the packet
@@ -209,7 +227,7 @@ private:
         Cp::FenceOp fence;
         Cp::DmaOp dma;
         u32 queue = 0;                       ///< WaitMet, MemoryAcquired, Copy
-        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address
+        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
         GS::StageView stage, ps; ///< VS or CS; PS
@@ -273,6 +291,8 @@ private:
     // thread 2
     void Loop();
     void Execute(Record& r, u64 index);
+    /// Nothing more executes; the first failure's text is kept (thread 2, or thread 1 while the queue is drained).
+    void Fail(std::string text);
 
     Vk::Executor& exec_;
     Vk::BufferCache* buffers_ = nullptr;
@@ -280,6 +300,7 @@ private:
     Cp::RegisterFile replica_;
     const u64 spin_ticks_;
     const bool async_, async_copies_, verify_;
+    bool async_acquire_ = false;
     std::atomic<u64> verified_{0}, verify_mismatches_{0}; ///< thread 2 (Options::verify)
     GS::ShaderFrontend* frontend_ = nullptr;
     const std::atomic<u64>* map_gen_ = nullptr;
@@ -290,6 +311,7 @@ private:
     void* copy_ctx_ = nullptr;
     // thread 1: timeline copies queued since the queue was last idle; the executor's pending timeline writes then
     std::vector<std::pair<u64, u64>> queued_tw_, exec_tw_;
+    u64 qtw_lo_ = ~0ull, qtw_hi_ = 0, etw_lo_ = ~0ull, etw_hi_ = 0; ///< (P4.11: their bounds - most checks miss both)
     u64 tw_version_seen_ = ~0ull;
     // stage 2, thread 1: GPU writes (shader writes of records, timeline writes) the frontend's reads may have to wait
     // for - until the record's work completed on the GPU (`value`: its timeline value; 0: thread 2 publishes it in
@@ -306,7 +328,7 @@ private:
     static constexpr u32 kRecRing = 1u << 16;
     std::unique_ptr<std::atomic<u64>[]> rec_value_; ///< thread 2: the timeline value record i's work completes at
     u64 forced_fallback_n_ = 0; ///< thread 2 (ForcedCopyFallbackEvery)
-    std::atomic<u64> copy_fallbacks_{0};
+    std::atomic<u64> copy_fallbacks_{0}, copy_failures_{0};
 
     std::unique_ptr<Record[]> slots_;
     std::unique_ptr<u32[]> journal_;

@@ -1742,6 +1742,23 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
     return true;
 }
 
+namespace {
+/// SSPC_DIAG_ACQUIRE_DRAIN=off: the P4.4 behaviour (CPU writes applied only between the backend's loop rounds) - a
+/// control run for the A/B, not a configuration
+bool AcquireDrainOff() {
+    static const bool off = [] {
+        char v[8] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_DIAG_ACQUIRE_DRAIN", v, sizeof(v)) == 3 && std::string_view(v) == "off";
+        if (o) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_ACQUIRE_DRAIN=off - CPU writes before a met "
+                                   "WAIT_REG_MEM are not applied before the work after it");
+        }
+        return o;
+    }();
+    return off;
+}
+} // namespace
+
 void Executor::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
     const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     GuestSync(queue); // (a met WAIT_REG_MEM: the guest's own ordering point)
@@ -1753,20 +1770,27 @@ void Executor::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
         race_.acquires.emplace_back(__rdtsc(), poll_address);
     }
     stats_.acquires_blocked += blocked ? 1 : 0;
-    // SSPC_DIAG_ACQUIRE_DRAIN=off: the P4.4 behaviour (CPU writes applied only between the backend's loop rounds) - a
-    // control run for the A/B, not a configuration
-    static const bool off = [] {
-        char v[8] = {};
-        const bool o = GetEnvironmentVariableA("SSPC_DIAG_ACQUIRE_DRAIN", v, sizeof(v)) == 3 && std::string_view(v) == "off";
-        if (o) {
-            SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_ACQUIRE_DRAIN=off - CPU writes before a met "
-                                   "WAIT_REG_MEM are not applied before the work after it");
-        }
-        return o;
-    }();
-    if (!off && acquire_hook_ != nullptr && acquire_hook_(acquire_ctx_)) {
+    if (RunAcquireHook()) {
         ++stats_.acquires_applied;
     }
+}
+
+bool Executor::RunAcquireHook() const {
+    return !AcquireDrainOff() && acquire_hook_ != nullptr && acquire_hook_(acquire_ctx_);
+}
+
+void Executor::MemoryAcquiredApplied(u32 queue, bool blocked, u64 poll_address, u64 unblock_tsc, bool applied) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb);
+    GuestSync(queue);
+    ++stats_.acquires;
+    if (blocked) {
+        last_unblock_tsc_ = unblock_tsc;
+    }
+    if (g_watch_page.load(std::memory_order_relaxed) != 0 && race_.acquires.size() < 64) {
+        race_.acquires.emplace_back(unblock_tsc != 0 ? unblock_tsc : __rdtsc(), poll_address);
+    }
+    stats_.acquires_blocked += blocked ? 1 : 0;
+    stats_.acquires_applied += applied ? 1 : 0;
 }
 
 void Executor::WaitMetByHeldFence(u32 queue) {

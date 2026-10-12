@@ -218,8 +218,18 @@ public:
         acquire_hook_ = hook;
         acquire_ctx_ = ctx;
     }
+    /// P4.11 (SSPC_P411_ASYNC_ACQUIRE=1, the parallel processor with its frontend): MemoryAcquired split in two - the
+    /// hook as MemoryAcquired would run it (SSPC_DIAG_ACQUIRE_DRAIN=off: not at all), on the processor's thread while
+    /// the recording thread executes earlier records (it touches no executor state: the backend's hook takes the
+    /// tracker, the caches' locked invalidation queues and the frontend); then, in stream order on the recording thread,
+    /// the rest (the guest's ordering point, the counts; `applied`: the hook found writes; `unblock_tsc`: when the wait
+    /// was met, for a blocked one).
+    bool RunAcquireHook() const;
+    void MemoryAcquiredApplied(u32 queue, bool blocked, u64 poll_address, u64 unblock_tsc, bool applied);
     /// TSC of the last met WAIT_REG_MEM on memory that had blocked (the frame log, P4.6).
     u64 LastUnblockTsc() const { return last_unblock_tsc_; }
+    /// P4.11 soak telemetry: command buffer batches the executor owns (free and in flight).
+    u64 BatchObjects() const { return free_.size() + in_flight_.size() + (open_ ? 1 : 0); }
     /// Called at each flip marker queued for presentation (after its batch was submitted), with its timeline value.
     void SetFlipHook(void (*hook)(void*, u64), void* ctx) {
         flip_hook_ = hook;
@@ -243,6 +253,7 @@ public:
     /// snapshot for the processor's reads while draws are recorded on the other thread).
     void TimelineWriteRanges(std::vector<std::pair<u64, u64>>& out) const;
     u64 TimelineWritesVersion() const { return tw_version_; }
+    u64 TimelineWritesCount() const { return timeline_writes_.size(); } ///< (P4.11 soak telemetry)
     /// P4.10.4: work number `seq` of `queue` was taken by a write/copy the processor believed recorded and the CPU did
     /// instead (after Synchronize): it completes with the next batch (its fences come).
     void CompleteRefusedWork(u32 queue, u64 seq);
