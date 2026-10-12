@@ -154,6 +154,16 @@ std::span<const u16> GroupRegisters(Group group);
 /// register is 0.
 void ContextDefaults(std::span<u32, 0x400> context);
 
+/// Every change of a RegisterFile, in order, as it is made (P4.10: the parallel command processor's journal - a second
+/// register file replaying it holds the same values and group versions at the same point of the stream).
+class RegisterSink {
+public:
+    virtual ~RegisterSink() = default;
+    virtual void OnWrite(Space space, u32 offset, const u32* values, u32 count) = 0;
+    virtual void OnReset() = 0;
+    virtual void OnLoad(std::span<const u32> values) = 0;
+};
+
 class RegisterFile {
 public:
     RegisterFile();
@@ -204,6 +214,10 @@ public:
     void SetMirror(u32* mirror) {
         mirror_ = mirror;
     }
+    /// Every accepted Write, Reset and Load also reported to `sink` (nullptr: none).
+    void SetSink(RegisterSink* sink) {
+        sink_ = sink;
+    }
 
     /// 64-bit content hash of a group's registers, kept up to date at every change (the XOR of a 64-bit mix of each
     /// register's index and value): O(1), no pass over the group's registers when a pipeline key is built.
@@ -231,6 +245,7 @@ private:
     u64 writes_ = 0;
     u64 changes_ = 0;
     u32* mirror_ = nullptr;
+    RegisterSink* sink_ = nullptr;
 };
 
 /// One queue's compute registers [0x2E00, 0x2E50).

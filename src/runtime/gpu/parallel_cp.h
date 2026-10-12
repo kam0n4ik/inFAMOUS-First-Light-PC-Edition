@@ -1,0 +1,340 @@
+// SecondSonPC — the parallel command processor (Phase 4, P4.10; docs/PHASE4_P410_PARALLEL_COMMAND_PROCESSING.md).
+//
+// SSPC_P410_PARALLEL_CP=1 (off by default): the native backend's command processor and its executor on two threads.
+//
+//   thread 1 (the backend's GPU thread)  PM4 packets, the register file, the processor's memory reads/writes, fences,
+//                                        waits, everything between the loop's rounds (polls, flushes, idle waits);
+//                                        with SSPC_P410_FRONTEND=1 also the shader frontend of each draw/dispatch
+//        │  an ordered, bounded queue of records: draws and dispatches (the descriptor; the queue's compute registers
+//        │  at the packet; the frontend's preparation when thread 1 made it) and the processor's calls that need no
+//        │  answer (cache actions, fences, DMA reports, met waits, timeline copies); register writes in a journal
+//        ▼
+//   thread 2 (the recording thread)      the executor for each record, in order (and the shader frontend unless thread
+//                                        1 made it), against a replica of the register file (the journal replayed up
+//                                        to the record: the registers exactly as they were at the record's packet)
+//
+// The calls that need an answer from the executor in its current state, or a CPU-side effect after the GPU work before
+// it (Synchronize, timeline writes/GDS DMA, a flip, a memory acquire when the frontend is on thread 1), drain the queue -
+// thread 1 waits until thread 2 has executed every earlier record - and are then made on thread 1 directly, exactly as
+// without the queue. So does the backend loop between rounds. With the queue empty, any call is made directly.
+//
+// What thread 1 does while thread 2 records: the processor's own state; its memory writes (a compute ring's read
+// pointer after each packet, a fence with no work outstanding) whose buffer cache invalidation and memo change are
+// handed to thread 2 in order (DeferInvalidateIfCached, MemoryChanged); its memory reads (a write on the GPU's timeline
+// queued or pending there: drained first); the frontend's reads (a GPU write queued or not known complete there:
+// drained, then the executor's own check - TimelineReader's - decides).
+//
+// Waiting: a bounded spin (SSPC_P410_SPIN_US, default 20 us) on the queue's counters, then a blocking wait on them
+// (std::atomic::wait - WaitOnAddress); a waiter flag keeps the other side from waking anybody who does not sleep.
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "base/abi.h"
+#include "runtime/gpu/command_processor.h"
+#include "runtime/gpu/shader/shader_frontend.h"
+
+namespace SecondSon::Gpu::Vk {
+class BufferCache;
+class Executor;
+class Timeline;
+}
+
+namespace SecondSon::Gpu::Native {
+
+namespace GS = Gpu::Shader;
+
+/// Why thread 1 drained the queue (counted).
+enum class DrainReason : u8 {
+    RoundEnd,       ///< the backend loop's round ended (polls, flushes, idle waits follow)
+    CacheAction,    ///< EVENT_WRITE / ACQUIRE_MEM
+    Fence,          ///< EOP / EOS / RELEASE_MEM (held or written)
+    Dma,            ///< a DMA_DATA / WRITE_DATA report
+    Flip,           ///< the flip marker
+    TimelineWrite,  ///< WRITE_DATA / DMA fill offered to the GPU's timeline
+    TimelineCopy,   ///< DMA_DATA memory-to-memory offered to the timeline
+    TimelineGds,    ///< DMA_DATA with GDS offered to the timeline
+    MemoryAcquired, ///< a WAIT_REG_MEM on memory met
+    WaitMet,        ///< a WAIT_REG_MEM met by a held fence
+    Synchronize,    ///< the processor waits for the GPU before a CPU-side effect
+    MemoryRead,     ///< the processor reads memory a timeline write is pending for
+    MemoryWrite,    ///< the processor writes memory without physical backing (the tracker's pages)
+    FrontendRead,   ///< the frontend (thread 1) reads memory a GPU write may still be pending for
+    Stop,
+    Count,
+};
+std::string_view DrainReasonName(DrainReason r);
+
+/// Running totals (TSC ticks where named; thread 2's fields are written by thread 2 only, read by thread 1 at any time).
+struct ParallelTotals {
+    u64 records = 0, draws = 0, dispatches = 0, journal_records = 0;
+    u64 drains = 0;          ///< drains that had to wait (the queue was not empty)
+    u64 drains_empty = 0;    ///< drains of an empty queue (nothing to wait for)
+    std::array<u64, static_cast<size_t>(DrainReason::Count)> drains_by{}; ///< waiting ones, by reason
+    u64 t1_drain_ticks = 0;  ///< thread 1 waiting for drains
+    u64 t1_full_ticks = 0, t1_full_waits = 0; ///< thread 1 waiting for a free slot / journal room (backpressure)
+    u64 t1_sleeps = 0;       ///< thread 1's blocking waits (after the spin)
+    u64 depth_sum = 0;       ///< records already queued at each push
+    u64 depth_max = 0;
+    u64 journal_words = 0;
+    u64 t2_busy_ticks = 0;   ///< thread 2 executing records (journal replay included)
+    u64 t2_idle_ticks = 0;   ///< thread 2 waiting for records
+    u64 t2_sleeps = 0;
+    u64 t2_records = 0;
+    u64 deferred_invalidations = 0; ///< processor writes' buffer cache invalidations handed to thread 2
+    u64 memo_changes = 0;           ///< guest memory changes handed to thread 2 with a record
+    /// P4.10.4: the processor's other calls queued as records (thread 2 executes them in order) / made at once on thread
+    /// 1 because the queue was empty (no wait), by kind: cache action, fence, DMA report, wait met, memory acquired,
+    /// timeline copy
+    std::array<u64, 6> queued_by{}, direct_by{};
+    u64 copies_refused = 0;     ///< timeline copies thread 1 refused by their shape (the processor copies, as before)
+    u64 copy_fallbacks = 0;     ///< queued timeline copies the executor refused: copied by the CPU on thread 2
+    u64 timeline_read_drains = 0; ///< processor reads of memory a queued/pending timeline copy may write: drained
+    // P4.10 stage 2 (SSPC_P410_FRONTEND=1): the frontend on thread 1
+    u64 front_ticks = 0;          ///< thread 1 in the frontend (stage copies included)
+    u64 front_reads = 0, front_read_hits = 0; ///< its memory reads / of them: a pending GPU write possible (drained)
+    u64 front_syncs = 0;          ///< of those: the executor found a pending write (it waited for the GPU)
+    u64 gpu_writes = 0, gw_rebuilds = 0, gw_block_hits = 0; ///< GPU write ranges noted; bitmap rebuilds; block hits
+    u64 gw_max = 0;               ///< most ranges pending at once
+};
+
+/// P4.10.4 diagnostics: every N-th queued timeline copy is refused on thread 2 as if the executor had refused it (its
+/// CPU fallback tested in the game); 0: none.
+u32 ForcedCopyFallbackEvery();
+
+class ParallelCp final : public Cp::GpuWork, public Cp::RegisterSink {
+public:
+    struct Options {
+        u32 spin_us = 20;         ///< how long a waiting side spins before it blocks (0: blocks at once)
+        bool async = true;        ///< the calls that need no answer queued (false: each drains - the first prototype)
+        bool async_copies = true; ///< timeline copies queued too (their answer from their shape)
+        /// Stage 2: the shader frontend runs on thread 1 (nullptr: on thread 2, inside the executor); with it the
+        /// guest maps' generation (its reads keep backing runs) and the timeline (the GPU writes it completed).
+        GS::ShaderFrontend* frontend = nullptr;
+        const std::atomic<u64>* map_gen = nullptr;
+        const Vk::Timeline* timeline = nullptr;
+        /// SSPC_P410_VERIFY=1: every draw/dispatch record carries the processor's register file hash at its packet
+        /// (all groups' hashes) and thread 2 compares its replica's (the counts in the report)
+        bool verify = false;
+    };
+    /// `buffers`: the executor's buffer cache (the processor's writes invalidate it on thread 2).
+    ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options);
+    ~ParallelCp() override;
+    ParallelCp(const ParallelCp&) = delete;
+    ParallelCp& operator=(const ParallelCp&) = delete;
+
+    /// The processor whose register file is journaled and whose compute registers are copied into dispatch records;
+    /// the executor reads the replica from now on. Thread 1, before Start.
+    void Attach(Cp::CommandProcessor& cp);
+    /// Starts thread 2.
+    void Start();
+    /// Drains, stops thread 2 and joins it. Thread 1 (or after it stopped).
+    void Stop();
+
+    /// What thread 2 does for a queued timeline copy the executor refused (the processor's own fallback: the CPU copies
+    /// after the GPU completed the earlier work): the copy and the caches' invalidation. true: copied.
+    void SetCopyFallback(bool (*copy)(void* ctx, u64 src, u64 dst, u64 bytes), void* ctx) {
+        copy_fallback_ = copy;
+        copy_ctx_ = ctx;
+    }
+    /// Thread 1: waits until thread 2 has executed every record pushed so far; the journal, deferred invalidations and
+    /// memory changes not yet handed on are applied here (thread 2 parked).
+    void Drain(DrainReason why);
+    /// Thread 1: a write on the GPU's timeline may be pending over [addr, addr + bytes) - one queued and not executed
+    /// yet, or one the executor held at the last point the queue was empty (the processor's reads drain then).
+    bool TimelinePending(u64 addr, u64 bytes);
+    /// Thread 1: guest memory changed (a write of the processor): the frontend does not take a memoized stage
+    /// preparation past it (handed on with the next record; at once when the queue is drained or the frontend is here).
+    void MemoryChanged();
+    /// Thread 1: the processor wrote [addr, addr + bytes): BufferCache::InvalidateIfCached on thread 2 before the first
+    /// record pushed after the write (or at the next drain) - where the write is in the stream, not before older records.
+    void DeferInvalidateIfCached(u64 addr, u64 bytes);
+    /// The frontend runs on thread 1 (stage 2).
+    bool FrontendAhead() const { return frontend_ != nullptr; }
+    /// thread 2 caught an exception (nothing more is executed; the backend stops).
+    bool Failed() const { return failed_.load(std::memory_order_acquire); }
+    std::string FailureText() const;
+
+    /// The register file draws read (thread 2's replica).
+    const Cp::RegisterFile& Replica() const { return replica_; }
+    ParallelTotals Totals() const;
+    /// Records queued now (approximate, any thread).
+    u64 Depth() const;
+    std::string Report() const;
+
+    // Cp::GpuWork (thread 1, inside CommandProcessor::Step)
+    void Draw(const Cp::DrawDescriptor& draw) override;
+    void Dispatch(const Cp::DispatchDescriptor& dispatch) override;
+    void CacheAction(const Cp::CacheActionOp& op) override;
+    void Flip(const Cp::FlipMarker& marker) override;
+    void Fence(const Cp::FenceOp& op) override;
+    void Dma(const Cp::DmaOp& op) override;
+    void Interrupt(u32 queue, Cp::FenceKind kind) override;
+    void Synchronize(u32 queue) override;
+    bool WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) override;
+    bool CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) override;
+    bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
+                       u32 pattern) override;
+    void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
+    void WaitMetByHeldFence(u32 queue) override;
+
+    // Cp::RegisterSink (thread 1: the processor's register file)
+    void OnWrite(Cp::Space space, u32 offset, const u32* values, u32 count) override;
+    void OnReset() override;
+    void OnLoad(std::span<const u32> values) override;
+
+private:
+    enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy };
+    struct Record {
+        Kind kind = Kind::Journal;
+        bool memory_changed = false; ///< a guest memory change reported before it
+        bool has_cs = false;
+        bool blocked = false;  ///< MemoryAcquired
+        bool prepared = false; ///< stage 2: the frontend's preparation below (a filtered draw has none)
+        u64 journal_end = 0;   ///< the journal applied up to here before it executes
+        u64 reg_hash = 0;      ///< Options::verify: the processor's registers at the packet
+        Cp::DrawDescriptor draw;
+        Cp::DispatchDescriptor dispatch;
+        Cp::ComputeRegisters cs;
+        Cp::CacheActionOp cache;
+        Cp::FenceOp fence;
+        Cp::DmaOp dma;
+        u32 queue = 0;                       ///< WaitMet, MemoryAcquired, Copy
+        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address
+        // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
+        GS::DrawPreparation prep;
+        GS::StageView stage, ps; ///< VS or CS; PS
+        const GS::GraphicsPipelineState* state = nullptr;
+    };
+    static constexpr u32 kSlots = 1024; ///< records (power of two)
+    static constexpr u32 kJournalWords = 1u << 22; ///< 16 MiB of register writes (power of two)
+    enum JournalOp : u32 { kOpWrite = 1, kOpReset = 2, kOpLoad = 3, kOpPad = 15 };
+
+    /// Stage 2: the frontend's guest memory on thread 1 - a GPU write that may still be pending drains the queue and
+    /// lets the executor decide (TimelineReader's check); the bytes from the backing's host view (as TimelineReader).
+    class FrontReader final : public GS::GuestReader {
+    public:
+        explicit FrontReader(ParallelCp& p) : p_(p) {}
+        bool Read(u64 addr, void* dst, u64 bytes) override;
+
+    private:
+        ParallelCp& p_;
+        struct Run {
+            u64 begin = 0, end = 0;
+            const u8* host = nullptr;
+            u64 gen = 0;
+        };
+        std::array<Run, 4> runs_{};
+        u32 next_run_ = 0;
+        std::array<std::pair<u64, u64>, 4> no_run_{}; ///< (1 MiB block + 1, generation) without a backing run
+        u32 next_no_run_ = 0;
+    };
+
+    /// The queue is empty and thread 2 parked: thread 1 may use the executor itself (after ApplyPending).
+    bool Idle() const { return head_.load(std::memory_order_acquire) == next_; }
+    /// The journal, deferred invalidations and a memory change not handed on yet, applied by thread 1 (queue idle).
+    void ApplyPending();
+    void SnapshotTimeline(); ///< the executor's pending timeline writes (queue idle)
+    void RunCopy(const Record& r);
+
+    // thread 1
+    Record& BeginRecord(Kind kind);
+    void PushRecord();
+    void JournalReserve(u32 words);
+    u32* JournalAt(u64 pos) { return journal_.get() + (pos & (kJournalWords - 1)); }
+    void WaitHead(u64 target, bool full); ///< until head_ >= target
+    /// Stage 2: the frontend for the record being filled; its GPU writes noted; the memo told when it writes memory.
+    void PrepareDraw(Record& r);
+    void PrepareDispatch(Record& r);
+    void NoteStageWrites(const GS::StageView& s, u64 record, bool& writes);
+    /// Stage 2, the queue not idle: a GPU write of a record not executed, or not known complete, may overlap.
+    bool MayBeGpuWritten(u64 addr, u64 bytes);
+    void AddGpuWrite(u64 begin, u64 end, u64 record, u64 value);
+    void RetireGpuWrites();
+    void RebuildGpuWriteBits();
+    /// Stage 2: the processor's calls queued for thread 2 tell the frontend here, in stream order (thread 2 does not).
+    void FrontMemoChanged() {
+        if (frontend_ != nullptr) {
+            frontend_->GuestMemoryChanged();
+        }
+    }
+    // either thread (thread 2's, or thread 1's while the queue is drained)
+    void ApplyJournal(u64 end);
+    void ApplyDeferred(u64 before); ///< the deferred invalidations of writes before record `before`
+    // thread 2
+    void Loop();
+    void Execute(Record& r, u64 index);
+
+    Vk::Executor& exec_;
+    Vk::BufferCache* buffers_ = nullptr;
+    Cp::CommandProcessor* cp_ = nullptr;
+    Cp::RegisterFile replica_;
+    const u64 spin_ticks_;
+    const bool async_, async_copies_, verify_;
+    std::atomic<u64> verified_{0}, verify_mismatches_{0}; ///< thread 2 (Options::verify)
+    GS::ShaderFrontend* frontend_ = nullptr;
+    const std::atomic<u64>* map_gen_ = nullptr;
+    const Vk::Timeline* timeline_ = nullptr;
+    FrontReader reader_{*this};
+    u32 front_fine_counter_ = 0;
+    bool (*copy_fallback_)(void*, u64, u64, u64) = nullptr;
+    void* copy_ctx_ = nullptr;
+    // thread 1: timeline copies queued since the queue was last idle; the executor's pending timeline writes then
+    std::vector<std::pair<u64, u64>> queued_tw_, exec_tw_;
+    u64 tw_version_seen_ = ~0ull;
+    // stage 2, thread 1: GPU writes (shader writes of records, timeline writes) the frontend's reads may have to wait
+    // for - until the record's work completed on the GPU (`value`: its timeline value; 0: thread 2 publishes it in
+    // rec_value_ once the record ran); a bit per 64 KiB block of the 40-bit space they touch (rebuilt as they retire)
+    struct GpuWrite {
+        u64 begin = 0, end = 0, record = 0, value = 0;
+    };
+    std::deque<GpuWrite> gw_;
+    std::unique_ptr<u64[]> gw_bits_;
+    std::vector<u32> gw_dirty_; ///< the words of gw_bits_ set
+    bool gw_stale_ = false;     ///< entries retired since the bits were built
+    static constexpr u32 kGwBlockBits = 16;
+    static constexpr u64 kGwWords = (1ull << (40 - kGwBlockBits)) / 64;
+    static constexpr u32 kRecRing = 1u << 16;
+    std::unique_ptr<std::atomic<u64>[]> rec_value_; ///< thread 2: the timeline value record i's work completes at
+    u64 forced_fallback_n_ = 0; ///< thread 2 (ForcedCopyFallbackEvery)
+    std::atomic<u64> copy_fallbacks_{0};
+
+    std::unique_ptr<Record[]> slots_;
+    std::unique_ptr<u32[]> journal_;
+    alignas(64) std::atomic<u64> tail_{0}; ///< records pushed (thread 1 writes)
+    alignas(64) std::atomic<u64> head_{0}; ///< records executed (thread 2 writes)
+    alignas(64) std::atomic<u64> t1_wait_target_{0}; ///< thread 1 sleeps until head_ reaches it (0: not sleeping)
+    alignas(64) std::atomic<u32> t2_waiting_{0};      ///< thread 2 sleeps until tail_ moves
+    alignas(64) std::atomic<u64> jhead_{0}; ///< journal applied up to (the applying side writes)
+    u64 jtail_ = 0;                         ///< journal written up to (thread 1)
+    u64 next_ = 0;                          ///< thread 1's next record (tail_ once pushed)
+    bool pending_memory_changed_ = false;   ///< thread 1
+
+    struct Deferred {
+        u64 before = 0; ///< the first record pushed after the write
+        u64 addr = 0, bytes = 0;
+    };
+    std::mutex deferred_mutex_;
+    std::vector<Deferred> deferred_; ///< InvalidateIfCached ranges in stream order (under deferred_mutex_)
+    std::atomic<bool> has_deferred_{false};
+
+    std::thread thread_;
+    bool started_ = false;
+    std::atomic<bool> failed_{false};
+    std::string failure_; ///< written by thread 2 before failed_ is set
+
+    // totals: thread 1's plain, thread 2's atomics (single writer)
+    ParallelTotals t1_;
+    std::atomic<u64> t2_busy_{0}, t2_idle_{0}, t2_sleeps_{0}, t2_records_{0};
+};
+
+} // namespace SecondSon::Gpu::Native

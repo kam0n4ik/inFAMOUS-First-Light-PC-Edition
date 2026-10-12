@@ -74,6 +74,19 @@ s32 Hi16(u32 v) {
     return static_cast<s16>(static_cast<u16>(v >> 16));
 }
 
+/// P4.10: a callback of the processor other than a draw or dispatch, timed into ExecutorStats::t_cb.
+class CallbackTimer {
+public:
+    CallbackTimer(u64& ticks, u64& count) : ticks_(ticks), t0_(__rdtsc()) { ++count; }
+    ~CallbackTimer() { ticks_ += __rdtsc() - t0_; }
+    CallbackTimer(const CallbackTimer&) = delete;
+    CallbackTimer& operator=(const CallbackTimer&) = delete;
+
+private:
+    u64& ticks_;
+    u64 t0_;
+};
+
 constexpr u32 kQuerySlots = 1024; ///< batches in flight stay far below
 constexpr u32 kProfBatches = 64, kProfPerBatch = 2048; ///< the profiler's pool: batch slots x timestamps
 /// P4.8 Performance Inspector: batch slots x timestamps at category changes (a batch has ~500 commands; the
@@ -598,7 +611,7 @@ void Executor::NoteAccesses(const std::vector<std::pair<u64, u64>>& reads,
     }
     if (unknown || !writes.empty()) {
         pending_writes_ = true;
-        frontend_.GuestMemoryChanged(); // (P4.7: no memoized stage preparation past a write)
+        GuestMemoryChanged(); // (P4.7: no memoized stage preparation past a write)
     }
 }
 
@@ -875,6 +888,7 @@ void Executor::Poll() {
     });
     if (!timeline_writes_.empty()) {
         std::erase_if(timeline_writes_, [&](const TimelineWrite& w) { return w.value <= completed; });
+        ++tw_version_;
         tw_lo_ = ~0ull;
         tw_hi_ = 0;
         for (const auto& w : timeline_writes_) {
@@ -1478,6 +1492,21 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
     return true;
 }
 
+void Executor::TimelineWriteRanges(std::vector<std::pair<u64, u64>>& out) const {
+    out.clear();
+    for (const TimelineWrite& w : timeline_writes_) {
+        out.emplace_back(w.begin, w.end);
+    }
+}
+
+void Executor::CompleteRefusedWork(u32 queue, u64 seq) {
+    if (!Begin()) {
+        return;
+    }
+    Note(queue, seq);
+    ++commands_; // (a batch with it is submitted at the round's end like any other: its completion completes `seq`)
+}
+
 bool Executor::TimelineWritePending(u64 addr, u64 bytes) const {
     if (timeline_writes_.empty() || addr >= tw_hi_ || addr + bytes <= tw_lo_) {
         return false;
@@ -1538,6 +1567,7 @@ void Executor::TimelineReader::Verify(u64 addr, const void* dst, u64 bytes) {
 }
 
 bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     batch_fence_ = true;
     // vkCmdUpdateBuffer: 4-byte aligned, up to 64 KiB; guest memory only (VideoOut's labels are host memory)
     if (bytes == 0 || bytes > 65536 || (dst & 3) != 0 || (bytes & 3) != 0 || dst >= (1ull << 40)) {
@@ -1579,6 +1609,7 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     write_run_ = true;
     run_ranges_.emplace_back(dst, dst + bytes);
     timeline_writes_.push_back({dst, dst + bytes, cur_.value});
+    ++tw_version_;
     tw_lo_ = std::min(tw_lo_, dst);
     tw_hi_ = std::max(tw_hi_, dst + bytes);
     images_.Invalidate(dst, bytes); // textures there are uploaded again (after the write, in stream order)
@@ -1587,6 +1618,7 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
 }
 
 bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     // guest memory only (VideoOut's labels are host memory); overlapping ranges are a memmove the CPU does
     if (bytes == 0 || src >= (1ull << 40) || dst >= (1ull << 40) || (src < dst + bytes && dst < src + bytes)) {
         ++stats_.tc_refused;
@@ -1638,6 +1670,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     NoteAccesses(acc_reads_, acc_writes_, false);
     // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
     timeline_writes_.push_back({dst, dst + bytes, cur_.value});
+    ++tw_version_;
     tw_lo_ = std::min(tw_lo_, dst);
     tw_hi_ = std::max(tw_hi_, dst + bytes);
     images_.Invalidate(dst, bytes); // textures there are uploaded again (they read the video memory copy, after it)
@@ -1648,6 +1681,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
 
 bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                              u32 pattern) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     // GDS is gds_ (a storage buffer the shaders bind): its DMA recorded in stream order instead of the processor
     // waiting for the GPU and touching the mapped buffer (P4.6). Guest memory only on the other side.
     if (bytes == 0 || (gds_offset & 3) != 0 || (bytes & 3) != 0 || gds_.buffer == VK_NULL_HANDLE ||
@@ -1695,6 +1729,7 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
         f.vkCmdCopyBuffer(cur_.cb, gds_.buffer, mbuf, 1, &region);
         // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
         timeline_writes_.push_back({memory, memory + bytes, cur_.value});
+        ++tw_version_;
         tw_lo_ = std::min(tw_lo_, memory);
         tw_hi_ = std::max(tw_hi_, memory + bytes);
         images_.Invalidate(memory, bytes);
@@ -1708,6 +1743,7 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
 }
 
 void Executor::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     GuestSync(queue); // (a met WAIT_REG_MEM: the guest's own ordering point)
     ++stats_.acquires;
     if (blocked) {
@@ -1734,6 +1770,7 @@ void Executor::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
 }
 
 void Executor::WaitMetByHeldFence(u32 queue) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     GuestSync(queue);
     // the guest's GPU waits for its earlier work here (EVENT_WRITE_EOS + WAIT_REG_MEM): everything recorded after it
     // waits for everything before it - the next command's global barrier (the batch-end barrier covers later batches)
@@ -1764,13 +1801,14 @@ bool Executor::WaitOldest(u64 timeout_ns) {
 }
 
 void Executor::Synchronize(u32) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     SyncFrom(0);
 }
 
 void Executor::SyncFrom(u32 source) {
     // the CPU side of a packet must land after the GPU work before it: complete everything handed on so far
     ++stats_.syncs;
-    frontend_.GuestMemoryChanged(); // (P4.7: write-backs land in the host's memory)
+    GuestMemoryChanged(); // (P4.7: write-backs land in the host's memory)
     if (device_lost_) {
         return;
     }
@@ -1798,6 +1836,7 @@ void Executor::SyncFrom(u32 source) {
 }
 
 void Executor::Fence(const Cp::FenceOp& op) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     if (op.deferred && !op.written && (op.data_sel == 3 || op.data_sel == 4) && op.kind != Cp::FenceKind::EndOfShader) {
         // a clock the processor writes once this work completed: the GPU's time here, measured by a timestamp
         if (open_ && cur_.clock_base != ~0u && cur_.clock_fences.size() < kClockPerBatch) {
@@ -1832,7 +1871,33 @@ void Executor::Interrupt(u32 queue, Cp::FenceKind) {
 }
 
 void Executor::GuestMemoryChanged() {
-    frontend_.GuestMemoryChanged();
+    if (memo_bumps_) {
+        frontend_.GuestMemoryChanged();
+    }
+}
+
+bool Executor::SyncForFrontendRead(u64 addr, u64 bytes) {
+    // (TimelineReader's checks: a write still on the GPU's timeline, or a shader's write the host does not have yet)
+    if (TimelineWritePending(addr, bytes)) {
+        ++stats_.timeline_read_syncs;
+        SyncFrom(1);
+        return true;
+    }
+    if (buffers_.GpuWritePending(addr, bytes, timeline_.CompletedCached()) || buffers_.HostWritePending(addr, bytes)) {
+        ++stats_.gpu_write_read_syncs;
+        SyncFrom(1);
+        return true;
+    }
+    return false;
+}
+
+bool Executor::FrontendReadPending(u64 addr, u64 bytes) {
+    return TimelineWritePending(addr, bytes) ||
+           buffers_.GpuWritePending(addr, bytes, timeline_.CompletedCached()) || buffers_.HostWritePending(addr, bytes);
+}
+
+u64 Executor::RecordedValue() const {
+    return open_ ? cur_.value : timeline_.LastSubmitted();
 }
 
 void Executor::SetMapGeneration(const std::atomic<u64>* gen) {
@@ -1850,8 +1915,9 @@ void Executor::SetMapGeneration(const std::atomic<u64>* gen) {
 }
 
 void Executor::Dma(const Cp::DmaOp& op) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     ++stats_.dma;
-    frontend_.GuestMemoryChanged(); // (P4.7)
+    GuestMemoryChanged(); // (P4.7)
     if (op.timeline) {
         return; // recorded by CopyOnTimeline: the copy keeps the caches coherent itself
     }
@@ -1863,6 +1929,7 @@ void Executor::Dma(const Cp::DmaOp& op) {
 }
 
 void Executor::CacheAction(const Cp::CacheActionOp& op) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     GuestSync(op.queue);
     // (diagnostics: the guest's own flush between two of its dispatches - per queue, by event type; 63: ACQUIRE_MEM)
     const u32 type = op.event == 0 ? 63u : (op.event & 0x3F);
@@ -1962,7 +2029,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     const GS::ResourceBindingPlan& plan = s.plan;
     const GS::ShaderReflection& refl = s.module->result.reflection;
     const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
-    const Cp::RegisterFile& regs = cp_->Registers();
+    const Cp::RegisterFile& regs = *regs_;
     buf_adjust_.assign(plan.buffers.size(), 0);
     // buffers
     for (size_t i = 0; i < plan.buffers.size(); ++i) {
@@ -2477,20 +2544,42 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
     }
 }
 
+bool Executor::DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& d) {
+    const u32 mode = (regs.Get(kCbColorControl) >> 4) & 7;
+    return mode == 2 || mode == 5 || d.primitive_type == 0; // EliminateFastClear, FmaskDecompress, None
+}
+
 void Executor::Draw(const Cp::DrawDescriptor& d) {
     const u64 t0 = GS::Ticks();
     const GS::FineSample fine_sample(fine_counter_); // (SSPC_GPU_TIMINGS=sample:N: this draw's stage timers)
+    // the frontend reads the guest's descriptors now (a write still on the GPU's timeline lands first: before this draw
+    // is noted, so that flush completes only the earlier work)
+    PreparedCommand pc;
+    if (!DrawFiltered(*regs_, d)) {
+        const u64 tf0 = GS::FineTicks();
+        pc.prep = &frontend_.PrepareDraw(d, *regs_, reader_);
+        pc.stage = &frontend_.Stage(GS::HwStage::Vs);
+        pc.ps = &frontend_.Stage(GS::HwStage::Ps);
+        pc.state = pc.prep->ready ? frontend_.Pipelines().Graphics(pc.prep->pipeline) : nullptr;
+        stats_.t_front += GS::FineTicks() - tf0;
+    }
+    RecordDraw(d, pc, t0);
+}
+
+void Executor::DrawPrepared(const Cp::DrawDescriptor& d, const PreparedCommand& pc) {
+    const u64 t0 = GS::Ticks();
+    const GS::FineSample fine_sample(fine_counter_);
+    RecordDraw(d, pc, t0);
+}
+
+void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0) {
     ++stats_.draws;
     ++trace_.ordinal;
     const auto& f = Fn();
-    const Cp::RegisterFile& regs = cp_->Registers();
+    const Cp::RegisterFile& regs = *regs_;
     const u32 mode = (regs.Get(kCbColorControl) >> 4) & 7;
-    const bool filtered = mode == 2 || mode == 5 || d.primitive_type == 0; // EliminateFastClear, FmaskDecompress, None
-    // the frontend reads the guest's descriptors now (a write still on the GPU's timeline lands first: before this draw
-    // is noted, so that flush completes only the earlier work)
-    const u64 tf0 = GS::FineTicks();
-    const GS::DrawPreparation* prepared = filtered ? nullptr : &frontend_.PrepareDraw(d, regs, reader_);
-    stats_.t_front += GS::FineTicks() - tf0;
+    const bool filtered = DrawFiltered(regs, d);
+    const GS::DrawPreparation* prepared = filtered ? nullptr : pc.prep;
     if (!Begin()) {
         return;
     }
@@ -2501,12 +2590,17 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         Skipped(Skip::FilteredMode, fmt::format("CB_COLOR_CONTROL mode {}, primitive {}", mode, d.primitive_type));
         return;
     }
+    if (prepared == nullptr || pc.stage == nullptr || pc.ps == nullptr) {
+        // (not filtered at the draw's packet but here: the registers differ - never with the P4.10 replica)
+        ++stats_.prepared_mismatches;
+        Skipped(Skip::NotReady, fmt::format("draw at {:#x}: no preparation", d.packet_addr));
+        return;
+    }
     const GS::DrawPreparation& prep = *prepared;
     if (!prep.ready) {
         Skipped(prep.unsupported ? Skip::Unsupported : Skip::NotReady,
-                fmt::format("draw at {:#x}: VS {}, PS {}", d.packet_addr,
-                            GS::StageStatusName(frontend_.Stage(GS::HwStage::Vs).status),
-                            GS::StageStatusName(frontend_.Stage(GS::HwStage::Ps).status)));
+                fmt::format("draw at {:#x}: VS {}, PS {}", d.packet_addr, GS::StageStatusName(pc.stage->status),
+                            GS::StageStatusName(pc.ps->status)));
         return;
     }
     u64 ts = GS::FineTicks();
@@ -2515,9 +2609,9 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
         acc += now - ts;
         ts = now;
     };
-    const GS::GraphicsPipelineState* st = frontend_.Pipelines().Graphics(prep.pipeline);
-    const GS::StageView& vs = frontend_.Stage(GS::HwStage::Vs);
-    const GS::StageView& ps = frontend_.Stage(GS::HwStage::Ps);
+    const GS::GraphicsPipelineState* st = pc.state;
+    const GS::StageView& vs = *pc.stage;
+    const GS::StageView& ps = *pc.ps;
     const bool has_ps = st != nullptr && st->ps_module != 0 && ps.module != nullptr;
     std::string err;
     const PipelineObjects* pipe = st == nullptr ? nullptr
@@ -3384,17 +3478,35 @@ void Executor::Draw(const Cp::DrawDescriptor& d) {
 }
 
 void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
+    DispatchWith(d, cp_->Compute(d.queue));
+}
+
+void Executor::DispatchWith(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs) {
     const u64 t0 = GS::Ticks();
     const GS::FineSample fine_sample(fine_counter_); // (SSPC_GPU_TIMINGS=sample:N: this dispatch's stage timers)
+    PreparedCommand pc;
+    if (cs != nullptr) {
+        const u64 tf0 = GS::FineTicks();
+        pc.prep = &frontend_.PrepareDispatch(d, std::span<const u32, Cp::kComputeCount>(cs->values), reader_);
+        pc.stage = &frontend_.Stage(GS::HwStage::Cs);
+        stats_.t_front += GS::FineTicks() - tf0;
+    }
+    RecordDispatch(d, cs, pc, t0);
+}
+
+void Executor::DispatchPrepared(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs,
+                                const PreparedCommand& pc) {
+    const u64 t0 = GS::Ticks();
+    const GS::FineSample fine_sample(fine_counter_);
+    RecordDispatch(d, cs, pc, t0);
+}
+
+void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs,
+                              const PreparedCommand& pc, u64 t0) {
     ++stats_.dispatches;
     ++trace_.ordinal;
     const auto& f = Fn();
-    const Cp::ComputeRegisters* cs = cp_->Compute(d.queue);
-    const u64 tf0 = GS::FineTicks();
-    const GS::DrawPreparation* prepared =
-        cs == nullptr ? nullptr
-                      : &frontend_.PrepareDispatch(d, std::span<const u32, Cp::kComputeCount>(cs->values), reader_);
-    stats_.t_front += GS::FineTicks() - tf0;
+    const GS::DrawPreparation* prepared = cs == nullptr ? nullptr : pc.prep;
     if (!Begin()) {
         return;
     }
@@ -3405,14 +3517,18 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         Skipped(Skip::NotReady, "no compute registers for the queue");
         return;
     }
+    if (prepared == nullptr || pc.stage == nullptr) {
+        ++stats_.prepared_mismatches;
+        Skipped(Skip::NotReady, fmt::format("dispatch at {:#x}: no preparation", d.packet_addr));
+        return;
+    }
     const GS::DrawPreparation& prep = *prepared;
     if (!prep.ready) {
         Skipped(prep.unsupported ? Skip::Unsupported : Skip::NotReady,
-                fmt::format("dispatch at {:#x}: CS {}", d.packet_addr,
-                            GS::StageStatusName(frontend_.Stage(GS::HwStage::Cs).status)));
+                fmt::format("dispatch at {:#x}: CS {}", d.packet_addr, GS::StageStatusName(pc.stage->status)));
         return;
     }
-    const GS::StageView& csv = frontend_.Stage(GS::HwStage::Cs);
+    const GS::StageView& csv = *pc.stage;
     if (LabelChanges((1ull << 62) | csv.address)) {
         Label((1ull << 62) | csv.address,
               fmt::format("X cs{:x} {}x{}x{}{} @{:x}", csv.address, d.groups[0], d.groups[1], d.groups[2],
@@ -3462,7 +3578,7 @@ void Executor::Dispatch(const Cp::DispatchDescriptor& d) {
         for (const auto& b : csv.plan.buffers) {
             if (b.kind == GS::BufferKind::Guest && b.written && b.status == GS::ResourceStatus::Ok) {
                 // registered when targets bound: the CMASK/HTILE addresses seen so far
-                const Cp::RegisterFile& regs = cp_->Registers();
+                const Cp::RegisterFile& regs = *regs_;
                 bool meta = false;
                 for (u32 i = 0; i < 8 && !meta; ++i) {
                     meta = (u64{regs.Get(Cp::Reg::CbColor0Base + i * Cp::Reg::CbColorStride + 7)} << 8) == b.address;
@@ -4738,6 +4854,7 @@ void Executor::EvictGpuImages() {
         MarkWrites(5); // a later read of the memory waits for the copy
         // the CPU side (the processor's reads, the frontend's descriptor reads) waits for it
         timeline_writes_.push_back({addr, addr + bytes, cur_.value});
+        ++tw_version_;
         tw_lo_ = std::min(tw_lo_, addr);
         tw_hi_ = std::max(tw_hi_, addr + bytes);
         images_.Invalidate(addr, bytes); // textures there are uploaded again, after the copy
@@ -4745,6 +4862,7 @@ void Executor::EvictGpuImages() {
 }
 
 void Executor::Flip(const Cp::FlipMarker&) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     batch_fence_ = true;
     images_.NewFrame();
     EvictGpuImages();

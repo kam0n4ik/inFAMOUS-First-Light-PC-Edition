@@ -216,7 +216,8 @@ bool Write(const std::filesystem::path& file) {
     out << "n,game_submit_ms,flip_enter_ms,game_flip_ms,done_enter_ms,done_exit_ms,submits,cp_flip_ms,last_unblock_ms,"
            "gpu_done_ms,present_ms,game_idle_wait_ms,game_idle_waits,cp_ms,record_ms,sync_ms,blocked_label_ms,"
            "blocked_other_ms,empty_ms,gpu_busy_ms,draws,dispatches,batches,blocks,shaders,shader_ms,shader_disk,"
-           "pipelines,pipeline_ms,module_ms\n";
+           "pipelines,pipeline_ms,module_ms,callbacks_ms,par_wait_ms,par_busy_ms,par_idle_ms,par_drains,par_records,"
+           "par_depth_mean\n";
     const u32 total = std::max({g_state.game_n.load(), g_state.cp_n, g_state.present_n.load()});
     const u32 first = total > kCap ? total - kCap : 0; // (the ring: the last kCap frames)
     const Row* prev = nullptr;
@@ -236,13 +237,20 @@ bool Write(const std::filesystem::path& file) {
                                dms(t.blocked_other_ns, pt.blocked_other_ns), dms(t.empty_ns, pt.empty_ns),
                                dms(t.gpu_busy_ns, pt.gpu_busy_ns), dn(t.draws, pt.draws),
                                dn(t.dispatches, pt.dispatches), dn(t.batches, pt.batches), dn(t.blocks, pt.blocks));
-            out << fmt::format(",{},{:.3f},{},{},{:.3f},{:.3f}\n", dn(t.shaders, pt.shaders),
+            out << fmt::format(",{},{:.3f},{},{},{:.3f},{:.3f}", dn(t.shaders, pt.shaders),
                                dms(t.shader_ns, pt.shader_ns), dn(t.shader_disk, pt.shader_disk),
                                dn(t.pipelines, pt.pipelines), dms(t.pipeline_ns, pt.pipeline_ns),
                                dms(t.module_ns, pt.module_ns));
+            const u64 recs = dn(t.par_records, pt.par_records);
+            out << fmt::format(",{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.2f}\n", dms(t.callbacks_ns, pt.callbacks_ns),
+                               dms(t.par_wait_ns, pt.par_wait_ns), dms(t.par_busy_ns, pt.par_busy_ns),
+                               dms(t.par_idle_ns, pt.par_idle_ns), dn(t.par_drains, pt.par_drains), recs,
+                               recs != 0 ? static_cast<double>(dn(t.par_depth_sum, pt.par_depth_sum)) /
+                                               static_cast<double>(recs)
+                                         : 0.0);
             prev = &r;
         } else {
-            out << ",,,,,,,,,,,,,,,,,,,\n";
+            out << ",,,,,,,,,,,,,,,,,,,,,,,,,,\n";
         }
     }
     return static_cast<bool>(out);

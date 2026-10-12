@@ -65,6 +65,12 @@ def main(argv):
     for k in ("cp_ms", "record_ms", "sync_ms", "blocked_label_ms", "blocked_other_ms", "empty_ms", "gpu_busy_ms",
               "draws", "dispatches", "batches", "blocks"):
         res["mean_" + k] = mean([r[k] for r in fr])
+    # P4.10 (older logs have no such columns): the processor's other callbacks; the parallel command processor
+    for k in ("callbacks_ms", "par_wait_ms", "par_busy_ms", "par_idle_ms", "par_drains", "par_records",
+              "par_depth_mean"):
+        v = [r[k] for r in fr if r.get(k) is not None]
+        if v:
+            res["mean_" + k] = mean(v)
 
     # the frame's path (pairs by row: the n-th game flip, flip marker, completion, present)
     def lat(a, b, rr=rows):

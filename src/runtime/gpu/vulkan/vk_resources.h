@@ -49,6 +49,8 @@ public:
     /// A query or a wait returned VK_ERROR_DEVICE_LOST.
     bool Lost() const { return last_error_ == VK_ERROR_DEVICE_LOST; }
     u64 CompletedCached() const { return completed_; } ///< the last value seen (no query)
+    /// P4.10: the GPU's value now without touching the cached one (any thread; 0 on an error).
+    u64 QueryCompleted() const;
 
 private:
     DeviceContext& ctx_;

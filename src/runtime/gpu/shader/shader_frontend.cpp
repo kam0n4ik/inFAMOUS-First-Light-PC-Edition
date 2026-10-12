@@ -68,7 +68,7 @@ const u32 g_fine_every = [] {
     return std::max<u32>(every, 1);
 }();
 
-bool g_fine_now = false;
+thread_local bool g_fine_now = false;
 
 u64 TicksToNs(u64 ticks) {
     return static_cast<u64>(static_cast<double>(ticks) / TicksPerNs());

@@ -30,6 +30,8 @@
 namespace SecondSon::Gpu::Shader {
 class ShaderFrontend;
 struct StageView;
+struct DrawPreparation;
+struct GraphicsPipelineState;
 }
 
 namespace SecondSon::Gpu::Vk {
@@ -129,6 +131,10 @@ struct ExecutorStats {
     std::array<u64, 3> wb_bytes_by{}; ///< write-back bytes by batch end: fence/flip/sync/idle, full+fence, full only
     std::array<u64, 6> shadow_sizes{}; ///< written dispatch bindings: <=64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, larger
     std::array<u64, 3> sync_eff{}, sync_eff_us{}; ///< waits that did wait: processor packets, frontend reads, processor reads
+    /// P4.10: TSC ticks in the processor's callbacks other than draws and dispatches (fences, cache actions, DMA, timeline
+    /// writes/copies, waits met, flips, Synchronize) - the processor's own time is its rounds minus these and recording
+    u64 t_cb = 0, n_cb = 0;
+    u64 prepared_mismatches = 0; ///< P4.10: a draw/dispatch without the preparation its registers ask for (never)
     std::string first_skip[static_cast<size_t>(Skip::Count)];
 };
 
@@ -141,6 +147,16 @@ struct ExecutorOptions {
     u32 max_draws_per_batch = 500;
 };
 
+/// P4.10: what the shader frontend prepared for one draw or dispatch, handed to the executor's recording (made by the
+/// frontend on the same thread, or a copy the parallel command processor made on its thread at the command's packet).
+/// prep nullptr: none (a filtered draw; a dispatch without compute registers).
+struct PreparedCommand {
+    const GS::DrawPreparation* prep = nullptr;
+    const GS::StageView* stage = nullptr; ///< VS of a draw, CS of a dispatch
+    const GS::StageView* ps = nullptr;    ///< a draw's PS
+    const GS::GraphicsPipelineState* state = nullptr; ///< a ready draw's pipeline state
+};
+
 class Executor final : public Cp::GpuWork {
 public:
     Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, GuestBuffers& guest, BufferCache& buffers,
@@ -149,7 +165,13 @@ public:
     ~Executor() override;
 
     /// The processor whose work this executes (its registers are read at each draw; CompleteWork is called on it).
-    void Attach(Cp::CommandProcessor* cp) { cp_ = cp; }
+    void Attach(Cp::CommandProcessor* cp) {
+        cp_ = cp;
+        regs_ = cp != nullptr ? &cp->Registers() : nullptr;
+    }
+    /// P4.10: the register file draws read instead of the processor's (the parallel command processor's replica, which
+    /// holds the registers as they were at the draw's packet while the processor already reads later ones).
+    void SetRegisters(const Cp::RegisterFile* regs) { regs_ = regs; }
     /// The command journal, markers and the device loss report (the backend always sets it; --gpu-native-diag turns
     /// the journal on).
     void SetDiagnostics(Diagnostics* diag) { diag_ = diag; }
@@ -161,6 +183,24 @@ public:
     // Cp::GpuWork (the GPU thread, inside CommandProcessor::Run)
     void Draw(const Cp::DrawDescriptor& draw) override;
     void Dispatch(const Cp::DispatchDescriptor& dispatch) override;
+    /// P4.10: a dispatch with its queue's compute registers as they were at its packet (`cs` nullptr: none).
+    void DispatchWith(const Cp::DispatchDescriptor& dispatch, const Cp::ComputeRegisters* cs);
+    /// P4.10: a draw / dispatch the frontend already prepared (on the processor's thread): only recorded here.
+    void DrawPrepared(const Cp::DrawDescriptor& draw, const PreparedCommand& prepared);
+    void DispatchPrepared(const Cp::DispatchDescriptor& dispatch, const Cp::ComputeRegisters* cs,
+                          const PreparedCommand& prepared);
+    /// A draw the hardware does not draw (fast clear elimination, FMASK decompression, primitive None).
+    static bool DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& draw);
+    /// P4.10: the frontend's memo is told about guest memory changes from here (true) or not (false: the parallel
+    /// command processor's thread, which runs the frontend, tells it in stream order itself).
+    void SetMemoBumps(bool on) { memo_bumps_ = on; }
+    /// P4.10: a frontend read of [addr, addr + bytes) made elsewhere (the queue drained): what TimelineReader does
+    /// first - a write still on the GPU's timeline or a shader's write the host does not have lands (true: it waited).
+    bool SyncForFrontendRead(u64 addr, u64 bytes);
+    /// The same check without the wait: such a write is pending over [addr, addr + bytes).
+    bool FrontendReadPending(u64 addr, u64 bytes);
+    /// P4.10: the timeline value everything recorded so far completes at (the open batch's, else the last submitted).
+    u64 RecordedValue() const;
     void CacheAction(const Cp::CacheActionOp& op) override;
     void Flip(const Cp::FlipMarker& marker) override;
     void Fence(const Cp::FenceOp& op) override;
@@ -199,6 +239,13 @@ public:
     /// A write recorded on the GPU's timeline that has not completed overlaps [addr, addr + bytes): a CPU read of that
     /// memory has to Synchronize first (the command processor's reads, the frontend's descriptor reads).
     bool TimelineWritePending(u64 addr, u64 bytes) const;
+    /// P4.10.4: those writes' ranges, and a number that moves whenever they change (the parallel command processor's
+    /// snapshot for the processor's reads while draws are recorded on the other thread).
+    void TimelineWriteRanges(std::vector<std::pair<u64, u64>>& out) const;
+    u64 TimelineWritesVersion() const { return tw_version_; }
+    /// P4.10.4: work number `seq` of `queue` was taken by a write/copy the processor believed recorded and the CPU did
+    /// instead (after Synchronize): it completes with the next batch (its fences come).
+    void CompleteRefusedWork(u32 queue, u64 seq);
 
     /// Submits the open batch (nothing when empty).
     void Flush();
@@ -381,6 +428,10 @@ private:
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
 
     bool Begin();
+    void RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0);
+    void RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs, const PreparedCommand& pc,
+                        u64 t0);
+    bool memo_bumps_ = true;
     void Note(u32 queue, u64 seq);
     void EndRendering();
     /// `site`: who asked (counted): 0 other, 1/2 shadows in, 3 shadows out, 4 timeline write, 5 timeline copy, 6 upload,
@@ -583,6 +634,7 @@ private:
     OwnedBuffer& gds_;
     ExecutorOptions options_;
     Cp::CommandProcessor* cp_ = nullptr;
+    const Cp::RegisterFile* regs_ = nullptr; ///< what draws read (the processor's, or the P4.10 replica)
     std::array<u32, Cp::kNumQueues> queue_pipe_{};
 
     Batch cur_;
@@ -653,6 +705,7 @@ private:
     ExecutorStats stats_;
     std::vector<TimelineWrite> timeline_writes_; ///< not completed yet (pruned in Poll)
     u64 tw_lo_ = ~0ull, tw_hi_ = 0;              ///< their bounds
+    u64 tw_version_ = 0;                         ///< bumped at every change of timeline_writes_ (P4.10.4)
     bool write_run_ = false;                     ///< the commands recorded last were timeline writes
     std::vector<std::pair<u64, u64>> run_ranges_; ///< the ranges that run wrote (a write over one needs a barrier)
     TimelineReader reader_{*this};

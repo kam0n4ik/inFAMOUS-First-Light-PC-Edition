@@ -166,7 +166,8 @@ bool LookupMemoOn();
 /// gpu_native.txt; the GPU thread's)
 bool LookupMemoVerify();
 struct LookupMemoChecks {
-    u64 verified = 0, mismatches = 0;
+    // (atomic: P4.10 runs the frontend's and the executor's memos on two threads)
+    std::atomic<u64> verified{0}, mismatches{0};
 };
 LookupMemoChecks& LookupMemoCounts();
 inline size_t LookupMemoSlot(u64 key) {

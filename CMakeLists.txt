@@ -78,6 +78,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/host_shaders.cpp
     src/runtime/gpu/image_layout.cpp
     src/runtime/gpu/native_backend.cpp
+    src/runtime/gpu/parallel_cp.cpp
     src/runtime/gpu/cpu_sampler.cpp
     src/runtime/gpu/native_videoout.cpp
     src/runtime/gpu/page_tracker.cpp

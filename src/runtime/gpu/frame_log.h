@@ -29,6 +29,14 @@ struct GpuThreadTotals {
     u64 shader_disk = 0;                ///< translations taken from the disk cache instead
     u64 pipelines = 0, pipeline_ns = 0; ///< pipelines created (graphics + compute) and the driver's time for them
     u64 module_ns = 0;                  ///< vkCreateShaderModule and the auxiliary stages' emission
+    // P4.10: the processor's time split further; the parallel command processor (SSPC_P410_PARALLEL_CP=1)
+    u64 callbacks_ns = 0;     ///< of cp_ns: the processor's callbacks other than draws/dispatches (fences, DMA, ...)
+    u64 par_wait_ns = 0;      ///< of cp_ns: the GPU thread waiting for the recording thread (drains, a full queue)
+    u64 par_busy_ns = 0;      ///< the recording thread executing records (draws/dispatches: record_ns is of it)
+    u64 par_idle_ns = 0;      ///< the recording thread waiting for records
+    u64 par_drains = 0;       ///< drains that waited
+    u64 par_records = 0;      ///< records pushed
+    u64 par_depth_sum = 0;    ///< queue depth at each push (mean: / records)
 };
 
 /// The backend starts: time zero and the rows' storage.

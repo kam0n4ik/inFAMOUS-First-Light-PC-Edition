@@ -64,6 +64,11 @@ u64 Timeline::Completed() {
     return completed_;
 }
 
+u64 Timeline::QueryCompleted() const {
+    u64 v = 0;
+    return Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v) == VK_SUCCESS ? v : 0;
+}
+
 bool Timeline::Wait(u64 value, u64 timeout_ns) {
     if (completed_ >= value) {
         return true;

@@ -217,6 +217,9 @@ bool RegisterFile::Write(Space space, u32 offset, const u32* values, u32 count) 
     if (mirror_ != nullptr) {
         std::memcpy(mirror_ + first, values, size_t{count} * sizeof(u32));
     }
+    if (sink_ != nullptr) {
+        sink_->OnWrite(space, offset, values, count);
+    }
     writes_ += count;
     if (changed != 0) {
         changes_ += n;
@@ -253,6 +256,9 @@ void RegisterFile::Reset() {
     if (mirror_ != nullptr) {
         std::memcpy(mirror_, values_.data(), sizeof(values_));
     }
+    if (sink_ != nullptr) {
+        sink_->OnReset();
+    }
     RehashAll();
     Changed(kAllGroups);
 }
@@ -261,6 +267,9 @@ void RegisterFile::Load(std::span<const u32, kNumRegs> values) {
     std::copy(values.begin(), values.end(), values_.begin());
     if (mirror_ != nullptr) {
         std::memcpy(mirror_, values_.data(), sizeof(values_));
+    }
+    if (sink_ != nullptr) {
+        sink_->OnLoad(values);
     }
     RehashAll();
     Changed(kAllGroups);

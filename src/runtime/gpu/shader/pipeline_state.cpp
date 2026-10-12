@@ -167,7 +167,7 @@ const GraphicsPipelineState* PipelineStateCache::Graphics(u32 id) const {
 }
 
 u64 PipelineStateCache::MemoryBytes() const {
-    return entries_.capacity() * sizeof(Entry) + index_.size() * (sizeof(u64) + sizeof(u32) + 2 * sizeof(void*));
+    return entries_.size() * sizeof(Entry) + index_.size() * (sizeof(u64) + sizeof(u32) + 2 * sizeof(void*));
 }
 
 } // namespace SecondSon::Gpu::Shader

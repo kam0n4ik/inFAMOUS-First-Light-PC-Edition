@@ -28,6 +28,7 @@
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/cpu_sampler.h"
 #include "runtime/gpu/page_tracker.h"
+#include "runtime/gpu/parallel_cp.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
@@ -51,11 +52,33 @@ public:
     PageTracker* tracker = nullptr;
     Vk::BufferCache* buffers = nullptr; ///< its video memory copy of what the processor writes is invalidated
     Vk::Executor* executor = nullptr; ///< its writes on the GPU's timeline land before a read of them
+    /// P4.10 (SSPC_P410_PARALLEL_CP=1): the recording thread executes draws behind the processor - what this memory
+    /// does to the executor goes through it (drained first, or handed on in stream order)
+    ParallelCp* parallel = nullptr;
+    void CachedWrite(u64 addr, u64 bytes) {
+        if (buffers == nullptr) {
+            return;
+        }
+        if (parallel != nullptr) {
+            parallel->DeferInvalidateIfCached(addr, bytes); // (BufferCache::InvalidateIfCached: the recording thread's)
+        } else {
+            buffers->InvalidateIfCached(addr, bytes);
+        }
+    }
     bool Read(u64 addr, void* dst, u64 bytes) override {
         if (VideoOut::LabelRead(addr, dst, bytes)) {
             return true;
         }
-        if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {
+        if (parallel != nullptr) {
+            // (the executor's list is the recording thread's while records are queued: the queued copies and what it
+            // held when the queue was last empty decide; a possible overlap drains, then the executor decides)
+            if (parallel->TimelinePending(addr, bytes)) {
+                parallel->Drain(DrainReason::MemoryRead);
+                if (executor->TimelineWritePending(addr, bytes)) {
+                    executor->SyncFromMemoryRead();
+                }
+            }
+        } else if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {
             executor->SyncFromMemoryRead();
         }
         GuestMemory* gm = GetGuestMemory();
@@ -70,7 +93,9 @@ public:
         return unordered_labels && VideoOut::IsLabel(addr, bytes);
     }
     bool Write(u64 addr, const void* src, u64 bytes) override {
-        if (executor != nullptr) {
+        if (parallel != nullptr) {
+            parallel->MemoryChanged(); // (with the next record: where the write is in the stream)
+        } else if (executor != nullptr) {
             executor->GuestMemoryChanged(); // (P4.7: no memoized stage preparation past the processor's write)
         }
         if (VideoOut::LabelWrite(addr, src, bytes)) {
@@ -88,16 +113,12 @@ public:
         for (const Run& r : runs) {
             if (r.host != nullptr && r.gen == gen && addr >= r.begin && addr + bytes <= r.end) {
                 std::memcpy(r.host + (addr - r.begin), src, bytes);
-                if (buffers != nullptr) {
-                    buffers->InvalidateIfCached(addr, bytes);
-                }
+                CachedWrite(addr, bytes);
                 return true;
             }
         }
         if (gm->TryWriteBacking(reinterpret_cast<void*>(addr), src, bytes)) {
-            if (buffers != nullptr) {
-                buffers->InvalidateIfCached(addr, bytes); // written past the tracker: the video memory copy is older
-            }
+            CachedWrite(addr, bytes); // written past the tracker: the video memory copy is older
             u8* host = nullptr;
             u64 rb = 0, rs = 0;
             if (gm->BackingRun(addr, &host, &rb, &rs) && host != nullptr && addr >= rb && addr + bytes <= rb + rs) {
@@ -108,6 +129,9 @@ public:
         // memory without physical backing (flexible, anonymous): written in place when the pages are writable (a
         // texture's write-protected pages given back first: its copy is stale after this write)
         if (tracker != nullptr) {
+            if (parallel != nullptr) {
+                parallel->Drain(DrainReason::MemoryWrite); // (the tracker's arming is the recording thread's)
+            }
             tracker->Disarm(addr, bytes);
         }
         MEMORY_BASIC_INFORMATION mbi{};
@@ -117,9 +141,7 @@ public:
             return false;
         }
         std::memcpy(reinterpret_cast<void*>(addr), src, bytes);
-        if (buffers != nullptr) {
-            buffers->InvalidateIfCached(addr, bytes);
-        }
+        CachedWrite(addr, bytes);
         return true;
     }
     struct Run {
@@ -250,6 +272,10 @@ private:
     bool DrainCpuWrites();
     /// The executor reached a flip marker (its batch submitted, the flip queued): the frame log's row (P4.6).
     void OnFlip(u64 gpu_value);
+    /// P4.10.4: a queued timeline copy the executor refused, done as the processor would (after Synchronize): the CPU
+    /// copies guest memory and the caches drop the destination. The recording thread. true: copied.
+    bool CpuCopy(u64 src, u64 dst, u64 bytes);
+    std::vector<u8> copy_scratch_; ///< CpuCopy's (the recording thread's)
 
     Options options_;
     std::unique_ptr<Vk::DeviceContext> ctx_;
@@ -265,6 +291,7 @@ private:
     std::unique_ptr<GS::ShaderFrontend> frontend_;
     std::unique_ptr<Vk::Executor> executor_;
     std::unique_ptr<Cp::CommandProcessor> cp_;
+    std::unique_ptr<ParallelCp> parallel_; ///< P4.10 SSPC_P410_PARALLEL_CP=1 (destroyed before the processor)
     Vk::OwnedBuffer gds_;
     GS::DeviceProfile profile_;
     Memory memory_;
@@ -428,10 +455,50 @@ bool Backend::Start(const Options& o, std::string& error) {
     images_->SetBufferCache(buffers_.get());
     executor_ = std::make_unique<Vk::Executor>(*ctx_, *timeline_, *ring_, *guest_, *buffers_, *images_, *pipelines_,
                                                *frontend_, presenter_.get(), gds_, eo);
+    // P4.10: SSPC_P410_PARALLEL_CP=1 - draws and dispatches recorded on a second thread behind the command processor
+    // (parallel_cp.h); 0 or unset: one thread (the default). SSPC_P410_SPIN_US: how long a waiting side spins first.
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_P410_PARALLEL_CP", v, sizeof(v)) == 1 && v[0] == '1') {
+        u32 spin_us = 20;
+        if (char s[16] = {}; GetEnvironmentVariableA("SSPC_P410_SPIN_US", s, sizeof(s)) > 0) {
+            spin_us = static_cast<u32>(std::strtoul(s, nullptr, 10));
+        }
+        // SSPC_P410_ASYNC=0: the processor's other calls drain the queue (the first prototype); SSPC_P410_ASYNC_COPIES=0:
+        // timeline copies do (the rest queued)
+        const auto env_off = [](const char* name) {
+            char e[8] = {};
+            return GetEnvironmentVariableA(name, e, sizeof(e)) == 1 && e[0] == '0';
+        };
+        const bool async = !env_off("SSPC_P410_ASYNC"), async_copies = !env_off("SSPC_P410_ASYNC_COPIES");
+        // the shader frontend on the processor's thread too (stage 2: the recording thread only records);
+        // SSPC_P410_FRONTEND=0 - on the recording thread (stage 1b)
+        const bool frontend_ahead = !env_off("SSPC_P410_FRONTEND");
+        ParallelCp::Options po;
+        po.verify = [] {
+            char e[8] = {};
+            return GetEnvironmentVariableA("SSPC_P410_VERIFY", e, sizeof(e)) == 1 && e[0] == '1';
+        }();
+        po.spin_us = spin_us;
+        po.async = async;
+        po.async_copies = async_copies;
+        if (frontend_ahead) {
+            po.frontend = frontend_.get();
+            po.map_gen = &memory_.map_gen;
+            po.timeline = timeline_.get();
+        }
+        parallel_ = std::make_unique<ParallelCp>(*executor_, buffers_.get(), po);
+        parallel_->SetCopyFallback(
+            [](void* self, u64 src, u64 dst, u64 bytes) { return static_cast<Backend*>(self)->CpuCopy(src, dst, bytes); },
+            this);
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P410_PARALLEL_CP=1 - draws and dispatches are recorded on a second "
+                               "thread behind the command processor (spin {} us before a blocking wait; other calls {}, "
+                               "timeline copies {}; the shader frontend on the {} thread)",
+                 spin_us, async ? "queued" : "drained", async && async_copies ? "queued" : "drained",
+                 frontend_ahead ? "processor's" : "recording");
+    }
     Cp::Options cpo;
     cpo.mode = Cp::Mode::Isolated;
     cpo.memory = &memory_;
-    cpo.work = executor_.get();
+    cpo.work = parallel_ ? static_cast<Cp::GpuWork*>(parallel_.get()) : executor_.get();
     cpo.gds = gds_.mapped;
     // P4.6: the command processor does not stop for the GPU where the guest's GPU would not - a WAIT_REG_MEM a held
     // fence will meet passes in the GPU's order (EVENT_WRITE_EOS + a wait for it: ~27 GPU drains a frame before), DMA
@@ -474,6 +541,9 @@ bool Backend::Start(const Options& o, std::string& error) {
     }
     cp_ = std::make_unique<Cp::CommandProcessor>(cpo);
     executor_->Attach(cp_.get());
+    if (parallel_) {
+        parallel_->Attach(*cp_); // (the executor reads its replica of the registers from now on)
+    }
     executor_->SetWriteShadowRing(shadow_ring_.get());
     diag_ = std::make_unique<Vk::Diagnostics>(*ctx_, o.diagnostics, o.logs_dir);
     executor_->SetDiagnostics(diag_.get());
@@ -510,6 +580,7 @@ bool Backend::Start(const Options& o, std::string& error) {
     memory_.tracker = &tracker_;
     memory_.buffers = buffers_.get();
     memory_.executor = executor_.get();
+    memory_.parallel = parallel_.get();
     executor_->SetMapGeneration(&memory_.map_gen); // P4.7: the frontend's reads keep backing runs between maps
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
@@ -526,6 +597,9 @@ bool Backend::Start(const Options& o, std::string& error) {
     VideoOut::SetLabelCallback([](void* ctx) { static_cast<Backend*>(ctx)->cv_.notify_one(); }, this);
     VideoOut::Start(this);
     stop_.store(false);
+    if (parallel_) {
+        parallel_->Start();
+    }
     thread_ = std::thread([this] { Loop(); });
     if (Inspector::On()) {
         Inspector::SetGpuThread(reinterpret_cast<HANDLE>(thread_.native_handle()));
@@ -594,6 +668,29 @@ bool Backend::DrainCpuWrites() {
         frontend_->Invalidate(a, sz);
     });
     return any;
+}
+
+bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
+    GuestMemory* gm = GetGuestMemory();
+    if (gm == nullptr || !GuestMemory::IsValidGpuMapping(src, bytes) || !GuestMemory::IsValidGpuMapping(dst, bytes)) {
+        return false;
+    }
+    copy_scratch_.resize(bytes);
+    gm->CopySparse(src, copy_scratch_.data(), bytes);
+    if (!gm->TryWriteBacking(reinterpret_cast<void*>(dst), copy_scratch_.data(), bytes)) {
+        // memory without physical backing: in place when writable (Memory::Write's path; the tracker's pages first)
+        tracker_.Disarm(dst, bytes);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(dst), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0 ||
+            reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize < dst + bytes) {
+            return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(dst), copy_scratch_.data(), bytes);
+    }
+    images_->Invalidate(dst, bytes); // (what Executor::Dma does for a DMA the CPU executed)
+    buffers_->Invalidate(dst, bytes);
+    return true;
 }
 
 void Backend::Loop() {
@@ -674,6 +771,16 @@ void Backend::Loop() {
                 break;
             }
             pending |= cp_->PendingSubmissions(q) != 0;
+        }
+        if (parallel_) {
+            // P4.10: everything the round handed to the recording thread executed - polls, flushes and idle waits as
+            // with one thread (part of the round's time: the processor's work is done only now)
+            parallel_->Drain(DrainReason::RoundEnd);
+            if (parallel_->Failed()) {
+                SSPC_LOG(GPU, Error, "native backend: {}; the process exits with code 5", parallel_->FailureText());
+                std::thread([] { Lifecycle::Exit(5, "native GPU backend: the parallel recording thread failed"); }).detach();
+                return;
+            }
         }
         const u64 round_ns = ns_since(cp_t0);
         prof_cp += round_ns;
@@ -889,6 +996,16 @@ void Backend::OnFlip(u64 gpu_value) {
     t.pipelines = p.graphics + p.compute;
     t.pipeline_ns = p.create_ns;
     t.module_ns = p.module_ns;
+    t.callbacks_ns = GS::TicksToNs(s.t_cb);
+    if (parallel_) { // (the flip marker is executed with the queue drained: thread 2's totals are settled)
+        const ParallelTotals pt = parallel_->Totals();
+        t.par_wait_ns = GS::TicksToNs(pt.t1_drain_ticks + pt.t1_full_ticks);
+        t.par_busy_ns = GS::TicksToNs(pt.t2_busy_ticks);
+        t.par_idle_ns = GS::TicksToNs(pt.t2_idle_ticks);
+        t.par_drains = pt.drains;
+        t.par_records = pt.records;
+        t.par_depth_sum = pt.depth_sum;
+    }
     FrameLog::CpFlip(gpu_value, t, executor_->LastUnblockTsc());
     if (Inspector::On()) {
         Inspector::CpTotals it;
@@ -939,6 +1056,9 @@ void Backend::Stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+    if (parallel_) {
+        parallel_->Stop(); // (its queue was drained by the loop's last round)
+    }
     VideoOut::Stop();
     Gnm::SetHost(nullptr);
     if (frontend_) {
@@ -967,10 +1087,22 @@ void Backend::Stop() {
 
 std::string Backend::Report() {
     std::string out = device_lost_.load() ? "STATUS: FAILED - VK_ERROR_DEVICE_LOST (logs\\gpu_device_lost.txt)\n"
-                                          : "STATUS: running/stopped normally\n";
+                      : parallel_ && parallel_->Failed()
+                          ? "STATUS: FAILED - " + parallel_->FailureText() + "\n"
+                          : "STATUS: running/stopped normally\n";
     out += fmt::format("SecondSonPC native GPU backend (P4.4)\ndevice: {}\nsubmissions: {}, "
                                   "command processor errors: {} {}\n",
                                   ctx_ ? ctx_->Name() : "-", submissions_, cp_errors_, first_cp_error_);
+    if (parallel_) {
+        out += parallel_->Report();
+    }
+    if (executor_) {
+        const auto& s = executor_->Stats();
+        out += fmt::format("the processor's other callbacks (P4.10): {} calls, {:.0f} ms; recording {:.0f} ms; draws/"
+                           "dispatches without the preparation their registers ask for {}\n",
+                           s.n_cb, static_cast<double>(GS::TicksToNs(s.t_cb)) / 1e6,
+                           static_cast<double>(s.record_ns) / 1e6, s.prepared_mismatches);
+    }
     if (executor_) {
         const auto& s = executor_->Stats();
         out += fmt::format("draws {} (executed {}), dispatches {} (executed {}), batches {}, completed {}, flips {} "
@@ -1141,7 +1273,7 @@ std::string Backend::Report() {
                            b.n_upload_calls, b.block_upload_pages, b.block_upload_refused);
         out += fmt::format("lookup memos (P4.9): {}; verified hits {}, mismatches {}\n",
                            GS::LookupMemoOn() ? (GS::LookupMemoVerify() ? "on, verify" : "on") : "off",
-                           GS::LookupMemoCounts().verified, GS::LookupMemoCounts().mismatches);
+                           GS::LookupMemoCounts().verified.load(), GS::LookupMemoCounts().mismatches.load());
         if (b.wb_checked_bytes != 0) {
             out += fmt::format("write-backs checked (SSPC_DIAG_WB_DIRTY): {} MiB, changed 256-byte chunks {} ({} MiB), "
                                "changed words {} ({} KiB)\n",

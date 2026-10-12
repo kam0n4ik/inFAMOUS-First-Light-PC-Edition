@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -91,7 +92,9 @@ private:
     };
     u64 Hash(const void* data, size_t bytes) const;
     std::unordered_multimap<u64, u32> index_;
-    std::vector<Entry> entries_;
+    /// (a deque: an entry never moves - P4.10 hands Graphics()'s pointer to the recording thread while this thread adds
+    /// pipelines; entries are never removed)
+    std::deque<Entry> entries_;
     PipelineCacheStats stats_;
     u64 (*test_hash_)(const void*, size_t) = nullptr;
 };

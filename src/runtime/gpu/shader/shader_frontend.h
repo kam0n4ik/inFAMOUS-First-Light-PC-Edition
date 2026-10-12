@@ -68,7 +68,7 @@ u64 TicksToNs(u64 ticks);
 /// FineSample around it sets g_fine_now): the stage sums are 1/N of the whole; reports multiply them by FineScale().
 extern const bool g_fine_timing;
 extern const u32 g_fine_every;
-extern bool g_fine_now; ///< the GPU thread's (the only one that reads FineTicks)
+extern thread_local bool g_fine_now; ///< per thread (P4.10: the frontend and the executor may run on two threads)
 inline u64 FineTicks() {
     return (g_fine_timing || g_fine_now) ? __rdtsc() : 0;
 }
