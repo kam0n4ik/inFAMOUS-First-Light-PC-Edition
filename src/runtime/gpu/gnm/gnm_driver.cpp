@@ -27,7 +27,8 @@
 // The bridge's stubs keep their results and warn once that they do nothing; "not available in retail firmware"
 // functions keep the retail answer the bridge gives (logged once at Debug; at Warning when that answer is 0 = OK).
 // Without a host (SecondSonPC's backend not running) every function that needs one logs an error (the first 16) and
-// refuses: 0x80D11000, or 0x80D170FF for the compute queue functions.
+// refuses: 0x80D11000, or 0x80D170FF for the compute queue functions. During the orderly exit (the backend stopped by
+// its exit step while the game's threads still run) the refusal is the same, logged once at Info.
 //
 // Threads: g_submit_mutex orders submissions, DingDong and SubmitDone (the bridge's m_submit_lock); the submission lock
 // is a flag under g_idle_mutex with a condition variable (the bridge's submission_lock / m_wait_idle / cv_lock). The
@@ -52,6 +53,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "runtime/exports.h"
 #include "runtime/gpu/frame_log.h"
@@ -192,6 +194,7 @@ bool IsVertexStage(u32 stage) {
 std::atomic<Host*> g_host{nullptr};
 std::atomic<s32> g_sdk_version{0};
 std::atomic<u32> g_errors_without_host{0};
+std::atomic<bool> g_refused_while_exiting{false};
 std::atomic<u64> g_tess_factor_ring{0};
 
 std::mutex g_submit_mutex;
@@ -230,6 +233,16 @@ std::vector<Registration> g_registrations; ///< under g_irq_mutex
 Host* CurrentHost(const char* function) {
     Host* const host = g_host.load(std::memory_order_acquire);
     if (host == nullptr) [[unlikely]] {
+        // The orderly exit stops the backend (exit step "native GPU backend") while the game's threads still run: their
+        // GPU calls after it are expected and refused with one line, not errors (P4.12: sceGnmDingDong of async
+        // compute after the window was closed)
+        if (Lifecycle::Current() != Lifecycle::State::Running) {
+            if (!g_refused_while_exiting.exchange(true, std::memory_order_relaxed)) {
+                SSPC_LOG(GPU, Info, "{}: refused - the process is exiting and the GPU backend has stopped (further "
+                         "refusals during the exit are not logged)", function);
+            }
+            return host;
+        }
         const u32 n = g_errors_without_host.fetch_add(1, std::memory_order_relaxed);
         if (n < 16) {
             SSPC_LOG(GPU, Error, "{}: SecondSonPC's GPU backend is not running (no Gnm host): refused{}", function,
