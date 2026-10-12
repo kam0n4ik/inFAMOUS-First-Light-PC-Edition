@@ -54,6 +54,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/inspector.cpp
     src/runtime/gpu/inspector_catalog.cpp
     src/runtime/gpu/stall_trace.cpp
+    src/runtime/gpu/shader_trace.cpp
     src/runtime/gpu/frame_pacing.cpp
     src/runtime/gpu/gnm/gnm_driver.cpp
     src/runtime/gpu/pm4.cpp
@@ -63,6 +64,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/shader/runtime_params.cpp
     src/runtime/gpu/shader/shader_cache.cpp
     src/runtime/gpu/shader/shader_capture.cpp
+    src/runtime/gpu/shader/shader_disk_cache.cpp
     src/runtime/gpu/shader/shader_frontend.cpp
     src/runtime/gpu/shader/shader_resources.cpp
     src/runtime/gpu/shader/shader_translator.cpp
@@ -74,6 +76,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/vulkan/vk_capture.cpp
     src/runtime/gpu/vulkan/vk_image_cache.cpp
     src/runtime/gpu/vulkan/vk_pipelines.cpp
+    src/runtime/gpu/vulkan/vk_precompile.cpp
     src/runtime/gpu/vulkan/vk_presenter.cpp
     src/runtime/gpu/vulkan/vk_resources.cpp
     src/runtime/gpu/host_shaders.cpp
@@ -138,6 +141,28 @@ set_source_files_properties(src/runtime/cpu/exceptions.cpp PROPERTIES
     COMPILE_DEFINITIONS "SSPC_GIT_REV=\"${SSPC_GIT_REV}\"")
 
 sspc_attach_bootstrap(sspc_runtime)
+
+# P4.14: the native backend's persistent shader cache generation (src/runtime/gpu/shader/shader_disk_cache.*): the
+# bridge's recompiler generation and the contents of SecondSonPC's frontend and translator adapter sources. A change of
+# one of them re-runs this configure step; a cache written by another generation is never read.
+file(GLOB _sspc_gen_inputs CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/gpu/shader/*.cpp
+     ${CMAKE_SOURCE_DIR}/src/runtime/gpu/shader/*.h)
+list(FILTER _sspc_gen_inputs EXCLUDE REGEX "shader_(disk_cache|capture)\\.(cpp|h)$")
+list(APPEND _sspc_gen_inputs ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/shader_translator_host.cpp
+     ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/shader_bridge_hooks.h)
+list(SORT _sspc_gen_inputs)
+set(_sspc_gen_acc "${SSPC_SHADER_CACHE_GENERATION}")
+foreach(_f IN LISTS _sspc_gen_inputs)
+    file(SHA256 "${_f}" _h)
+    get_filename_component(_n "${_f}" NAME)
+    string(APPEND _sspc_gen_acc "|${_n}:${_h}")
+endforeach()
+string(SHA256 _sspc_gen_full "${_sspc_gen_acc}")
+string(SUBSTRING "${_sspc_gen_full}" 0 16 SSPC_NATIVE_SHADER_GENERATION)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_sspc_gen_inputs})
+set_source_files_properties(src/runtime/gpu/shader/shader_disk_cache.cpp PROPERTIES
+    COMPILE_DEFINITIONS "SSPC_NATIVE_SHADER_GENERATION=\"${SSPC_NATIVE_SHADER_GENERATION}\"")
+message(STATUS "SecondSonPC: native shader cache generation ${SSPC_NATIVE_SHADER_GENERATION}")
 
 # P3.6.6: the SecondSonPC <-> bridge boundary, checked whenever a source, a patch or the allowlist changes
 # (cmake/sspc_boundary_check.cmake; report in the build directory). A violation fails the build.

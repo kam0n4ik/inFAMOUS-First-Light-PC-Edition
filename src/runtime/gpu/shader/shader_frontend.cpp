@@ -12,7 +12,10 @@
 
 #include <fmt/format.h>
 
+#include "base/log.h"
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/shader/shader_disk_cache.h"
+#include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 
 namespace SecondSon::Gpu::Shader {
@@ -277,6 +280,9 @@ Module* ShaderFrontend::NewModule(Program& program, const RuntimeParams& runtime
 }
 
 bool ShaderFrontend::Enqueue(Job job) {
+    if (job.module->disk_record != 0 && disk_ != nullptr && LoadFromDisk(*job.module)) {
+        return true; // (P4.14: its translation from an earlier run)
+    }
     if (translator_ == nullptr) {
         translator_ = options_.translator != nullptr ? options_.translator : GetShaderTranslator();
     }
@@ -352,6 +358,8 @@ void ShaderFrontend::Run(Job& job) {
     if (ns > run_ns_max_.load(std::memory_order_relaxed)) {
         run_ns_max_.store(ns, std::memory_order_relaxed); // (one writer at a time in the native backend: synchronous)
     }
+    ShaderTrace::Event(ShaderTrace::Kind::Translate, t0, t1, job.program->footer_hash, result.spirv.size() * 4,
+                       static_cast<u32>(m.runtime.hw));
     {
         std::scoped_lock lock{mutex_};
         ++w_translations_;
@@ -362,7 +370,67 @@ void ShaderFrontend::Run(Job& job) {
         w_translate_.Add(ns);
     }
     m.result = std::move(result);
+    if (ok) {
+        m.spirv_hash = HashSpirv(m.result.spirv);
+        if (disk_ != nullptr) {
+            disk_->AddModule(*job.program, m, !m.keyed); // (P4.14: a copy queued for the cache's writer)
+        }
+    }
     m.state.store(ok ? ModuleState::Ready : ModuleState::Failed, std::memory_order_release);
+}
+
+void ShaderFrontend::RestoreFromDisk(Program& program) {
+    static constexpr std::array<u32, 16> kNoUserData{};
+    for (ModuleStub& st : disk_->Stubs(program.id)) {
+        Module* m = nullptr;
+        if (st.layout) {
+            if (program.FindLayout(st.runtime) != nullptr) {
+                continue; // (two runs' first modules of one runtime: the first record stands)
+            }
+            m = NewModule(program, st.runtime, st.start, kNoUserData);
+            program.layouts.push_back({st.runtime, m});
+        } else {
+            u64 collisions = 0;
+            if (program.FindModule(st.key, collisions) != nullptr) {
+                continue;
+            }
+            m = NewModule(program, st.runtime, st.start, kNoUserData);
+            m->key = std::move(st.key);
+            m->keyed = true;
+        }
+        m->disk_record = st.record + 1;
+        ++stats_.disk_stubs;
+    }
+}
+
+bool ShaderFrontend::LoadFromDisk(Module& m) {
+    const u32 record = m.disk_record - 1;
+    m.disk_record = 0; // (read once: a failure translates it)
+    DiskModule dm;
+    std::string error;
+    bool ok = disk_->LoadModule(record, dm, error);
+    // the record must be the module it was found for: the same runtime, start and (keyed) key
+    if (ok && (std::memcmp(&dm.runtime, &m.runtime, sizeof(RuntimeParams)) != 0 || !(dm.start == m.start) ||
+               dm.layout == m.keyed || (m.keyed && !(dm.key == m.key)))) {
+        ok = false;
+        error = fmt::format("record {} is not the module it was indexed as", record);
+    }
+    if (!ok) {
+        if (stats_.disk_load_failures++ < 8) {
+            SSPC_LOG(GPU, Warning, "shader cache: {} - translated instead", error);
+        }
+        return false;
+    }
+    m.user_data = dm.user_data;
+    m.spirv_hash = dm.spirv_hash;
+    stats_.disk_saved_us += dm.result.translate_us + dm.result.emit_us;
+    m.result = std::move(dm.result);
+    m.from_disk = true;
+    m.queued = true;
+    ++stats_.disk_loads;
+    disk_loads_total_.fetch_add(1, std::memory_order_relaxed);
+    m.state.store(ModuleState::Ready, std::memory_order_release);
+    return true;
 }
 
 void ShaderFrontend::WorkerLoop() {
@@ -470,6 +538,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         ++stats_.program_reuse;
     } else {
         const auto l = programs_.Get(memory, addr, hw);
+        if (l.created && disk_ != nullptr) {
+            RestoreFromDisk(*l.program); // (P4.14)
+        }
         s.address = addr;
         s.program = l.program;
         s.footer_hash = l.footer_hash;
@@ -504,6 +575,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     }
     Module& first = *layout->module;
     if (!first.queued && may_queue && first.state.load(std::memory_order_acquire) == ModuleState::Pending) {
+        if (first.disk_record != 0) {
+            std::copy(user_data.begin(), user_data.end(), first.user_data.begin()); // (the record replaces them)
+        }
         Enqueue(Job{&program, &first, addr, &memory, {}, {}, {}});
     }
     const ModuleState fs = first.state.load(std::memory_order_acquire);
@@ -569,6 +643,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     }
     s.module = m;
     if (!m->queued && may_queue && m->state.load(std::memory_order_acquire) == ModuleState::Pending) {
+        if (m->disk_record != 0) {
+            std::copy(user_data.begin(), user_data.end(), m->user_data.begin()); // (the record replaces them)
+        }
         Job job{&program, m, addr, &memory, s.plan.flat, fe != nullptr ? fe->code : std::vector<u32>{}, {}};
         for (const VertexBinding& v : s.plan.vertices) {
             job.vertex_sharps.push_back(v.read);
@@ -757,6 +834,9 @@ std::string ShaderFrontend::Report() const {
                      "failed {}, first translations retried {}; translate {} ms, emit {} ms, SPIR-V {} KiB\n",
                      st.queued, st.queue_full, st.gated, st.translations, st.translation_failures, st.layout_retries,
                      st.translate_us / 1000, st.emit_us / 1000, st.spirv_bytes / 1024);
+    t += fmt::format("disk cache (P4.14): modules found for programs met {}, read instead of translated {} (saving {} ms "
+                     "of translation as recorded), unusable records {}\n",
+                     st.disk_stubs, st.disk_loads, st.disk_saved_us / 1000, st.disk_load_failures);
     t += fmt::format("SRT walks: guest reads {}, refused reads (0) {}, walkers not interpreted {}, walks failed {}\n",
                      st.srt_reads, st.srt_faults, st.srt_compile_failures, st.srt_walk_failures);
     t += "resources:";

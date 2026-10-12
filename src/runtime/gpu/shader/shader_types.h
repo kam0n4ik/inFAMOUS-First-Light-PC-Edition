@@ -201,4 +201,16 @@ struct ShaderReflection {
     BindingStart end;      ///< ... and the next stage starts at
 };
 
+/// A translated module's SPIR-V by content (XXH3-128 of its words; P4.14): what a pipeline is built from, the same in
+/// every run - the persistent cache's and the pipeline manifest's reference to a stage.
+struct SpirvHash {
+    u64 lo = 0, hi = 0;
+    bool operator==(const SpirvHash&) const = default;
+    bool Empty() const { return lo == 0 && hi == 0; }
+};
+SpirvHash HashSpirv(std::span<const u32> spirv);
+struct SpirvHashHasher {
+    size_t operator()(const SpirvHash& h) const noexcept { return static_cast<size_t>(h.lo ^ (h.hi * 0x9E3779B97F4A7C15ull)); }
+};
+
 } // namespace SecondSon::Gpu::Shader

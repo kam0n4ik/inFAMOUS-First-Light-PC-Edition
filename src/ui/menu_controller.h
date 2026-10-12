@@ -46,4 +46,10 @@ private:
 
 MenuController& Menu();
 
+/// P4.14: the start-up shader precompiler's progress over the game window (docs/PHASE4_SHADER_PRECOMPILER.md §6): a
+/// panel with "Preparing shaders", done / total, a bar and the skip hint, drawn by the menu's overlay (nothing without
+/// it: an automated run, no window). Main thread, while the start waits: the window's messages are pumped here.
+/// `finished`: the panel is hidden. true: Esc was pressed (the user skips the wait).
+bool ShowStartupProgress(u32 done, u32 total, u32 failed, double elapsed_s, bool finished);
+
 } // namespace SecondSon::Ui

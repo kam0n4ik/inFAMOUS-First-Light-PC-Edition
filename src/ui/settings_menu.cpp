@@ -38,7 +38,9 @@ constexpr Color kGlyphBg{38, 42, 54, 255};
 constexpr Color kShade{0, 0, 0, 150};
 
 constexpr Category kOrder[] = {Category::Display,  Category::Graphics, Category::Audio,     Category::Controls,
-                               Category::Keyboard, Category::Gamepad,  Category::Interface, Category::Game};
+                               Category::Keyboard, Category::Gamepad,  Category::Interface, Category::Shaders,
+                               Category::Game};
+constexpr u64 kConfirmCommandNs = 5'000'000'000;
 
 using A = Input::Action;
 constexpr A kMoveActions[] = {A::MoveForward, A::MoveBack, A::MoveLeft, A::MoveRight, A::Walk};
@@ -259,6 +261,15 @@ void SettingsMenu::RebuildRows() {
     if (category_ == Category::Display) {
         info("Game render resolution", "Разрешение рендеринга игры", "info.render");
     }
+    if (category_ == Category::Shaders) {
+        info("Cache size", "Размер кэша", "info.cache.size");
+        info("In the cache", "В кэше", "info.cache.content");
+        info("This run", "В этом запуске", "info.cache.run");
+        rows_.push_back({.kind = Row::Kind::Command, .en = "Clear the shader cache", .ru = "Очистить кэш шейдеров",
+                         .tag = "cmd.clear_shaders"});
+        rows_.push_back({.kind = Row::Kind::Command, .en = "Clear the Vulkan pipeline cache",
+                         .ru = "Очистить Vulkan pipeline cache", .tag = "cmd.clear_pipelines"});
+    }
     rows_.push_back({.kind = Row::Kind::ResetCategory, .en = "Reset this section", .ru = "Сбросить раздел",
                      .tag = "reset.category"});
     if (focus_ >= rows_.size()) {
@@ -300,6 +311,10 @@ void SettingsMenu::MoveFocus(int delta) {
         focus_ = static_cast<size_t>(last_ok);
         slot_ = 0;
     }
+}
+
+std::string SettingsMenu::TakeCommand() {
+    return std::exchange(command_, {});
 }
 
 std::string SettingsMenu::FocusedId() const {
@@ -501,6 +516,18 @@ void SettingsMenu::Activate() {
         return;
     case Row::Kind::Header:
     case Row::Kind::Info:
+        return;
+    case Row::Kind::Command:
+        if (armed_ == row.tag && env_.now_ns - armed_ns_ < kConfirmCommandNs) {
+            command_ = row.tag;
+            armed_.clear();
+            status_ = std::string(T("Done: the cache is cleared at the next start.",
+                                    "Готово: кэш будет очищен при следующем запуске."));
+        } else {
+            armed_ = row.tag;
+            armed_ns_ = env_.now_ns;
+            status_ = std::string(T("Press once more to confirm.", "Нажмите ещё раз для подтверждения."));
+        }
         return;
     case Row::Kind::Setting:
         break;
@@ -1045,8 +1072,23 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
                 text = std::string(T("F1 menu · F10 FPS · F11 full screen", "F1 меню · F10 FPS · F11 полный экран"));
             } else if (row.tag == "info.render") {
                 text = std::string(T("1920 × 1080 (the window scales the frame)", "1920 × 1080 (окно масштабирует кадр)"));
+            } else if (row.tag == "info.cache.size") {
+                text = env_.shader_cache_size;
+            } else if (row.tag == "info.cache.content") {
+                text = env_.shader_cache_content;
+            } else if (row.tag == "info.cache.run") {
+                text = env_.shader_cache_run;
             }
             out.Text(ctrl, text, 16.0f * s, kText2, Align::Right);
+            break;
+        }
+        case Row::Kind::Command: {
+            const Rect b{ctrl.x + ctrl.w * 0.35f, rr.y + 8 * s, ctrl.w * 0.65f, rr.h - 16 * s};
+            const bool armed = armed_ == row.tag && env_.now_ns - armed_ns_ < kConfirmCommandNs;
+            out.StrokeRect(b, focused || armed ? kAccent : kKeycapLine, std::max(1.0f, 1.5f * s), 8 * s);
+            out.Text(b, armed ? T("Confirm", "Подтвердить") : T("Clear", "Очистить"), 16.0f * s, kText, Align::Center,
+                     FontWeight::Semibold);
+            hits_.push_back({.kind = Hit::Kind::Row, .rect = b, .index = ri, .part = Hit::Part::Button});
             break;
         }
         case Row::Kind::ResetCategory: {
@@ -1191,6 +1233,23 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
         } else if (row.kind == Row::Kind::ResetCategory) {
             help = std::string(T("Every setting of this section back to SecondSonPC.toml's value.",
                                  "Все настройки раздела вернутся к значениям из SecondSonPC.toml."));
+        } else if (row.tag == "cmd.clear_shaders") {
+            help = std::string(T("The translated shaders, the list of known pipelines and the Vulkan pipeline cache "
+                                 "are deleted at the next start: that start and the first visit of every place compile "
+                                 "again.",
+                                 "Переведённые шейдеры, список известных конвейеров и Vulkan pipeline cache удаляются "
+                                 "при следующем запуске: этот запуск и первое посещение каждого места компилируют "
+                                 "заново."));
+        } else if (row.tag == "cmd.clear_pipelines") {
+            help = std::string(T("Only the driver's compiled pipelines (vulkan.bin) are deleted at the next start; the "
+                                 "translated shaders and the list of pipelines stay (they are compiled again at the "
+                                 "start).",
+                                 "При следующем запуске удаляются только скомпилированные драйвером конвейеры "
+                                 "(vulkan.bin); переведённые шейдеры и список конвейеров остаются (компилируются "
+                                 "заново при запуске)."));
+        } else if (row.tag.starts_with("info.cache.")) {
+            help = std::string(T("The native backend's persistent shader cache ([ShaderCache] dir).",
+                                 "Постоянный кэш шейдеров собственного бэкенда ([ShaderCache] dir)."));
         } else if (row.tag == "info.backend") {
             help = std::string(T("Chosen at start (--gpu-backend). Settings that need the other backend are marked "
                                  "unavailable.",

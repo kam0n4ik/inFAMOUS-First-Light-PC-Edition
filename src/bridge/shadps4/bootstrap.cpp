@@ -54,6 +54,7 @@
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "bridge/shadps4/settings_host.h"
+#include "ui/menu_controller.h"
 #include "bridge/shadps4/track_diag.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
@@ -640,6 +641,11 @@ void StartBridgeLibraries(const Loader::Bindings& bindings, bool selftest) {
 
 /// The game's view of the file system (Vfs). /savedata0 is added by the SaveData observer when
 /// the game mounts it (SaveData is BRIDGE until Phase 3).
+/// P4.14: the start-up shader precompiler's progress over the game window (the settings menu's overlay); true: skip.
+bool ShowPrecompileProgress(void*, const Gpu::Native::Options::PrecompileStatus& s) {
+    return Ui::ShowStartupProgress(s.done, s.total, s.failed, s.elapsed_s, s.finished);
+}
+
 void SetupFilesystem(const App::Config& cfg, const std::string& serial) {
     static std::unique_ptr<Filesystem::FsHost> fs_host = CreateFsHost();
     Filesystem::SetHost(fs_host.get());
@@ -738,6 +744,22 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         no.sdk_version = Core::ReadCompiledSdkVersion(guest_eboot_path);
         no.capture_flip = cfg.gpu_capture_flip;
         no.logs_dir = cfg.logs_dir;
+        // P4.14: the persistent shader cache and the start-up precompiler ([ShaderCache]; --shader-cache <dir> /
+        // --no-shader-cache for test runs)
+        no.shader_cache = cfg.shader_cache;
+        no.shader_cache_dir = cfg.shader_cache_dir;
+        if (!serial.empty()) {
+            no.game = serial;
+        }
+        no.precompile = cfg.pc.shader_precompile;
+        if (char v[4] = {}; GetEnvironmentVariableA("SSPC_SHADER_PRECOMPILE", v, sizeof(v)) == 1) {
+            no.precompile = v[0] == '1'; // (a diagnostic switch for test runs: 0 off, 1 on)
+        }
+        no.cache_max_mib = cfg.pc.shader_cache_max_mib;
+        no.precompile_threads = cfg.pc.shader_precompile_threads;
+        if (cfg.pc.shader_precompile_progress && cfg.test_presses.empty()) {
+            no.precompile_progress = &ShowPrecompileProgress;
+        }
         std::string gpu_error;
         if (!Gpu::Native::Start(no, gpu_error)) {
             Fatal("--gpu-backend sspc: SecondSonPC's GPU backend did not start: " + gpu_error);
@@ -927,7 +949,18 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
     std::thread([timeline, shots] {
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& ev : timeline) {
-            std::this_thread::sleep_until(t0 + std::chrono::duration<double>(ev.at));
+            // (P4.14: the time the start waited for the shader precompiler moves the script with the game - read
+            // until it is due: the wait ends after the script started)
+            while (true) {
+                const auto due = t0 + std::chrono::duration<double>(ev.at) +
+                                 std::chrono::nanoseconds(Gpu::Native::StartupPauseNs());
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= due) {
+                    break;
+                }
+                const auto left = std::chrono::duration_cast<std::chrono::microseconds>(due - now);
+                std::this_thread::sleep_for(std::min(left, std::chrono::microseconds(50'000)));
+            }
             SDL_Event e{};
             switch (ev.kind) {
             case Kind::KeyDown:

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "base/log.h"
 #include "input/device_tracker.h"
 #include "input/keyboard_mouse.h"
+#include "runtime/gpu/native_backend.h"
 #include "runtime/pad/pad.h"
 #include "settings/registry.h"
 #include "settings/settings_service.h"
@@ -222,6 +225,22 @@ MenuEnv BuildEnv() {
     } else if (const auto error = service.LastSaveError(); !error.empty()) {
         env.save_note = (env.ru ? "Не удалось сохранить настройки: " : "Settings not saved: ") + error;
     }
+    // P4.14: the native backend's shader cache
+    if (const auto ci = Gpu::Native::CacheInfo(); ci.enabled) {
+        const auto mib = [](u64 b) { return static_cast<double>(b) / (1 << 20); };
+        env.shader_cache_size = fmt::format("{:.0f} + {:.0f} MiB (vulkan.bin) / {} MiB", mib(ci.file_bytes),
+                                            mib(ci.vulkan_bytes), cfg.pc.shader_cache_max_mib);
+        env.shader_cache_content =
+            env.ru ? fmt::format("шейдеров: {}, конвейеров: {}", ci.modules, ci.pipelines)
+                   : fmt::format("{} shaders, {} pipelines", ci.modules, ci.pipelines);
+        env.shader_cache_run =
+            env.ru ? fmt::format("заранее {} из {} ({:.1f} с), из кэша: {}, новых: {}", ci.precompile_built,
+                                 ci.precompile_total, ci.precompile_ms / 1000.0, ci.module_loads, ci.translations)
+                   : fmt::format("prepared {} of {} ({:.1f} s), read {}, new {}", ci.precompile_built,
+                                 ci.precompile_total, ci.precompile_ms / 1000.0, ci.module_loads, ci.translations);
+    } else {
+        env.shader_cache_size = env.ru ? "выключен (или бэкенд моста)" : "off (or the bridge's backend)";
+    }
     env.now_ns = NowNs();
     return env;
 }
@@ -279,6 +298,16 @@ void Render(bool force) {
     }
     st.menu->SetEnv(BuildEnv());
     DrawList list;
+    if (const std::string cmd = st.menu->TakeCommand(); !cmd.empty()) {
+        // P4.14: a clearing request for the next start (the cache is in use now: nothing is deleted while it runs)
+        const auto cfg = Settings::Instance().Current();
+        std::error_code ec;
+        std::filesystem::create_directories(cfg.shader_cache_dir, ec);
+        const auto file = cfg.shader_cache_dir /
+                          (cmd == "cmd.clear_shaders" ? "clear_shaders.request" : "clear_pipelines.request");
+        std::ofstream(file) << "requested in the settings menu\n";
+        SSPC_LOG(App, Info, "settings menu: {} asked for the next start ({})", cmd, file.string());
+    }
     st.menu->Build(st.overlay.Measure(), list);
     if (!st.overlay.Present(st.hwnd, list)) {
         // an open menu nobody can see would hold the game's input: closed, the game gets it back
@@ -451,6 +480,65 @@ u32 ChordTimer(void*, SDL_TimerID, u32) {
 }
 
 } // namespace
+
+bool ShowStartupProgress(u32 done, u32 total, u32 failed, double elapsed_s, bool finished) {
+    auto& st = S();
+    if (!st.overlay_ok || st.hwnd == nullptr) {
+        return false;
+    }
+    if (finished) {
+        st.overlay.Hide();
+        return false;
+    }
+    // the start waits on the window's thread: its messages are pumped here (SDL queues its events for later)
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    RECT cr{};
+    if (!GetClientRect(st.hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) {
+        return false;
+    }
+    const float w = static_cast<float>(cr.right), h = static_cast<float>(cr.bottom);
+    const float s = std::max(h / 1080.0f, 0.5f);
+    const bool ru = Settings::Instance().Initialized() ? Ru(Settings::Instance().Current()) : true;
+    const Rect panel{(w - 640 * s) / 2, (h - 170 * s) / 2, 640 * s, 170 * s};
+    DrawList list;
+    list.Reset(w, h);
+    list.SetSurface(panel);
+    list.SetDim(96);
+    list.FillRect(panel, {22, 24, 30, 240}, 14 * s);
+    list.StrokeRect(panel, {255, 255, 255, 40}, 1.0f * s, 14 * s);
+    const float x = panel.x + 28 * s, iw = panel.w - 56 * s;
+    list.Text({x, panel.y + 20 * s, iw, 34 * s}, ru ? "Подготовка шейдеров" : "Preparing shaders", 26 * s,
+              {255, 255, 255, 255}, Align::Left, FontWeight::Semibold);
+    const u32 pct = total != 0 ? static_cast<u32>(u64{done} * 100 / total) : 100;
+    const auto group = [](u32 v) { // 1 842 (a narrow space between thousands)
+        std::string t = std::to_string(v);
+        for (int i = static_cast<int>(t.size()) - 3; i > 0; i -= 3) {
+            t.insert(static_cast<size_t>(i), "\xE2\x80\xAF");
+        }
+        return t;
+    };
+    const std::string line = (ru ? std::string("Подготовлено ") : std::string("Prepared ")) + group(done) + " / " +
+                             group(total) + " (" + std::to_string(pct) + "%)";
+    list.Text({x, panel.y + 62 * s, iw, 26 * s}, line, 20 * s, {225, 228, 235, 255});
+    const Rect bar{x, panel.y + 96 * s, iw, 10 * s};
+    list.FillRect(bar, {255, 255, 255, 36}, 5 * s);
+    list.FillRect({bar.x, bar.y, bar.w * static_cast<float>(pct) / 100.0f, bar.h}, {88, 166, 255, 255}, 5 * s);
+    std::string hint = ru ? "Компиляция графических конвейеров… Esc — начать игру сейчас (остальное — в фоне)"
+                          : "Compiling graphics pipelines… Esc - start the game now (the rest in the background)";
+    if (failed != 0) {
+        hint += (ru ? " · ошибок " : " · failed ") + std::to_string(failed);
+    }
+    (void)elapsed_s;
+    list.Text({x, panel.y + 120 * s, iw, 36 * s}, hint, 15 * s, {170, 176, 190, 255}, Align::Left, FontWeight::Regular,
+              true);
+    st.overlay.Present(st.hwnd, list);
+    // Esc while the game window is in front (pressed since the last call)
+    return GetForegroundWindow() == st.hwnd && (GetAsyncKeyState(VK_ESCAPE) & 1) != 0;
+}
 
 MenuController& Menu() {
     static MenuController controller;

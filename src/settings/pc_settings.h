@@ -29,6 +29,12 @@ struct PcSettings {
     std::string ui_language = "auto"; // "auto" (as [Language] system) | "ru" | "en"
     u32 ui_scale = 100;               // % on top of the window height / 1080
     std::string prompts = "auto";     // button hints in the menu: "auto" | "playstation" | "xbox" | "keyboard"
+
+    // [ShaderCache] (P4.14): the native backend's persistent shader cache (enabled/dir are older keys of the table)
+    bool shader_precompile = true;          // the pipelines known from earlier runs prepared before the game starts
+    bool shader_precompile_progress = true; // the progress panel while they are (Esc skips the wait)
+    u32 shader_cache_max_mib = 2048;        // the shader cache file's size limit
+    u32 shader_precompile_threads = 0;      // 0: automatic (half the logical processors, at most 6)
 };
 
 } // namespace SecondSon::Settings

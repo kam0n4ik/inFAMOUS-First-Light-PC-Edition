@@ -29,8 +29,10 @@
 #include "runtime/gpu/cpu_sampler.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
+#include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/kernel/clock.h"
+#include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
@@ -38,6 +40,7 @@
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
+#include "runtime/gpu/vulkan/vk_precompile.h"
 #include "runtime/gpu/vulkan/vk_presenter.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 
@@ -291,6 +294,17 @@ private:
     /// P4.10.4: a queued timeline copy the executor refused, done as the processor would (after Synchronize): the CPU
     /// copies guest memory and the caches drop the destination. The recording thread. true: copied.
     bool CpuCopy(u64 src, u64 dst, u64 bytes);
+    /// P4.14: the persistent shader cache, the driver's pipeline cache and the start-up precompiler (Start).
+    void StartShaderCache(const Options& o);
+    void RunPrecompile(const Options& o);
+    /// The disk cache's thread every 10 s: the pipeline cache saved when pipelines were added and none for 10 s.
+    void MaybeSavePipelineCache();
+    std::string CacheReport();
+
+public:
+    ShaderCacheInfo CacheInfo();
+
+private:
     std::vector<u8> copy_scratch_; ///< CpuCopy's (the recording thread's)
 
     Options options_;
@@ -302,6 +316,11 @@ private:
     std::unique_ptr<Vk::GuestBuffers> guest_;
     std::unique_ptr<Vk::BufferCache> buffers_; ///< the guest's buffers in video memory
     std::unique_ptr<Vk::ImageCache> images_;
+    // P4.14 (before the factory: destroyed after it and its precompiler)
+    std::unique_ptr<GS::ShaderDiskCache> disk_;
+    std::unique_ptr<Vk::PipelineCacheFile> pcache_;
+    std::atomic<u64> pc_saved_count_{0}, pc_prev_count_{0};
+    std::chrono::steady_clock::time_point pc_saved_at_{};
     std::unique_ptr<Vk::PipelineFactory> pipelines_;
     std::unique_ptr<Vk::Presenter> presenter_;
     std::unique_ptr<GS::ShaderFrontend> frontend_;
@@ -460,6 +479,9 @@ bool Backend::Start(const Options& o, std::string& error) {
     }
     fo.profile = &profile_;
     frontend_ = std::make_unique<GS::ShaderFrontend>(fo);
+    // P4.14: SSPC_SHADER_STALL_TRACE (its times are moved to the frame log's origin once that starts, below)
+    ShaderTrace::Start(o.logs_dir);
+    StartShaderCache(o);
     Vk::ExecutorOptions eo;
     eo.capture_flip = o.capture_flip;
     eo.capture_path = o.logs_dir / "p44" / "native_frame.png";
@@ -608,8 +630,12 @@ bool Backend::Start(const Options& o, std::string& error) {
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
     FrameLog::Start();
+    ShaderTrace::SetOrigin(FrameLog::StartTsc());
     // P4.12: SSPC_P412_STALL_TRACE=light|deep[,...] - the stall trace (off otherwise: nothing of it runs); deep mode
     // converts the batches' GPU timestamps with the device's calibrated timestamps (GPU ticks <-> QPC)
+    if (ShaderTrace::On()) {
+        StallTrace::EnableForward(); // (P4.14: the waits for the shader stall trace's breakdown of long frames)
+    }
     if (StallTrace::Start(o.logs_dir, ctx_->Caps().timestamp_period) && ctx_->Caps().calibrated_timestamps) {
         StallTrace::SetCalibration(
             [](void* c, u64& gpu, u64& qpc, u64& deviation) {
@@ -1120,6 +1146,7 @@ void Backend::OnFlip(u64 gpu_value) {
     t.pipelines = p.graphics + p.compute;
     t.pipeline_ns = p.create_ns;
     t.module_ns = p.module_ns;
+    t.shader_disk = frontend_->DiskLoads();
     t.callbacks_ns = GS::TicksToNs(s.t_cb);
     if (parallel_) { // (the flip marker is executed with the queue drained: thread 2's totals are settled)
         const ParallelTotals pt = parallel_->Totals();
@@ -1188,6 +1215,9 @@ void Backend::Stop() {
     if (parallel_) {
         parallel_->Stop(); // (its queue was drained by the loop's last round)
     }
+    if (pipelines_) {
+        pipelines_->StopPrecompile(); // (P4.14: its workers; the pipelines they built stay until the factory goes)
+    }
     VideoOut::Stop();
     Gnm::SetHost(nullptr);
     if (frontend_) {
@@ -1197,11 +1227,21 @@ void Backend::Stop() {
         std::scoped_lock lock{ctx_->QueueMutex()};
         Vk::Fn().vkDeviceWaitIdle(ctx_->Device());
     }
+    if (disk_) {
+        disk_->SetPeriodic(nullptr, nullptr, 0);
+    }
+    if (pcache_ && pcache_->Save()) { // (P4.14: the driver's compiled pipelines for the next run)
+        SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved", static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+    }
+    if (disk_) {
+        disk_->Close(); // (what is queued written first)
+    }
     std::error_code ec;
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
     StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
+    ShaderTrace::Stop(); // (P4.14)
     if (Inspector::On() && executor_) {
         Inspector::WriteFile("pipelines.csv", executor_->InspectorPipelines());
         Inspector::WriteFile("gpu_native.txt", Report());
@@ -1213,6 +1253,245 @@ void Backend::Stop() {
     if (game_sampler_.Running()) {
         std::ofstream(options_.logs_dir / "gpu_cpu_profile_game.txt", std::ios::trunc) << game_sampler_.Report(60);
     }
+}
+
+// ---- P4.14: the persistent shader cache, the driver's pipeline cache, the start-up precompiler
+
+std::atomic<u64> g_startup_pause_ns{0};
+
+/// The settings menu's requests (files the menu leaves in [ShaderCache] dir, applied at the next start, before anything
+/// is open): clear_shaders.request - every generation's directory under `root`; clear_pipelines.request - their
+/// vulkan.bin only. A directory another process holds (its lock file) is left.
+void ApplyClearRequests(const std::filesystem::path& requests, const std::filesystem::path& root) {
+    std::error_code ec;
+    const bool shaders = std::filesystem::exists(requests / "clear_shaders.request", ec);
+    const bool pipelines = std::filesystem::exists(requests / "clear_pipelines.request", ec);
+    if (!shaders && !pipelines) {
+        return;
+    }
+    u32 removed = 0, kept = 0;
+    for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+        if (!e.is_directory()) {
+            continue;
+        }
+        if (std::filesystem::exists(e.path() / "lock", ec) && !std::filesystem::remove(e.path() / "lock", ec)) {
+            ++kept; // (in use by another process)
+            continue;
+        }
+        if (shaders) {
+            removed += std::filesystem::remove_all(e.path(), ec) != static_cast<std::uintmax_t>(-1) ? 1 : 0;
+        } else {
+            std::filesystem::remove(e.path() / "vulkan.bin", ec);
+            std::filesystem::remove(e.path() / "vulkan.bin.tmp", ec);
+            ++removed;
+        }
+    }
+    std::filesystem::remove(requests / "clear_shaders.request", ec);
+    std::filesystem::remove(requests / "clear_pipelines.request", ec);
+    SSPC_LOG(GPU, Warning, "shader cache: cleared as asked in the settings menu ({}): {} director{} {}{}",
+             shaders ? "shaders and pipelines" : "the Vulkan pipeline cache", removed, removed == 1 ? "y" : "ies",
+             shaders ? "removed" : "without vulkan.bin", kept != 0 ? fmt::format(", {} in use left", kept) : "");
+}
+
+/// Other generations' directories (another build or GPU profile): the three used last are kept (A/B builds), older
+/// ones removed. Only directories with a cache file; never one in use.
+void PruneGenerations(const std::filesystem::path& root, const std::string& current) {
+    std::error_code ec;
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> others;
+    for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+        if (!e.is_directory() || e.path().filename() == current) {
+            continue;
+        }
+        const auto pack = e.path() / "shaders.pack";
+        if (!std::filesystem::exists(pack, ec) || std::filesystem::exists(e.path() / "lock", ec)) {
+            continue;
+        }
+        others.emplace_back(std::filesystem::last_write_time(pack, ec), e.path());
+    }
+    std::ranges::sort(others, [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = 3; i < others.size(); ++i) {
+        std::filesystem::remove_all(others[i].second, ec);
+        SSPC_LOG(GPU, Info, "shader cache: an old generation removed ({})", others[i].second.string());
+    }
+}
+
+void Backend::StartShaderCache(const Options& o) {
+    if (!o.shader_cache || o.shader_cache_dir.empty()) {
+        SSPC_LOG(GPU, Info, "native backend: no persistent shader cache ([ShaderCache] enabled = false or "
+                            "--no-shader-cache): shaders translated and pipelines created as they are met");
+        return;
+    }
+    const auto root = o.shader_cache_dir / o.game / "native";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    ApplyClearRequests(o.shader_cache_dir, root);
+    const std::string gen = GS::ShaderCacheGeneration(profile_);
+    PruneGenerations(root, gen);
+    auto disk = std::make_unique<GS::ShaderDiskCache>();
+    std::string error;
+    if (!disk->Open({.dir = root / gen, .generation = gen, .max_bytes = u64{o.cache_max_mib} << 20}, error)) {
+        SSPC_LOG(GPU, Warning, "native backend: the shader cache could not be opened ({}): without it", error);
+        return;
+    }
+    const auto ds = disk->Stats();
+    SSPC_LOG(GPU, Info,
+             "shader cache {} ({}): {:.1f} MiB, {} records - programs {}, modules {}, SPIR-V {}, pipelines {}; read in "
+             "{:.0f} ms{}{}{}",
+             (root / gen).string(), disk->Writable() ? "read/write" : "read only",
+             static_cast<double>(ds.file_bytes) / (1 << 20), ds.records, ds.programs, ds.modules, ds.spirv, ds.pipelines,
+             ds.open_ms, ds.recreated ? fmt::format(", started anew ({})", ds.recreate_reason) : "",
+             ds.torn_bytes != 0 ? fmt::format(", {} bytes of a torn tail cut off", ds.torn_bytes) : "",
+             ds.skipped_records != 0 ? fmt::format(", {} records not used", ds.skipped_records) : "");
+    pcache_ = std::make_unique<Vk::PipelineCacheFile>(*ctx_, root / gen / "vulkan.bin");
+    if (!pcache_->Load()) {
+        SSPC_LOG(GPU, Warning, "pipeline cache (driver): {}", pcache_->LoadNote());
+        pcache_.reset();
+    } else {
+        SSPC_LOG(GPU, Info, "pipeline cache (driver): {}", pcache_->LoadNote());
+    }
+    disk_ = std::move(disk);
+    pipelines_->SetPersistence(pcache_ ? pcache_->Handle() : VK_NULL_HANDLE, disk_.get());
+    frontend_->SetDiskCache(disk_.get());
+    pc_saved_at_ = std::chrono::steady_clock::now();
+    if (pcache_) {
+        disk_->SetPeriodic([](void* self) { static_cast<Backend*>(self)->MaybeSavePipelineCache(); }, this, 10000);
+    }
+    if (o.precompile) {
+        RunPrecompile(o);
+    } else {
+        SSPC_LOG(GPU, Info, "shader precompiler: off ([ShaderCache] precompile = false)");
+    }
+}
+
+void Backend::RunPrecompile(const Options& o) {
+    std::vector<GS::PipelineDesc> descs = disk_->Pipelines();
+    if (descs.empty()) {
+        SSPC_LOG(GPU, Info, "shader precompiler: the manifest is empty (a first run): nothing to prepare");
+        return;
+    }
+    Vk::PrecompileOptions po;
+    po.threads = o.precompile_threads;
+    pipelines_->StartPrecompile(std::move(descs), po);
+    Vk::PipelinePrecompiler* pre = pipelines_->Precompiler();
+    if (pre == nullptr) {
+        return;
+    }
+    // the game starts once they are ready (or the user skips the wait, or the time limit): the start waits here,
+    // the host shows the progress
+    const auto t0 = std::chrono::steady_clock::now();
+    bool skipped = false, timed_out = false;
+    Options::PrecompileStatus st;
+    while (true) {
+        const Vk::PrecompileProgress p = pre->Progress();
+        st = {p.total, p.Done(), p.failed, p.elapsed_ms / 1000.0, p.finished};
+        if (p.finished) {
+            break;
+        }
+        if (o.precompile_progress != nullptr && o.precompile_progress(o.precompile_progress_ctx, st)) {
+            skipped = true;
+            break;
+        }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > o.precompile_max_s) {
+            timed_out = true;
+            break;
+        }
+        Sleep(o.precompile_progress != nullptr ? 30 : 20);
+    }
+    st.finished = true;
+    if (o.precompile_progress != nullptr) {
+        o.precompile_progress(o.precompile_progress_ctx, st); // (the host hides it)
+    }
+    pre->SetBackground();
+    g_startup_pause_ns.store(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+    const Vk::PrecompileProgress p = pre->Progress();
+    SSPC_LOG(GPU, Info, "shader precompiler: {} of {} pipelines ready in {:.0f} ms ({} failed, {} without their SPIR-V){}",
+             p.built, p.total, p.elapsed_ms, p.failed, p.missing_spirv,
+             skipped     ? std::string(" - skipped by the user: the rest is built in the background")
+             : timed_out ? fmt::format(" - not finished after {:.0f} s: the rest is built in the background",
+                                       o.precompile_max_s)
+                         : std::string());
+}
+
+void Backend::MaybeSavePipelineCache() {
+    // saved when pipelines were added since the last save and none in the last 10 s (the driver's cache is copied while
+    // it is quiet: a save during a burst of creations could hold its lock), at most once a minute
+    const Vk::PipelinePrecompiler* pre = pipelines_->Precompiler();
+    const u64 count = pipelines_->CreatedOnDemand() + (pre != nullptr ? pre->Progress().built : 0);
+    const u64 prev = pc_prev_count_.exchange(count);
+    if (count == pc_saved_count_.load() || count != prev ||
+        std::chrono::steady_clock::now() - pc_saved_at_ < std::chrono::seconds(60)) {
+        return;
+    }
+    if (pcache_->Save()) {
+        pc_saved_count_.store(count);
+        pc_saved_at_ = std::chrono::steady_clock::now();
+    }
+}
+
+std::string Backend::CacheReport() {
+    if (!disk_) {
+        return "persistent shader cache (P4.14): off\n";
+    }
+    const auto ds = disk_->Stats();
+    const auto& fs = frontend_->Stats();
+    const auto& ps = pipelines_->Stats();
+    std::string out = fmt::format(
+        "persistent shader cache (P4.14): {} - {:.1f} MiB; at start {} programs, {} modules, {} SPIR-V, {} pipelines "
+        "(read in {:.0f} ms{}); this run: modules read {} (unusable {}, translation time saved as recorded {:.0f} ms), "
+        "translated {}; written {} records {:.1f} MiB (modules {}, pipelines {}, SPIR-V {}), not added (size limit) {}, "
+        "write errors {}\n",
+        disk_->Dir().string(), static_cast<double>(ds.file_bytes) / (1 << 20), ds.programs, ds.modules, ds.spirv,
+        ds.pipelines, ds.open_ms, ds.torn_bytes != 0 ? fmt::format(", torn tail {} bytes cut", ds.torn_bytes) : "",
+        fs.disk_loads, fs.disk_load_failures, static_cast<double>(fs.disk_saved_us) / 1000.0,
+        frontend_->Translations().count, ds.written_records, static_cast<double>(ds.written_bytes) / (1 << 20),
+        ds.written_modules, ds.written_pipelines, ds.written_spirv, ds.dropped_full, ds.write_errors);
+    out += fmt::format("pipelines on demand: created {} (driver cache feedback {}: hits {}, misses {}), the same "
+                       "description again {}, taken precompiled {} (waited for {} of them, {:.1f} ms)\n",
+                       ps.graphics + ps.compute, ps.feedback, ps.cache_hits, ps.feedback - ps.cache_hits, ps.desc_reuse,
+                       ps.prebuilt, ps.prebuilt_waited, static_cast<double>(ps.prebuilt_wait_ns) / 1e6);
+    if (const Vk::PipelinePrecompiler* pre = pipelines_->Precompiler()) {
+        const auto p = pre->Progress();
+        out += fmt::format("start-up precompiler: {} pipelines in the manifest, built {} ({:.0f} ms of the workers' time, "
+                           "{:.0f} ms wall), failed {} (SPIR-V missing {}), claimed by the game first {}, taken {}, "
+                           "never taken {}\n",
+                           p.total, p.built, static_cast<double>(p.build_ns) / 1e6, p.elapsed_ms, p.failed,
+                           p.missing_spirv, p.claimed, p.taken, pre->NeverTaken());
+    }
+    if (pcache_) {
+        out += fmt::format("pipeline cache (driver): at start {}; saved {} times, last {:.1f} MiB\n", pcache_->LoadNote(),
+                           pcache_->Saves(), static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+    }
+    return out;
+}
+
+ShaderCacheInfo Backend::CacheInfo() {
+    ShaderCacheInfo info;
+    if (!disk_) {
+        return info;
+    }
+    const auto ds = disk_->Stats();
+    info.enabled = true;
+    info.dir = disk_->Dir().string();
+    info.file_bytes = ds.file_bytes;
+    std::error_code ec;
+    const auto vb = std::filesystem::file_size(disk_->Dir() / "vulkan.bin", ec);
+    info.vulkan_bytes = ec ? 0 : vb;
+    info.programs = ds.programs + ds.written_programs;
+    info.modules = ds.modules + ds.written_modules;
+    info.spirv = ds.spirv + ds.written_spirv;
+    info.pipelines = ds.pipelines + ds.written_pipelines;
+    info.module_loads = frontend_->DiskLoads();
+    info.translations = frontend_->Translations().count;
+    if (const Vk::PipelinePrecompiler* pre = pipelines_->Precompiler()) {
+        const auto p = pre->Progress();
+        info.precompile_total = p.total;
+        info.precompile_built = p.built;
+        info.precompile_taken = p.taken;
+        info.precompile_ms = p.elapsed_ms;
+    }
+    info.created_on_demand = pipelines_->CreatedOnDemand();
+    return info;
 }
 
 std::string Backend::Report() {
@@ -1425,6 +1704,7 @@ std::string Backend::Report() {
         const auto tr = frontend_->Translations();
         out += fmt::format("shader translations (GCN -> SPIR-V): {}, {:.1f} ms in all, slowest {:.1f} ms\n", tr.count,
                            tr.ns / 1e6, tr.max_ns / 1e6);
+        out += CacheReport();
     }
     if (frontend_) {
         const auto& fs = frontend_->Stats();
@@ -1474,6 +1754,14 @@ void Stop() {
     if (g_backend != nullptr) {
         g_backend->Stop();
     }
+}
+
+u64 StartupPauseNs() {
+    return g_startup_pause_ns.load();
+}
+
+ShaderCacheInfo CacheInfo() {
+    return g_backend != nullptr ? g_backend->CacheInfo() : ShaderCacheInfo{};
 }
 
 bool Running() {

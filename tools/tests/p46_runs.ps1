@@ -19,7 +19,8 @@ param(
     [switch]$Validate,
     [string]$Env = "",
     [string]$Exe = "",
-    [string]$OutRoot = ""
+    [string]$OutRoot = "",
+    [string]$ExtraArgs = ""
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -41,13 +42,15 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
         if (Test-Path $profileDir) { Remove-Item $profileDir -Recurse -Force }
         New-Item -ItemType Directory -Force $profileDir | Out-Null
         Copy-Item $sources[$scene] "$profileDir\home" -Recurse
-        foreach ($f in "gpu_device_lost.txt", "vk_validation.log", "gpu_native.txt", "gpu_frames.csv") {
+        foreach ($f in "gpu_device_lost.txt", "vk_validation.log", "gpu_native.txt", "gpu_frames.csv",
+                    "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt") {
             Remove-Item "$root\logs\$f" -ErrorAction SilentlyContinue
         }
         $press = "space@12,space@22,move:-3000:0@56:0.25,move:-3000:0@58:0.25,move:-3000:0@60:0.25"
         $gameArgs = "--loader sspc --user-data $profileDir --vram-log 5 --press $press"
         if ($Backend -eq "sspc") { $gameArgs += " --gpu-backend sspc" }
         if ($Validate) { $gameArgs += " --gpu-native-validate" }
+        if ($ExtraArgs) { $gameArgs += " $ExtraArgs" } # (P4.14: e.g. --shader-cache <dir> for a test cache)
         $saved = @{}
         foreach ($kv in ($Env -split ';' | Where-Object { $_ })) {
             $n, $v = $kv -split '=', 2
@@ -67,7 +70,8 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
         }
         $out = "$outRoot\${scene}_$rep"
         New-Item -ItemType Directory -Force $out | Out-Null
-        foreach ($f in "gpu_device_lost.txt", "gpu_native.txt", "gpu_frames.csv", "SecondSonPC.log", "vk_validation.log") {
+        foreach ($f in "gpu_device_lost.txt", "gpu_native.txt", "gpu_frames.csv", "SecondSonPC.log", "vk_validation.log",
+                    "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt") {
             if (Test-Path "$root\logs\$f") { Copy-Item "$root\logs\$f" $out }
         }
         foreach ($f in "screen.png", "run.json") {

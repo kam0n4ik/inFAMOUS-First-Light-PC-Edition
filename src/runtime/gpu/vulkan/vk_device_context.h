@@ -9,6 +9,7 @@
 // (correctness first, docs §E). Created once, destroyed after the device is idle; nothing else owns these objects.
 #pragma once
 
+#include <array>
 #include <filesystem>
 
 #include <memory>
@@ -88,6 +89,10 @@ public:
     const VkPhysicalDeviceMemoryProperties& Memory() const { return memory_; }
     const std::string& Name() const { return name_; }
     u32 DriverVersion() const { return driver_version_; }
+    /// What a VkPipelineCache's data is valid for (P4.14: the cache file is checked against them before it is given back)
+    u32 VendorId() const { return vendor_id_; }
+    u32 DeviceId() const { return device_id_; }
+    const std::array<u8, VK_UUID_SIZE>& PipelineCacheUuid() const { return cache_uuid_; }
 
     /// A memory type in `bits` with every flag of `want` and none of `avoid`; -1: none.
     s32 FindMemoryType(u32 bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid = 0) const;
@@ -127,6 +132,8 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
     std::string name_;
     u32 driver_version_ = 0;
+    u32 vendor_id_ = 0, device_id_ = 0;
+    std::array<u8, VK_UUID_SIZE> cache_uuid_{};
     std::mutex queue_mutex_;
 };
 

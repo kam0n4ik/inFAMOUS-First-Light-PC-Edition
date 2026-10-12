@@ -49,6 +49,10 @@ struct Module {
     std::string srt_error;
     u64 uses = 0;
     u64 queued_tick = 0;        ///< when it was queued (TSC), the wait until ready is counted
+    // P4.14 (the persistent shader cache, shader_disk_cache.h)
+    SpirvHash spirv_hash;       ///< the result's SPIR-V by content (set before `state` leaves Pending)
+    u32 disk_record = 0;        ///< Pending: its translation is in the disk cache (record + 1), read instead of made
+    bool from_disk = false;     ///< its result was read from the disk cache
 };
 
 /// The resources a program reads for one value of its runtime parameters: the first module translated for it.
@@ -92,6 +96,7 @@ public:
         ProgramError error = ProgramError::None;
         bool read = false;    ///< the code was read now
         bool changed = false; ///< the address holds another program than before
+        bool created = false; ///< the program is new to the cache (P4.14: its modules are looked up on disk then)
         u64 footer_hash = 0;  ///< the footer at this address (one program by content may have several footers)
     };
     /// The program at `addr` running as `stage`.

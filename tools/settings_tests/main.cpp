@@ -117,6 +117,10 @@ int Shots(const fs::path& out) {
                                 : (ru ? "собственный SecondSonPC (экспериментальный)" : "SecondSonPC's own (experimental)");
         env.displays = {"DELL U2720Q", "Generic PnP Monitor"};
         env.window_sizes = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}};
+        env.shader_cache_size = "25 + 17 MiB (vulkan.bin) / 2048 MiB"; // (P4.14: as the host shows it)
+        env.shader_cache_content = ru ? "шейдеров: 833, конвейеров: 585" : "833 shaders, 585 pipelines";
+        env.shader_cache_run = ru ? "заранее 546 из 546 (0.9 с), из кэша: 793, новых: 39"
+                                  : "prepared 546 of 546 (0.9 s), read 793, new 39";
         env.now_ns = 1'000'000'000;
         menu.SetEnv(env);
         menu.Open();
@@ -159,6 +163,7 @@ int Shots(const fs::path& out) {
     shot("ru_1080_gamepad_ps.png", 1920, 1080, true, C::Gamepad, kAllCaps, P::PlayStation, nullptr, 0);
     shot("ru_1080_interface_xbox.png", 1920, 1080, true, C::Interface, kAllCaps, P::Xbox, nullptr, 0);
     shot("ru_1080_game.png", 1920, 1080, true, C::Game, kAllCaps, P::Keyboard, nullptr, 0);
+    shot("ru_1080_shaders.png", 1920, 1080, true, C::Shaders, kAllCaps, P::Keyboard, "cmd.clear_shaders", 0);
     shot("ru_1080_confirm_display.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, "display.fullscreen", 1);
     shot("en_1080_display.png", 1920, 1080, false, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
     shot("ru_720_display.png", 1280, 720, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);

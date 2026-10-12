@@ -22,7 +22,41 @@ struct Options {
     s32 sdk_version = 0;                 ///< the game's compiled SDK version (GnmDriver's init sequence)
     u64 capture_flip = 0;                ///< --gpu-capture-native-frame N
     std::filesystem::path logs_dir;      ///< reports, captures
+    // P4.14: the persistent shader cache and the start-up precompiler (docs/PHASE4_SHADER_PRECOMPILER.md)
+    bool shader_cache = false;             ///< [ShaderCache] enabled (--no-shader-cache: off)
+    std::filesystem::path shader_cache_dir; ///< [ShaderCache] dir: <dir>\<game>\native\<generation>
+    std::string game = "CUSA00004";
+    bool precompile = true;                ///< [ShaderCache] precompile: the manifest's pipelines before the game
+    u32 cache_max_mib = 2048;              ///< [ShaderCache] maxSizeMiB
+    u32 precompile_threads = 0;            ///< [ShaderCache] precompileThreads (0: auto)
+    double precompile_max_s = 300.0;       ///< the game starts after this long at most (the rest in the background)
+    /// The precompiler's progress, on the starting thread (the game window's: it pumps its messages and draws it),
+    /// every ~30 ms and once more with `finished` set. true: the user skipped the wait (the game starts; the rest is
+    /// built in the background). nullptr: nobody shows it (automated runs) - the start waits.
+    struct PrecompileStatus {
+        u32 total = 0, done = 0, failed = 0;
+        double elapsed_s = 0.0;
+        bool finished = false;
+    };
+    bool (*precompile_progress)(void* ctx, const PrecompileStatus& status) = nullptr;
+    void* precompile_progress_ctx = nullptr;
 };
+
+/// P4.14: how long the start waited for the precompiler (scripted input shifts its timeline by it; 0 without).
+u64 StartupPauseNs();
+
+/// P4.14: the persistent shader cache of this run (the settings menu's statistics). Any thread.
+struct ShaderCacheInfo {
+    bool enabled = false;
+    std::string dir;
+    u64 file_bytes = 0, vulkan_bytes = 0;
+    u64 programs = 0, modules = 0, spirv = 0, pipelines = 0; ///< in the cache (read at start + added)
+    u64 module_loads = 0, translations = 0;                 ///< this run: modules read / translated
+    u32 precompile_total = 0, precompile_built = 0, precompile_taken = 0;
+    double precompile_ms = 0.0;
+    u64 created_on_demand = 0;
+};
+ShaderCacheInfo CacheInfo();
 
 /// Brings the backend up (device, caches, threads, ownership). false with `error`: nothing claimed, nothing running.
 bool Start(const Options& options, std::string& error);

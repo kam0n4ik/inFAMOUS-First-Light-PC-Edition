@@ -46,6 +46,8 @@ struct MenuEnv {
     std::vector<std::string> audio_devices; // playback device names
     std::vector<std::pair<u32, u32>> window_sizes;
     std::string save_note; // changes are not saved / the last save failed (shown in the footer)
+    // P4.14: the shader cache's statistics (empty: no native backend's cache in this run)
+    std::string shader_cache_size, shader_cache_content, shader_cache_run;
     u64 now_ns = 0;
 };
 
@@ -97,10 +99,12 @@ public:
     }
     /// Focus a row by id in the current category (tests, the host).
     bool Focus(std::string_view id);
+    /// A command row confirmed (activated twice): its tag ("cmd.clear_shaders", ...), taken once by the host.
+    std::string TakeCommand();
 
 private:
     struct Row {
-        enum class Kind : u8 { Header, Setting, WindowSize, Info, ResetCategory };
+        enum class Kind : u8 { Header, Setting, WindowSize, Info, ResetCategory, Command };
         Kind kind = Kind::Setting;
         const Settings::Desc* desc = nullptr;
         std::string_view en, ru; // Header/Info/ResetCategory label
@@ -162,6 +166,9 @@ private:
     std::vector<std::pair<const Settings::Desc*, Settings::Value>> pending_display_;
     std::string status_;
     std::vector<Hit> hits_;
+    std::string command_;      ///< a confirmed command for the host
+    std::string armed_;        ///< a command row activated once: the next activation within kConfirmCommandNs runs it
+    u64 armed_ns_ = 0;
 };
 
 } // namespace SecondSon::Ui

@@ -506,6 +506,57 @@ void Build(Registry& r) {
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.prompts = std::get<std::string>(x); },
     });
 
+    // ------------------------------------------------------------------ Shaders and cache (P4.14, native backend)
+    v.push_back(Desc{
+        .id = "shaders.precompile", .table = "ShaderCache", .key = "precompile", .category = Category::Shaders,
+        .type = Type::Bool, .apply = Apply::Restart, .en = "Prepare shaders at start", .ru = "Готовить шейдеры при запуске",
+        .help_en = "Pipelines met in earlier runs are compiled before the game starts, so that they do not stop it "
+                   "later. Places never visited are still prepared on the way. Takes effect after a restart.",
+        .help_ru = "Конвейеры, встреченные в прошлых запусках, компилируются до начала игры, чтобы не останавливать её "
+                   "потом. Места, где игра ещё не была, по-прежнему готовятся на ходу. Вступает в силу после "
+                   "перезапуска.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.shader_precompile; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.shader_precompile = std::get<bool>(x); },
+    });
+    v.push_back(Desc{
+        .id = "shaders.showProgress", .table = "ShaderCache", .key = "showProgress", .category = Category::Shaders,
+        .type = Type::Bool, .apply = Apply::Restart, .en = "Show the preparation's progress",
+        .ru = "Показывать прогресс подготовки",
+        .help_en = "A panel over the window while the shaders are prepared; Esc there starts the game at once (the rest "
+                   "is prepared in the background). Off: the start waits without it.",
+        .help_ru = "Панель поверх окна, пока шейдеры готовятся; Esc на ней сразу запускает игру (остальное готовится в "
+                   "фоне). Выключено: запуск ждёт без панели.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.shader_precompile_progress; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.shader_precompile_progress = std::get<bool>(x); },
+        .requires_on = "shaders.precompile",
+    });
+    v.push_back(Desc{
+        .id = "shaders.maxSize", .table = "ShaderCache", .key = "maxSizeMiB", .category = Category::Shaders,
+        .type = Type::Int, .apply = Apply::Restart, .min = 256, .max = 16384, .ui_min = 256, .ui_max = 8192,
+        .step = 256, .unit = "MiB", .en = "Shader cache size", .ru = "Размер кэша шейдеров",
+        .help_en = "The cache file grows up to this size; past it nothing more is added (Clear starts it again). "
+                   "Takes effect after a restart.",
+        .help_ru = "Файл кэша растёт до этого размера; дальше новое не добавляется («Очистить» начинает его заново). "
+                   "Вступает в силу после перезапуска.",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.shader_cache_max_mib); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.shader_cache_max_mib = static_cast<u32>(std::get<s64>(x));
+        },
+    });
+    v.push_back(Desc{
+        .id = "shaders.threads", .table = "ShaderCache", .key = "precompileThreads", .category = Category::Shaders,
+        .type = Type::Int, .apply = Apply::Restart, .min = 0, .max = 16, .ui_min = 0, .ui_max = 12, .step = 1,
+        .en = "Preparation threads (0 = automatic)", .ru = "Потоков подготовки (0 = автоматически)",
+        .help_en = "How many processor threads compile shaders at start. Automatic: half the logical processors, at "
+                   "most 6; while the game runs, 2 at a low priority.",
+        .help_ru = "Сколько потоков процессора компилируют шейдеры при запуске. Автоматически — половина логических "
+                   "процессоров, не больше 6; во время игры — 2 с пониженным приоритетом.",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.shader_precompile_threads); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.shader_precompile_threads = static_cast<u32>(std::get<s64>(x));
+        },
+    });
+
     // ------------------------------------------------------------------ Game (the emulated PS4 sees these)
     v.push_back(Desc{
         .id = "game.language", .table = "Language", .key = "system", .category = Category::Game,
@@ -584,15 +635,18 @@ const Desc* FindByKey(std::string_view table, std::string_view key) {
 
 std::string_view CategoryId(Category category) {
     constexpr std::array<std::string_view, kCategoryCount> kIds{"display",  "graphics", "audio",     "controls",
-                                                                "keyboard", "gamepad",  "interface", "game"};
+                                                                "keyboard", "gamepad",  "interface", "game",
+                                                                "shaders"};
     return kIds[static_cast<size_t>(category)];
 }
 
 std::string_view CategoryLabel(Category category, bool ru) {
     constexpr std::array<std::string_view, kCategoryCount> kEn{"Display", "Graphics", "Audio",     "Mouse",
-                                                               "Keys",    "Controller", "Interface", "Game"};
+                                                               "Keys",    "Controller", "Interface", "Game",
+                                                               "Shaders & cache"};
     constexpr std::array<std::string_view, kCategoryCount> kRu{"Экран",   "Графика",   "Звук",      "Мышь",
-                                                               "Клавиши", "Геймпад",   "Интерфейс", "Игра"};
+                                                               "Клавиши", "Геймпад",   "Интерфейс", "Игра",
+                                                               "Шейдеры и кэш"};
     return (ru ? kRu : kEn)[static_cast<size_t>(category)];
 }
 

@@ -16,6 +16,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/shader/shader_translator.h"
+#include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_formats.h"
@@ -55,6 +56,44 @@ void CountCreation(PipelineStats& s, u64 ns, Name&& name) {
     }
 }
 
+/// The descriptor set layout's bindings of plans, as PipelineDesc keeps them: (binding << 32) | (type << 16) | count.
+void PlanBindings(std::span<const GS::ResourceBindingPlan* const> plans, std::vector<u64>& out) {
+    out.clear();
+    const auto put = [&out](u32 binding, VkDescriptorType type, u32 count) {
+        out.push_back((u64{binding} << 32) | (u64{static_cast<u32>(type)} << 16) | count);
+    };
+    for (const auto* p : plans) {
+        if (p == nullptr) {
+            continue;
+        }
+        for (const auto& b : p->buffers) {
+            put(b.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1);
+        }
+        for (const auto& i : p->images) {
+            put(i.binding, i.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                std::max<u32>(i.count, 1));
+        }
+        for (const auto& s : p->samplers) {
+            put(s.binding, VK_DESCRIPTOR_TYPE_SAMPLER, 1);
+        }
+    }
+}
+
+/// A ready module's SPIR-V by content (set when it was translated or read; computed for one that came another way).
+GS::SpirvHash SpirvOf(const GS::Module& m) {
+    return m.spirv_hash.Empty() ? GS::HashSpirv(m.result.spirv) : m.spirv_hash;
+}
+
+/// The driver's creation feedback as ShaderTrace::kPipe* flags.
+u32 FeedbackFlags(const VkPipelineCreationFeedback& fb) {
+    if ((fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0) {
+        return 0;
+    }
+    return ShaderTrace::kPipeFeedback |
+           ((fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0 ? ShaderTrace::kPipeCacheHit
+                                                                                                : 0u);
+}
+
 } // namespace
 
 u64 LayoutSignature(std::span<const GS::ResourceBindingPlan* const> plans) {
@@ -88,21 +127,12 @@ PipelineFactory::PipelineFactory(DeviceContext& ctx, const GS::DeviceProfile& pr
 }
 
 PipelineFactory::~PipelineFactory() {
+    StopPrecompile();
+    pre_.reset(); // (destroys the pipelines it built through Destroy)
     const auto& f = Fn();
     const VkDevice dev = ctx_.Device();
-    for (auto& [k, p] : pipelines_) {
-        if (p->pipeline != VK_NULL_HANDLE) {
-            f.vkDestroyPipeline(dev, p->pipeline, nullptr);
-        }
-        if (p->shared_layout) {
-            continue; // (the table's, below)
-        }
-        if (p->layout != VK_NULL_HANDLE) {
-            f.vkDestroyPipelineLayout(dev, p->layout, nullptr);
-        }
-        if (p->set_layout != VK_NULL_HANDLE) {
-            f.vkDestroyDescriptorSetLayout(dev, p->set_layout, nullptr);
-        }
+    for (auto& p : owned_) {
+        Destroy(*p);
     }
     for (auto& [k, l] : layouts_) {
         f.vkDestroyPipelineLayout(dev, l.layout, nullptr);
@@ -113,6 +143,54 @@ PipelineFactory::~PipelineFactory() {
     }
     for (auto& [k, m] : aux_) {
         f.vkDestroyShaderModule(dev, m, nullptr);
+    }
+}
+
+void PipelineFactory::Destroy(PipelineObjects& p) {
+    const auto& f = Fn();
+    const VkDevice dev = ctx_.Device();
+    if (p.pipeline != VK_NULL_HANDLE) {
+        f.vkDestroyPipeline(dev, p.pipeline, nullptr);
+        p.pipeline = VK_NULL_HANDLE;
+    }
+    if (p.shared_layout) {
+        return; // (the table's)
+    }
+    if (p.layout != VK_NULL_HANDLE) {
+        f.vkDestroyPipelineLayout(dev, p.layout, nullptr);
+        p.layout = VK_NULL_HANDLE;
+    }
+    if (p.set_layout != VK_NULL_HANDLE) {
+        f.vkDestroyDescriptorSetLayout(dev, p.set_layout, nullptr);
+        p.set_layout = VK_NULL_HANDLE;
+    }
+}
+
+VkDevice PipelineFactory::Device() const {
+    return ctx_.Device();
+}
+
+void PipelineFactory::SetPersistence(VkPipelineCache cache, GS::ShaderDiskCache* disk) {
+    cache_ = cache;
+    disk_ = disk;
+}
+
+void PipelineFactory::StartPrecompile(std::vector<GS::PipelineDesc> descs, const PrecompileOptions& options) {
+    if (disk_ == nullptr || descs.empty()) {
+        return;
+    }
+    if (share_layouts_) {
+        SSPC_LOG(GPU, Warning, "shader precompiler: off with SSPC_DIAG_SHARED_LAYOUTS=on (its layouts are not shared)");
+        return;
+    }
+    pre_ = std::make_unique<PipelinePrecompiler>(*this, *disk_, std::move(descs), options);
+    pre_->Start();
+}
+
+void PipelineFactory::StopPrecompile() {
+    if (pre_) {
+        pre_->Cancel();
+        pre_->Join();
     }
 }
 
@@ -130,8 +208,10 @@ VkShaderModule PipelineFactory::Module(const GS::Module& module, std::string& er
                                       .pCode = spirv.data()};
     VkShaderModule m = VK_NULL_HANDLE;
     const u64 t0 = NowNs();
+    const u64 tsc0 = __rdtsc();
     const VkResult r = Fn().vkCreateShaderModule(ctx_.Device(), &ci, nullptr, &m);
     stats_.module_ns += NowNs() - t0;
+    ShaderTrace::Event(ShaderTrace::Kind::ShaderModule, tsc0, __rdtsc(), module.id, spirv.size() * 4);
     if (r != VK_SUCCESS) {
         error = fmt::format("vkCreateShaderModule refused module {}", module.id);
         return VK_NULL_HANDLE;
@@ -151,6 +231,7 @@ VkShaderModule PipelineFactory::Aux(u32 which, const GS::RuntimeParams* fragment
             key = Mix(key, v);
         }
     }
+    std::scoped_lock lock{aux_mutex_};
     if (const auto it = aux_.find(key); it != aux_.end()) {
         return it->second;
     }
@@ -159,10 +240,8 @@ VkShaderModule PipelineFactory::Aux(u32 which, const GS::RuntimeParams* fragment
         error = "no shader translator for the auxiliary stages";
         return VK_NULL_HANDLE;
     }
-    const u64 t0 = NowNs();
     const auto spirv = t->EmitAuxStage(static_cast<GS::AuxStage>(which), fragment, profile_, error);
     if (spirv.empty()) {
-        stats_.module_ns += NowNs() - t0;
         return VK_NULL_HANDLE;
     }
     const VkShaderModuleCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -170,39 +249,25 @@ VkShaderModule PipelineFactory::Aux(u32 which, const GS::RuntimeParams* fragment
                                       .pCode = spirv.data()};
     VkShaderModule m = VK_NULL_HANDLE;
     const VkResult r = Fn().vkCreateShaderModule(ctx_.Device(), &ci, nullptr, &m);
-    stats_.module_ns += NowNs() - t0;
     if (r != VK_SUCCESS) {
         error = "the auxiliary stage's module was refused";
         return VK_NULL_HANDLE;
     }
     aux_.emplace(key, m);
-    ++stats_.aux_stages;
     return m;
 }
 
-bool PipelineFactory::MakeLayout(std::span<const GS::ResourceBindingPlan* const> plans, bool compute,
-                                 PipelineObjects& out, std::string& error) {
+bool PipelineFactory::MakeLayout(std::span<const u64> encoded, bool compute, PipelineObjects& out,
+                                 std::string& error) {
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    bindings.reserve(encoded.size());
     const VkShaderStageFlags stages = compute ? VK_SHADER_STAGE_COMPUTE_BIT : kAllGraphics;
     u32 count = 0;
-    for (const auto* p : plans) {
-        if (p == nullptr) {
-            continue;
-        }
-        for (const auto& b : p->buffers) {
-            bindings.push_back({b.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr});
-            ++count;
-        }
-        for (const auto& i : p->images) {
-            bindings.push_back({i.binding,
-                                i.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                std::max<u32>(i.count, 1), stages, nullptr});
-            count += std::max<u32>(i.count, 1);
-        }
-        for (const auto& s : p->samplers) {
-            bindings.push_back({s.binding, VK_DESCRIPTOR_TYPE_SAMPLER, 1, stages, nullptr});
-            ++count;
-        }
+    for (const u64 e : encoded) {
+        const u32 n = static_cast<u32>(e & 0xFFFF);
+        bindings.push_back({static_cast<u32>(e >> 32), static_cast<VkDescriptorType>((e >> 16) & 0xFFFF), n, stages,
+                            nullptr});
+        count += n;
     }
     out.bindings = count;
     out.push_descriptors = count < ctx_.Caps().max_push_descriptors;
@@ -245,6 +310,8 @@ bool PipelineFactory::MakeLayout(std::span<const GS::ResourceBindingPlan* const>
                                          .pushConstantRangeCount = 1,
                                          .pPushConstantRanges = &push};
     if (Fn().vkCreatePipelineLayout(ctx_.Device(), &pci, nullptr, &out.layout) != VK_SUCCESS) {
+        Fn().vkDestroyDescriptorSetLayout(ctx_.Device(), out.set_layout, nullptr);
+        out.set_layout = VK_NULL_HANDLE;
         error = "vkCreatePipelineLayout failed";
         return false;
     }
@@ -255,46 +322,79 @@ bool PipelineFactory::MakeLayout(std::span<const GS::ResourceBindingPlan* const>
     return true;
 }
 
-const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::GraphicsPipelineState& st,
-                                                 const GS::Module* vs, const GS::ResourceBindingPlan& vs_plan,
-                                                 const GS::Module* ps, const GS::ResourceBindingPlan* ps_plan,
-                                                 std::string& error) {
-    ++stats_.lookups;
+GS::PipelineDesc PipelineFactory::DescribeGraphics(const GS::GraphicsPipelineState& state, const GS::Module* vs,
+                                                   const GS::ResourceBindingPlan& vs_plan, const GS::Module* ps,
+                                                   const GS::ResourceBindingPlan* ps_plan) {
+    GS::PipelineDesc d;
+    d.compute = false;
+    d.state = state;
+    d.state.vs_module = 0;
+    d.state.ps_module = 0;
+    d.vs = vs != nullptr ? SpirvOf(*vs) : GS::SpirvHash{};
+    d.has_ps = ps != nullptr;
+    if (ps != nullptr) {
+        d.ps = SpirvOf(*ps);
+        d.fs_runtime = ps->runtime;
+    }
     const GS::ResourceBindingPlan* plans[2] = {ps_plan, &vs_plan};
-    const u64 key = Mix(Mix(0x6A, pipeline_id), LayoutSignature(plans));
-    if (const auto it = pipelines_.find(key); it != pipelines_.end()) {
-        return it->second.get();
-    }
-    const auto fail = [&](std::string why) -> const PipelineObjects* {
-        error = std::move(why);
-        ++stats_.failures;
-        if (stats_.first_failure.empty()) {
-            stats_.first_failure = error;
-            SSPC_LOG(GPU, Error, "native backend: graphics pipeline {}: {}", pipeline_id, error);
-        }
-        return nullptr;
-    };
-    if (vs == nullptr) {
-        return fail("no vertex stage");
-    }
-    auto obj = std::make_unique<PipelineObjects>();
-    if (!MakeLayout(plans, false, *obj, error)) {
-        return fail(error);
+    PlanBindings(plans, d.bindings);
+    return d;
+}
+
+GS::PipelineDesc PipelineFactory::DescribeCompute(const GS::Module& cs, const GS::ResourceBindingPlan& plan) {
+    GS::PipelineDesc d;
+    d.compute = true;
+    d.vs = SpirvOf(cs);
+    const GS::ResourceBindingPlan* plans[1] = {&plan};
+    PlanBindings(plans, d.bindings);
+    return d;
+}
+
+bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod, VkShaderModule ps_mod,
+                            PipelineObjects& out, u32& flags, std::string& error) {
+    flags = desc.compute ? ShaderTrace::kPipeCompute : 0u;
+    out.compute = desc.compute;
+    if (!MakeLayout(desc.bindings, desc.compute, out, error)) {
+        return false;
     }
     const auto& f = Fn();
+    const auto fail = [&](std::string why) {
+        error = std::move(why);
+        Destroy(out);
+        return false;
+    };
+    VkPipelineCreationFeedback feedback{};
+    std::array<VkPipelineCreationFeedback, 4> stage_feedback{};
+    if (desc.compute) {
+        const VkPipelineCreationFeedbackCreateInfo fci{.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+                                                       .pPipelineCreationFeedback = &feedback,
+                                                       .pipelineStageCreationFeedbackCount = 1,
+                                                       .pPipelineStageCreationFeedbacks = stage_feedback.data()};
+        const VkComputePipelineCreateInfo ci{.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                             .pNext = &fci,
+                                             .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                       .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                       .module = vs_mod,
+                                                       .pName = "main"},
+                                             .layout = out.layout};
+        const VkResult r = f.vkCreateComputePipelines(ctx_.Device(), cache_, 1, &ci, nullptr, &out.pipeline);
+        if (r != VK_SUCCESS) {
+            out.pipeline = VK_NULL_HANDLE;
+            return fail(fmt::format("vkCreateComputePipelines failed ({})", static_cast<int>(r)));
+        }
+        flags |= FeedbackFlags(feedback);
+        return true;
+    }
+    const GS::GraphicsPipelineState& st = desc.state;
     const DeviceCaps& caps = ctx_.Caps();
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
-    const VkShaderModule vs_mod = Module(*vs, error);
-    if (vs_mod == VK_NULL_HANDLE) {
-        return fail(error);
-    }
     stages.push_back({.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                       .stage = VK_SHADER_STAGE_VERTEX_BIT,
                       .module = vs_mod,
                       .pName = "main"});
     const bool rect = st.prim_type == 17, quad = st.prim_type == 19;
-    const GS::RuntimeParams* fs_runtime = ps != nullptr ? &ps->runtime : nullptr;
+    const GS::RuntimeParams* fs_runtime = desc.has_ps ? &desc.fs_runtime : nullptr;
     if (rect || quad) {
         const VkShaderModule tcs = Aux(static_cast<u32>(quad ? GS::AuxStage::QuadListTcs : GS::AuxStage::RectListTcs),
                                        fs_runtime, error);
@@ -311,11 +411,7 @@ const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::Grap
                           .module = tes,
                           .pName = "main"});
     }
-    if (ps != nullptr) {
-        const VkShaderModule ps_mod = Module(*ps, error);
-        if (ps_mod == VK_NULL_HANDLE) {
-            return fail(error);
-        }
+    if (desc.has_ps) {
         stages.push_back({.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                           .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
                           .module = ps_mod,
@@ -440,11 +536,17 @@ const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::Grap
         .pColorAttachmentFormats = color_formats.data(),
         .depthAttachmentFormat = st.z_format != 0 ? depth_format : VK_FORMAT_UNDEFINED,
         .stencilAttachmentFormat = st.stencil_format != 0 ? depth_format : VK_FORMAT_UNDEFINED};
+    // P4.14: the driver says whether the application's pipeline cache had it (the stall trace and the statistics)
+    const VkPipelineCreationFeedbackCreateInfo fci{.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+                                                   .pNext = &rendering,
+                                                   .pPipelineCreationFeedback = &feedback,
+                                                   .pipelineStageCreationFeedbackCount = static_cast<u32>(stages.size()),
+                                                   .pPipelineStageCreationFeedbacks = stage_feedback.data()};
     const VkPipelineDepthStencilStateCreateInfo ds{.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
                                                    .maxDepthBounds = 1.0f};
     const VkPipelineVertexInputStateCreateInfo vi{.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     const VkGraphicsPipelineCreateInfo ci{.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-                                          .pNext = &rendering,
+                                          .pNext = &fci,
                                           .stageCount = static_cast<u32>(stages.size()),
                                           .pStages = stages.data(),
                                           .pVertexInputState = &vi,
@@ -456,27 +558,127 @@ const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::Grap
                                           .pDepthStencilState = &ds,
                                           .pColorBlendState = &blend,
                                           .pDynamicState = &dynamic,
-                                          .layout = obj->layout};
-    const u64 t0 = NowNs();
-    const VkResult r = f.vkCreateGraphicsPipelines(ctx_.Device(), VK_NULL_HANDLE, 1, &ci, nullptr, &obj->pipeline);
-    CountCreation(stats_, NowNs() - t0, [&] {
-        return fmt::format("graphics p{} (vs module {}, ps module {})", pipeline_id, vs->id, ps != nullptr ? ps->id : 0);
-    });
+                                          .layout = out.layout};
+    const VkResult r = f.vkCreateGraphicsPipelines(ctx_.Device(), cache_, 1, &ci, nullptr, &out.pipeline);
     if (r != VK_SUCCESS) {
-        if (!obj->shared_layout) {
-            f.vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
-            f.vkDestroyDescriptorSetLayout(ctx_.Device(), obj->set_layout, nullptr);
-        }
+        out.pipeline = VK_NULL_HANDLE;
         return fail(fmt::format("vkCreateGraphicsPipelines failed ({})", static_cast<int>(r)));
     }
-    ++stats_.graphics;
+    flags |= FeedbackFlags(feedback);
+    return true;
+}
+
+const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& desc, const GS::Module* vs,
+                                               const GS::Module* ps, u32 pipeline_id, std::string& error) {
+    const u64 hash = desc.Hash();
+    const auto label = [&] {
+        return desc.compute ? fmt::format("cs module {}", vs->id) : fmt::format("gfx p{}", pipeline_id);
+    };
+    // the same pipeline made already in this run (another pipeline id, or another module with the same SPIR-V)
+    for (auto [a, b] = by_desc_.equal_range(hash); a != b; ++a) {
+        if (a->second.first == desc) {
+            ++stats_.desc_reuse;
+            pipelines_.emplace(key, a->second.second);
+            return a->second.second;
+        }
+    }
+    // built before the game started (P4.14)
+    if (pre_) {
+        bool waited = false;
+        u64 wait_ns = 0;
+        const u64 t0 = __rdtsc();
+        if (PipelineObjects* p = pre_->Take(desc, hash, waited, wait_ns)) {
+            ++stats_.prebuilt;
+            if (waited) {
+                ++stats_.prebuilt_waited;
+                stats_.prebuilt_wait_ns += wait_ns;
+            }
+            ShaderTrace::Event(ShaderTrace::Kind::PipelinePrebuilt, t0, __rdtsc(), hash, 0,
+                               (desc.compute ? ShaderTrace::kPipeCompute : 0u) | (waited ? ShaderTrace::kPipeWaited : 0u));
+            if (ctx_.Caps().debug_utils) {
+                ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(p->pipeline), label().c_str());
+            }
+            pipelines_.emplace(key, p);
+            by_desc_.emplace(hash, std::pair{desc, p});
+            return p;
+        }
+    }
+    // created now
+    const auto fail = [&](std::string why) -> const PipelineObjects* {
+        error = std::move(why);
+        ++stats_.failures;
+        if (stats_.first_failure.empty()) {
+            stats_.first_failure = error;
+            SSPC_LOG(GPU, Error, "native backend: {}: {}", label(), error);
+        }
+        return nullptr;
+    };
+    const VkShaderModule vs_mod = Module(*vs, error);
+    if (vs_mod == VK_NULL_HANDLE) {
+        return fail(error);
+    }
+    VkShaderModule ps_mod = VK_NULL_HANDLE;
+    if (!desc.compute && desc.has_ps) {
+        ps_mod = Module(*ps, error);
+        if (ps_mod == VK_NULL_HANDLE) {
+            return fail(error);
+        }
+    }
+    auto obj = std::make_unique<PipelineObjects>();
+    u32 flags = 0;
+    const u64 t0 = NowNs();
+    const u64 tsc0 = __rdtsc();
+    const bool ok = Build(desc, vs_mod, ps_mod, *obj, flags, error);
+    const u64 ns = NowNs() - t0;
+    CountCreation(stats_, ns, [&] {
+        return desc.compute ? fmt::format("compute (cs module {})", vs->id)
+                            : fmt::format("graphics p{} (vs module {}, ps module {})", pipeline_id, vs->id,
+                                          ps != nullptr ? ps->id : 0);
+    });
+    ShaderTrace::Event(ShaderTrace::Kind::PipelineCreate, tsc0, __rdtsc(), hash, 0,
+                       flags | (ok ? 0u : ShaderTrace::kPipeFailed));
+    if (!ok) {
+        return fail(error);
+    }
+    ++(desc.compute ? stats_.compute : stats_.graphics);
+    if ((flags & ShaderTrace::kPipeFeedback) != 0) {
+        ++stats_.feedback;
+        stats_.cache_hits += (flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0;
+    }
     if (ctx_.Caps().debug_utils) { // the id the executor's labels and SSPC_DIAG_* name (P4.6-G6)
-        ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(obj->pipeline),
-                  fmt::format("gfx p{}", pipeline_id).c_str());
+        ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(obj->pipeline), label().c_str());
     }
     const PipelineObjects* raw = obj.get();
-    pipelines_.emplace(key, std::move(obj));
+    owned_.push_back(std::move(obj));
+    pipelines_.emplace(key, raw);
+    by_desc_.emplace(hash, std::pair{desc, raw});
+    created_.fetch_add(1, std::memory_order_relaxed);
+    if (disk_ != nullptr) {
+        disk_->AddPipeline(desc, hash, ns); // (P4.14: the manifest the next run precompiles)
+    }
     return raw;
+}
+
+const PipelineObjects* PipelineFactory::Graphics(u32 pipeline_id, const GS::GraphicsPipelineState& st,
+                                                 const GS::Module* vs, const GS::ResourceBindingPlan& vs_plan,
+                                                 const GS::Module* ps, const GS::ResourceBindingPlan* ps_plan,
+                                                 std::string& error) {
+    ++stats_.lookups;
+    const GS::ResourceBindingPlan* plans[2] = {ps_plan, &vs_plan};
+    const u64 key = Mix(Mix(0x6A, pipeline_id), LayoutSignature(plans));
+    if (const auto it = pipelines_.find(key); it != pipelines_.end()) {
+        return it->second;
+    }
+    if (vs == nullptr) {
+        error = "no vertex stage";
+        ++stats_.failures;
+        if (stats_.first_failure.empty()) {
+            stats_.first_failure = error;
+            SSPC_LOG(GPU, Error, "native backend: graphics pipeline {}: {}", pipeline_id, error);
+        }
+        return nullptr;
+    }
+    return Obtain(key, DescribeGraphics(st, vs, vs_plan, ps, ps_plan), vs, ps, pipeline_id, error);
 }
 
 const PipelineObjects* PipelineFactory::Compute(const GS::Module& cs, const GS::ResourceBindingPlan& plan,
@@ -485,45 +687,9 @@ const PipelineObjects* PipelineFactory::Compute(const GS::Module& cs, const GS::
     const GS::ResourceBindingPlan* plans[1] = {&plan};
     const u64 key = Mix(Mix(0xC5, cs.id), LayoutSignature(plans));
     if (const auto it = pipelines_.find(key); it != pipelines_.end()) {
-        return it->second.get();
+        return it->second;
     }
-    auto obj = std::make_unique<PipelineObjects>();
-    obj->compute = true;
-    if (!MakeLayout(plans, true, *obj, error)) {
-        ++stats_.failures;
-        return nullptr;
-    }
-    const VkShaderModule m = Module(cs, error);
-    if (m == VK_NULL_HANDLE) {
-        ++stats_.failures;
-        return nullptr;
-    }
-    const VkComputePipelineCreateInfo ci{.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                   .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                                                   .module = m,
-                                                   .pName = "main"},
-                                         .layout = obj->layout};
-    const u64 t0 = NowNs();
-    const VkResult r = Fn().vkCreateComputePipelines(ctx_.Device(), VK_NULL_HANDLE, 1, &ci, nullptr, &obj->pipeline);
-    CountCreation(stats_, NowNs() - t0, [&] { return fmt::format("compute (cs module {})", cs.id); });
-    if (r != VK_SUCCESS) {
-        error = fmt::format("vkCreateComputePipelines failed ({})", static_cast<int>(r));
-        ++stats_.failures;
-        if (!obj->shared_layout) {
-            Fn().vkDestroyPipelineLayout(ctx_.Device(), obj->layout, nullptr);
-            Fn().vkDestroyDescriptorSetLayout(ctx_.Device(), obj->set_layout, nullptr);
-        }
-        return nullptr;
-    }
-    ++stats_.compute;
-    if (ctx_.Caps().debug_utils) {
-        ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(obj->pipeline),
-                  fmt::format("cs module {}", cs.id).c_str());
-    }
-    const PipelineObjects* raw = obj.get();
-    pipelines_.emplace(key, std::move(obj));
-    return raw;
+    return Obtain(key, DescribeCompute(cs, plan), &cs, nullptr, 0, error);
 }
 
 } // namespace SecondSon::Gpu::Vk

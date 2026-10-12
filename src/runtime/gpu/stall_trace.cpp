@@ -21,6 +21,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/shader_trace.h"
 #include "runtime/kernel/clock.h"
 
 namespace SecondSon::Gpu::StallTrace {
@@ -157,7 +158,7 @@ ThreadLog* MakeLog(Role role) {
     l->fticks.reset(new u64[size_t{kFrames} * kEvents]());
     l->fframe.reset(new u32[kFrames]);
     std::fill_n(l->fframe.get(), kFrames, ~0u);
-    if (detail::g_mode.load(std::memory_order_relaxed) == 2) {
+    if ((detail::g_mode.load(std::memory_order_relaxed) & 3) == 2) {
         l->cap = role == Role::Record ? g.opt.events : role == Role::Cp ? std::max<u64>(g.opt.events / 4, 1u << 18)
                                                                         : u64{1} << 18;
         l->ev.reset(new Event[l->cap]); // (not zeroed: pages are touched as events land)
@@ -450,7 +451,7 @@ const char* RoleName(Role r) {
 }
 
 bool Deep() {
-    return detail::g_mode.load(std::memory_order_relaxed) == 2;
+    return (detail::g_mode.load(std::memory_order_relaxed) & 3) == 2;
 }
 
 bool DeepRecords() {
@@ -458,6 +459,16 @@ bool DeepRecords() {
 }
 
 void detail::Record(Ev e, u64 t0, u64 t1, u64 a, u32 b, u16 c) {
+    const u32 mode = g_mode.load(std::memory_order_relaxed);
+    if ((mode & kForward) != 0 && t1 >= t0 + ShaderTrace::WaitMinTicks() && e != Ev::Record &&
+        e != Ev::PipelineCreate && e != Ev::ShaderTranslate && e != Ev::VblankWait) {
+        // (P4.14: the shader stall trace's breakdown of long frames; translations and pipelines it traces itself, the
+        // present thread's sleep to the next vblank is pacing, not a stall)
+        ShaderTrace::Event(ShaderTrace::Kind::Wait, t0, t1, a, b, static_cast<u32>(e));
+    }
+    if ((mode & 3) == 0) {
+        return;
+    }
     ThreadLog* l = Log(e);
     const size_t ei = static_cast<size_t>(e);
     const u64 d = t1 >= t0 ? t1 - t0 : 0;
@@ -488,7 +499,7 @@ void detail::Record(Ev e, u64 t0, u64 t1, u64 a, u32 b, u16 c) {
 }
 
 void SpanEndingNow(Ev e, u64 ns, u64 a) {
-    if (On()) {
+    if ((detail::g_mode.load(std::memory_order_relaxed) & 3) != 0) {
         const u64 t1 = Now();
         const u64 ticks = static_cast<u64>(static_cast<double>(ns) * g.tsc_hz / 1e9);
         detail::Record(e, t1 - std::min(t1, ticks), t1, a, 0, 0);
@@ -496,13 +507,13 @@ void SpanEndingNow(Ev e, u64 ns, u64 a) {
 }
 
 void RegisterThread(Role role) {
-    if (On() && t_log == nullptr) {
+    if ((detail::g_mode.load(std::memory_order_relaxed) & 3) != 0 && t_log == nullptr) {
         t_log = MakeLog(role);
     }
 }
 
 void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame) {
-    if (!On()) {
+    if ((detail::g_mode.load(std::memory_order_relaxed) & 3) == 0) {
         return;
     }
     if (gpu_t0 == 0 || gpu_t1 < gpu_t0) {
@@ -607,7 +618,7 @@ bool Start(const std::filesystem::path& logs_dir, double timestamp_period) {
             g.samples.resize(static_cast<size_t>(secs * opt.sample_hz * 2.2) + 1024);
         }
     }
-    detail::g_mode.store(mode, std::memory_order_release);
+    detail::g_mode.fetch_or(mode, std::memory_order_release); // (kForward may be set already)
     if (mode == 2 && opt.sample_hz != 0 && g.sampler == nullptr) {
         g.sampler = new std::thread(SamplerRun); // (joined by Stop; never destroyed while joinable)
     }
@@ -617,6 +628,13 @@ bool Start(const std::filesystem::path& logs_dir, double timestamp_period) {
                                      opt.win_a, opt.win_b, opt.events, opt.sample_hz)
                        : std::string{});
     return true;
+}
+
+void EnableForward() {
+    if (g.tsc_hz == 0.0) {
+        g.tsc_hz = static_cast<double>(std::max<u64>(Kernel::Clock::TscFrequency(), 1));
+    }
+    detail::g_mode.fetch_or(kForward, std::memory_order_release);
 }
 
 void SetCalibration(CalibrateFn fn, void* ctx) {
@@ -662,8 +680,14 @@ u32 CurrentFrame() {
 }
 
 void Stop() {
-    const u32 mode = detail::g_mode.load(std::memory_order_acquire);
-    if (mode == 0 || g.stopped) {
+    const u32 all = detail::g_mode.load(std::memory_order_acquire);
+    const u32 mode = all & 3;
+    if (all == 0 || g.stopped) {
+        return;
+    }
+    if (mode == 0) { // only the forwarding to the shader stall trace (P4.14): no files of this trace
+        g.stopped = true;
+        detail::g_mode.store(0, std::memory_order_release);
         return;
     }
     g.stopped = true;

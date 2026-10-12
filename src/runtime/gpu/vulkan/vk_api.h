@@ -55,6 +55,9 @@ namespace SecondSon::Gpu::Vk {
     X(vkBeginCommandBuffer)                                                                                            \
     X(vkEndCommandBuffer)                                                                                              \
     X(vkResetCommandBuffer)                                                                                            \
+    X(vkCreatePipelineCache)                                                                                           \
+    X(vkDestroyPipelineCache)                                                                                          \
+    X(vkGetPipelineCacheData)                                                                                          \
     X(vkGetFenceStatus)                                                                                                \
     X(vkCreateFence)                                                                                                   \
     X(vkDestroyFence)                                                                                                  \

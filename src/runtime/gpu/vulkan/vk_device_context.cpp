@@ -274,6 +274,10 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     f.vkGetPhysicalDeviceProperties2(pd, &p2);
     ctx->name_ = p2.properties.deviceName;
     ctx->driver_version_ = p2.properties.driverVersion;
+    ctx->vendor_id_ = p2.properties.vendorID;
+    ctx->device_id_ = p2.properties.deviceID;
+    std::copy(std::begin(p2.properties.pipelineCacheUUID), std::end(p2.properties.pipelineCacheUUID),
+              ctx->cache_uuid_.begin());
     if (p2.properties.apiVersion < VK_API_VERSION_1_3) {
         error = fmt::format("{} supports Vulkan {}.{} (1.3 is needed)", ctx->name_,
                             VK_API_VERSION_MAJOR(p2.properties.apiVersion),

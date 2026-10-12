@@ -11,7 +11,9 @@
 //   Shader(srt)      — the SRT walker interpreter against native execution, refused instructions, misuse;
 //   Shader(xlate)    — translations through the adapter: SPIR-V, reflection, errors, threads, Vulkan modules;
 //   Shader(cache)    — the frontend: modules by key, hits/misses, pipelines, collisions, dirty-state reuse;
-//   Shader(capture)  — the capture format's round trip, a corrupt file.
+//   Shader(capture)  — the capture format's round trip, a corrupt file;
+//   Shader(disk)     — the persistent shader cache (P4.14): a run's modules read by the next one instead of translated,
+//                      the manifest, a second process, a torn write, a damaged record, another generation, the limit.
 #include <windows.h>
 
 #include <atomic>
@@ -34,6 +36,7 @@
 #include "runtime/gpu/shader/runtime_params.h"
 #include "runtime/gpu/shader/shader_cache.h"
 #include "runtime/gpu/shader/shader_capture.h"
+#include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_resources.h"
 #include "runtime/gpu/shader/shader_translator.h"
@@ -1005,10 +1008,176 @@ void TestCapture(TestGroup& g, const App::Config& cfg) {
     g.Check("the test's files removed", !std::filesystem::exists(dir, ec), "");
 }
 
+// ---- Shader(disk) (P4.14: the persistent shader cache)
+
+void TestDisk(TestGroup& g, const App::Config& cfg) {
+    const auto dir = cfg.logs_dir / "selftest_shader_disk";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    const GS::DeviceProfile profile = TestProfile();
+    const std::string gen = GS::ShaderCacheGeneration(profile);
+    const auto cache_dir = dir / gen;
+    GS::DiskCacheOptions opt{.dir = cache_dir, .generation = gen};
+
+    // a first run: the frontend translates and the cache keeps what it made
+    std::vector<GS::SpirvHash> made;
+    std::vector<std::vector<u32>> made_spirv, made_flat;
+    std::vector<size_t> made_buffers;
+    {
+        GS::ShaderDiskCache disk;
+        std::string err;
+        const bool opened = disk.Open(opt, err);
+        DrawSetup s;
+        GS::ShaderFrontend fe({.async = false, .profile = &profile});
+        fe.SetDiskCache(&disk);
+        const auto& p = fe.PrepareDraw(s.d, s.regs, s.mem);
+        for (const auto* prog : fe.Programs().All()) {
+            for (const auto& m : prog->modules) {
+                made.push_back(m->spirv_hash);
+                made_spirv.push_back(m->result.spirv);
+                made_flat.push_back(m->result.flatbuf);
+                made_buffers.push_back(m->result.reflection.buffers.size());
+            }
+        }
+        disk.Flush();
+        const auto st = disk.Stats();
+        g.Check("a first run: a fresh cache, the draw translated, its programs, modules and SPIR-V written",
+                opened && p.ready && st.recreated && st.written_modules >= 2 && st.written_programs >= 2 &&
+                    st.written_spirv >= 1 && st.write_errors == 0,
+                fmt::format("{} - modules {}, programs {}, SPIR-V {}", err, st.written_modules, st.written_programs,
+                            st.written_spirv));
+        GS::PipelineDesc d;
+        d.has_ps = true;
+        d.vs = made.empty() ? GS::SpirvHash{} : made.front();
+        d.state.prim_type = 4;
+        d.bindings = {(u64{3} << 32) | (7u << 16) | 1};
+        disk.AddPipeline(d, d.Hash(), 1234);
+        disk.AddPipeline(d, d.Hash(), 1234); // (a second time: the manifest keeps it once)
+        disk.Flush();
+        g.Check("a pipeline added twice: one manifest record", disk.Stats().written_pipelines == 1, "");
+    }
+    // the next run: the same draw reads its modules instead of translating them
+    {
+        GS::ShaderDiskCache disk;
+        std::string err;
+        const bool opened = disk.Open(opt, err);
+        const auto st = disk.Stats();
+        g.Check("the next run: the cache read back whole (no record cut, nothing recreated)",
+                opened && !st.recreated && st.torn_bytes == 0 && st.modules == made.size() && st.pipelines == 1,
+                fmt::format("{} - modules {} of {}, pipelines {}", err, st.modules, made.size(), st.pipelines));
+        DrawSetup s;
+        GS::ShaderFrontend fe({.async = false, .profile = &profile});
+        fe.SetDiskCache(&disk);
+        const auto& p = fe.PrepareDraw(s.d, s.regs, s.mem);
+        bool same = true;
+        size_t i = 0;
+        for (const auto* prog : fe.Programs().All()) {
+            for (const auto& m : prog->modules) {
+                same = same && i < made.size() && m->from_disk && m->spirv_hash == made[i] &&
+                       m->result.spirv == made_spirv[i] && m->result.flatbuf == made_flat[i] &&
+                       m->result.reflection.buffers.size() == made_buffers[i];
+                ++i;
+            }
+        }
+        g.Check("the next run: the draw ready with no translation - every module read from the cache, the same SPIR-V, "
+                "flattened user data and resources",
+                p.ready && fe.Translations().count == 0 && fe.Stats().disk_loads == made.size() && same &&
+                    i == made.size(),
+                fmt::format("translations {}, read {}", fe.Translations().count, fe.Stats().disk_loads));
+        const auto descs = disk.Pipelines();
+        GS::PipelineDesc back;
+        size_t pos = 0;
+        std::vector<u8> bytes;
+        if (!descs.empty()) {
+            descs[0].Serialize(bytes);
+        }
+        g.Check("the pipeline manifest: the description read back equal, its hash the same",
+                descs.size() == 1 && back.Deserialize(bytes, pos) && back == descs[0] && back.Hash() == descs[0].Hash() &&
+                    back.bindings.size() == 1 && back.state.prim_type == 4,
+                "");
+        GS::ShaderDiskCache second;
+        const bool second_ok = second.Open(opt, err);
+        g.Check("a second process on the same directory: it reads, never writes", second_ok && !second.Writable(), err);
+    }
+    // a write cut by the process's end: the torn record is cut off at the next open, everything before it stays
+    const auto pack = cache_dir / "shaders.pack";
+    {
+        GS::ShaderDiskCache disk;
+        std::string err;
+        disk.Open(opt, err);
+        GS::PipelineDesc d;
+        d.compute = true;
+        d.vs.lo = 77;
+        disk.TestTearNextWrite(40);
+        disk.AddPipeline(d, d.Hash(), 5);
+        disk.Flush();
+    }
+    {
+        GS::ShaderDiskCache disk;
+        std::string err;
+        const bool opened = disk.Open(opt, err);
+        const auto st = disk.Stats();
+        g.Check("an interrupted write: the torn record cut off (40 bytes), the earlier records all kept",
+                opened && st.torn_bytes == 40 && st.modules == made.size() && st.pipelines == 1 && !st.recreated,
+                fmt::format("torn {}, modules {}, pipelines {}", st.torn_bytes, st.modules, st.pipelines));
+    }
+    // a damaged record at the end: it is cut, what precedes stays; the size limit
+    {
+        const auto size = std::filesystem::file_size(pack, ec);
+        std::fstream f(pack, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekg(static_cast<std::streamoff>(size - 20));
+        char c = 0;
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(size - 20));
+        f.write(&c, 1);
+    }
+    {
+        GS::ShaderDiskCache disk;
+        std::string err;
+        auto small = opt;
+        small.max_bytes = 1024; // (smaller than the file already: nothing more is added)
+        const bool opened = disk.Open(small, err);
+        const auto st = disk.Stats();
+        GS::PipelineDesc d;
+        d.vs.lo = 99;
+        disk.AddPipeline(d, d.Hash(), 1);
+        disk.Flush();
+        g.Check("a damaged byte in the last record: its checksum fails, it is cut, the rest kept; over the size limit "
+                "nothing is added (counted)",
+                opened && st.torn_bytes > 0 && st.records > 0 && !st.recreated && disk.Stats().dropped_full == 1,
+                fmt::format("torn {}, records {}, dropped {}", st.torn_bytes, st.records, disk.Stats().dropped_full));
+    }
+    // another generation in the same file (a format change): started anew, the old file kept once
+    {
+        GS::ShaderDiskCache disk;
+        std::string err;
+        auto other = opt;
+        other.generation = "0123456789abcdef";
+        const bool opened = disk.Open(other, err);
+        const auto st = disk.Stats();
+        g.Check("a file of another generation: not read - started anew, the old one kept as shaders.pack.bad",
+                opened && st.recreated && st.recreate_reason == "another generation" && st.records == 0 &&
+                    std::filesystem::exists(cache_dir / "shaders.pack.bad", ec),
+                st.recreate_reason);
+    }
+    // garbage instead of a cache file
+    {
+        std::ofstream(pack, std::ios::binary | std::ios::trunc) << std::string(200, 'x');
+        GS::ShaderDiskCache disk;
+        std::string err;
+        const bool opened = disk.Open(opt, err);
+        g.Check("a file that is not a cache: started anew (never parsed)",
+                opened && disk.Stats().recreated && disk.Stats().records == 0, disk.Stats().recreate_reason);
+    }
+    std::filesystem::remove_all(dir, ec);
+    g.Check("the test's files removed", !std::filesystem::exists(dir, ec), "");
+}
+
 } // namespace
 
 std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg) {
-    std::vector<TestGroup> out(9);
+    std::vector<TestGroup> out(10);
     out[0].name = "Shader(identity)";
     out[1].name = "Shader(validate)";
     out[2].name = "Shader(runtime)";
@@ -1018,6 +1187,7 @@ std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg) {
     out[6].name = "Shader(xlate)";
     out[7].name = "Shader(cache)";
     out[8].name = "Shader(capture)";
+    out[9].name = "Shader(disk)";
     TestIdentity(out[0]);
     TestValidation(out[1]);
     TestRuntime(out[2]);
@@ -1027,6 +1197,7 @@ std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg) {
     TestTranslate(out[6]);
     TestCache(out[7]);
     TestCapture(out[8], cfg);
+    TestDisk(out[9], cfg);
     return out;
 }
 

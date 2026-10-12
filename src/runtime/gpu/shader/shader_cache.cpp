@@ -128,6 +128,7 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
         program = p.get();
         programs_.emplace(id, std::move(p));
         ++stats_.new_programs;
+        out.created = true;
     }
     ++program->addresses;
     addresses_[key] = AddressEntry{program, epoch_, scratch_.footer.shader_hash, id.length, false};

@@ -78,7 +78,7 @@ const char* EvName(Ev e);
 const char* RoleName(Role r);
 
 namespace detail {
-extern std::atomic<u32> g_mode; ///< 0 off, 1 light, 2 deep
+extern std::atomic<u32> g_mode; ///< bits 0-1: 0 off, 1 light, 2 deep; kForward: waits forwarded (P4.14)
 void Record(Ev e, u64 t0, u64 t1, u64 a, u32 b, u16 c);
 } // namespace detail
 
@@ -136,6 +136,11 @@ void RegisterThread(Role role);
 /// The GPU's batch with timeline value `value` completed: its submission (TSC before the lock, after the call) and its
 /// GPU start/end (the device's timestamp ticks; 0 when not timed), the frame it was recorded in (flip markers then).
 void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame);
+
+/// P4.14: the waits go to the shader stall trace too (shader_trace.h; its SSPC_SHADER_STALL_TRACE), whether or not this
+/// trace runs. Before the backend's threads.
+constexpr u32 kForward = 4;
+void EnableForward();
 
 /// Reads SSPC_P412_STALL_TRACE; false when not set. Before the backend's threads. `timestamp_period`: ns per GPU tick.
 bool Start(const std::filesystem::path& logs_dir, double timestamp_period);

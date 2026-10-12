@@ -40,6 +40,8 @@
 
 namespace SecondSon::Gpu::Shader {
 
+class ShaderDiskCache;
+
 /// Log-scale histogram of nanoseconds (8 buckets per power of two): P50/P95/P99 within ~9 %.
 class Histogram {
 public:
@@ -157,6 +159,9 @@ struct FrontendStats {
     u64 memo_verified = 0, memo_mismatches = 0;
     std::array<u64, static_cast<size_t>(ResourceStatus::Count)> resources{};
     u64 epochs = 0;
+    /// P4.14 (the persistent shader cache): modules found on disk for programs met (stubs), read instead of translated,
+    /// records that could not be used (translated instead), the translation time those reads saved (as recorded)
+    u64 disk_stubs = 0, disk_loads = 0, disk_load_failures = 0, disk_saved_us = 0;
 };
 
 class ShaderFrontend {
@@ -184,6 +189,12 @@ public:
     /// SSPC_DIAG_MEMO_STATS=1: the stage memo's misses by cause (the user data dwords that differ, the input that
     /// changed); empty without it.
     std::string MemoReport() const;
+    /// P4.14: the persistent shader cache (nullptr: none). A program met for the first time gets the modules the cache
+    /// has for it (read when first needed instead of translated); new translations are added to it. Before the first
+    /// draw.
+    void SetDiskCache(ShaderDiskCache* cache) { disk_ = cache; }
+    /// Modules read from the disk cache so far (any thread: the frame log samples it).
+    u64 DiskLoads() const { return disk_loads_total_.load(std::memory_order_relaxed); }
     /// Waits until no translation is queued or running.
     void Drain();
     /// Stops the worker (the running translation finishes, queued ones are dropped); nothing is queued afterwards.
@@ -230,6 +241,11 @@ private:
                       std::span<const u32, 16> user_data);
     bool Enqueue(Job job);
     void Run(Job& job);
+    /// P4.14: the disk cache's modules of a program met for the first time, as Pending modules that read their record
+    /// when first needed.
+    void RestoreFromDisk(Program& program);
+    /// A module's record read in place of its translation; false: unusable (the module is translated instead).
+    bool LoadFromDisk(Module& module);
     void Prepare(Module& module);
     void WorkerLoop();
 
@@ -267,6 +283,8 @@ private:
     u32 next_module_ = 1;
     FrontendStats stats_;
     Timings times_;
+    ShaderDiskCache* disk_ = nullptr;
+    std::atomic<u64> disk_loads_total_{0};
 
     // the worker
     std::mutex mutex_;
