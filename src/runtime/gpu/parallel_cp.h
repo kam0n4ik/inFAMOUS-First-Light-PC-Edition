@@ -269,7 +269,9 @@ private:
     void PushRecord();
     void JournalReserve(u32 words);
     u32* JournalAt(u64 pos) { return journal_.get() + (pos & (kJournalWords - 1)); }
-    void WaitHead(u64 target, bool full); ///< until head_ >= target
+    /// until head_ >= target; `why`: the DrainReason of a drain, kWhyFull / kWhyJournal for backpressure (P4.12 trace)
+    void WaitHead(u64 target, bool full, u16 why);
+    static constexpr u16 kWhyFull = 0xFFFF, kWhyJournal = 0xFFFE;
     /// Stage 2: the frontend for the record being filled; its GPU writes noted; the memo told when it writes memory.
     void PrepareDraw(Record& r);
     void PrepareDispatch(Record& r);
@@ -327,6 +329,9 @@ private:
     static constexpr u64 kGwWords = (1ull << (40 - kGwBlockBits)) / 64;
     static constexpr u32 kRecRing = 1u << 16;
     std::unique_ptr<std::atomic<u64>[]> rec_value_; ///< thread 2: the timeline value record i's work completes at
+    /// P4.12 stall trace (on at Start only): when thread 1 pushed record i (TSC; thread 2 reads it after the tail it
+    /// waited for - what its wait was for)
+    std::unique_ptr<u64[]> push_tsc_;
     u64 forced_fallback_n_ = 0; ///< thread 2 (ForcedCopyFallbackEvery)
     std::atomic<u64> copy_fallbacks_{0}, copy_failures_{0};
 

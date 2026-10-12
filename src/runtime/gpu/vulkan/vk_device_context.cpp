@@ -346,6 +346,13 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     if (Has(dexts, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
         denable.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     }
+    // P4.12: the stall trace's deep mode converts the batches' GPU timestamps to the CPU's clock (only then: the device
+    // is otherwise created as before)
+    if (char st[256] = {}; GetEnvironmentVariableA("SSPC_P412_STALL_TRACE", st, sizeof(st)) >= 4 &&
+                         std::string_view(st).starts_with("deep") &&
+                         Has(dexts, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+        denable.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    }
     if (options.diagnostics) {
         // SSPC_DIAG_NV_CONFIG=off: without NVIDIA's diagnostics config (resource tracking may change the driver's
         // behaviour; a diagnostic experiment)
@@ -375,6 +382,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     caps.attachment_feedback_loop = enabled(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     caps.image_view_min_lod = enabled(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     caps.maintenance5 = enabled(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    caps.calibrated_timestamps = enabled(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 
     // --- features: every one the device has among those the translated code and the backend use (queried, then
     // passed back; the chain only holds structures of enabled extensions)
@@ -569,6 +577,9 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     }
     if (caps.color_write_mask_dynamic && f.vkCmdSetColorWriteMaskEXT == nullptr) {
         caps.color_write_mask_dynamic = false;
+    }
+    if (caps.calibrated_timestamps && f.vkGetCalibratedTimestampsEXT == nullptr) {
+        caps.calibrated_timestamps = false;
     }
     f.vkGetDeviceQueue(ctx->device_, ctx->family_, 0, &ctx->queue_);
 

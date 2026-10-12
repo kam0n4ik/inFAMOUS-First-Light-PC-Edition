@@ -16,6 +16,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/shader/shader_translator.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_formats.h"
 
@@ -41,6 +42,7 @@ u64 NowNs() {
 template <typename Name>
 void CountCreation(PipelineStats& s, u64 ns, Name&& name) {
     s.create_ns += ns;
+    StallTrace::SpanEndingNow(StallTrace::Ev::PipelineCreate, ns); // (P4.12)
     static constexpr u64 kEdges[] = {1'000'000, 5'000'000, 20'000'000, 50'000'000, 100'000'000};
     size_t b = 0;
     while (b < std::size(kEdges) && ns >= kEdges[b]) {

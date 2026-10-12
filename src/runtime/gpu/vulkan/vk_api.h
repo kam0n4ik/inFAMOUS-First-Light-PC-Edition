@@ -165,7 +165,8 @@ namespace SecondSon::Gpu::Vk {
     X(vkCmdSetCheckpointNV)                                                                                            \
     X(vkGetQueueCheckpointDataNV)                                                                                      \
     X(vkCmdWriteBufferMarkerAMD)                                                                                       \
-    X(vkGetDeviceFaultInfoEXT)
+    X(vkGetDeviceFaultInfoEXT)                                                                                         \
+    X(vkGetCalibratedTimestampsEXT)
 
 #define SSPC_VKA_MEMBER(name) PFN_##name name = nullptr;
 

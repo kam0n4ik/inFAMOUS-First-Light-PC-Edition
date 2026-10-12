@@ -29,6 +29,7 @@
 #include "runtime/gpu/cpu_sampler.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
@@ -607,6 +608,31 @@ bool Backend::Start(const Options& o, std::string& error) {
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
     FrameLog::Start();
+    // P4.12: SSPC_P412_STALL_TRACE=light|deep[,...] - the stall trace (off otherwise: nothing of it runs); deep mode
+    // converts the batches' GPU timestamps with the device's calibrated timestamps (GPU ticks <-> QPC)
+    if (StallTrace::Start(o.logs_dir, ctx_->Caps().timestamp_period) && ctx_->Caps().calibrated_timestamps) {
+        StallTrace::SetCalibration(
+            [](void* c, u64& gpu, u64& qpc, u64& deviation) {
+                const auto* ctx = static_cast<const Vk::DeviceContext*>(c);
+                const VkCalibratedTimestampInfoEXT info[2] = {
+                    {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT,
+                     .pNext = nullptr,
+                     .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT},
+                    {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT,
+                     .pNext = nullptr,
+                     .timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT}};
+                u64 ts[2] = {};
+                u64 dev = 0;
+                if (Vk::Fn().vkGetCalibratedTimestampsEXT(ctx->Device(), 2, info, ts, &dev) != VK_SUCCESS) {
+                    return false;
+                }
+                gpu = ts[0];
+                qpc = ts[1];
+                deviation = dev;
+                return true;
+            },
+            ctx_.get());
+    }
     // P4.8: SSPC_INSPECTOR=light - the Performance Inspector (off otherwise: nothing of it runs)
     if (Inspector::Start({.logs_dir = o.logs_dir,
                           .device = ctx_->Name(),
@@ -717,6 +743,7 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
+    StallTrace::RegisterThread(StallTrace::Role::Cp);
     std::deque<Submission> local;
     auto rate_t0 = std::chrono::steady_clock::now();
     u64 rate_flips = 0, rate_draws = 0, rate_record = 0, rate_wait = 0, rate_tw = 0, rate_gpu = 0, rate_submit = 0;
@@ -735,6 +762,7 @@ void Backend::Loop() {
     };
     while (!stop_.load(std::memory_order_acquire)) {
         const auto iter_t0 = Clock::now();
+        const u64 pre_tsc = StallTrace::On() ? StallTrace::Now() : 0; // (P4.12)
         {
             std::unique_lock lock{mutex_};
             local.swap(queue_);
@@ -742,6 +770,7 @@ void Backend::Loop() {
         for (const auto& s : local) {
             Apply(s);
         }
+        const size_t taken = local.size();
         local.clear();
         {
             std::vector<std::pair<u64, u64>> inval;
@@ -755,7 +784,12 @@ void Backend::Loop() {
         }
         // the guest's writes to tracked pages, before the work it submitted after them
         DrainCpuWrites();
+        if (pre_tsc != 0) {
+            StallTrace::Span(StallTrace::Ev::PreRound, pre_tsc, StallTrace::Now(), taken);
+        }
         bool progress = false, blocked = false, pending = false, blocked_label = false;
+        u32 round_packets = 0, round_capped = 0;
+        bool graphics_capped = false;
         const auto cp_t0 = Clock::now();
         round_t0_ = cp_t0;
         tot_pre_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(cp_t0 - iter_t0).count());
@@ -775,7 +809,8 @@ void Backend::Loop() {
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
                 continue;
             }
-            for (u32 i = 0; i < 4096; ++i) {
+            u32 i = 0;
+            for (; i < 4096; ++i) {
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
                     progress = true;
@@ -794,6 +829,9 @@ void Backend::Loop() {
                 }
                 break;
             }
+            round_packets += i; // (P4.12: the round's packets; a queue that stopped at the limit)
+            round_capped += i == 4096 ? 1 : 0;
+            graphics_capped |= i == 4096 && q == Cp::kGraphicsQueue;
             pending |= cp_->PendingSubmissions(q) != 0;
         }
         if (parallel_) {
@@ -811,7 +849,12 @@ void Backend::Loop() {
         tot_busy_ns_ += round_ns;
         tot_round_ns_ += round_ns;
         const auto poll_t0 = Clock::now();
-        executor_->Poll(); // completed batches: the processor writes its held labels now
+        {
+            const StallTrace::Scope poll_span(StallTrace::Ev::Poll, round_packets, round_capped,
+                                              graphics_capped ? 1 : 0);
+            executor_->Poll(); // completed batches: the processor writes its held labels now
+        }
+        StallTrace::MaybeCalibrate();
         const u64 poll_ns = ns_since(poll_t0);
         prof_poll += poll_ns;
         tot_busy_ns_ += poll_ns;
@@ -1013,6 +1056,7 @@ void Backend::Loop() {
             Gnm::RaiseInterrupt(Gnm::Interrupt::GpuIdle);
         }
         const auto idle_t0 = Clock::now();
+        const u64 idle_tsc = StallTrace::On() ? StallTrace::Now() : 0; // (P4.12)
         const bool busy = executor_->Busy();
         // SSPC_DIAG_BLOCK_SPIN_US=<n>: a WAIT_REG_MEM blocked on memory the game's CPU writes (no notification comes)
         // is polled again after n us instead of a 1 ms sleep (P4.6 experiment)
@@ -1039,6 +1083,12 @@ void Backend::Loop() {
             cv_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !queue_.empty() || stop_.load(); });
         }
         const u64 idle_ns = ns_since(idle_t0);
+        if (idle_tsc != 0) {
+            StallTrace::Span(blocked   ? (blocked_label ? StallTrace::Ev::IdleLabel : StallTrace::Ev::IdleFlag)
+                             : busy    ? StallTrace::Ev::IdleGpu
+                                       : StallTrace::Ev::IdleEmpty,
+                             idle_tsc, StallTrace::Now(), timeline_->LastSubmitted(), busy ? 1u : 0u);
+        }
         prof_idle += idle_ns;
         prof_idle_blocked += blocked ? idle_ns : 0;
         prof_idle_gpu += busy ? idle_ns : 0;
@@ -1081,6 +1131,11 @@ void Backend::OnFlip(u64 gpu_value) {
         t.par_depth_sum = pt.depth_sum;
     }
     FrameLog::CpFlip(gpu_value, t, executor_->LastUnblockTsc());
+    if (StallTrace::On()) { // (P4.12: the trace's events count to the next frame from here)
+        const u32 n = FrameLog::GetProgress().cp - 1;
+        StallTrace::Instant(StallTrace::Ev::FlipMarker, gpu_value, n);
+        StallTrace::CpFrame(n);
+    }
     if (Inspector::On()) {
         Inspector::CpTotals it;
         const u64 partial = static_cast<u64>(
@@ -1146,6 +1201,7 @@ void Backend::Stop() {
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
+    StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
     if (Inspector::On() && executor_) {
         Inspector::WriteFile("pipelines.csv", executor_->InspectorPipelines());
         Inspector::WriteFile("gpu_native.txt", Report());

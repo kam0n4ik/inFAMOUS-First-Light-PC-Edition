@@ -13,6 +13,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
@@ -127,6 +128,9 @@ void ParallelCp::Start() {
         return;
     }
     started_ = true;
+    if (StallTrace::Deep()) {
+        push_tsc_ = std::make_unique<u64[]>(kRecRing);
+    }
     thread_ = std::thread([this] { Loop(); });
 }
 
@@ -152,7 +156,7 @@ void ParallelCp::Stop() {
 
 ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
     if (next_ - head_.load(std::memory_order_acquire) >= kSlots) {
-        WaitHead(next_ - kSlots + 1, true); // backpressure: the oldest slot executed
+        WaitHead(next_ - kSlots + 1, true, kWhyFull); // backpressure: the oldest slot executed
     }
     Record& r = slots_[next_ & (kSlots - 1)];
     r.kind = kind;
@@ -171,6 +175,9 @@ void ParallelCp::PushRecord() {
     t1_.depth_sum += depth;
     t1_.depth_max = std::max(t1_.depth_max, depth);
     ++t1_.records;
+    if (push_tsc_ != nullptr) {
+        push_tsc_[next_ & (kRecRing - 1)] = __rdtsc(); // (published with tail_ below)
+    }
     ++next_;
     tail_.store(next_, std::memory_order_seq_cst);
     if (t2_waiting_.load(std::memory_order_seq_cst) != 0) {
@@ -181,11 +188,12 @@ void ParallelCp::PushRecord() {
     }
 }
 
-void ParallelCp::WaitHead(u64 target, bool full) {
+void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
     u64 h = head_.load(std::memory_order_acquire);
     if (h >= target) {
         return;
     }
+    const u64 h0 = h;
     const u64 t0 = __rdtsc();
     while (h < target && __rdtsc() - t0 < spin_ticks_) {
         _mm_pause();
@@ -201,13 +209,20 @@ void ParallelCp::WaitHead(u64 target, bool full) {
         t1_wait_target_.store(0, std::memory_order_relaxed);
         h = head_.load(std::memory_order_acquire);
     }
-    const u64 ticks = __rdtsc() - t0;
+    const u64 t1 = __rdtsc();
+    const u64 ticks = t1 - t0;
     if (full) {
         t1_.t1_full_ticks += ticks;
         ++t1_.t1_full_waits;
     } else {
         t1_.t1_drain_ticks += ticks;
     }
+    // P4.12: what thread 1 waited for - thread 2 executing records up to `target` (a: the target; b: records then
+    // queued; c: the drain's reason)
+    StallTrace::Span(!full ? StallTrace::Ev::Drain
+                     : why == kWhyJournal ? StallTrace::Ev::JournalFull
+                                          : StallTrace::Ev::QueueFull,
+                     t0, t1, target, static_cast<u32>(target - std::min(target, h0)), why);
 }
 
 void ParallelCp::ApplyPending() {
@@ -258,7 +273,7 @@ void ParallelCp::Drain(DrainReason why) {
     } else {
         ++t1_.drains;
         ++t1_.drains_by[static_cast<size_t>(why)];
-        WaitHead(next_, false);
+        WaitHead(next_, false, static_cast<u16>(why));
     }
     // thread 2 is parked (it waits for the next record): what is not handed on yet is applied here
     ApplyPending();
@@ -313,7 +328,7 @@ void ParallelCp::JournalReserve(u32 words) {
         BeginRecord(Kind::Journal);
         PushRecord();
         ++t1_.journal_records;
-        WaitHead(next_, true);
+        WaitHead(next_, true, kWhyJournal);
     }
     if (wrap) {
         journal_[idx] = u32{kOpPad} << 28; // the entry starts at the ring's start
@@ -589,6 +604,8 @@ void ParallelCp::ApplyDeferred(u64 before) {
 
 void ParallelCp::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuRecord");
+    StallTrace::RegisterThread(StallTrace::Role::Record);
+    const bool trace_records = StallTrace::DeepRecords();
     u64 h = head_.load(std::memory_order_relaxed);
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
     for (;;) {
@@ -609,18 +626,27 @@ void ParallelCp::Loop() {
                 t2_waiting_.store(0, std::memory_order_relaxed);
                 t = tail_.load(std::memory_order_acquire);
             }
-            add(t2_idle_, __rdtsc() - w0);
+            const u64 w1 = __rdtsc();
+            add(t2_idle_, w1 - w0);
+            // P4.12: waited for record h - thread 1 pushed it at push_tsc_[h] (deep), the wake-up is the rest
+            StallTrace::Span(StallTrace::Ev::RecordWait, w0, w1, push_tsc_ != nullptr ? push_tsc_[h & (kRecRing - 1)] : 0,
+                             static_cast<u32>(h));
         }
         const u64 b0 = __rdtsc();
         Record& r = slots_[h & (kSlots - 1)];
         const bool stop = r.kind == Kind::Stop;
+        const u16 kind = static_cast<u16>(r.kind); // (before Execute: a record is not touched by thread 1 until head_ moves)
         if (!stop) {
             Execute(r, h);
             if (rec_value_ != nullptr) {
                 rec_value_[h & (kRecRing - 1)].store(exec_.RecordedValue(), std::memory_order_relaxed);
             }
         }
-        add(t2_busy_, __rdtsc() - b0);
+        const u64 b1 = __rdtsc();
+        add(t2_busy_, b1 - b0);
+        if (trace_records) {
+            StallTrace::Span(StallTrace::Ev::Record, b0, b1, 0, static_cast<u32>(h), kind);
+        }
         add(t2_records_, 1);
         ++h;
         head_.store(h, std::memory_order_seq_cst);
@@ -643,6 +669,7 @@ void ParallelCp::RunCopy(const Record& r) {
     // the executor refused what thread 1 accepted by its shape: the processor's own fallback, here in stream order -
     // the earlier work completes, the CPU copies (caches invalidated), the copy's work number completes with the next
     // batch (its fences wait for it as for a recorded copy)
+    const StallTrace::Scope trace_copy(StallTrace::Ev::CopyFallback, r.bytes);
     exec_.Synchronize(r.queue);
     if (copy_fallback_ == nullptr || !copy_fallback_(copy_ctx_, r.src, r.dst, r.bytes)) {
         // P4.11: what the processor does with a DMA it cannot copy (a failed submission: an error, the game goes on) -

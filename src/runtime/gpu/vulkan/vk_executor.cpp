@@ -24,6 +24,7 @@
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/shader/shader_frontend.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_capture.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
@@ -357,6 +358,8 @@ bool Executor::Begin() {
     cur_.work.fill(0);
     cur_.queues.clear();
     cur_.value = timeline_.Next();
+    cur_.trace_frame = StallTrace::CurrentFrame(); // (P4.12)
+    cur_.submit_t0 = cur_.submit_t1 = 0;
     g_diag_submission.store(cur_.value, std::memory_order_relaxed);
     batch_first_cmd_ = batch_last_cmd_ = 0;
     if (diag_ != nullptr && diag_->Enabled()) {
@@ -725,8 +728,15 @@ void Executor::Flush() {
     g_diag_submission.store(cur_.value, std::memory_order_relaxed);
     VkResult r;
     const u64 submit_t0 = GS::Ticks();
+    u64 locked_t = 0;
+    bool contended = false;
     {
-        std::scoped_lock lock{ctx_.QueueMutex()};
+        std::unique_lock lock{ctx_.QueueMutex(), std::try_to_lock};
+        if (!lock.owns_lock()) {
+            contended = true; // (P4.12: the present thread or another submitter holds the queue)
+            lock.lock();
+        }
+        locked_t = GS::Ticks();
         // the video memory the batch's commands need bound first (the binds signal their own timeline)
         VkSemaphore bind_sem = VK_NULL_HANDLE;
         u64 bind_value = 0;
@@ -744,7 +754,16 @@ void Executor::Flush() {
                                .pSignalSemaphoreInfos = &signal};
         r = f.vkQueueSubmit2(ctx_.Queue(), 1, &si, VK_NULL_HANDLE);
     }
-    stats_.submit_ns += GS::TicksToNs(GS::Ticks() - submit_t0);
+    const u64 submit_t1 = GS::Ticks();
+    stats_.submit_ns += GS::TicksToNs(submit_t1 - submit_t0);
+    cur_.submit_t0 = submit_t0;
+    cur_.submit_t1 = submit_t1;
+    if (StallTrace::On()) {
+        if (contended) {
+            StallTrace::Span(StallTrace::Ev::QueueLock, submit_t0, locked_t, cur_.value);
+        }
+        StallTrace::Span(StallTrace::Ev::Submit, locked_t, submit_t1, cur_.value, static_cast<u32>(commands_));
+    }
     if (diag_ != nullptr) {
         diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
     }
@@ -773,6 +792,9 @@ void Executor::Poll() {
         return;
     }
     FrameLog::GpuCompleted(completed);
+    if (StallTrace::On() && !in_flight_.empty() && in_flight_.front().value <= completed) {
+        StallTrace::Instant(StallTrace::Ev::GpuCompleted, completed); // (P4.12: the labels of these batches land now)
+    }
     while (!in_flight_.empty() && in_flight_.front().value <= completed) {
         Batch b = std::move(in_flight_.front());
         in_flight_.pop_front();
@@ -807,6 +829,7 @@ void Executor::Poll() {
                 ts[1] >= ts[0]) {
                 stats_.gpu_busy_ns += static_cast<u64>(static_cast<double>(ts[1] - ts[0]) * ctx_.Caps().timestamp_period);
                 ++stats_.gpu_batches_timed;
+                StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame); // (P4.12)
                 if (insp_catalog_ != nullptr) {
                     // the frame's GPU time: the union of its batches' intervals (one queue; a batch's start may come
                     // before the previous one's end - its top-of-pipe timestamp)
@@ -1845,6 +1868,9 @@ void Executor::SyncFrom(u32 source) {
         ++stats_.flushes_sync;
         Flush();
     }
+    // P4.12: the wait for every batch submitted so far (its own flush above is in the Submit span)
+    const StallTrace::Scope trace_sync(StallTrace::Ev::GpuSync, in_flight_.empty() ? 0 : in_flight_.back().value, 0,
+                                       static_cast<u16>(source));
     // until done (a CPU access follows): a timeout without a lost device waits on (review MEDIUM 6)
     for (u32 round = 0; !in_flight_.empty() && !timeline_.Wait(in_flight_.back().value, 5'000'000'000ull); ++round) {
         if (timeline_.Lost()) {
@@ -4920,7 +4946,10 @@ void Executor::Flip(const Cp::FlipMarker&) {
             img = images_.Find(layout, ImageCache::Use::Texture, cur_.cb, cur_.value, err);
         }
         if (img != nullptr) {
-            frame = presenter_->AcquireFrame(250);
+            {
+                const StallTrace::Scope trace_acquire(StallTrace::Ev::FlipAcquire); // (P4.12)
+                frame = presenter_->AcquireFrame(250);
+            }
             if (frame >= 0) {
                 if (pending_writes_) {
                     GlobalBarrier();

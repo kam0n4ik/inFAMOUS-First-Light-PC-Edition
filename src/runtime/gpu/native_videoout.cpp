@@ -18,6 +18,7 @@
 #include "base/log.h"
 #include "runtime/exports.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/kernel/event_queues.h"
 
@@ -198,6 +199,7 @@ void CompleteFlip(const FlipRequest& r) {
 void PresentThread() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:VideoOutPresent");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    StallTrace::RegisterThread(StallTrace::Role::Present);
     const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LARGE_INTEGER freq{}, now{};
     QueryPerformanceFrequency(&freq);
@@ -221,6 +223,7 @@ void PresentThread() {
         QueryPerformanceCounter(&now);
         const double wait = next - static_cast<double>(now.QuadPart);
         if (wait > 0) {
+            const StallTrace::Scope trace_vblank(StallTrace::Ev::VblankWait); // (P4.12)
             const LONGLONG hundred_ns = static_cast<LONGLONG>(wait * 1e7 / static_cast<double>(freq.QuadPart));
             if (timer != nullptr && hundred_ns > 0) {
                 LARGE_INTEGER due{};
@@ -268,6 +271,7 @@ void PresentThread() {
                     take = true;
                     last_flip_vcount = vcount;
                 } else {
+                    StallTrace::Instant(StallTrace::Ev::NotReady, g_port.requests.front().gpu_value); // (P4.12)
                     std::scoped_lock s{g_stats_mutex};
                     ++g_stats.waited_vblanks;
                 }

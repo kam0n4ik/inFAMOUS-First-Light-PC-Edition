@@ -60,6 +60,7 @@
 #include "runtime/gpu/gnm/gnm_init_sequences.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/pm4.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/kernel/event_queues.h"
 #include "runtime/kernel/kernel.h"
@@ -292,7 +293,9 @@ void WaitGpuIdle() {
     }
     const u64 t0 = __rdtsc();
     g_idle_cv.wait(lk, [] { return !g_submission_locked; });
-    FrameLog::GameIdleWait(static_cast<u64>(static_cast<double>(__rdtsc() - t0) * 1e9 /
+    const u64 t1 = __rdtsc();
+    StallTrace::Span(StallTrace::Ev::GameIdleWait, t0, t1); // (P4.12)
+    FrameLog::GameIdleWait(static_cast<u64>(static_cast<double>(t1 - t0) * 1e9 /
                                             static_cast<double>(std::max<u64>(Kernel::Clock::TscFrequency(), 1))));
 }
 
@@ -606,7 +609,13 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
         FramePacing::Mark(FramePacing::Event::SubmitEnter);
     }
     FrameLog::GameFlipEnter();
+    StallTrace::RegisterThread(StallTrace::Role::Game); // (P4.12: its log made here once - not under the submit lock)
+    const StallTrace::Scope trace_flip(StallTrace::Ev::GameSubmitFlip); // (P4.12: entry to return)
+    const u64 lock_t0 = StallTrace::On() ? StallTrace::Now() : 0;
     std::scoped_lock lk{g_submit_mutex};
+    if (lock_t0 != 0) {
+        StallTrace::Span(StallTrace::Ev::GameSubmitLock, lock_t0, StallTrace::Now());
+    }
     WaitGpuIdle();
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::SubmitUnblocked);

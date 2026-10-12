@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include "base/log.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 
 #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
@@ -252,7 +253,11 @@ StreamRing::Status StreamRing::Allocate(u64 bytes, u64 align, u64 seq, Slice& ou
         }
         ++waits_;
         const u64 wait_for = fences_.front().seq;
-        if (wait_for > timeline_.LastSubmitted() || !timeline_.Wait(wait_for, 10'000'000'000ull)) {
+        if (wait_for > timeline_.LastSubmitted()) {
+            return Status::NeedFlush;
+        }
+        const StallTrace::Scope trace_wait(StallTrace::Ev::RingWait, wait_for); // (P4.12)
+        if (!timeline_.Wait(wait_for, 10'000'000'000ull)) {
             return Status::NeedFlush;
         }
         Collect(timeline_.Completed());

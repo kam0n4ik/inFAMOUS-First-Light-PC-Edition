@@ -16,6 +16,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/png_writer.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 
@@ -616,6 +617,7 @@ bool Presenter::RecordCopy(VkCommandBuffer cb, s32 frame, VkImage src, VkFormat 
 }
 
 void Presenter::Present(s32 frame, u64 flip_id) {
+    const StallTrace::Scope trace_present(StallTrace::Ev::Present, flip_id); // (P4.12)
     Impl& m = *impl_;
     const auto& f = Fn();
     Impl::Frame* fr = (frame >= 0 && frame < static_cast<s32>(kFrames)) ? &m.frames[frame] : nullptr;
@@ -641,10 +643,16 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     }
     Impl::Slot& s = m.slots[m.slot];
     m.slot = (m.slot + 1) % m.slots.size();
-    f.vkWaitForFences(m.ctx.Device(), 1, &s.fence, VK_TRUE, 2'000'000'000ull);
+    {
+        const StallTrace::Scope trace_fence(StallTrace::Ev::PresentFence);
+        f.vkWaitForFences(m.ctx.Device(), 1, &s.fence, VK_TRUE, 2'000'000'000ull);
+    }
     u32 index = 0;
-    VkResult r = f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, VK_NULL_HANDLE,
-                                         &index);
+    VkResult r;
+    {
+        const StallTrace::Scope trace_acquire(StallTrace::Ev::PresentAcquire);
+        r = f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, VK_NULL_HANDLE, &index);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         m.Recreate();
         release();
@@ -782,7 +790,15 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                            .pSignalSemaphoreInfos = &signal};
     VkResult pr = VK_SUCCESS;
     {
-        std::scoped_lock lock{m.ctx.QueueMutex()};
+        const u64 lock_t0 = StallTrace::On() ? StallTrace::Now() : 0;
+        std::unique_lock lock{m.ctx.QueueMutex(), std::try_to_lock};
+        if (!lock.owns_lock()) {
+            lock.lock(); // (P4.12: a batch's submission holds the queue)
+            if (lock_t0 != 0) {
+                StallTrace::Span(StallTrace::Ev::QueueLock, lock_t0, StallTrace::Now(), flip_id);
+            }
+        }
+        const StallTrace::Scope trace_submit(StallTrace::Ev::PresentSubmit, flip_id);
         r = f.vkQueueSubmit2(m.ctx.Queue(), 1, &si, s.fence);
         if (r == VK_SUCCESS) {
             const VkPresentInfoKHR pi{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,

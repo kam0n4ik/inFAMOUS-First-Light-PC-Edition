@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/stall_trace.h"
 
 namespace SecondSon::Gpu::Shader {
 
@@ -342,7 +343,9 @@ void ShaderFrontend::Run(Job& job) {
         result.error = TranslationError::Emit;
         result.detail = "the translator threw";
     }
-    const u64 ns = TicksToNs(Ticks() - t0);
+    const u64 t1 = Ticks();
+    StallTrace::Span(StallTrace::Ev::ShaderTranslate, t0, t1, job.program->footer_hash); // (P4.12)
+    const u64 ns = TicksToNs(t1 - t0);
     const bool ok = result.Ok();
     runs_total_.fetch_add(1, std::memory_order_relaxed);
     run_ns_total_.fetch_add(ns, std::memory_order_relaxed);

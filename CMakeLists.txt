@@ -53,6 +53,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/frame_log.cpp
     src/runtime/gpu/inspector.cpp
     src/runtime/gpu/inspector_catalog.cpp
+    src/runtime/gpu/stall_trace.cpp
     src/runtime/gpu/frame_pacing.cpp
     src/runtime/gpu/gnm/gnm_driver.cpp
     src/runtime/gpu/pm4.cpp

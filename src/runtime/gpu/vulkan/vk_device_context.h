@@ -58,6 +58,7 @@ struct DeviceCaps {
     bool checkpoints = false;       ///< VK_NV_device_diagnostic_checkpoints (diagnostics)
     bool buffer_markers = false;    ///< VK_AMD_buffer_marker (diagnostics)
     bool diagnostics_config = false; ///< VK_NV_device_diagnostics_config (diagnostics)
+    bool calibrated_timestamps = false; ///< VK_EXT_calibrated_timestamps (P4.12 stall trace, deep mode only)
     bool validation = false; ///< the validation layer is on
     u32 subgroup_size = 0;
     u32 max_push_descriptors = 0;

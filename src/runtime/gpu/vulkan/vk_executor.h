@@ -309,6 +309,9 @@ private:
         u8 insp_last = 0xFF;
         bool insp_overflow = false;
         u32 insp_frame = 0;
+        // P4.12 stall trace: the submission (TSC before the queue's lock, after vkQueueSubmit2), the frame recorded in
+        u64 submit_t0 = 0, submit_t1 = 0;
+        u32 trace_frame = 0;
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};

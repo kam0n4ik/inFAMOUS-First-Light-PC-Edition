@@ -92,6 +92,8 @@ class Thread:
         self.switched_out_at: int | None = None
         self.out_reason = ""
         self.ready_at: int | None = None
+        self.ready_waits: list[int] = []  # (P4.12) each readied -> running delay, us
+        self.run_by_cpu: collections.Counter[int] = collections.Counter()  # (P4.12) run time per logical CPU, us
 
 
 def classify(frames: list[str], guest_ranges: list[tuple[int, int, str]], ip: int) -> tuple[str, str]:
@@ -261,6 +263,7 @@ def main() -> int:
                 if prev and prev[1] == pid and prev[0] == old_tid:
                     t = th(old_tid)
                     t.run_us += ts - prev[2]
+                    t.run_by_cpu[cpu] += ts - prev[2]
                 if old_pid == pid:
                     t = th(old_tid)
                     t.switched_out_at = ts
@@ -275,6 +278,7 @@ def main() -> int:
                     if t.ready_at is not None:
                         t.ready_wait_us += ts - t.ready_at
                         t.ready_count += 1
+                        t.ready_waits.append(ts - t.ready_at)
                         t.ready_at = None
                 cpu_cur[cpu] = (new_tid, new_pid, ts)
                 continue
@@ -358,6 +362,12 @@ def main() -> int:
             "samples": t.samples, "kernel_pct": round(100 * t.kernel_samples / t.samples, 1) if t.samples else None,
             "switch_ins": t.switch_ins,
             "ready_wait_ms_avg": round(t.ready_wait_us / t.ready_count / 1000, 3) if t.ready_count else None,
+            # (P4.12) the readied -> running delays' distribution, the run time per logical CPU
+            "ready_count": t.ready_count, "ready_wait_ms_total": round(t.ready_wait_us / 1000, 2),
+            **({f"ready_wait_us_p{q}": sorted(t.ready_waits)[min(len(t.ready_waits) - 1, int(q / 100 * len(t.ready_waits)))]
+                for q in (50, 95, 99)} if t.ready_waits else {}),
+            "ready_wait_us_max": max(t.ready_waits) if t.ready_waits else None,
+            "run_ms_by_cpu": {c: round(v / 1000, 1) for c, v in sorted(t.run_by_cpu.items())},
             "categories_ms": {k: round(v * ms_per_sample, 1) for k, v in t.cats.most_common()},
             "top_leaf": [[k, v] for k, v in t.leaf.most_common(8)],
             "wait_reasons": dict(t.wait_reasons.most_common(6)),
