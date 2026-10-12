@@ -26,6 +26,7 @@ src/bridge/shadps4/selftest_shader.cpp | tests | SecondSonPC's shader frontend, 
 src/bridge/shadps4/guest_stack.cpp | kernel (threads) | guest stacks in the selected guest memory manager | core/guest_memory.h
 src/bridge/shadps4/guest_stack.h | kernel (threads) | VAddr | common/types.h
 src/bridge/shadps4/input_host.cpp | input | Pad::Host over the bridge's SDL controllers, overlay, clock | common/elf_info.h common/singleton.h core/libraries/kernel/time.h imgui/renderer/imgui_core.h input/controller.h input/input_handler.h sdl_window.h
+src/bridge/shadps4/settings_host.cpp | pc settings | the bridge's own run-time controls of what it owns while playing (master volume, its FPS counter overlay, FSR/RCAS of its presenter) and the capabilities of the run | core/devtools/layer.h core/emulator_settings.h video_core/renderer_vulkan/vk_presenter.h
 src/bridge/shadps4/kernel_host.cpp | kernel | Kernel::Host and ThreadHost: errno and clock adapters (patches 0023/0024), TCB slot, debugger thread list | core/debug_state.h core/guest_memory.h core/libraries/kernel/kernel.h core/libraries/kernel/threads/pthread.h core/libraries/kernel/time.h core/tls.h
 src/bridge/shadps4/lifecycle_host.cpp | lifecycle | the bridge's Emulator::Shutdown hook (patch 0026), its log flush | common/logging/log.h emulator.h
 src/bridge/shadps4/loader_host.cpp | loader, cpu | Loader::Host over the guest memory interfaces, TCB slot (patch 0021), the bridge's CPU patcher | common/elf_info.h common/thread.h core/cpu_patches.h core/guest_memory.h core/libraries/kernel/threads.h core/tls.h

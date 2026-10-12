@@ -4,6 +4,7 @@
 #include "runtime/pad/pad.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -117,6 +118,8 @@ s32 g_next_handle = 1;
 std::map<s32, Opened> g_handles;
 u64 g_virtual_touch_down_us = 0;
 bool g_virtual_touch = false;
+Input::GamepadTuning g_tuning;         // [Gamepad] (g_mutex)
+std::atomic<bool> g_menu_blocks{false}; // SecondSonPC's settings menu has the input
 
 s32 SlotOf(s32 handle) {
     const auto it = g_handles.find(handle);
@@ -147,7 +150,7 @@ void Fill(PadData& d, s32 slot, Input::ReadInfo* info = nullptr) {
     d.connected = true;
     d.timestamp = now;
     d.connected_count = physical ? p.connected_count : 1;
-    if (host->OverlayHasInput()) {
+    if (host->OverlayHasInput() || g_menu_blocks.load(std::memory_order_relaxed)) {
         d.buttons = kIntercepted;
         d.left_x = d.left_y = d.right_x = d.right_y = 128;
         return;
@@ -163,6 +166,7 @@ void Fill(PadData& d, s32 slot, Input::ReadInfo* info = nullptr) {
     u32 buttons = v.buttons;
     u8 lx = v.lx, ly = v.ly, rx = v.rx, ry = v.ry, l2 = v.l2, r2 = v.r2;
     if (physical) {
+        Input::TuneRightStick(p.rx, p.ry, g_tuning); // the camera stick ([Gamepad]; neutral: unchanged)
         buttons |= p.buttons;
         if (Deflection(p.lx, p.ly) > Deflection(lx, ly)) {
             lx = p.lx;
@@ -503,9 +507,11 @@ SSPC_SYSV_ABI s32 SetLightBar(s32 handle, const LightBarParam* param) {
 
 SSPC_SYSV_ABI s32 SetVibration(s32 handle, const VibrationParam* param) {
     s32 slot;
+    u32 percent;
     {
         std::scoped_lock lock{g_mutex};
         slot = SlotOf(handle);
+        percent = g_tuning.vibration_percent;
     }
     if (slot == kNoHandle) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
@@ -514,7 +520,9 @@ SSPC_SYSV_ABI s32 SetVibration(s32 handle, const VibrationParam* param) {
         return ORBIS_PAD_ERROR_INVALID_ARG;
     }
     if (Host* host = g_host; host != nullptr && slot >= 0) {
-        host->SetVibration(slot, param->large_motor, param->small_motor);
+        // [Gamepad] vibration: the strength the game asks for, scaled (100 %: unchanged, 0 %: motors off)
+        host->SetVibration(slot, Input::ScaleMotor(param->large_motor, percent),
+                           Input::ScaleMotor(param->small_motor, percent));
     }
     return ORBIS_OK;
 }
@@ -539,6 +547,15 @@ const Runtime::Export kExports[] = {
 void SetHost(Host* host) {
     std::scoped_lock lock{g_mutex};
     g_host = host;
+}
+
+void SetGamepadTuning(const Input::GamepadTuning& tuning) {
+    std::scoped_lock lock{g_mutex};
+    g_tuning = tuning;
+}
+
+void SetMenuBlocksInput(bool blocked) {
+    g_menu_blocks.store(blocked, std::memory_order_relaxed);
 }
 
 void SetInputLog(bool on) {

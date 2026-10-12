@@ -9,6 +9,7 @@
 #include "base/abi.h"
 #include "base/log.h"
 #include "input/settings.h"
+#include "settings/pc_settings.h"
 
 namespace SecondSon::App {
 
@@ -60,6 +61,10 @@ struct Config {
 
     // [Input] + [Keyboard]: the keyboard/mouse controller of player 1 (docs/INPUT_MAPPING.md)
     Input::Settings input = Input::DefaultSettings();
+
+    // [Display] monitor, [Graphics], [Gamepad], [Interface]: PC settings of the in-game settings menu, parsed through
+    // the settings registry (docs/PC_SETTINGS_IMPLEMENTATION.md)
+    Settings::PcSettings pc;
 
     // [Log]
     Log::Level log_level = Log::Level::Info;

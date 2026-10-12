@@ -20,6 +20,7 @@
 #include "input/keyboard_mouse.h"
 #include "runtime/pad/pad.h"
 #include "sdl_window.h"
+#include "ui/menu_controller.h"
 
 namespace SecondSon::Bridge {
 
@@ -96,6 +97,15 @@ public:
 };
 
 bool InterceptWindowEvent(const SDL_Event& event) {
+    // SecondSonPC's settings menu first (F1, its controller button; everything while it is open).
+    switch (Ui::Menu().OnEvent(event)) {
+    case Ui::EventRoute::Consumed:
+        return true;
+    case Ui::EventRoute::BridgeOnly:
+        return false;
+    case Ui::EventRoute::Normal:
+        break;
+    }
     const auto r = Input::Player1().OnEvent(event);
     if (r.hotkey == Input::KeyboardMouse::Hotkey::ToggleFps) {
         SDL_Event fps{};

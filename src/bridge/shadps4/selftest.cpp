@@ -58,6 +58,7 @@
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/pthread_sync.h"
 #include "runtime/memory/direct_memory.h"
+#include "settings/settings_checks.h"
 #include "runtime/psf/param_sfo.h"
 #include "runtime/user/user_service.h"
 
@@ -4829,6 +4830,26 @@ void TestGuestMemoryApi(Totals& t) {
     c.Summary();
 }
 
+/// PC settings (docs/PC_SETTINGS_IMPLEMENTATION.md): registry, user file, service, bindings, controllers, menu model.
+void TestPcSettings(Totals& t, const App::Config& cfg) {
+    std::map<std::string, std::unique_ptr<InputChecks>> groups; // stable names for InputChecks
+    std::vector<InputChecks*> order;
+    ::SecondSon::Settings::RunChecks(
+        [&](std::string_view group, std::string_view what, bool ok, const std::string& detail) {
+            auto& c = groups[std::string(group)];
+            if (!c) {
+                const auto it = groups.find(std::string(group));
+                c = std::make_unique<InputChecks>(t, it->first.c_str());
+                order.push_back(c.get());
+            }
+            c->Check(std::string(what), ok, detail);
+        },
+        cfg.logs_dir / "selftest_settings");
+    for (auto* c : order) {
+        c->Summary();
+    }
+}
+
 int RunSelfTest(const App::Config& cfg) {
     Totals t;
     TestParamSfo(t, cfg);
@@ -4839,6 +4860,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestUserService(t);
     TestPad(t);
     TestInput(t);
+    TestPcSettings(t, cfg);
     TestKernelTime(t);
     TestKernelSema(t);
     TestKernelEventFlag(t);

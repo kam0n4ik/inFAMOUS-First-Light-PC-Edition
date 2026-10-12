@@ -9,6 +9,7 @@
 #include <span>
 
 #include "base/abi.h"
+#include "input/gamepad_tuning.h"
 #include "input/motion.h"
 
 namespace SecondSon::Runtime {
@@ -55,6 +56,11 @@ public:
     virtual bool ReportsTouchTime() = 0;
 };
 void SetHost(Host* host);
+/// [Gamepad] PC options of the real controllers (right stick sensitivity/inversion, rumble strength). Any thread.
+void SetGamepadTuning(const Input::GamepadTuning& tuning);
+/// SecondSonPC's settings menu is open (or a controller button that closed it is still held): the game reads
+/// "intercepted" pads, as when the bridge overlay navigates. Any thread.
+void SetMenuBlocksInput(bool blocked);
 /// [Debug] inputLog: once a second while player 1's right stick or mouse is active, what
 /// scePadReadState hands the game and what the game's stick filter made of it.
 void SetInputLog(bool on);
