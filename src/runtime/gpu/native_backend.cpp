@@ -56,6 +56,9 @@ public:
     PageTracker* tracker = nullptr;
     Vk::BufferCache* buffers = nullptr; ///< its video memory copy of what the processor writes is invalidated
     Vk::Executor* executor = nullptr; ///< its writes on the GPU's timeline land before a read of them
+    /// P5.2: the processor's writes reach the shader frontend's code trust (set when the frontend runs on the
+    /// processor's thread)
+    GS::ShaderFrontend* frontend = nullptr;
     /// P4.10 (SSPC_P410_PARALLEL_CP=1): the recording thread executes draws behind the processor - what this memory
     /// does to the executor goes through it (drained first, or handed on in stream order)
     ParallelCp* parallel = nullptr;
@@ -97,6 +100,9 @@ public:
         return unordered_labels && VideoOut::IsLabel(addr, bytes);
     }
     bool Write(u64 addr, const void* src, u64 bytes) override {
+        if (frontend != nullptr) {
+            frontend->GpuWrote(addr, bytes); // (P5.2)
+        }
         if (parallel != nullptr) {
             parallel->MemoryChanged(); // (with the next record: where the write is in the stream)
         } else if (executor != nullptr) {
@@ -644,6 +650,10 @@ bool Backend::Start(const Options& o, std::string& error) {
         },
         &tracker_);
     memory_.tracker = &tracker_;
+    // (P5.2: the parallel processor runs the frontend on its thread unless SSPC_P410_FRONTEND=0)
+    if (char v[4] = {}; !parallel_ || !(GetEnvironmentVariableA("SSPC_P410_FRONTEND", v, sizeof(v)) == 1 && v[0] == '0')) {
+        memory_.frontend = frontend_.get();
+    }
     memory_.buffers = buffers_.get();
     memory_.executor = executor_.get();
     memory_.parallel = parallel_.get();

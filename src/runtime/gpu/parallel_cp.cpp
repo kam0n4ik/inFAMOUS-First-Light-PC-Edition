@@ -372,6 +372,9 @@ void ParallelCp::AddGpuWrite(u64 begin, u64 end, u64 record, u64 value) {
     }
     gw_.push_back({begin, end, record, value});
     ++t1_.gpu_writes;
+    if (frontend_ != nullptr) {
+        frontend_->GpuWrote(begin, end - begin); // (P5.2: trusted shader code under a GPU write is read again)
+    }
     t1_.gw_max = std::max<u64>(t1_.gw_max, gw_.size());
     const u64 b0 = begin >> kGwBlockBits, b1 = std::min((end - 1) >> kGwBlockBits, kGwWords * 64 - 1);
     for (u64 b = b0; b <= b1; ++b) {

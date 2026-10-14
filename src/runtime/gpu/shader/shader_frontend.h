@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "base/abi.h"
@@ -187,6 +188,11 @@ public:
     /// P5.2: the write tracker for FrontendOptions::code_trust (its writes come back through Invalidate). Before the
     /// first draw, on the thread that prepares draws.
     void SetCodeTracker(TrackCodeFn track, void* ctx);
+    /// P5.2: the GPU or the command processor writes [addr, addr + size) (a processor write, a DMA copy on the GPU's
+    /// timeline; written buffer bindings are noted by the frontend itself): trusted shader code there is read again at
+    /// its next use, and the write is counted (the CPU's writes reach Invalidate through the write tracking). The
+    /// thread that prepares draws.
+    void GpuWrote(u64 addr, u64 size);
     /// Guest memory may have changed (a GPU command's write, the command processor's, a met wait, a new submission):
     /// no stage takes its memoized preparation again - its resources are read anew (P4.7).
     void GuestMemoryChanged() { memory_gen_.fetch_add(1, std::memory_order_relaxed); }
@@ -259,6 +265,13 @@ private:
     ShaderTranslator* translator_ = nullptr;
     ProgramCache programs_;
     FetchCache fetches_;
+    // P5.2 code trust: the tracker the caches call through TrackCode, and the 64 KiB blocks of tracked code (GpuWrote)
+    static bool TrackCode(void* self, u64 addr, u64 size);
+    void NoteGpuWrites(const StageView& s);
+    TrackCodeFn code_track_ = nullptr;
+    void* code_track_ctx_ = nullptr;
+    std::unordered_set<u64> code_blocks_;
+    u64 gpu_writes_checked_ = 0, gpu_code_writes_ = 0;
     PipelineStateCache pipelines_;
     std::array<StageView, static_cast<size_t>(HwStage::Count)> stages_{};
     std::array<bool, static_cast<size_t>(HwStage::Count)> runtime_valid_{};

@@ -1647,6 +1647,9 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
         ++stats_.tc_refused;
         return false;
     }
+    if (memo_bumps_) {
+        frontend_.GpuWrote(dst, bytes); // (P5.2: the frontend runs on this thread; trusted shader code there is re-read)
+    }
     if (!Begin()) {
         return false;
     }

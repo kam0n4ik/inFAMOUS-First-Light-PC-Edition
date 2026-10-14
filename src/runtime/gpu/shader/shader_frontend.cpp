@@ -243,8 +243,52 @@ void ShaderFrontend::NewFrame() {
 }
 
 void ShaderFrontend::SetCodeTracker(TrackCodeFn track, void* ctx) {
-    programs_.SetCodeTrust(options_.code_trust, track, ctx);
-    fetches_.SetCodeTrust(options_.code_trust, track, ctx);
+    code_track_ = track;
+    code_track_ctx_ = ctx;
+    programs_.SetCodeTrust(options_.code_trust, track != nullptr ? &TrackCode : nullptr, this);
+    fetches_.SetCodeTrust(options_.code_trust, track != nullptr ? &TrackCode : nullptr, this);
+}
+
+bool ShaderFrontend::TrackCode(void* self, u64 addr, u64 size) {
+    auto* f = static_cast<ShaderFrontend*>(self);
+    if (!f->code_track_(f->code_track_ctx_, addr, size)) {
+        return false;
+    }
+    for (u64 b = addr >> 16; b <= (addr + size - 1) >> 16; ++b) {
+        f->code_blocks_.insert(b);
+    }
+    return true;
+}
+
+void ShaderFrontend::GpuWrote(u64 addr, u64 size) {
+    if (code_blocks_.empty() || size == 0) {
+        return;
+    }
+    ++gpu_writes_checked_;
+    const u64 first = addr >> 16, last = (addr + size - 1) >> 16;
+    bool hit = last - first > 4096; // (a huge range: let the caches' own range checks decide)
+    for (u64 b = first; !hit && b <= last; ++b) {
+        hit = code_blocks_.contains(b);
+    }
+    if (!hit) {
+        return;
+    }
+    const u64 before = programs_.Stats().invalidations + fetches_.invalidations;
+    Invalidate(addr, size);
+    if (programs_.Stats().invalidations + fetches_.invalidations != before) {
+        ++gpu_code_writes_; // the GPU or the processor wrote over trusted shader code
+    }
+}
+
+void ShaderFrontend::NoteGpuWrites(const StageView& s) {
+    if (code_blocks_.empty()) {
+        return;
+    }
+    for (const BufferBinding& b : s.plan.buffers) {
+        if (b.kind == BufferKind::Guest && b.written && b.status == ResourceStatus::Ok && b.size != 0) {
+            GpuWrote(b.address, b.size);
+        }
+    }
 }
 
 void ShaderFrontend::Invalidate(u64 addr, u64 size) {
@@ -498,6 +542,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
             if (!memo_verify_) {
                 ++stats_.memo_hits;
                 ++s.module->uses;
+                NoteGpuWrites(s); // (P5.2: its writes happen again with this draw)
                 return StageStatus::Ready;
             }
             verify = StageFingerprint(s);
@@ -692,6 +737,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     memo.addr = addr;
     memo.start = start;
     std::memcpy(memo.user_data.data(), user_data.data(), sizeof(memo.user_data));
+    NoteGpuWrites(s); // (P5.2)
     return StageStatus::Ready;
 }
 
@@ -834,12 +880,13 @@ std::string ShaderFrontend::Report() const {
     t += fmt::format("\nfetch shaders: {} (reads {}, changed {})\n", fetches_.Size(), fetches_.reads,
                      fetches_.changed);
     t += fmt::format("code trust (P5.2, SSPC_P52_CODE_TRUST={}): programs trusted by write tracking {}, missed writes "
-                     "{}; fetch shaders trusted {}, invalidated {}, missed writes {}\n",
+                     "{}; fetch shaders trusted {}, invalidated {}, missed writes {}; GPU/processor writes checked {}, "
+                     "over tracked code {} (code blocks {})\n",
                      options_.code_trust == CodeTrust::On       ? "1"
                      : options_.code_trust == CodeTrust::Verify ? "verify"
                                                                 : "0",
                      pc.trusted_tracked, pc.trust_mismatches, fetches_.trusted_tracked, fetches_.invalidations,
-                     fetches_.trust_mismatches);
+                     fetches_.trust_mismatches, gpu_writes_checked_, gpu_code_writes_, code_blocks_.size());
     t += fmt::format("runtime parameters: built {}, kept {}\n", st.runtime_builds, st.runtime_reuse);
     t += fmt::format("modules: {} (layouts {}); key hits {}, misses {}, hash collisions {}, layout changed by the "
                      "specialization {}\n",
