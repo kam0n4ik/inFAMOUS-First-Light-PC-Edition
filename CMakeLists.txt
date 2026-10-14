@@ -25,7 +25,11 @@ add_library(sspc_runtime STATIC
     src/base/log.cpp
     src/base/vram_monitor.cpp
     src/engine/guest_hooks.cpp
+    src/engine/guest_probe.cpp
     src/engine/job_system.cpp
+    src/engine/render/dcb_scan.cpp
+    src/engine/render/frame_trace.cpp
+    src/engine/render/pass_graph.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
     src/input/settings.cpp
@@ -229,7 +233,11 @@ set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${
 add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     tools/engine_tests/main.cpp
     src/engine/guest_hooks.cpp
+    src/engine/guest_probe.cpp
     src/engine/job_system.cpp
+    src/engine/render/dcb_scan.cpp
+    src/engine/render/pass_graph.cpp
+    src/runtime/gpu/pm4.cpp
     src/base/log.cpp
 )
 target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

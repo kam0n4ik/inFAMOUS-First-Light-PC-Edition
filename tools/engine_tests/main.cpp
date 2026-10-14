@@ -16,7 +16,10 @@
 #include <windows.h>
 
 #include "engine/guest_hooks.h"
+#include "engine/guest_probe.h"
 #include "engine/job_system.h"
+#include "engine/render/dcb_scan.h"
+#include "engine/render/pass_graph.h"
 
 using namespace SecondSon;
 using namespace SecondSon::Engine;
@@ -322,6 +325,146 @@ void Bench() {
     }
 }
 
+// --- P5.3A: entry probe, command buffer walk, pass graph -------------------------------------------------------------
+
+using AddFn = SSPC_SYSV_ABI s32 (*)(s32, s32);
+AddFn g_add_original = nullptr;
+int g_add_probe_calls = 0;
+SSPC_SYSV_ABI s32 AddProbe(s32 a, s32 b) {
+    ++g_add_probe_calls;
+    return g_add_original(a, b) + 1000;
+}
+
+void TestEntryProbe() {
+    // mov eax, edi; add eax, esi; 10 x nop; ret - a System V add(a, b) whose 14-byte prologue moves to the trampoline.
+    u8 code[15] = {0x89, 0xF8, 0x01, 0xF0};
+    std::memset(code + 4, 0x90, 10);
+    code[14] = 0xC3;
+    auto* page = static_cast<u8*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    CHECK(page != nullptr);
+    std::memcpy(page, code, sizeof(code));
+    const u64 base = reinterpret_cast<u64>(page);
+    CHECK(reinterpret_cast<AddFn>(page)(2, 3) == 5);
+
+    u8 t[TrampolineSize(14)] = {};
+    CHECK(BuildTrampoline(code, 14, 0x1122334455667788ull, t) == 28);
+    CHECK(std::memcmp(t, code, 14) == 0 && t[14] == 0xFF && t[15] == 0x25 && t[16] == 0 && t[19] == 0);
+    u64 resume = 0;
+    std::memcpy(&resume, t + 20, 8);
+    CHECK(resume == 0x1122334455667788ull);
+
+    std::string error;
+    const ProbeSite wrong{{0, sizeof(code), HashBytes(code, sizeof(code)) ^ 1}, 14};
+    CHECK(InstallEntryProbe(base, wrong, reinterpret_cast<const void*>(&AddProbe), error) == nullptr);
+    CHECK(!error.empty());
+    CHECK(reinterpret_cast<AddFn>(page)(2, 3) == 5); // untouched
+    const ProbeSite short_prologue{{0, sizeof(code), HashBytes(code, sizeof(code))}, 13};
+    CHECK(InstallEntryProbe(base, short_prologue, reinterpret_cast<const void*>(&AddProbe), error) == nullptr);
+
+    const ProbeSite site{{0, sizeof(code), HashBytes(code, sizeof(code))}, 14};
+    void* original = InstallEntryProbe(base, site, reinterpret_cast<const void*>(&AddProbe), error);
+    CHECK(original != nullptr);
+    g_add_original = reinterpret_cast<AddFn>(original);
+    CHECK(g_add_original(20, 22) == 42);                         // the trampoline is the original function
+    CHECK(reinterpret_cast<AddFn>(page)(2, 3) == 1005);          // callers of the entry reach the probe
+    CHECK(reinterpret_cast<AddFn>(page)(-7, 7) == 1000 && g_add_probe_calls == 2);
+}
+
+struct Pm4Writer {
+    std::vector<u32> dw;
+    void Packet(u8 op, std::initializer_list<u32> body) {
+        dw.push_back(0xC0000000u | (static_cast<u32>(body.size() - 1) << 16) | (u32{op} << 8));
+        dw.insert(dw.end(), body);
+    }
+    void Context(u32 reg, u32 value) {
+        Packet(0x69, {reg, value});
+    }
+};
+
+void TestDcbScan() {
+    using namespace Render;
+    Pm4Writer w;
+    // Colour target 0: 1920x1080 at 0x1234500, format 0xA, number type 4.
+    w.Packet(0x69, {Reg::CbColor0Base, 0x12345, 1920 / 8 - 1, 1920 * 1080 / 64 - 1, 0, (0xAu << 2) | (4u << 8)});
+    w.Context(Reg::CbTargetMask, 0xF);
+    w.Context(Reg::CbColorControl, 1u << 4);
+    // Depth 1920x1080 at 0x20000, test + write.
+    w.Context(Reg::DbZInfo, 3);
+    w.Context(Reg::DbZReadBase, 0x200);
+    w.Context(Reg::DbZWriteBase, 0x200);
+    w.Context(Reg::DbDepthSize, (1920 / 8 - 1) | ((1080 / 8 - 1) << 11));
+    w.Context(Reg::DbDepthControl, 0x6);
+    w.Packet(0x76, {0x008, 0x100000, 0}); // SPI_SHADER_PGM_LO/HI_PS: program at 0x10000000
+    w.Packet(0x2F, {4});                  // NUM_INSTANCES
+    w.Packet(0x2D, {36, 2});              // DRAW_INDEX_AUTO 36 vertices
+    w.Packet(0x10, {0, 0, 0});            // NOP
+    w.Packet(0x2F, {1});
+    w.Context(Reg::CbTargetMask, 0);      // depth-only, test without write
+    w.Context(Reg::DbDepthControl, 0x2);
+    w.Packet(0x27, {100, 0, 0, 30, 0});   // DRAW_INDEX_2: 30 indices
+    w.Packet(0x76, {0x20C, 0x200000, 0}); // COMPUTE_PGM_LO/HI: 0x20000000
+    w.Packet(0x15, {8, 8, 1, 1});         // DISPATCH_DIRECT
+    w.Packet(0x58, {0, 0, 0, 0, 0, 0});   // ACQUIRE_MEM
+    w.dw.push_back(0xC0050000u | (0x10u << 8)); // NOP claiming 6 body dwords, truncated
+
+    ScanState state;
+    ScanResult r;
+    ScanCommands(w.dw, state, r);
+    CHECK(r.draws == 2 && r.draws_instanced == 1 && r.indices == 36 * 4 + 30);
+    CHECK(r.dispatches == 1 && r.cache_actions == 1 && r.malformed == 1);
+    CHECK(r.draws_depth_test == 2 && r.draws_depth_write == 1 && r.draws_no_color == 1);
+    const TargetDesc color{0x1234500, 1920, 1080, 0xA | (4u << 8), false};
+    const TargetDesc depth{0x20000, 1920, 1080, 3, true};
+    CHECK(r.targets.size() == 2 && r.targets[0] == color && r.targets[1] == depth);
+    CHECK(r.depth_read.size() == 1 && r.depth_read[0] == depth);
+    CHECK(r.shaders.size() == 2 && r.shaders[0] == 0x10000000 && r.shaders[1] == 0x20000000);
+    CHECK(state.num_instances == 1 && state.context[Reg::CbTargetMask] == 0);
+}
+
+void TestPassGraph() {
+    using namespace Render;
+    const u32 tsharp[8] = {0x12345, 0x01u | (0xAu << 20) | (7u << 26), 1919u | (1079u << 14), 0, 0, 0, 0, 0};
+    const ResourceUse tex = DecodeTexture(tsharp, ResourceKind::Texture);
+    CHECK(tex.base == 0x10001234500ull && tex.width == 1920 && tex.height == 1080 && tex.format == (0xA | (7u << 8)));
+    const u32 vsharp[4] = {0x5000, 0x2u | (16u << 16), 64, 0};
+    const ResourceUse buf = DecodeBuffer(vsharp, ResourceKind::RwBuffer);
+    CHECK(buf.base == 0x200005000ull && buf.width == 16 && buf.height == 64);
+
+    std::vector<ContextRecord> ctx(5);
+    ctx[0].kind = NodeKind::Pre;
+    ctx[0].scan.targets.push_back({0xA000, 64, 64, 1, false}); // pre writes A
+    ctx[1].kind = NodeKind::Pass;
+    ctx[1].pass = 1;
+    ctx[1].uses.push_back({0xA000, 64, 64, 1, ResourceKind::Texture}); // pass 1 reads A ...
+    ctx[2].kind = NodeKind::Pass;
+    ctx[2].pass = 1;
+    ctx[2].sub = 1;
+    ctx[2].uses.push_back({0xB000, 4, 16, 0, ResourceKind::RwBuffer}); // ... and writes B (second context)
+    ctx[3].kind = NodeKind::Pass;
+    ctx[3].pass = 2;
+    ctx[3].uses.push_back({0xB000, 4, 16, 0, ResourceKind::Buffer});  // pass 2 reads B
+    ctx[3].uses.push_back({0xC000, 8, 8, 1, ResourceKind::Texture});  // and C, written later (previous frame's)
+    ctx[3].uses.push_back({0xD000, 8, 8, 1, ResourceKind::Texture});  // and D, never written (static)
+    ctx[4].kind = NodeKind::Post;
+    ctx[4].scan.targets.push_back({0xC000, 8, 8, 1, false});
+
+    const Graph g = BuildGraph(ctx);
+    CHECK(g.nodes.size() == 4 && g.nodes[1].contexts == 2 && NodeName(g.nodes[1]) == "pass 1");
+    CHECK(NodeName(g.nodes[0]) == "pre" && NodeName(g.nodes[3]) == "post");
+    CHECK(g.edges.size() == 3);
+    const auto has = [&](u32 from, u32 to, bool prev) {
+        return std::any_of(g.edges.begin(), g.edges.end(),
+                           [&](const Edge& e) { return e.from == from && e.to == to && e.prev_frame == prev; });
+    };
+    CHECK(has(0, 1, false) && has(1, 2, false) && has(3, 2, true));
+    CHECK(g.lifetimes.size() == 3);
+    const auto life = std::find_if(g.lifetimes.begin(), g.lifetimes.end(), [](const Lifetime& l) { return l.base == 0xA000; });
+    CHECK(life != g.lifetimes.end() && life->target && life->first_write == 0 && life->last_read == 1 &&
+          life->readers == 1);
+    const auto b = std::find_if(g.lifetimes.begin(), g.lifetimes.end(), [](const Lifetime& l) { return l.base == 0xB000; });
+    CHECK(b != g.lifetimes.end() && !b->target && b->first_write == 1 && b->first_read == 2 && b->readers == 1);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -332,6 +475,9 @@ int main(int argc, char** argv) {
     TestWaitHelps();
     TestQuit();
     TestStress();
+    TestEntryProbe();
+    TestDcbScan();
+    TestPassGraph();
     if (bench) {
         Bench();
     }

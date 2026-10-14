@@ -1,0 +1,624 @@
+// SecondSonPC — dynamic trace of the engine's render frame (see frame_trace.h).
+#include "engine/render/frame_trace.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include <fmt/format.h>
+#include <windows.h>
+
+#include "base/log.h"
+#include "engine/guest_probe.h"
+#include "engine/render/dcb_scan.h"
+#include "engine/render/pass_graph.h"
+#include "engine/render/render_layout.h"
+
+namespace SecondSon::Engine::Render::Trace {
+
+namespace {
+
+namespace L = Layout;
+
+// --- what the probes are installed on (eboot.bin of CUSA00004; tools/native-reconstruction/function_hashes.py) ------
+constexpr ProbeSite kSubmitFrameSite{{L::kSubmitFrame, 0xb51, 0x4a5ea347de017770ull}, 20};
+constexpr ProbeSite kResetSite{{L::kContextReset, 0x164, 0xa8a9df2ac8bb0624ull}, 20};
+constexpr ProbeSite kReserveSite{{L::kDcbReserve, 0xb1, 0x4a5898f412269a7full}, 18};
+constexpr ProbeSite kSetterSites[4] = {
+    {{L::kSetTextures, 0xc3, 0xec36a84fd3ea6732ull}, 17},
+    {{L::kSetRwTextures, 0xc6, 0x10784ab701e6ed41ull}, 17},
+    {{L::kSetBuffers, 0xc3, 0x89684355b1fee78cull}, 17},
+    {{L::kSetRwBuffers, 0xc6, 0xe44b61ff8aa2933bull}, 17},
+};
+constexpr ResourceKind kSetterKinds[4] = {ResourceKind::Texture, ResourceKind::RwTexture, ResourceKind::Buffer,
+                                          ResourceKind::RwBuffer};
+constexpr u32 kSetterDwords[4] = {8, 8, 4, 4};
+// Functions whose behaviour the trace assumes (frame layout, pool, submission order).
+constexpr GuestFunction kAssumed[] = {
+    {0x1f2c60, 0x1f, 0xef1991cc4587b6dfull},  // AcquireContext: pool slot = frame + 0x1dcc0 + i * 0xdef0
+    {0x1f2c80, 0x78, 0x732887cdc1f0c5c0ull},  // AcquireContext with the key of another context
+    {0x1f2d00, 0x6d, 0x508742f4e89e9133ull},  // AcquireContext with key + state (chunks of a pass)
+    {0x11f2c0, 0x69, 0x6f5977e13daedae8ull},  // GetSubmitList: chunks at R+0xcc70 + the current one
+    {0x1ef490, 0x4d, 0x8965d7a7e907cae3ull},  // qsort comparator: pass (signed), sub (unsigned), address
+    {0x198a70, 0x142, 0xf9148f1bdad6e925ull}, // LaunchPasses: 41 contexts, key {pass, 0}
+    {0x1f14e0, 0x6b2, 0xaac6e89cd7ca59b1ull}, // frame overflow check: the only per-frame caller of Reset
+};
+
+using SubmitFrameFn = SSPC_SYSV_ABI void (*)(u8* frame, u32 flags);
+using ResetFn = SSPC_SYSV_ABI void (*)(u8* context);
+using ReserveFn = SSPC_SYSV_ABI u64 (*)(void* cb, u32 dwords, u8* context);
+using SetterFn = SSPC_SYSV_ABI void (*)(u8* cue, s32 stage, u32 slot, s32 count, const u32* descriptors);
+
+struct Options {
+    u32 every = 300;
+    u32 dumps = 8;
+    u32 stats_s = 10;
+    std::filesystem::path dir = "logs\\p53_render_trace";
+};
+
+u64 g_base = 0;
+Options g_options;
+SubmitFrameFn g_submit = nullptr;
+ResetFn g_reset = nullptr;
+ReserveFn g_reserve = nullptr;
+SetterFn g_setters[4] = {};
+
+// --- counters (any thread) -----------------------------------------------------------------------------------------
+struct Counters {
+    std::atomic<u64> frames{0};
+    std::atomic<u64> slots_seen{0};      ///< pool slots acquired, summed over frames
+    std::atomic<u64> slots_fresh{0};     ///< ... whose first chunk differs from the one they ended the last frame with
+    std::atomic<u64> slots_stale{0};     ///< ... whose first chunk is the same (the buffer was not restarted)
+    std::atomic<u64> slots_first_use{0}; ///< ... not acquired in the last frame
+    std::atomic<u64> slots_empty{0};     ///< ... with no command buffer at all (begin = 0: reset, nothing recorded)
+    std::atomic<u64> max_chunks{0};
+    std::atomic<u64> resets{0};
+    std::atomic<u64> resets_pool{0};
+    std::atomic<u64> reserves{0};
+    std::atomic<u64> ccb_used{0}; ///< contexts whose constant command buffer (G+0x80) held commands at submission
+    std::atomic<u64> setter_records{0};
+    std::atomic<u64> samples{0};
+};
+Counters g_count;
+
+std::mutex g_callers_lock;
+std::map<u64, u64> g_reset_callers; ///< caller rva -> calls
+
+// --- guest memory reads ----------------------------------------------------------------------------------------------
+template <typename T>
+T At(u64 address) {
+    T value;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(T));
+    return value;
+}
+
+bool Readable(u64 address, u64 bytes) {
+    u64 at = address;
+    while (at < address + bytes) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) {
+            return false;
+        }
+        at = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
+u64 Frame() {
+    return g_base + L::kFrame;
+}
+u64 PoolSlot(u32 i) {
+    return Frame() + L::kFramePool + u64{i} * L::kPoolSlotStride;
+}
+bool IsPoolSlot(u64 r) {
+    const u64 first = PoolSlot(0);
+    return r >= first && r < first + u64{L::kPoolSlots} * L::kPoolSlotStride && (r - first) % L::kPoolSlotStride == 0;
+}
+
+/// The first chunk of a context's DCB: the oldest finished chunk, or the current one.
+u64 FirstChunk(u64 r) {
+    const u32 chunks = At<u32>(r + L::kContextChunkCount);
+    return chunks != 0 ? At<u64>(r + L::kContextChunks) : At<u64>(r + L::kContextGfx + L::kCbBegin);
+}
+
+struct Span {
+    u64 start;
+    u32 dwords;
+};
+
+/// What GetSubmitList (0x11f2c0) hands SubmitFrame for the context.
+std::vector<Span> SubmitList(u64 r) {
+    std::vector<Span> list;
+    const u32 chunks = std::min(At<u32>(r + L::kContextChunkCount), L::kMaxChunks);
+    for (u32 i = 0; i < chunks; ++i) {
+        const u64 entry = r + L::kContextChunks + u64{i} * L::kChunkStride;
+        list.push_back({At<u64>(entry), At<u32>(entry + 8)});
+    }
+    const u64 begin = At<u64>(r + L::kContextGfx + L::kCbBegin);
+    const u64 cmd = At<u64>(r + L::kContextGfx + L::kCbCmdPtr);
+    if (cmd > begin && cmd - begin < (u64{1} << 32)) {
+        list.push_back({begin, static_cast<u32>((cmd - begin) / 4)});
+    }
+    return list;
+}
+
+bool CurrentChunkEmpty(u64 r) {
+    const u64 begin = At<u64>(r + L::kContextGfx + L::kCbBegin);
+    const u64 cmd = At<u64>(r + L::kContextGfx + L::kCbCmdPtr);
+    return ((cmd - begin) & 0xFFFFFFFCull) == 0;
+}
+
+u64 CcbBytes(u64 r) {
+    const u64 cb = r + L::kContextGfx + L::kGfxCcb;
+    const u64 begin = At<u64>(cb + L::kCbBegin);
+    const u64 cmd = At<u64>(cb + L::kCbCmdPtr);
+    return cmd >= begin && cmd - begin < (u64{1} << 28) ? cmd - begin : 0;
+}
+
+// --- resource bindings recorded by the setter probes -----------------------------------------------------------------
+struct SetterRecord {
+    u64 cue;
+    u32 desc[8];
+    u8 kind;
+    u8 stage;
+    u16 slot;
+};
+struct ThreadLog {
+    std::mutex lock;
+    std::vector<SetterRecord> records;
+};
+std::mutex g_logs_lock;
+std::vector<std::unique_ptr<ThreadLog>> g_logs;
+thread_local ThreadLog* t_log = nullptr;
+std::atomic<bool> g_armed{false};
+constexpr size_t kMaxRecordsPerThread = 1u << 20;
+
+ThreadLog* MyLog() {
+    if (t_log == nullptr) {
+        auto log = std::make_unique<ThreadLog>();
+        t_log = log.get();
+        std::lock_guard guard(g_logs_lock);
+        g_logs.push_back(std::move(log));
+    }
+    return t_log;
+}
+
+template <int K>
+SSPC_SYSV_ABI void SetterProbe(u8* cue, s32 stage, u32 slot, s32 count, const u32* descriptors) {
+    if (g_armed.load(std::memory_order_relaxed) && count > 0 && descriptors != nullptr) {
+        ThreadLog* log = MyLog();
+        std::lock_guard guard(log->lock);
+        const s32 n = std::min(count, 64);
+        for (s32 i = 0; i < n && log->records.size() < kMaxRecordsPerThread; ++i) {
+            SetterRecord rec{};
+            rec.cue = reinterpret_cast<u64>(cue);
+            std::memcpy(rec.desc, descriptors + i * kSetterDwords[K], kSetterDwords[K] * 4);
+            rec.kind = static_cast<u8>(K);
+            rec.stage = static_cast<u8>(stage);
+            rec.slot = static_cast<u16>(slot + i);
+            log->records.push_back(rec);
+        }
+    }
+    g_setters[K](cue, stage, slot, count, descriptors);
+}
+
+std::vector<SetterRecord> TakeRecords() {
+    std::vector<SetterRecord> all;
+    std::lock_guard guard(g_logs_lock);
+    for (const auto& log : g_logs) {
+        std::lock_guard g(log->lock);
+        all.insert(all.end(), log->records.begin(), log->records.end());
+        log->records.clear();
+    }
+    return all;
+}
+
+// --- Reset / DcbReserve probes ----------------------------------------------------------------------------------------
+SSPC_SYSV_ABI void ResetProbe(u8* context) {
+    g_count.resets.fetch_add(1, std::memory_order_relaxed);
+    if (IsPoolSlot(reinterpret_cast<u64>(context))) {
+        g_count.resets_pool.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0)) - g_base;
+    {
+        std::lock_guard guard(g_callers_lock);
+        ++g_reset_callers[caller];
+    }
+    g_reset(context);
+}
+
+SSPC_SYSV_ABI u64 ReserveProbe(void* cb, u32 dwords, u8* context) {
+    g_count.reserves.fetch_add(1, std::memory_order_relaxed);
+    return g_reserve(cb, dwords, context);
+}
+
+// --- the frame -----------------------------------------------------------------------------------------------------
+struct SlotMemo {
+    u64 first = 0;
+    bool valid = false;
+};
+SlotMemo g_memo[L::kPoolSlots]; // main thread (SubmitFrame) only
+u64 g_frame_no = 0;
+bool g_sample_this = false;
+u32 g_dumps_written = 0;
+bool g_warned_frame = false;
+
+struct PoolEntry {
+    u64 r;
+    s32 pass;
+    u32 sub;
+};
+
+std::string Hex(u64 v) {
+    return fmt::format("\"{:#x}\"", v);
+}
+
+std::string TargetJson(const TargetDesc& t) {
+    return fmt::format("{{\"base\":{},\"w\":{},\"h\":{},\"fmt\":{},\"depth\":{}}}", Hex(t.base), t.width, t.height,
+                       t.format, t.depth ? "true" : "false");
+}
+
+std::string UseJson(const ResourceUse& u) {
+    static constexpr const char* kKinds[] = {"tex", "rwtex", "buf", "rwbuf"};
+    return fmt::format("{{\"base\":{},\"a\":{},\"b\":{},\"fmt\":{},\"kind\":\"{}\"}}", Hex(u.base), u.width, u.height,
+                       u.format, kKinds[static_cast<u8>(u.kind)]);
+}
+
+std::string FunctionRva(u64 pointer) {
+    return pointer >= g_base && pointer < g_base + 0x2000000 ? Hex(pointer - g_base) : "null";
+}
+
+void WriteSample(const std::vector<ContextRecord>& ordered, const Graph& graph, u32 acquired, u64 unattributed,
+                 double scan_ms) {
+    std::string out;
+    auto it = std::back_inserter(out);
+    fmt::format_to(it, "{{\n\"frame\":{},\"acquired\":{},\"contexts\":{},\"unattributed_bindings\":{},"
+                       "\"scan_ms\":{:.2f},\n\"context_list\":[\n",
+                   g_frame_no, acquired, ordered.size(), unattributed, scan_ms);
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        const ContextRecord& c = ordered[i];
+        static constexpr const char* kKinds[] = {"deform", "pre", "pass", "post"};
+        fmt::format_to(it,
+                       "{{\"kind\":\"{}\",\"pass\":{},\"sub\":{},\"r\":{},\"chunks\":{},\"bytes\":{},\"ccb\":{},"
+                       "\"draws\":{},\"dispatches\":{},\"bindings\":{}}}{}\n",
+                       kKinds[static_cast<u8>(c.kind)], c.pass, c.sub, Hex(c.context), c.chunks, c.bytes,
+                       c.ccb_bytes, c.scan.draws + c.scan.draws_indirect,
+                       c.scan.dispatches, c.uses.size(), i + 1 < ordered.size() ? "," : "");
+    }
+    fmt::format_to(it, "],\n\"nodes\":[\n");
+    for (size_t i = 0; i < graph.nodes.size(); ++i) {
+        const Node& n = graph.nodes[i];
+        const ScanResult& s = n.scan;
+        std::string fns = "null";
+        if (n.kind == NodeKind::Pass && n.id >= 0 && n.id < static_cast<s32>(L::kPassCount)) {
+            const u64 entry = g_base + L::kPassTable + u64(n.id) * 24;
+            fns = fmt::format("[{},{},{}]", FunctionRva(At<u64>(entry)), FunctionRva(At<u64>(entry + 8)),
+                              FunctionRva(At<u64>(entry + 16)));
+        }
+        fmt::format_to(it,
+                       "{{\"index\":{},\"name\":\"{}\",\"pass_functions\":{},\"contexts\":{},\"bytes\":{},"
+                       "\"packets\":{},\"draws\":{},\"draws_indirect\":{},\"draws_instanced\":{},\"indices\":{},"
+                       "\"dispatches\":{},\"depth_test\":{},\"depth_write\":{},\"no_color\":{},\"events\":{},"
+                       "\"cache_actions\":{},\"waits\":{},\"dma\":{},\"indirect_buffers\":{},\"malformed\":{},"
+                       "\"shaders\":{},\"targets\":[",
+                       i, NodeName(n), fns, n.contexts, n.bytes, s.packets, s.draws, s.draws_indirect,
+                       s.draws_instanced, s.indices, s.dispatches, s.draws_depth_test, s.draws_depth_write,
+                       s.draws_no_color, s.events, s.cache_actions, s.waits, s.dma, s.indirect_buffers, s.malformed,
+                       s.shaders.size());
+        for (size_t k = 0; k < s.targets.size(); ++k) {
+            fmt::format_to(it, "{}{}", k ? "," : "", TargetJson(s.targets[k]));
+        }
+        fmt::format_to(it, "],\"depth_read\":[");
+        for (size_t k = 0; k < s.depth_read.size(); ++k) {
+            fmt::format_to(it, "{}{}", k ? "," : "", TargetJson(s.depth_read[k]));
+        }
+        u32 tex = 0, buf = 0;
+        for (const ResourceUse& u : n.reads) {
+            (u.kind == ResourceKind::Texture ? tex : buf) += 1;
+        }
+        fmt::format_to(it, "],\"textures_read\":{},\"buffers_read\":{},\"rw\":[", tex, buf);
+        u32 written = 0;
+        for (const ResourceUse& u : n.writes) {
+            if (u.kind == ResourceKind::RwTexture || u.kind == ResourceKind::RwBuffer) {
+                fmt::format_to(it, "{}{}", written++ ? "," : "", UseJson(u));
+                if (written >= 64) {
+                    break;
+                }
+            }
+        }
+        fmt::format_to(it, "],\"texture_sample\":[");
+        u32 listed = 0;
+        for (const ResourceUse& u : n.reads) {
+            if (u.kind == ResourceKind::Texture && listed < 48) {
+                fmt::format_to(it, "{}{}", listed++ ? "," : "", UseJson(u));
+            }
+        }
+        fmt::format_to(it, "]}}{}\n", i + 1 < graph.nodes.size() ? "," : "");
+    }
+    fmt::format_to(it, "],\n\"edges\":[\n");
+    for (size_t i = 0; i < graph.edges.size(); ++i) {
+        const Edge& e = graph.edges[i];
+        fmt::format_to(it, "{{\"from\":\"{}\",\"to\":\"{}\",\"resources\":{},\"sample\":{},\"prev_frame\":{}}}{}\n",
+                       NodeName(graph.nodes[e.from]), NodeName(graph.nodes[e.to]), e.resources, Hex(e.sample),
+                       e.prev_frame ? "true" : "false", i + 1 < graph.edges.size() ? "," : "");
+    }
+    fmt::format_to(it, "],\n\"lifetimes\":[\n");
+    for (size_t i = 0; i < graph.lifetimes.size(); ++i) {
+        const Lifetime& l = graph.lifetimes[i];
+        fmt::format_to(it,
+                       "{{\"base\":{},\"target\":{},\"first_write\":\"{}\",\"last_write\":\"{}\",\"first_read\":{},"
+                       "\"last_read\":{},\"readers\":{}}}{}\n",
+                       Hex(l.base), l.target ? "true" : "false", NodeName(graph.nodes[l.first_write]),
+                       NodeName(graph.nodes[l.last_write]),
+                       l.first_read < 0 ? "null" : fmt::format("\"{}\"", NodeName(graph.nodes[l.first_read])),
+                       l.last_read < 0 ? "null" : fmt::format("\"{}\"", NodeName(graph.nodes[l.last_read])), l.readers,
+                       i + 1 < graph.lifetimes.size() ? "," : "");
+    }
+    fmt::format_to(it, "]\n}}\n");
+
+    std::error_code ec;
+    std::filesystem::create_directories(g_options.dir, ec);
+    const auto file = g_options.dir / fmt::format("frame_{:06}.json", g_frame_no);
+    std::ofstream f(file, std::ios::binary | std::ios::trunc);
+    f << out;
+    SSPC_LOG(Engine, Info, "render trace: frame {} -> {} ({} contexts, {} nodes, {} edges, scan {:.1f} ms)",
+             g_frame_no, file.string(), ordered.size(), graph.nodes.size(), graph.edges.size(), scan_ms);
+}
+
+void Sample(const std::vector<PoolEntry>& pool, u32 acquired) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<SetterRecord> records = TakeRecords();
+    std::unordered_map<u64, std::vector<ResourceUse>> uses; // by context R
+    for (const SetterRecord& rec : records) {
+        const ResourceKind kind = kSetterKinds[rec.kind];
+        const bool texture = kind == ResourceKind::Texture || kind == ResourceKind::RwTexture;
+        uses[rec.cue - L::kContextCue].push_back(texture ? DecodeTexture(rec.desc, kind) : DecodeBuffer(rec.desc, kind));
+    }
+
+    std::vector<ContextRecord> ordered;
+    const auto add = [&](NodeKind kind, s32 pass, u32 sub, u64 r) {
+        ContextRecord c;
+        c.kind = kind;
+        c.pass = pass;
+        c.sub = sub;
+        c.context = r;
+        c.chunks = At<u32>(r + L::kContextChunkCount);
+        c.ccb_bytes = CcbBytes(r);
+        if (c.ccb_bytes != 0) {
+            g_count.ccb_used.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (auto u = uses.find(r); u != uses.end()) {
+            c.uses = std::move(u->second);
+            uses.erase(u);
+        }
+        ordered.push_back(std::move(c));
+    };
+    for (u32 k = 0; k < L::kDeformContextCount; ++k) {
+        const u64 r = g_base + L::kDeformContexts + u64{k} * L::kContextSize;
+        if (!SubmitList(r).empty()) {
+            add(NodeKind::Deform, static_cast<s32>(k), 0, r);
+        }
+    }
+    add(NodeKind::Pre, 0, 0, Frame() + L::kFramePreContext);
+    std::vector<PoolEntry> sorted;
+    for (const PoolEntry& e : pool) {
+        if (!CurrentChunkEmpty(e.r)) {
+            sorted.push_back(e); // SubmitFrame skips a slot whose current chunk is empty
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const PoolEntry& a, const PoolEntry& b) {
+        if (a.pass != b.pass) {
+            return a.pass < b.pass;
+        }
+        if (a.sub != b.sub) {
+            return a.sub < b.sub;
+        }
+        return a.r < b.r;
+    });
+    for (const PoolEntry& e : sorted) {
+        add(NodeKind::Pass, e.pass, e.sub, e.r);
+    }
+    add(NodeKind::Post, 0, 0, Frame() + L::kFramePostContext);
+    u64 unattributed = 0;
+    for (const auto& [r, list] : uses) {
+        unattributed += list.size();
+    }
+
+    ScanState state;
+    for (ContextRecord& c : ordered) {
+        for (const Span& s : SubmitList(c.context)) {
+            c.bytes += u64{s.dwords} * 4;
+            if (s.dwords != 0 && Readable(s.start, u64{s.dwords} * 4)) {
+                ScanCommands({reinterpret_cast<const u32*>(s.start), s.dwords}, state, c.scan);
+            } else if (s.dwords != 0) {
+                ++c.scan.malformed;
+            }
+        }
+    }
+    const Graph graph = BuildGraph(ordered);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    g_count.setter_records.fetch_add(records.size(), std::memory_order_relaxed);
+    g_count.samples.fetch_add(1, std::memory_order_relaxed);
+    WriteSample(ordered, graph, acquired, unattributed, ms);
+}
+
+SSPC_SYSV_ABI void SubmitFrameProbe(u8* frame, u32 flags) {
+    ++g_frame_no;
+    g_count.frames.fetch_add(1, std::memory_order_relaxed);
+    const bool ours = reinterpret_cast<u64>(frame) == Frame();
+    if (!ours && !g_warned_frame) {
+        g_warned_frame = true;
+        SSPC_LOG(Engine, Warning, "render trace: SubmitFrame on {:#x}, not the frame object {:#x}; not traced",
+                 reinterpret_cast<u64>(frame), Frame());
+    }
+    std::vector<PoolEntry> pool;
+    u32 acquired = 0;
+    if (ours) {
+        acquired = static_cast<u32>(std::clamp(At<s32>(Frame() + L::kFrameAcquired), 0, s32{L::kPoolSlots}));
+        u64 max_chunks = 0;
+        for (u32 i = 0; i < acquired; ++i) {
+            const u64 r = PoolSlot(i);
+            const u64 first = FirstChunk(r);
+            max_chunks = std::max<u64>(max_chunks, At<u32>(r + L::kContextChunkCount));
+            if (!g_memo[i].valid) {
+                g_count.slots_first_use.fetch_add(1, std::memory_order_relaxed);
+            } else if (first == 0) {
+                g_count.slots_empty.fetch_add(1, std::memory_order_relaxed); // reset, nothing recorded since
+            } else if (g_memo[i].first == first) {
+                g_count.slots_stale.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_count.slots_fresh.fetch_add(1, std::memory_order_relaxed);
+            }
+            pool.push_back({r, At<s32>(r + L::kSlotPass), At<u32>(r + L::kSlotSub)});
+        }
+        for (u32 i = acquired; i < L::kPoolSlots; ++i) {
+            g_memo[i].valid = false;
+        }
+        g_count.slots_seen.fetch_add(acquired, std::memory_order_relaxed);
+        u64 prev = g_count.max_chunks.load(std::memory_order_relaxed);
+        while (max_chunks > prev && !g_count.max_chunks.compare_exchange_weak(prev, max_chunks)) {
+        }
+        if (g_sample_this) {
+            g_armed.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    g_submit(frame, flags);
+
+    if (!ours) {
+        return;
+    }
+    for (u32 i = 0; i < acquired; ++i) {
+        g_memo[i] = {FirstChunk(PoolSlot(i)), true};
+    }
+    if (g_sample_this) {
+        g_sample_this = false;
+        Sample(pool, acquired);
+        ++g_dumps_written;
+    }
+    if (g_dumps_written < g_options.dumps && g_options.every != 0 && (g_frame_no + 1) % g_options.every == 0) {
+        TakeRecords(); // drop what was bound outside a sampled frame
+        g_sample_this = true;
+        g_armed.store(true, std::memory_order_relaxed);
+    }
+}
+
+void Reporter(u32 seconds) {
+    struct Snap {
+        u64 frames, seen, fresh, stale, first, empty, resets, pool_resets, reserves;
+    };
+    const auto take = [] {
+        return Snap{g_count.frames.load(),      g_count.slots_seen.load(),      g_count.slots_fresh.load(),
+                    g_count.slots_stale.load(), g_count.slots_first_use.load(), g_count.slots_empty.load(),
+                    g_count.resets.load(),      g_count.resets_pool.load(),     g_count.reserves.load()};
+    };
+    Snap prev = take();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        const Snap s = take();
+        std::string callers;
+        {
+            std::lock_guard guard(g_callers_lock);
+            for (const auto& [rva, n] : g_reset_callers) {
+                callers += fmt::format(" {:#x}x{}", rva, n);
+            }
+        }
+        SSPC_LOG(Engine, Info,
+                 "render trace/{}s: frames {}, pool slots {} (fresh {}, stale {}, empty {}, first use {}), max chunks "
+                 "{}, Reset {} (pool {}; callers since start:{}), DCB reserve {}, CCB used {}, samples {}",
+                 seconds, s.frames - prev.frames, s.seen - prev.seen, s.fresh - prev.fresh, s.stale - prev.stale,
+                 s.empty - prev.empty, s.first - prev.first, g_count.max_chunks.load(), s.resets - prev.resets,
+                 s.pool_resets - prev.pool_resets, callers.empty() ? " none" : callers, s.reserves - prev.reserves,
+                 g_count.ccb_used.load(), g_count.samples.load());
+        prev = s;
+    }
+}
+
+std::string Env(const char* name) {
+    char v[512] = {};
+    const DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+    return n > 0 && n < sizeof(v) ? std::string(v, n) : std::string();
+}
+
+u32 EnvU32(const char* name, u32 fallback) {
+    const std::string v = Env(name);
+    return v.empty() ? fallback : static_cast<u32>(std::strtoul(v.c_str(), nullptr, 10));
+}
+
+} // namespace
+
+bool InstallFromEnvironment(u64 eboot_base) {
+    if (Env("SSPC_P53_RENDER_TRACE") != "1") {
+        return true;
+    }
+    g_options.every = EnvU32("SSPC_P53_RENDER_TRACE_EVERY", g_options.every);
+    g_options.dumps = EnvU32("SSPC_P53_RENDER_TRACE_DUMPS", g_options.dumps);
+    g_options.stats_s = EnvU32("SSPC_P53_RENDER_TRACE_STATS", g_options.stats_s);
+    if (const std::string d = Env("SSPC_P53_RENDER_TRACE_DIR"); !d.empty()) {
+        g_options.dir = d;
+    }
+
+    std::string error;
+    for (const GuestFunction& f : kAssumed) {
+        if (!VerifyGuestFunction(eboot_base, f, error)) {
+            SSPC_LOG(Engine, Error, "render trace not installed: {}", error);
+            return false;
+        }
+    }
+    std::vector<const ProbeSite*> sites = {&kSubmitFrameSite, &kResetSite, &kReserveSite};
+    for (const ProbeSite& s : kSetterSites) {
+        sites.push_back(&s);
+    }
+    for (const ProbeSite* s : sites) {
+        if (!VerifyGuestFunction(eboot_base, s->function, error)) {
+            SSPC_LOG(Engine, Error, "render trace not installed: {}", error);
+            return false;
+        }
+    }
+
+    g_base = eboot_base;
+    const auto install = [&](const ProbeSite& site, const void* target) {
+        void* original = InstallEntryProbe(eboot_base, site, target, error);
+        if (original == nullptr) {
+            // Verified bytes, but the host refused to write: nothing ran yet, earlier probes may be in - stop rather
+            // than run half-probed (as the native job queue does).
+            SSPC_LOG(Engine, Critical, "render trace: {}", error);
+            std::abort();
+        }
+        return original;
+    };
+    g_submit = reinterpret_cast<SubmitFrameFn>(install(kSubmitFrameSite, reinterpret_cast<const void*>(&SubmitFrameProbe)));
+    g_reset = reinterpret_cast<ResetFn>(install(kResetSite, reinterpret_cast<const void*>(&ResetProbe)));
+    g_reserve = reinterpret_cast<ReserveFn>(install(kReserveSite, reinterpret_cast<const void*>(&ReserveProbe)));
+    g_setters[0] = reinterpret_cast<SetterFn>(install(kSetterSites[0], reinterpret_cast<const void*>(&SetterProbe<0>)));
+    g_setters[1] = reinterpret_cast<SetterFn>(install(kSetterSites[1], reinterpret_cast<const void*>(&SetterProbe<1>)));
+    g_setters[2] = reinterpret_cast<SetterFn>(install(kSetterSites[2], reinterpret_cast<const void*>(&SetterProbe<2>)));
+    g_setters[3] = reinterpret_cast<SetterFn>(install(kSetterSites[3], reinterpret_cast<const void*>(&SetterProbe<3>)));
+
+    SSPC_LOG(Engine, Warning,
+             "DIAGNOSTICS: SSPC_P53_RENDER_TRACE=1 - entry probes on SubmitFrame 0x1f1e30, Reset 0x11f050, DCB reserve "
+             "0x11eed0 and the CUE setters 0x16d10/0x16de0/0x16b70/0x16c40 (read-only); a frame every {} written to {} "
+             "(at most {})",
+             g_options.every, g_options.dir.string(), g_options.dumps);
+    if (g_options.stats_s != 0) {
+        std::thread(Reporter, g_options.stats_s).detach();
+    }
+    return true;
+}
+
+} // namespace SecondSon::Engine::Render::Trace
