@@ -21,6 +21,7 @@
 #include "engine/render/dcb_scan.h"
 #include "engine/render/native_draw.h"
 #include "engine/render/native_render_ops.h"
+#include "engine/render/native_state.h"
 #include "engine/render/pass_graph.h"
 #include "engine/render/render_layout.h"
 
@@ -626,6 +627,192 @@ void TestNativeDrawShadow() {
     VirtualFree(image, 0, MEM_RELEASE);
 }
 
+// P5.3D native render state: stand-ins for the game's Gnm helpers - a target is bound when its base dword is not 0.
+SSPC_SYSV_ABI u32 FakeRtBase(const void* t) {
+    return static_cast<const u32*>(t)[0];
+}
+SSPC_SYSV_ABI u32 FakeRtFmaskBase(const void* t) {
+    return static_cast<const u32*>(t)[9];
+}
+SSPC_SYSV_ABI void FakeRtSetFmask(void* t, u32 base) {
+    static_cast<u32*>(t)[9] = base;
+}
+SSPC_SYSV_ABI u32 FakeDtZBase(const void* d) {
+    return static_cast<const u32*>(d)[2];
+}
+SSPC_SYSV_ABI u32 FakeDtHtile(const void* d) {
+    return static_cast<const u32*>(d)[9];
+}
+
+void TestNativeState() {
+    namespace S = Render::NativeState;
+    using Render::RegWrite;
+    S::Env env;
+    env.rt_base = &FakeRtBase;
+    env.rt_fmask_base = &FakeRtFmaskBase;
+    env.rt_set_fmask = &FakeRtSetFmask;
+    env.dt_z_base = &FakeDtZBase;
+    env.dt_htile = &FakeDtHtile;
+    env.db_reg_2de = 489;
+    const auto find = [](const RegWrite* w, u32 n, u32 reg) -> const RegWrite* {
+        const RegWrite* hit = nullptr;
+        for (u32 i = 0; i < n; ++i) {
+            if (w[i].reg == reg) {
+                hit = &w[i]; // the last write wins, as in the register file
+            }
+        }
+        return hit;
+    };
+    const auto f = [](u32 bits) {
+        float v;
+        std::memcpy(&v, &bits, 4);
+        return v;
+    };
+
+    // Viewport 0x11b60 over 1920x1080.
+    RegWrite vw[32];
+    S::Writer v{vw, 32};
+    S::Viewport(0, 0, 1920, 1080, v);
+    CHECK(!v.overflow && v.n == 2 + 6 + 1 + 2 + 1 + 4 && v.pm4_dwords == 28);
+    CHECK(vw[0].reg == 0xA0B4 && f(vw[0].value) == 0.0f && f(vw[1].value) == 1.0f);
+    CHECK(vw[2].reg == 0xA10F && f(vw[2].value) == 960.0f && f(vw[3].value) == 960.0f && f(vw[4].value) == -540.0f &&
+          f(vw[5].value) == 540.0f && f(vw[6].value) == 1.0f && f(vw[7].value) == 0.0f);
+    CHECK(vw[8].reg == 0xA206 && vw[8].value == 0x43F);
+    CHECK(vw[9].reg == 0xA00C && vw[9].value == 0 && vw[10].value == (1080u << 16 | 1920u));
+    CHECK(vw[11].reg == 0xA08D && vw[11].value == (32u << 16 | 60u)); // floor(960/16+.5)=60, floor(540/16+.5)=34 -> 32
+    const float x_adj = (f(0x46FFFFFEu) - 960.0f + 960.0f - 960.0f) / 960.0f; // the smaller of the two distances
+    CHECK(vw[12].reg == 0xA2FA && f(vw[14].value) == x_adj && f(vw[13].value) == 1.0f && f(vw[12].value) > 1.0f);
+
+    // SetRenderTargets 0x11f910: two colour targets (the second one unbound), depth target 0, the previous set had 4.
+    static u8 set[0x800] = {};
+    const u64 ts = reinterpret_cast<u64>(set);
+    const auto put = [&](u32 at, u32 value) { std::memcpy(set + at, &value, 4); };
+    const auto putf = [&](u32 at, float value) { std::memcpy(set + at, &value, 4); };
+    put(0x0, 1280);
+    put(0x4, 720);
+    putf(0x14, -1.0f); // the normalised rectangle: the whole target
+    putf(0x18, -1.0f);
+    putf(0x1C, 1.0f);
+    putf(0x20, 1.0f);
+    put(0x24, 0xFF);   // CB_TARGET_MASK
+    put(0x77C, 2);
+    put(0x784, 0);
+    for (u32 i = 0; i < 16; ++i) {
+        put(0x28 + i * 4, 0x100 + i); // target 0: base 0x100, extent dword 0x10F
+    }
+    put(0x28 + 4 * 4, 0x2000);         // CB_COLOR_INFO: FMASK compression ...
+    put(0x28 + 7 * 4, 5);              // ... CMASK present
+    put(0x28 + 9 * 4, 0);              // ... no FMASK: 0x52e0 derives one
+    put(0x28 + 0xD0, 0);               // target 1: base 0 - not bound
+    for (u32 i = 0; i < 13; ++i) {
+        put(0x74 + i * 4, 0x200 + i);  // depth target: Z base 0x202, extent dword 0x20C
+    }
+    S::StateBlock st;
+    st.color_mask = 0xF;
+    RegWrite tw[Render::kMaxStateWrites];
+    S::Writer t{tw, Render::kMaxStateWrites};
+    S::SetRenderTargets(st, ts, nullptr, env, t);
+    CHECK(!t.overflow);
+    CHECK(t.pm4_dwords == 18 + 3 + 24 + 3 + 3 + 28 + 4 + 3 * 2);
+    CHECK(tw[0].reg == 0xA318 && tw[0].value == 0x100 && tw[13].reg == 0xA318 + 13);
+    CHECK(find(tw, t.n, 0xA318 + 9)->value == 0x100); // the derived FMASK base = the colour base
+    CHECK(find(tw, t.n, 0xA31C)->value == 0x2000);     // FMASK compression bit 14 cleared (it was 0)
+    CHECK(find(tw, t.n, Render::kStateCbExtent0)->value == 0x10F);
+    CHECK(find(tw, t.n, 0xA31C + 15)->value == 0 && find(tw, t.n, Render::kStateCbExtent0 + 1) == nullptr);
+    CHECK(find(tw, t.n, 0xA010)->value == 0x200 && find(tw, t.n, 0xA017)->value == 0x207 &&
+          find(tw, t.n, 0xA00F)->value == 0x20B && find(tw, t.n, 0xA002)->value == 0x208 &&
+          find(tw, t.n, 0xA2AF)->value == 0x20A && find(tw, t.n, Render::kStateDbExtent)->value == 0x20C);
+    CHECK(find(tw, t.n, 0xA2DE)->value == 489 && find(tw, t.n, 0xA08E)->value == 0xFF);
+    CHECK(find(tw, t.n, 0xA081)->value == (1u << 31) && find(tw, t.n, 0xA082)->value == (720u << 16 | 1280u));
+    CHECK(find(tw, t.n, 0xA31C + 30)->value == 0 && find(tw, t.n, 0xA31C + 45)->value == 0); // slots 2, 3 off
+    CHECK(st.color_mask == 3 && st.targets == ts && st.rect[2] == 1280 && st.rect[3] == 720);
+
+    // No target set: every bound colour target off, no depth.
+    S::Writer none{tw, Render::kMaxStateWrites};
+    S::SetRenderTargets(st, 0, nullptr, env, none);
+    CHECK(none.n == 2 + 2 + 1 && none.pm4_dwords == 3 * 2 + 6 && st.color_mask == 0 && st.targets == 0);
+    CHECK(find(tw, none.n, Render::kStateDbExtent)->value == 0);
+
+    // TransitionTo 0x120020: only what differs and is in the block's mask; the same target set is not rebound.
+    static u32 block[14] = {};
+    const u64 bp = reinterpret_cast<u64>(block);
+    for (u32 i = 0; i < 6; ++i) {
+        block[i] = 0x10 + i;
+    }
+    block[6] = 0b100101; // PA_SU_SC_MODE_CNTL, DB_RENDER_CONTROL, DB_STENCIL_CONTROL
+    block[7] = 0x01020304;
+    std::memcpy(block + 8, &ts, 8);
+    S::StateBlock sb;
+    sb.valid = 0b000011;
+    sb.reg[0] = 0x10; // already PA_SU_SC_MODE_CNTL's value: not written again
+    sb.targets = ts;
+    S::Writer x{tw, Render::kMaxStateWrites};
+    S::TransitionTo(sb, bp, env, x);
+    CHECK(x.n == 4 && tw[0].reg == 0xA000 && tw[0].value == 0x12 && tw[1].reg == 0xA10B && tw[1].value == 0x15 &&
+          tw[2].reg == 0xA10C && tw[3].reg == 0xA10D && tw[3].value == 0x01020304);
+    CHECK(x.pm4_dwords == 3 + 3 + 4 && sb.valid == 0b100111 && sb.reg[2] == 0x12 && sb.stencil == 0x01020304);
+    S::Writer again{tw, Render::kMaxStateWrites};
+    S::TransitionTo(sb, bp, env, again);
+    CHECK(again.n == 0 && again.pm4_dwords == 0);
+
+    // Primitive type, index size; the state marker with a pseudo register.
+    RegWrite pw[2];
+    S::Writer p{pw, 2};
+    S::SetPrimitiveType(0x44, p);
+    S::SetIndexSize(1, 2, p);
+    CHECK(p.n == 2 && pw[0].reg == 0xC242 && pw[0].value == 4 && pw[1].reg == 0xA29F && pw[1].value == 1 &&
+          p.pm4_dwords == 3 + 2);
+    S::Writer q{pw, 2};
+    S::SetIndexSize(0, 1, q);
+    CHECK(pw[0].value == (1u << 10 | 1u << 6));
+
+    // The one-packet setters the material and mesh code call directly.
+    const auto leaf = [&](u64 rva) -> const S::LeafSpec& {
+        for (const S::LeafSpec& s : S::kLeaves) {
+            if (s.rva == rva) {
+                return s;
+            }
+        }
+        return S::kLeaves[0];
+    };
+    RegWrite lw[2];
+    S::Writer l1{lw, 2};
+    S::LeafWrite(leaf(0x6228a0), 3, 0xFFFFFFFF, l1); // CB_BLEND3_CONTROL
+    CHECK(l1.n == 1 && lw[0].reg == 0xA1E3 && lw[0].value == 0xFFFF1FFF && l1.pm4_dwords == 3);
+    S::Writer l2{lw, 2};
+    S::LeafWrite(leaf(0x6229a0), 0x11223344, 0, l2); // stencil reference/mask, front and back
+    CHECK(l2.n == 2 && lw[0].reg == 0xA10C && lw[1].reg == 0xA10D && lw[1].value == 0x11223344 && l2.pm4_dwords == 4);
+    S::Writer l3{lw, 2};
+    S::LeafWrite(leaf(0x622b30), 0xF, 0xCC, l3); // CB_COLOR_CONTROL mode 7, ROP 0xCC
+    CHECK(lw[0].reg == 0xA202 && lw[0].value == (7u << 4 | 0xCCu << 16));
+    S::Writer l4{lw, 2};
+    S::LeafWrite(leaf(0x626cc0), 3, 0, l4);
+    CHECK(lw[0].reg == 0xA293 && lw[0].value == (1u << 16 | 0x6020000));
+    S::Writer l5{lw, 2};
+    S::LeafWrite(leaf(0x6250b0), 4, 0, l5);
+    CHECK(lw[0].reg == 0xC24D && lw[0].value == 4 && l5.pm4_dwords == 2);
+    S::Writer l6{lw, 2};
+    S::LeafWrite(leaf(0x6221a0), 0xA003, 0x40, l6);
+    CHECK(l6.n == 1 && lw[0].reg == 0xA003 && lw[0].value == 0x40 && !l6.overflow);
+    S::Writer l7{lw, 2};
+    S::LeafWrite(leaf(0x6221a0), 0x2C00, 1, l7); // not a context register: no native write
+    CHECK(l7.overflow && l7.n == 0);
+    S::Writer l8{lw, 2};
+    S::LeafWrite(leaf(0x6270e0), 0xFFFFFFFF, 0, l8);
+    CHECK(lw[0].reg == 0xA205 && lw[0].value == 0x393FFF);
+    const RegWrite m[2] = {{0xA318, 7}, {Render::kStateDbExtent, 9}};
+    u32 marker[Render::RegistersMarkerDwords(2)] = {};
+    CHECK(Render::EncodeRegistersMarker(m, Render::kApply, marker, Render::OpKind::State) ==
+          Render::RegistersMarkerDwords(2));
+    RegWrite back[Render::kMaxStateWrites];
+    u32 back_n = 0;
+    u16 flags = 0;
+    CHECK(Render::MarkerKind(marker) == Render::OpKind::State &&
+          !Render::DecodeRegistersMarker(marker, back, back_n, flags) && // not a commit's register marker
+          Render::DecodeRegistersMarker(marker, back, back_n, flags, Render::OpKind::State, Render::kMaxStateWrites) &&
+          back_n == 2 && Render::IsStatePseudo(back[1].reg) && !Render::IsStatePseudo(back[0].reg));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -640,6 +827,7 @@ int main(int argc, char** argv) {
     TestDcbScan();
     TestPassGraph();
     TestNativeDrawShadow();
+    TestNativeState();
     if (bench) {
         Bench();
     }

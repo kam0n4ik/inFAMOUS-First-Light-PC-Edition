@@ -94,13 +94,14 @@ bool DecodeDrawMarker(std::span<const u32> packet, DrawOp& op, u16& flags) {
     return true;
 }
 
-u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out) {
-    const u32 n = static_cast<u32>(std::min<size_t>(writes.size(), kMaxRegWrites));
+u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out, OpKind kind) {
+    const u32 cap = kind == OpKind::State ? kMaxStateWrites : kMaxRegWrites;
+    const u32 n = static_cast<u32>(std::min<size_t>(writes.size(), cap));
     const u32 total = RegistersMarkerDwords(n);
     u32* p = out;
     *p++ = kNopHeader | ((total - 2) << 16);
     *p++ = kMarkerMagic;
-    *p++ = static_cast<u32>(OpKind::Registers) | (u32{flags} << 16);
+    *p++ = static_cast<u32>(kind) | (u32{flags} << 16);
     *p++ = n;
     for (u32 i = 0; i < n; ++i) {
         *p++ = writes[i].reg;
@@ -109,13 +110,14 @@ u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out)
     return total;
 }
 
-bool DecodeRegistersMarker(std::span<const u32> packet, RegWrite* out, u32& count, u16& flags) {
-    if (!IsMarker(packet) || packet.size() < 4 || MarkerKind(packet) != OpKind::Registers) {
+bool DecodeRegistersMarker(std::span<const u32> packet, RegWrite* out, u32& count, u16& flags, OpKind kind,
+                           u32 capacity) {
+    if (!IsMarker(packet) || packet.size() < 4 || MarkerKind(packet) != kind) {
         return false;
     }
     flags = static_cast<u16>(packet[2] >> 16);
     count = packet[3];
-    if (count > kMaxRegWrites || packet.size() != RegistersMarkerDwords(count)) {
+    if (count > capacity || packet.size() != RegistersMarkerDwords(count)) {
         return false;
     }
     for (u32 i = 0; i < count; ++i) {
@@ -228,6 +230,11 @@ u32 PassSlot(s32 pass) {
 DrawCounters& Counters() {
     static DrawCounters counters;
     return counters;
+}
+
+NativeControl& Control() {
+    static NativeControl control;
+    return control;
 }
 
 } // namespace SecondSon::Engine::Render

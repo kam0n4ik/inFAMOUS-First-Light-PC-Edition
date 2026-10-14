@@ -37,6 +37,17 @@ void Merge(ScanResult& into, const ScanResult& from) {
     into.dma += from.dma;
     into.indirect_buffers += from.indirect_buffers;
     into.malformed += from.malformed;
+    for (size_t i = 0; i < into.opcode_packets.size(); ++i) {
+        into.opcode_packets[i] += from.opcode_packets[i];
+    }
+    for (size_t i = 0; i < into.context_writes.size(); ++i) {
+        into.context_writes[i] += from.context_writes[i];
+        into.sh_writes[i] += from.sh_writes[i];
+        into.uconfig_writes[i] += from.uconfig_writes[i];
+    }
+    for (size_t i = 0; i < into.native_ops.size(); ++i) {
+        into.native_ops[i] += from.native_ops[i];
+    }
     for (const TargetDesc& t : from.targets) {
         AddUnique(into.targets, t);
     }

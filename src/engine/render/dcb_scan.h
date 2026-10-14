@@ -4,6 +4,7 @@
 // colour and depth targets it can write and the shaders it runs. Nothing here executes or changes a packet.
 #pragma once
 
+#include <array>
 #include <span>
 #include <vector>
 
@@ -50,6 +51,13 @@ struct ScanResult {
     std::vector<TargetDesc> targets; ///< distinct targets written by the draws (colour, then depth when written)
     std::vector<TargetDesc> depth_read; ///< depth targets tested but not written
     std::vector<u64> shaders;           ///< distinct shader programs (PS, VS, ..., CS) the draws/dispatches ran
+    // P5.3D: what PM4 a stretch still holds (type-3 packets by opcode, register writes by register) and the native
+    // operations SecondSonPC wrote in it (NOPs with kMarkerMagic, by OpKind 1..3).
+    std::array<u32, 256> opcode_packets{};
+    std::array<u32, 0x400> context_writes{}; ///< SET_CONTEXT_REG, by offset from 0xA000
+    std::array<u32, 0x400> sh_writes{};      ///< SET_SH_REG, by offset from 0x2C00
+    std::array<u32, 0x400> uconfig_writes{}; ///< SET_UCONFIG_REG, by offset from 0xC000
+    std::array<u32, 4> native_ops{};
 };
 
 /// Walks `stream` (whole packets, as the command buffer holds them) from `state`, updating both.

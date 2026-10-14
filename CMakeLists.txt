@@ -31,6 +31,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/frame_trace.cpp
     src/engine/render/native_draw.cpp
     src/engine/render/native_render_ops.cpp
+    src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
@@ -242,6 +243,7 @@ add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     src/engine/render/native_render_ops.cpp
     src/engine/render/pass_graph.cpp
     src/runtime/gpu/pm4.cpp
+    src/engine/render/native_state.cpp
     src/base/log.cpp
 )
 target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

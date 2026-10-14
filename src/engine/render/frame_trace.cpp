@@ -348,7 +348,25 @@ void WriteSample(const std::vector<ContextRecord>& ordered, const Graph& graph, 
                 fmt::format_to(it, "{}{}", listed++ ? "," : "", UseJson(u));
             }
         }
-        fmt::format_to(it, "]}}{}\n", i + 1 < graph.nodes.size() ? "," : "");
+        // P5.3D: the PM4 the node still holds and the native operations in it (what native apply replaced shows here).
+        fmt::format_to(it, "],\"native_ops\":[{},{},{}],\"opcodes\":{{", s.native_ops[1], s.native_ops[2],
+                       s.native_ops[3]);
+        const auto counts = [&](const auto& a, u32 base, const char* prefix) {
+            u32 n = 0;
+            for (size_t k = 0; k < a.size(); ++k) {
+                if (a[k] != 0) {
+                    fmt::format_to(it, "{}\"{}{:x}\":{}", n++ ? "," : "", prefix, base + k, a[k]);
+                }
+            }
+        };
+        counts(s.opcode_packets, 0, "0x");
+        fmt::format_to(it, "}},\"context_regs\":{{");
+        counts(s.context_writes, 0xA000, "0x");
+        fmt::format_to(it, "}},\"sh_regs\":{{");
+        counts(s.sh_writes, 0x2C00, "0x");
+        fmt::format_to(it, "}},\"uconfig_regs\":{{");
+        counts(s.uconfig_writes, 0xC000, "0x");
+        fmt::format_to(it, "}}}}{}\n", i + 1 < graph.nodes.size() ? "," : "");
     }
     fmt::format_to(it, "],\n\"edges\":[\n");
     for (size_t i = 0; i < graph.edges.size(); ++i) {

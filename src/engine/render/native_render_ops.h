@@ -26,6 +26,9 @@ inline constexpr u32 kMarkerMagic = 0x43505353u; ///< "SSPC" (little endian) - n
 enum class OpKind : u16 {
     Draw = 1,      ///< DrawOp: verified (kVerify) and/or executed (kApply) by the processor
     Registers = 2, ///< kApply: register writes of the engine's CUE commit done natively (RegWrite list)
+    State = 3,     ///< P5.3D: render state of SetRenderTargets / TransitionTo / primitive and index type (RegWrite
+                   ///< list with the kState* pseudo registers): kApply writes it, kVerify compares it with the
+                   ///< state the game's PM4 left (the marker follows the game's packets)
 };
 
 enum OpFlags : u16 {
@@ -91,13 +94,24 @@ struct RegWrite {
     u32 value = 0;
 };
 inline constexpr u32 kMaxRegWrites = 128;
+inline constexpr u32 kMaxStateWrites = 192; ///< SetRenderTargets with 8 colour targets, depth, viewport: < 170
 constexpr u32 RegistersMarkerDwords(u32 writes) {
     return 1 + 3 + 2 * writes; ///< header, magic, kind | flags, count, pairs
 }
-/// Writes the NOP for `writes` (at most kMaxRegWrites). Returns RegistersMarkerDwords(n).
-u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out);
-/// The marker's writes into `out` (kMaxRegWrites); false if it is not a well-formed one.
-bool DecodeRegistersMarker(std::span<const u32> packet, RegWrite* out, u32& count, u16& flags);
+/// Writes the NOP for `writes` (at most kMaxRegWrites; kMaxStateWrites for OpKind::State). Returns
+/// RegistersMarkerDwords(n).
+u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out, OpKind kind = OpKind::Registers);
+/// The marker's writes into `out` (room for `capacity`); false if it is not a well-formed one of `kind`.
+bool DecodeRegistersMarker(std::span<const u32> packet, RegWrite* out, u32& count, u16& flags,
+                           OpKind kind = OpKind::Registers, u32 capacity = kMaxRegWrites);
+
+/// State pseudo registers: what the driver's one-dword NOP after a colour / depth target setup tells the processor
+/// (the target's real extent, CommandProcessor::ExtentHint), given by the operation instead.
+inline constexpr u32 kStateCbExtent0 = 0xFFFF0000u; ///< + colour target 0..7
+inline constexpr u32 kStateDbExtent = 0xFFFF0008u;
+inline constexpr bool IsStatePseudo(u32 reg) {
+    return reg >= kStateCbExtent0 && reg <= kStateDbExtent;
+}
 /// The operation kind of a marker (IsMarker true).
 inline OpKind MarkerKind(std::span<const u32> packet) {
     return static_cast<OpKind>(packet[2] & 0xFFFF);
@@ -151,9 +165,31 @@ struct DrawCounters {
     std::atomic<u64> applied_draws{0};     ///< kApply draws executed from their operation (no draw packet)
     std::atomic<u64> applied_registers{0}; ///< register writes of native commits (no SET_*_REG packet)
     std::atomic<u64> applied_commits{0};
+    std::atomic<u64> state_applied{0};       ///< P5.3D: kApply state operations written (no PM4 of the game)
+    std::atomic<u64> state_applied_writes{0};
+    std::atomic<u64> state_verified{0};      ///< kVerify state operations compared with the PM4 path's state
+    std::atomic<u64> state_matched{0};
+    std::atomic<u64> state_mismatched{0};
+    std::atomic<u64> state_values_checked{0};
+    std::atomic<u32> state_first_bad_reg{0}; ///< the first mismatching register (0: none) and its two values
+    std::atomic<u32> state_first_bad_want{0};
+    std::atomic<u32> state_first_bad_have{0};
     std::atomic<u64> pass_verified[kPassSlots] = {};
     std::atomic<u64> pass_mismatched[kPassSlots] = {};
 };
 DrawCounters& Counters();
+
+/// P5.3D A/B comparison (SSPC_P53_NATIVE_AB=<frames>): the processor counts the flips it meets; the engine runs its
+/// native operations (apply mode) only in every other block of that many flips - the game's PM4 path in the first
+/// block, the native path in the second, and so on. 0 (default): native whenever apply mode is on.
+struct NativeControl {
+    std::atomic<u64> flips{0};
+    u32 ab_frames = 0;
+};
+NativeControl& Control();
+inline bool NativeActive() {
+    const NativeControl& c = Control();
+    return c.ab_frames == 0 || ((c.flips.load(std::memory_order_relaxed) / c.ab_frames) & 1) != 0;
+}
 
 } // namespace SecondSon::Engine::Render

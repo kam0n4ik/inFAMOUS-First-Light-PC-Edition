@@ -204,6 +204,8 @@ public:
     void CacheAction(const Cp::CacheActionOp& op) override;
     void Flip(const Cp::FlipMarker& marker) override;
     void Fence(const Cp::FenceOp& op) override;
+    /// P5.3D A/B: images at those addresses now -> SSPC_DIAG_CAPTURE_DIR (CaptureImageAt's output, pass < 0 there).
+    void CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 native_draws, u32 pm4_draws) override;
     void Dma(const Cp::DmaOp& op) override;
     void Interrupt(u32 queue, Cp::FenceKind kind) override;
     void Synchronize(u32 queue) override;

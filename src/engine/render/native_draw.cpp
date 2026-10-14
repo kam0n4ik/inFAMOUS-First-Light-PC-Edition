@@ -2,18 +2,21 @@
 #include "engine/render/native_draw.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <fmt/format.h>
 #include <windows.h>
 
 #include "base/log.h"
 #include "engine/guest_probe.h"
+#include "engine/render/native_state.h"
 #include "engine/render/render_layout.h"
 
 namespace SecondSon::Engine::Render::NativeDraw {
@@ -37,6 +40,23 @@ constexpr GuestFunction kAssumed[] = {
     {0x624cb0, 0x15f, 0x79dea00a63f200beull}, // SET_CONTEXT_REG SPI_PS_INPUT_CNTL_0 x n
 };
 
+// P5.3D native render state (native_state.h): the context's state methods, probed at entry.
+constexpr ProbeSite kSetTargetsSite{{0x11f910, 0x3ec, 0x65b79a72c0f31c59ull}, 17};
+constexpr ProbeSite kTransitionSite{{0x120020, 0x206, 0xe0bb63e1c9509805ull}, 17};
+constexpr ProbeSite kPrimTypeSite{{0x623740, 0x68, 0xad8002618fc3e975ull}, 17};
+constexpr ProbeSite kIndexSizeSite{{0x624f80, 0x7e, 0x49f8a233037eaadcull}, 16};
+constexpr GuestFunction kStateAssumed[] = {
+    {0x11ffe0, 0x33, 0xe2332a445ab4b43full},  // SetStateBlock: the block layout R+0xDE48..+0xDE84 (no PM4)
+    {0x637bf0, 0x110, 0xface254e00952095ull}, // RenderTarget base, called
+    {0x637f30, 0xf3, 0x4e98f932a83ffc48ull},  // RenderTarget FMASK base, called
+    {0x637e30, 0xfe, 0x99edeec68bcc4fd2ull},  // RenderTarget set FMASK base, called
+    {0x621450, 0xdb, 0x574543ccea059a4cull},  // DepthRenderTarget Z base, called
+    {0x6219e0, 0xe1, 0x7f2e84c819b5dcafull},  // DepthRenderTarget HTILE base, called
+};
+constexpr u64 kBarrierFlag = 0xe15e10;  ///< u8: 0x11f910 starts with ACQUIRE_MEM (0x625e80) when set
+constexpr u64 kDebugRtFlag = 0xe171fc;  ///< u8: 0x11f910 ends with a debug colour target 7 / depth when set
+constexpr u64 kDbReg2deTable = 0xaefb40; ///< u32[]: 0x6272e0's values
+
 // CUE fields the commit 0x14ad0 reads (GFX_CONTEXT_LAYOUT.md §2, RENDER_ENGINE_ARCHITECTURE.md §4).
 constexpr u64 kCuePsShader = 0xC0A8;  ///< PS shader object; its register block at +8
 constexpr u64 kCueVsShader = 0xC0B0;  ///< VS shader object
@@ -55,10 +75,41 @@ using CommitFn = SSPC_SYSV_ABI void (*)(u8* cue);
 u64 g_base = 0;
 u64 g_canary = 0;        ///< SSPC_P53_NATIVE_DRAW_CANARY=<n>: every n-th marker is spoiled on purpose (0: none)
 u64 g_apply_passes = 0;  ///< apply:<passes>: bit per pass whose commits and draws run natively
+bool g_verify = true;    ///< SSPC_P53_NATIVE_VERIFY=0 (measurements): no shadow markers, no kVerify on native draws
 DrawIndexFn g_draw_index = nullptr;
 DrawAutoFn g_draw_auto = nullptr;
 CommitFn g_commit = nullptr;
 CommitEnv g_env;
+
+// P5.3D: SSPC_P53_NATIVE_STATE=verify|apply.
+using SetTargetsFn = SSPC_SYSV_ABI void (*)(u8* r, u64 targets, const u32* rect);
+using TransitionFn = SSPC_SYSV_ABI void (*)(u8* r, u64 block);
+using PrimTypeFn = SSPC_SYSV_ABI void (*)(u8* dcb, u32 prim);
+using IndexSizeFn = SSPC_SYSV_ABI void (*)(u8* dcb, u32 size, u32 policy);
+bool g_state_on = false;     ///< the probes are installed
+bool g_state_apply = false;  ///< apply: in the apply passes the state methods run natively
+bool g_state_verify = true;  ///< the other known contexts: the game's method, then a kVerify state marker
+SetTargetsFn g_set_targets = nullptr;
+TransitionFn g_transition = nullptr;
+PrimTypeFn g_prim_type = nullptr;
+IndexSizeFn g_index_size = nullptr;
+NativeState::Env g_state_env;
+thread_local bool t_in_state = false; ///< inside a verified state method (its nested calls are part of it)
+
+enum StateFn : u32 { kFnTargets, kFnTransition, kFnPrim, kFnIndex, kFnLeaf, kStateFns };
+void* g_leaf_game[NativeState::kLeafCount] = {};
+std::atomic<u64> g_leaf_native[NativeState::kLeafCount] = {};
+enum StateFallback : u32 { kFbFlags, kFbOverflow, kFbNoSpace, kStateFallbacks };
+struct StateCounters {
+    std::atomic<u64> native[kStateFns] = {};
+    std::atomic<u64> fallback[kStateFallbacks] = {};
+    std::atomic<u64> verified[kStateFns] = {};
+    std::atomic<u64> block_mismatch[kStateFns] = {};  ///< R+0xDE48.. after the game's method != the native result
+    std::atomic<u64> size_mismatch[kStateFns] = {};   ///< PM4 dwords the game wrote != the native count
+    std::atomic<u64> size_unchecked{0};               ///< the game's packets crossed into a new chunk
+    std::atomic<u32> first_size_fn{0xFFFFFFFF}, first_size_want{0}, first_size_have{0};
+};
+StateCounters g_state;
 
 struct EngineCounters {
     std::atomic<u64> draws{0};
@@ -72,8 +123,9 @@ struct EngineCounters {
 };
 EngineCounters g_engine;
 
+/// Native in this pass now (the A/B schedule may hold it back for a block of frames: NativeActive).
 bool Applies(s32 pass) {
-    return pass >= 0 && pass < 64 && ((g_apply_passes >> pass) & 1) != 0;
+    return pass >= 0 && pass < 64 && ((g_apply_passes >> pass) & 1) != 0 && NativeActive();
 }
 
 template <typename T>
@@ -174,6 +226,9 @@ bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_d
     if (Applies(op.pass) && !apply) {
         g_engine.draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
     }
+    if (!apply && !g_verify) {
+        return false; // SSPC_P53_NATIVE_VERIFY=0: no shadow marker, the game's draw as it is
+    }
     if (!apply && g_canary != 0 && g_engine.draws.load(std::memory_order_relaxed) % g_canary == 0) {
         op.canary = true; // the processor must see the count differ
         op.index_count += 1;
@@ -183,7 +238,7 @@ bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_d
         g_engine.no_space.fetch_add(1, std::memory_order_relaxed);
         return false; // nothing written: the game's wrapper draws (it reports its own failure if it has no room)
     }
-    Advance(dcb, at, EncodeDrawMarker(op, apply ? u16(kApply | kVerify) : u16(kVerify), at));
+    Advance(dcb, at, EncodeDrawMarker(op, apply ? u16(g_verify ? kApply | kVerify : kApply) : u16(kVerify), at));
     g_engine.marked.fetch_add(1, std::memory_order_relaxed);
     if (apply) {
         g_engine.native_draws.fetch_add(1, std::memory_order_relaxed);
@@ -233,6 +288,274 @@ SSPC_SYSV_ABI void CommitProbe(u8* cue_ptr) {
     g_engine.native_commits.fetch_add(1, std::memory_order_relaxed);
 }
 
+// --- P5.3D: native render state -------------------------------------------------------------------------------------
+
+enum class StatePath { Game, Verify, Apply };
+
+StatePath DecideState(u64 r) {
+    s32 pass = -1;
+    u32 sub = 0;
+    if (t_in_state || !ContextPass(g_base, r, pass, sub)) {
+        return StatePath::Game;
+    }
+    if (g_state_apply && Applies(pass)) {
+        return StatePath::Apply;
+    }
+    return g_state_verify ? StatePath::Verify : StatePath::Game;
+}
+
+/// 0x11f910's barrier / debug-target branches (globals the game sets): not reproduced, the game's method runs.
+bool StateFlagsSet() {
+    return At<u8>(g_base + kBarrierFlag) != 0 || At<u8>(g_base + kDebugRtFlag) != 0;
+}
+
+/// The operation's writes as a state marker in the DCB. False (nothing written) when it cannot be.
+bool EmitState(u8* dcb, const NativeState::Writer& w, u16 flags) {
+    if (w.overflow) {
+        g_state.fallback[kFbOverflow].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (w.n == 0) {
+        return true;
+    }
+    u32* at = Room(dcb, RegistersMarkerDwords(w.n));
+    if (at == nullptr) {
+        g_state.fallback[kFbNoSpace].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    Advance(dcb, at, EncodeRegistersMarker({w.out, w.n}, flags, at, OpKind::State));
+    return true;
+}
+
+/// Verify: the game's method runs (`call`); what it left is compared with the native result - the PM4 dwords it wrote
+/// (engine side), R's state block (when `block` is given), and, through a kVerify marker after its packets, the
+/// register file and target extents the processor holds (processor side).
+template <typename Call>
+void VerifyState(StateFn fn, u64 r, u8* dcb, const NativeState::StateBlock* block, const NativeState::Writer& w,
+                 Call&& call) {
+    const u64 cb = reinterpret_cast<u64>(dcb);
+    const u64 end0 = At<u64>(cb + L::kCbEnd), ptr0 = At<u64>(cb + L::kCbCmdPtr);
+    t_in_state = true;
+    call();
+    t_in_state = false;
+    const u64 end1 = At<u64>(cb + L::kCbEnd), ptr1 = At<u64>(cb + L::kCbCmdPtr);
+    g_state.verified[fn].fetch_add(1, std::memory_order_relaxed);
+    if (end1 != end0 || ptr1 < ptr0) {
+        g_state.size_unchecked.fetch_add(1, std::memory_order_relaxed);
+    } else if (const u64 wrote = (ptr1 - ptr0) / 4; wrote != w.pm4_dwords) {
+        g_state.size_mismatch[fn].fetch_add(1, std::memory_order_relaxed);
+        u32 none = 0xFFFFFFFF;
+        if (g_state.first_size_fn.compare_exchange_strong(none, fn)) {
+            g_state.first_size_want.store(w.pm4_dwords);
+            g_state.first_size_have.store(static_cast<u32>(wrote));
+        }
+    }
+    if (block != nullptr) {
+        NativeState::StateBlock after;
+        NativeState::LoadBlock(r, after);
+        if (std::memcmp(&after, block, NativeState::kStateBlockBytes) != 0) {
+            g_state.block_mismatch[fn].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    EmitState(dcb, w, kVerify);
+}
+
+SSPC_SYSV_ABI void SetTargetsProbe(u8* rp, u64 targets, const u32* rect) {
+    const u64 r = reinterpret_cast<u64>(rp);
+    const StatePath path = DecideState(r);
+    if (path == StatePath::Game) {
+        g_set_targets(rp, targets, rect);
+        return;
+    }
+    if (StateFlagsSet()) {
+        g_state.fallback[kFbFlags].fetch_add(1, std::memory_order_relaxed);
+        g_set_targets(rp, targets, rect);
+        return;
+    }
+    u8* dcb = rp + L::kContextGfx;
+    NativeState::StateBlock s;
+    NativeState::LoadBlock(r, s);
+    RegWrite writes[kMaxStateWrites];
+    NativeState::Writer w{writes, kMaxStateWrites};
+    NativeState::SetRenderTargets(s, targets, rect, g_state_env, w);
+    if (path == StatePath::Verify) {
+        VerifyState(kFnTargets, r, dcb, &s, w, [&] { g_set_targets(rp, targets, rect); });
+        return;
+    }
+    if (!EmitState(dcb, w, kApply)) {
+        g_set_targets(rp, targets, rect);
+        return;
+    }
+    NativeState::StoreBlock(r, s);
+    g_state.native[kFnTargets].fetch_add(1, std::memory_order_relaxed);
+}
+
+SSPC_SYSV_ABI void TransitionProbe(u8* rp, u64 block) {
+    const u64 r = reinterpret_cast<u64>(rp);
+    const StatePath path = DecideState(r);
+    if (path == StatePath::Game) {
+        g_transition(rp, block);
+        return;
+    }
+    if (StateFlagsSet()) {
+        g_state.fallback[kFbFlags].fetch_add(1, std::memory_order_relaxed);
+        g_transition(rp, block);
+        return;
+    }
+    u8* dcb = rp + L::kContextGfx;
+    NativeState::StateBlock s;
+    NativeState::LoadBlock(r, s);
+    RegWrite writes[kMaxStateWrites];
+    NativeState::Writer w{writes, kMaxStateWrites};
+    NativeState::TransitionTo(s, block, g_state_env, w);
+    if (path == StatePath::Verify) {
+        VerifyState(kFnTransition, r, dcb, &s, w, [&] { g_transition(rp, block); });
+        return;
+    }
+    if (!EmitState(dcb, w, kApply)) {
+        g_transition(rp, block);
+        return;
+    }
+    NativeState::StoreBlock(r, s);
+    g_state.native[kFnTransition].fetch_add(1, std::memory_order_relaxed);
+}
+
+SSPC_SYSV_ABI void PrimTypeProbe(u8* dcb, u32 prim) {
+    const u64 r = reinterpret_cast<u64>(dcb) - L::kContextGfx;
+    const StatePath path = DecideState(r);
+    if (path == StatePath::Game) {
+        g_prim_type(dcb, prim);
+        return;
+    }
+    RegWrite writes[1];
+    NativeState::Writer w{writes, 1};
+    NativeState::SetPrimitiveType(prim, w);
+    if (path == StatePath::Verify) {
+        VerifyState(kFnPrim, r, dcb, nullptr, w, [&] { g_prim_type(dcb, prim); });
+    } else if (EmitState(dcb, w, kApply)) {
+        g_state.native[kFnPrim].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_prim_type(dcb, prim);
+    }
+}
+
+SSPC_SYSV_ABI void IndexSizeProbe(u8* dcb, u32 size, u32 policy) {
+    const u64 r = reinterpret_cast<u64>(dcb) - L::kContextGfx;
+    const StatePath path = DecideState(r);
+    if (path == StatePath::Game) {
+        g_index_size(dcb, size, policy);
+        return;
+    }
+    RegWrite writes[1];
+    NativeState::Writer w{writes, 1};
+    NativeState::SetIndexSize(size, policy, w);
+    if (path == StatePath::Verify) {
+        VerifyState(kFnIndex, r, dcb, nullptr, w, [&] { g_index_size(dcb, size, policy); });
+    } else if (EmitState(dcb, w, kApply)) {
+        g_state.native[kFnIndex].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_index_size(dcb, size, policy);
+    }
+}
+
+/// A one-packet Gnm state setter (NativeState::kLeaves[i]) on a render context's DCB.
+template <typename Call>
+void RunLeaf(u32 i, u8* dcb, u32 a, u32 b, Call&& game) {
+    const u64 r = reinterpret_cast<u64>(dcb) - L::kContextGfx;
+    const StatePath path = DecideState(r);
+    if (path == StatePath::Game) {
+        game();
+        return;
+    }
+    RegWrite writes[2];
+    NativeState::Writer w{writes, 2};
+    NativeState::LeafWrite(NativeState::kLeaves[i], a, b, w);
+    if (w.overflow) {
+        g_state.fallback[kFbOverflow].fetch_add(1, std::memory_order_relaxed);
+        game();
+        return;
+    }
+    if (path == StatePath::Verify) {
+        VerifyState(kFnLeaf, r, dcb, nullptr, w, game);
+    } else if (EmitState(dcb, w, kApply)) {
+        g_state.native[kFnLeaf].fetch_add(1, std::memory_order_relaxed);
+        g_leaf_native[i].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        game();
+    }
+}
+
+using Leaf1Fn = SSPC_SYSV_ABI void (*)(u8* dcb, u32 a);
+using Leaf2Fn = SSPC_SYSV_ABI void (*)(u8* dcb, u32 a, u32 b);
+using LeafFFn = SSPC_SYSV_ABI void (*)(float x, float y, u8* dcb);
+
+template <u32 I>
+SSPC_SYSV_ABI void Leaf1Probe(u8* dcb, u32 a) {
+    RunLeaf(I, dcb, a, 0, [&] { reinterpret_cast<Leaf1Fn>(g_leaf_game[I])(dcb, a); });
+}
+template <u32 I>
+SSPC_SYSV_ABI void Leaf2Probe(u8* dcb, u32 a, u32 b) {
+    RunLeaf(I, dcb, a, b, [&] { reinterpret_cast<Leaf2Fn>(g_leaf_game[I])(dcb, a, b); });
+}
+template <u32 I>
+SSPC_SYSV_ABI void LeafFProbe(float x, float y, u8* dcb) {
+    u32 a = 0, b = 0;
+    std::memcpy(&a, &x, 4);
+    std::memcpy(&b, &y, 4);
+    RunLeaf(I, dcb, a, b, [&] { reinterpret_cast<LeafFFn>(g_leaf_game[I])(x, y, dcb); });
+}
+
+template <u32 I>
+constexpr const void* LeafProbe() {
+    constexpr NativeState::Leaf k = NativeState::kLeaves[I].kind;
+    if constexpr (k == NativeState::Leaf::FloatPair) {
+        return reinterpret_cast<const void*>(&LeafFProbe<I>);
+    } else if constexpr (k == NativeState::Leaf::Blend || k == NativeState::Leaf::ColorControl ||
+                         k == NativeState::Leaf::Generic) {
+        return reinterpret_cast<const void*>(&Leaf2Probe<I>);
+    } else {
+        return reinterpret_cast<const void*>(&Leaf1Probe<I>);
+    }
+}
+template <u32... I>
+std::array<const void*, sizeof...(I)> LeafProbes(std::integer_sequence<u32, I...>) {
+    return {LeafProbe<I>()...};
+}
+
+void ReportState() {
+    const DrawCounters& c = Counters();
+    const auto four = [](const std::atomic<u64>* a) {
+        return fmt::format("{}/{}/{}/{}/{}", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load());
+    };
+    std::string leaves;
+    for (u32 i = 0; i < NativeState::kLeafCount; ++i) {
+        if (const u64 n = g_leaf_native[i].load(); n != 0) {
+            leaves += fmt::format(" {:#x}:{}", NativeState::kLeaves[i].rva, n);
+        }
+    }
+    if (!leaves.empty()) {
+        SSPC_LOG(Engine, Info, "native state setters (native calls):{}", leaves);
+    }
+    SSPC_LOG(Engine, Info,
+             "native state (targets/transition/prim/index/setters): native {}, fallbacks (flags {}, overflow {}, no "
+             "space {}) "
+             "| verify: calls {}, state block mismatched {}, PM4 size mismatched {} (unchecked {}{}) | processor "
+             "applied {} ({} writes), verified {}, matched {}, mismatched {}{}",
+             four(g_state.native), g_state.fallback[kFbFlags].load(), g_state.fallback[kFbOverflow].load(),
+             g_state.fallback[kFbNoSpace].load(), four(g_state.verified), four(g_state.block_mismatch),
+             four(g_state.size_mismatch), g_state.size_unchecked.load(),
+             g_state.first_size_fn.load() == 0xFFFFFFFF
+                 ? std::string()
+                 : fmt::format("; first: fn {} native {} game {}", g_state.first_size_fn.load(),
+                               g_state.first_size_want.load(), g_state.first_size_have.load()),
+             c.state_applied.load(), c.state_applied_writes.load(), c.state_verified.load(), c.state_matched.load(),
+             c.state_mismatched.load(),
+             c.state_first_bad_reg.load() == 0
+                 ? std::string()
+                 : fmt::format(" (first: reg {:#x} native {:#x} PM4 {:#x})", c.state_first_bad_reg.load(),
+                               c.state_first_bad_want.load(), c.state_first_bad_have.load()));
+}
+
 void Reporter(u32 seconds) {
     static constexpr const char* kFields[kMismatchFields] = {"kind",    "index count", "index base", "VS regs",
                                                              "PS regs", "VS table",    "PS table"};
@@ -250,6 +573,9 @@ void Reporter(u32 seconds) {
             if (const u64 n = c.pass_mismatched[p].load(); n != 0) {
                 passes += fmt::format(" p{}:{}/{}", p, n, c.pass_verified[p].load());
             }
+        }
+        if (g_state_on) {
+            ReportState();
         }
         if (g_apply_passes != 0) {
             SSPC_LOG(Engine, Info,
@@ -538,7 +864,7 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         g_commit = reinterpret_cast<CommitFn>(commit);
         std::string passes;
         for (u32 p = 0; p <= 40; ++p) {
-            if (Applies(static_cast<s32>(p))) {
+            if (((g_apply_passes >> p) & 1) != 0) {
                 passes += fmt::format(" {}", p);
             }
         }
@@ -546,6 +872,90 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
                  "EXPERIMENT: SSPC_P53_NATIVE_DRAW={} - passes{}: CUE commit 0x14ad0 and draws run natively (register "
                  "writes and draws handed to the command processor, no PM4 of their own); other passes in shadow mode",
                  mode, passes);
+    }
+    if (const std::string state = Env("SSPC_P53_NATIVE_STATE"); !state.empty() && state != "0" && state != "off") {
+        if (state != "verify" && state != "apply") {
+            SSPC_LOG(Engine, Error, "SSPC_P53_NATIVE_STATE={}: want verify or apply; native state not installed", state);
+        } else {
+            g_state_apply = state == "apply" && g_apply_passes != 0;
+            if (state == "apply" && !g_state_apply) {
+                SSPC_LOG(Engine, Error,
+                         "SSPC_P53_NATIVE_STATE=apply needs SSPC_P53_NATIVE_DRAW=apply:<passes> (and the native "
+                         "backend); verify instead");
+            }
+            bool ok = true;
+            for (const GuestFunction& f : kStateAssumed) {
+                ok = ok && VerifyGuestFunction(eboot_base, f, error);
+            }
+            for (const ProbeSite* s : {&kSetTargetsSite, &kTransitionSite, &kPrimTypeSite, &kIndexSizeSite}) {
+                ok = ok && VerifyGuestFunction(eboot_base, s->function, error);
+            }
+            for (const NativeState::LeafSpec& s : NativeState::kLeaves) {
+                ok = ok && VerifyGuestFunction(eboot_base, GuestFunction{s.rva, s.size, s.hash}, error);
+            }
+            if (!ok) {
+                SSPC_LOG(Engine, Error, "native state not installed: {}", error);
+            } else {
+                g_state_env.rt_base = reinterpret_cast<NativeState::TargetFn>(eboot_base + 0x637bf0);
+                g_state_env.rt_fmask_base = reinterpret_cast<NativeState::TargetFn>(eboot_base + 0x637f30);
+                g_state_env.rt_set_fmask = reinterpret_cast<NativeState::SetFmaskFn>(eboot_base + 0x637e30);
+                g_state_env.dt_z_base = reinterpret_cast<NativeState::TargetFn>(eboot_base + 0x621450);
+                g_state_env.dt_htile = reinterpret_cast<NativeState::TargetFn>(eboot_base + 0x6219e0);
+                g_state_env.db_reg_2de = At<u32>(eboot_base + kDbReg2deTable + 3 * 4);
+                void* t = InstallEntryProbe(eboot_base, kSetTargetsSite, reinterpret_cast<const void*>(&SetTargetsProbe),
+                                            error);
+                void* x = t ? InstallEntryProbe(eboot_base, kTransitionSite,
+                                                reinterpret_cast<const void*>(&TransitionProbe), error)
+                            : nullptr;
+                void* p = x ? InstallEntryProbe(eboot_base, kPrimTypeSite, reinterpret_cast<const void*>(&PrimTypeProbe),
+                                                error)
+                            : nullptr;
+                void* i = p ? InstallEntryProbe(eboot_base, kIndexSizeSite,
+                                                reinterpret_cast<const void*>(&IndexSizeProbe), error)
+                            : nullptr;
+                const auto leaf_probes =
+                    LeafProbes(std::make_integer_sequence<u32, NativeState::kLeafCount>{});
+                for (u32 k = 0; i != nullptr && k < NativeState::kLeafCount; ++k) {
+                    const NativeState::LeafSpec& s = NativeState::kLeaves[k];
+                    const ProbeSite site{{s.rva, s.size, s.hash}, s.prologue};
+                    g_leaf_game[k] = InstallEntryProbe(eboot_base, site, leaf_probes[k], error);
+                    if (g_leaf_game[k] == nullptr) {
+                        i = nullptr;
+                    }
+                }
+                if (i == nullptr) {
+                    SSPC_LOG(Engine, Critical, "native state: {}", error);
+                    std::abort(); // verified bytes, but the host refused the write: stop rather than run half-probed
+                }
+                g_set_targets = reinterpret_cast<SetTargetsFn>(t);
+                g_transition = reinterpret_cast<TransitionFn>(x);
+                g_prim_type = reinterpret_cast<PrimTypeFn>(p);
+                g_index_size = reinterpret_cast<IndexSizeFn>(i);
+                g_state_on = true;
+                SSPC_LOG(Engine, Warning,
+                         "EXPERIMENT: SSPC_P53_NATIVE_STATE={} - SetRenderTargets 0x11f910, TransitionTo 0x120020, "
+                         "primitive type 0x623740, index size 0x624f80 and {} one-packet state setters (blend, "
+                         "depth/stencil, rasterizer, depth bias, instances): {}",
+                         state, NativeState::kLeafCount,
+                         g_state_apply ? "native in the apply passes (state markers, no PM4 of their own), verified "
+                                         "against the game's PM4 elsewhere"
+                                       : "the game's PM4, verified against the native result");
+            }
+        }
+    }
+    if (Env("SSPC_P53_NATIVE_VERIFY") == "0") {
+        g_verify = false;
+        g_state_verify = false;
+        SSPC_LOG(Engine, Warning,
+                 "SSPC_P53_NATIVE_VERIFY=0: native operations without their checks (no shadow markers in the other "
+                 "passes, no comparison of native draws or state) - for measurements; correctness runs keep it on");
+    }
+    if (const std::string ab = Env("SSPC_P53_NATIVE_AB"); !ab.empty() && g_apply_passes != 0) {
+        Control().ab_frames = static_cast<u32>(std::strtoul(ab.c_str(), nullptr, 10));
+        SSPC_LOG(Engine, Warning,
+                 "EXPERIMENT: SSPC_P53_NATIVE_AB={} - blocks of {} flips alternate: the game's PM4 path (verified), then "
+                 "the native path",
+                 ab, Control().ab_frames);
     }
     if (const std::string s = Env("SSPC_P53_NATIVE_DRAW_CANARY"); !s.empty()) {
         g_canary = std::strtoull(s.c_str(), nullptr, 10);

@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include <fmt/format.h>
+#include <windows.h> // GetEnvironmentVariableA (SSPC_P53_CAPTURE_*)
 
 #include "base/log.h"
 
@@ -591,6 +592,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
         const Pm4::NopMarker m = Pm4::ClassifyNop(p);
         if (m == Pm4::NopMarker::PatchedFlip) {
             ++stats_.flips;
+            Engine::Render::Control().flips.fetch_add(1, std::memory_order_relaxed); // (the A/B schedule's clock)
             options_.work->Flip(FlipMarker{.queue = q.id, .packet_addr = addr, .after_seq = q.work_seq});
         } else if (m == Pm4::NopMarker::SetVsharpInUdata || m == Pm4::NopMarker::SetTsharpInUdata ||
                    m == Pm4::NopMarker::SetSsharpInUdata) {
@@ -1058,6 +1060,49 @@ StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u3
     R::DrawCounters& c = R::Counters();
     c.markers.fetch_add(1, std::memory_order_relaxed);
     u16 flags = 0;
+    if (R::MarkerKind(p) == R::OpKind::State) {
+        // P5.3D native render state. kApply: the writes the game's state packets would make, and the target extents
+        // their NOP hints give (ExtentHint). kVerify: the game's packets ran just before; what they left must be it.
+        R::RegWrite writes[R::kMaxStateWrites];
+        u32 count = 0;
+        if (q.compute || !R::DecodeRegistersMarker(p, writes, count, flags, R::OpKind::State, R::kMaxStateWrites) ||
+            (flags & (R::kApply | R::kVerify)) == 0) {
+            c.malformed.fetch_add(1, std::memory_order_relaxed);
+            return StepStatus::Packet;
+        }
+        const auto extent = [this](u32 reg) -> u32& {
+            return reg == R::kStateDbExtent ? db_extent_ : cb_extent_[reg - R::kStateCbExtent0];
+        };
+        if ((flags & R::kApply) != 0) {
+            for (u32 i = 0; i < count; ++i) {
+                if (R::IsStatePseudo(writes[i].reg)) {
+                    extent(writes[i].reg) = writes[i].value;
+                } else if (!regs_.WriteReg(writes[i].reg, writes[i].value)) {
+                    c.malformed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            c.state_applied.fetch_add(1, std::memory_order_relaxed);
+            c.state_applied_writes.fetch_add(count, std::memory_order_relaxed);
+            return StepStatus::Packet;
+        }
+        bool match = true;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 reg = writes[i].reg;
+            const u32 have = R::IsStatePseudo(reg) ? extent(reg) : regs_.Get(reg);
+            if (have != writes[i].value) {
+                match = false;
+                u32 none = 0;
+                if (c.state_first_bad_reg.compare_exchange_strong(none, reg)) {
+                    c.state_first_bad_want.store(writes[i].value);
+                    c.state_first_bad_have.store(have);
+                }
+            }
+        }
+        c.state_values_checked.fetch_add(count, std::memory_order_relaxed);
+        c.state_verified.fetch_add(1, std::memory_order_relaxed);
+        (match ? c.state_matched : c.state_mismatched).fetch_add(1, std::memory_order_relaxed);
+        return StepStatus::Packet;
+    }
     if (R::MarkerKind(p) == R::OpKind::Registers) {
         // A native CUE commit (P5.3C): its register writes go straight to the register file, as SET_SH_REG /
         // SET_CONTEXT_REG would have put them (user-data slots written this way hold no inline V#/T#/S#).
@@ -1084,21 +1129,22 @@ StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u3
         c.applied_registers.fetch_add(count, std::memory_order_relaxed);
         return StepStatus::Packet;
     }
-    auto op = std::make_unique<R::DrawOp>();
-    if (!R::DecodeDrawMarker(p, *op, flags) || (flags & (R::kVerify | R::kApply)) == 0) {
+    R::DrawOp op;
+    if (!R::DecodeDrawMarker(p, op, flags) || (flags & (R::kVerify | R::kApply)) == 0) {
         c.malformed.fetch_add(1, std::memory_order_relaxed);
         return StepStatus::Packet;
     }
+    PassCaptureMarker(op.pass, (flags & R::kApply) != 0);
     if (native_expect_ != nullptr) {
         c.orphaned.fetch_add(1, std::memory_order_relaxed); // the previous marker met no draw
         native_expect_.reset();
     }
     const bool apply = (flags & R::kApply) != 0;
-    const bool indexed = op->indexed;
-    const u32 count = op->index_count;
-    const u64 base = op->index_base;
+    const bool indexed = op.indexed;
+    const u32 count = op.index_count;
+    const u64 base = op.index_base;
     if ((flags & R::kVerify) != 0) {
-        native_expect_ = std::move(op);
+        native_expect_ = std::make_unique<R::DrawOp>(op); // (only a verified draw keeps its operation)
         native_expect_queue_ = q.id;
     }
     if (!apply) {
@@ -1117,6 +1163,69 @@ StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u3
     }
     const u32 body[3] = {header(Pm4::Op::DrawIndexAuto, 2), count, 2u};
     return Draw(q, addr, body, DrawKind::IndexAuto);
+}
+
+void CommandProcessor::PassCaptureMarker(s32 pass, bool applied) {
+    PassCapture& c = pass_capture_;
+    if (!c.parsed) {
+        c.parsed = true;
+        char s[128] = {};
+        if (GetEnvironmentVariableA("SSPC_P53_CAPTURE_PASSES", s, sizeof(s)) > 0) {
+            for (char* p = s; *p != 0;) {
+                const unsigned long v = std::strtoul(p, &p, 10);
+                if (v < 64) {
+                    c.passes |= u64{1} << v;
+                }
+                while (*p == ',' || *p == ' ') {
+                    ++p;
+                }
+            }
+        }
+        if (GetEnvironmentVariableA("SSPC_P53_CAPTURE_FLIPS", s, sizeof(s)) > 0) {
+            char* p = s;
+            c.first = std::strtoull(p, &p, 10);
+            c.count = *p == '+' ? std::strtoull(p + 1, &p, 10) : 1;
+        }
+        if (c.passes != 0) {
+            SSPC_LOG(GPU, Warning,
+                     "DIAGNOSTIC: SSPC_P53_CAPTURE_PASSES - the targets of passes {:#x} (bits) captured where their "
+                     "draws end, in flips {} .. {} (the processor's count)",
+                     c.passes, c.first, c.first + c.count);
+        }
+    }
+    if (c.passes == 0) {
+        return;
+    }
+    const auto wanted = [&c](s32 p) { return p >= 0 && p < 64 && ((c.passes >> p) & 1) != 0; };
+    if (pass != c.pass) {
+        if (!c.targets.empty() && wanted(c.pass)) {
+            options_.work->CaptureTargets(c.targets.data(), static_cast<u32>(c.targets.size()), c.pass, c.native,
+                                          c.pm4);
+        }
+        c.targets.clear();
+        c.native = c.pm4 = 0;
+        c.pass = pass;
+    }
+    const u64 flips = Engine::Render::Control().flips.load(std::memory_order_relaxed);
+    if (!wanted(pass) || flips < c.first || flips >= c.first + c.count) {
+        return;
+    }
+    ++(applied ? c.native : c.pm4);
+    // What the draw after this marker writes: the bound colour targets (CB_COLORn_INFO.FORMAT set) and the depth target.
+    const auto add = [&c](u64 address) {
+        if (address != 0 && std::find(c.targets.begin(), c.targets.end(), address) == c.targets.end()) {
+            c.targets.push_back(address);
+        }
+    };
+    for (u32 n = 0; n < 8; ++n) {
+        const u32 base = Reg::CbColor0Base + n * Reg::CbColorStride;
+        if (((regs_.Get(base + 4) >> 2) & 0x1F) != 0) { // CB_COLORn_INFO
+            add(u64{regs_.Get(base)} << 8);
+        }
+    }
+    if ((regs_.Get(Reg::DbZInfo) & 3) != 0) {
+        add(u64{regs_.Get(Reg::DbZInfo + 4)} << 8); // DB_Z_WRITE_BASE
+    }
 }
 
 void CommandProcessor::VerifyNativeDraw(const DrawDescriptor& d) {

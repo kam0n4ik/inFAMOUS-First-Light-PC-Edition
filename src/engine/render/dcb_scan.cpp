@@ -3,6 +3,7 @@
 
 #include <algorithm>
 
+#include "engine/render/native_render_ops.h"
 #include "runtime/gpu/pm4.h"
 
 namespace SecondSon::Engine::Render {
@@ -118,12 +119,19 @@ void ScanCommands(std::span<const u32> stream, ScanState& s, ScanResult& r) {
         if (p.type != 3) {
             continue;
         }
+        ++r.opcode_packets[p.opcode & 0xFF];
         switch (p.opcode) {
+        case Op::Nop:
+            if (body.size() >= 2 && body[0] == kMarkerMagic && (body[1] & 0xFFFF) < r.native_ops.size()) {
+                ++r.native_ops[body[1] & 0xFFFF];
+            }
+            break;
         case Op::SetContextReg:
             if (!body.empty()) {
                 const u32 first = body[0] & 0xFFFF;
                 for (u32 k = 1; k < body.size() && first + k - 1 < 0x400; ++k) {
                     s.context[first + k - 1] = body[k];
+                    ++r.context_writes[first + k - 1];
                 }
             }
             break;
@@ -132,6 +140,17 @@ void ScanCommands(std::span<const u32> stream, ScanState& s, ScanResult& r) {
                 const u32 first = body[0] & 0xFFFF;
                 for (u32 k = 1; k < body.size(); ++k) {
                     WriteSh(s, first + k - 1, body[k]);
+                    if (first + k - 1 < 0x400) {
+                        ++r.sh_writes[first + k - 1];
+                    }
+                }
+            }
+            break;
+        case Op::SetUconfigReg:
+            if (!body.empty()) {
+                const u32 first = body[0] & 0xFFFF;
+                for (u32 k = 1; k < body.size() && first + k - 1 < 0x400; ++k) {
+                    ++r.uconfig_writes[first + k - 1];
                 }
             }
             break;

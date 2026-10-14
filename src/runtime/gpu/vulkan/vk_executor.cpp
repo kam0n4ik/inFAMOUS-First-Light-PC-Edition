@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include "base/log.h"
+#include "engine/render/native_render_ops.h"
 #include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -4294,21 +4295,28 @@ void Executor::DrawHistogram() {
 }
 
 void Executor::CaptureImageAt() {
-    // SSPC_DIAG_CAPTURE_IMAGE=<hex address>:<flip>[,<hex address>:<flip>...]: the GPU-written image at that address as it
-    // is at that flip's end -> logs\p45\image_<address>_<flip>.raw/.txt (+ .png for display formats); P4.5
+    // SSPC_DIAG_CAPTURE_IMAGE=<hex address>:<flip>[+<flips>][,...]: the GPU-written image at that address as it is at
+    // that flip's end (+<flips>: at each of that many flips from it) -> logs\p45\image_<address>_<flip>.raw/.txt (+ .png
+    // for display formats); P4.5. SSPC_DIAG_CAPTURE_DIR=<dir>: there instead of logs\p45, with captures.csv - each
+    // capture with the native render operations the processor had applied so far (P5.3D A/B: which path drew a flip).
     struct Want {
         u64 addr, flip;
     };
     static const std::vector<Want> wants = [] {
         std::vector<Want> v;
-        char s[256] = {};
+        char s[1024] = {};
         if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_IMAGE", s, sizeof(s)) > 0) {
             for (char* p = s; *p != 0;) {
                 Want w{std::strtoull(p, &p, 16), 0};
                 if (*p == ':') {
                     w.flip = std::strtoull(p + 1, &p, 10);
                 }
-                v.push_back(w);
+                if (*p == '+') {
+                    flips = std::clamp<u64>(std::strtoull(p + 1, &p, 10), 1, 4096);
+                }
+                for (u64 k = 0; k < flips; ++k) {
+                    v.push_back(Want{w.addr, w.flip + k});
+                }
                 while (*p == ',' || *p == ' ') {
                     ++p;
                 }
@@ -4320,10 +4328,11 @@ void Executor::CaptureImageAt() {
     if (wants.empty() || !Begin()) {
         return;
     }
+                u64 flips = 1;
     const u64 id = VideoOut::NextFlipId();
     for (const Want& w : wants) {
-        if (w.flip != id) {
-            continue;
+        if (w.flip == id) {
+            CaptureTargets(&w.addr, 1, -1, 0, 0);
         }
         CachedImage* img = images_.FindTargetAt(w.addr);
         if (img == nullptr) {
@@ -4340,15 +4349,43 @@ void Executor::CaptureImageAt() {
         if (!readback_) {
             readback_ = std::make_unique<ImageReadback>(ctx_);
         }
+    }
+}
+
+void Executor::CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 native_draws, u32 pm4_draws) {
+    static const std::filesystem::path dir = [this] {
+        char s[512] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_DIR", s, sizeof(s));
+        return n > 0 && n < sizeof(s) ? std::filesystem::path(s)
+                                       : options_.capture_path.parent_path().parent_path() / "p45";
+    }();
+    if (!Begin()) {
+        return;
+    }
+    const u64 id = VideoOut::NextFlipId();
+    for (u32 k = 0; k < count; ++k) {
+        const struct {
+            u64 addr;
+        } w{addresses[k]};
         const bool depth = img->layout.props.is_depth;
         const VkFormat fmt = depth ? VK_FORMAT_D32_SFLOAT : img->format;
         const u32 texel = depth ? 4u : std::max<u32>(img->layout.num_bits / 8, 1);
         for (u32 layer = 0; layer < std::min<u32>(std::max<u32>(img->layout.layers, 1), 8); ++layer) {
             readback_->Record(cur_.cb, cur_.value, img->image, fmt, depth ? VK_IMAGE_ASPECT_DEPTH_BIT : img->aspect,
-                              layer, img->layout.size.width, img->layout.size.height, texel,
-                              options_.capture_path.parent_path().parent_path() / "p45" /
-                                  fmt::format("image_{:x}_{}_l{}", w.addr, id, layer),
-                              true);
+                              layer, img->layout.size.width, img->layout.size.height, texel, dir / stem, true);
+        }
+        {
+            const Engine::Render::DrawCounters& c = Engine::Render::Counters();
+            const bool fresh = !std::filesystem::exists(dir / "captures.csv");
+            std::ofstream csv(dir / "captures.csv", std::ios::app);
+            if (fresh) {
+                csv << "flip,address,format,width,height,native_draws,native_commits,native_state,verified_draws,"
+                       "state_verified,pass,pass_native_draws,pass_pm4_draws\n";
+            }
+            csv << fmt::format("{},{:x},{},{},{},{},{},{},{},{},{},{},{}\n", id, w.addr, static_cast<u32>(fmt),
+                               img->layout.size.width, img->layout.size.height, c.applied_draws.load(),
+                               c.applied_commits.load(), c.state_applied.load(), c.verified.load(),
+                               c.state_verified.load(), pass, native_draws, pm4_draws);
         }
         SSPC_LOG(GPU, Info, "DIAGNOSTIC: image capture img{} {:#x} fmt {} {}x{} layers {} at flip {}", img->id, w.addr,
                  img->layout.pixel_format, img->layout.size.width, img->layout.size.height, img->layout.layers, id);
@@ -4358,7 +4395,11 @@ void Executor::CaptureImageAt() {
 void Executor::DiagCaptureDraw(u32 pipeline, const std::array<CachedImage*, 8>& color_img, bool after) {
     // SSPC_DIAG_CAPTURE_DRAW=<hex address>:<first flip>:<count>:<pipeline>: in each of those flips, the render target at
     // that address before and after the first draw of that pipeline, downsampled 4x -> logs\p45\draw\<before|after>_
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
     // <flip> (P4.5: what one draw adds, frame after frame - the smoke's own flicker against its background's)
+            const std::string stem = pass < 0 ? fmt::format("image_{:x}_{}_l{}", w.addr, id, layer)
+                                              : fmt::format("p{}_{:x}_{}_l{}", pass, w.addr, id, layer);
     struct Range {
         u64 addr = 0, first = 0, count = 0;
         u32 pipeline = 0;

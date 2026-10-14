@@ -185,6 +185,11 @@ public:
     virtual void Dispatch(const DispatchDescriptor& dispatch) = 0;
     virtual void CacheAction(const CacheActionOp&) {}
     virtual void Flip(const FlipMarker&) {}
+    /// P5.3D A/B image comparison (SSPC_P53_CAPTURE_PASSES): the targets render pass `pass` wrote, as they are where
+    /// its draws end in the stream (the next pass's first draw marker); how many of its draws ran natively and how many
+    /// from the game's PM4. Diagnostics; a sink may ignore it.
+    virtual void CaptureTargets(const u64* /*addresses*/, u32 /*count*/, s32 /*pass*/, u32 /*native_draws*/,
+                                u32 /*pm4_draws*/) {}
     virtual void Fence(const FenceOp&) {} ///< Shadow: what would be written; Isolated: when held, and when written
     virtual void Dma(const DmaOp&) {}     ///< Shadow: what would be copied; Isolated: what was copied
     virtual void Interrupt(u32 /*queue*/, FenceKind) {}
@@ -484,6 +489,18 @@ private:
     std::unique_ptr<Engine::Render::DrawOp> native_expect_; ///< kVerify marker waiting for its draw (P5.3B)
     u32 native_expect_queue_ = 0;
     u32 native_logged_ = 0;
+    /// P5.3D A/B image comparison: SSPC_P53_CAPTURE_PASSES=<pass>[,...] with SSPC_P53_CAPTURE_FLIPS=<first>+<n> (the
+    /// processor's flip count): the targets those passes' draws wrote, captured where the next pass's draws begin.
+    struct PassCapture {
+        u64 passes = 0;
+        u64 first = 0, count = 0;
+        bool parsed = false;
+        s32 pass = -100;          ///< the pass of the last draw marker
+        std::vector<u64> targets; ///< written by the current pass's draws so far
+        u32 native = 0, pm4 = 0;  ///< the current pass's draws: kApply markers, kVerify-only markers
+    };
+    PassCapture pass_capture_;
+    void PassCaptureMarker(s32 pass, bool applied);
     PacketObserver* observer_ = nullptr;
     CpError last_error_;
     Counters stats_;
