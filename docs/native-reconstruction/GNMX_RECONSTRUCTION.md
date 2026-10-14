@@ -50,6 +50,20 @@
 `0x439ab0`, `0x439c90`; `setWindowScissor` — из `0x11f910`, `0x11fe80`, `0x11ff00`; общий писатель диапазона
 `0x624cb0` — из `0x5b40`, `0xcd40`, `0x140d0`, `0x14ad0` [A].
 
+### 3.1 User data, ресурсы, предвыборка, commit [A]
+
+| Адрес | Наше имя | Аргументы | PM4 / действие | Уверенность |
+|---|---|---|---|---|
+| `0x626520` | setUserDataRegion | cb, stage, sgpr, values*, count (≤16) | `NOP 0x6875000D` (маркер) + `SET_SH_REG USER_DATA_<stage>+sgpr` × count; базы стадий — таблица `0xaf0070` | высокая |
+| `0x626400` | setPointerInUserData | cb, stage, sgpr, u64 ptr | `SET_SH_REG` × 2 (указатель) | высокая |
+| `0x623630` | prefetchIntoL2 | cb, addr, size | `DMA_DATA` в `CP_DMA_READ_TAGS` (0x3022C) — CP SecondSonPC распознаёт как предвыборку без записи | высокая |
+| `0x0123d0` | allocateEmbedded (линейный аллокатор контекста) | ctx, dwords | блок из `ctx+0x20…0x30`, при нехватке — колбэк `ctx+0x00` | высокая |
+| `0x014ad0` | commit перед draw (Constant-Update-Engine-подобный) | ctx | смена шейдеров по флагам; тень ресурсов стадии → блок → указатели в user data; предвыборка кода | высокая (поведение), имена [H] |
+| `0x0140d0` | commit перед dispatch | ctx | то же для CS (`0x63c…` — вычислительные методы) | средняя |
+| `0x1f1e30` | SubmitFrame | frame, flip | EOP-метка кадра, ожидание прошлого кадра, `SubmitAndFlip`, переключение 5 пар буферов | высокая |
+
+Подробная раскладка контекста и кадра — GFX_CONTEXT_LAYOUT.md.
+
 ## 4. Отложенный кандидат: viewport как нативная операция
 
 Замена `setViewport` записью в командный буфер пакета `NOP` (12 dword, как оригинал) с сигнатурой и данными операции,
