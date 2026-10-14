@@ -8,10 +8,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <map>
 
 #include <fmt/format.h>
+
+#include "engine/guest_hooks.h"
 
 namespace SecondSon::Gpu {
 
@@ -46,6 +49,109 @@ bool CpuSampler::StartByName(const std::wstring& name_part, u32 period_us, u32 d
     stop_.store(false);
     sampler_ = std::thread([this] { Run(); });
     started_ = true;
+    return true;
+}
+
+bool CpuSampler::StartRaw(u32 period_us, u32 delay_s) {
+    if (started_) {
+        return false;
+    }
+    raw_ = true;
+    unwind_ = false;
+    raw_buf_.reserve(size_t{8} << 20); // 64 MiB of addresses; a full buffer drops the rest (counted)
+    period_us_ = std::max<u32>(period_us, 500);
+    delay_s_ = delay_s;
+    stop_.store(false);
+    sampler_ = std::thread([this] { Run(); });
+    started_ = true;
+    return true;
+}
+
+void CpuSampler::RunRawTick() {
+    const auto in_guest = [this](u64 a) { return a >= guest_lo_ && a < guest_hi_; };
+    for (size_t t = 0; t < threads_.size(); ++t) {
+        const HANDLE target = threads_[t];
+        if (SuspendThread(target) == static_cast<DWORD>(-1)) {
+            ++failed_;
+            continue;
+        }
+        // nothing below allocates, logs or takes a lock the target may hold
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        u64 rec[2 + kDepth];
+        u32 n = 0;
+        if (GetThreadContext(target, &ctx)) {
+            rec[n++] = ctx.Rip;
+            u64 caller = 0;
+            if (!in_guest(ctx.Rip)) {
+                u64 sp[512];
+                if (SafeRead(ctx.Rsp, sp, sizeof(sp))) {
+                    for (const u64 v : sp) {
+                        if (in_guest(v)) {
+                            caller = v;
+                            break;
+                        }
+                    }
+                }
+            }
+            rec[n++] = caller;
+            // the game's frames: [rbp] = the caller's rbp, [rbp + 8] = the return address
+            u64 rbp = ctx.Rbp;
+            for (u32 k = 0; k < kDepth && rbp != 0 && (rbp & 7) == 0; ++k) {
+                u64 frame[2];
+                if (!SafeRead(rbp, frame, sizeof(frame)) || !in_guest(frame[1])) {
+                    break;
+                }
+                rec[n++] = frame[1];
+                if (frame[0] <= rbp) {
+                    break; // the chain must go up the stack
+                }
+                rbp = frame[0];
+            }
+        }
+        ResumeThread(target);
+        if (n == 0) {
+            ++failed_;
+            continue;
+        }
+        ++samples_;
+        if (raw_buf_.size() + 1 + n > raw_buf_.capacity()) {
+            ++raw_dropped_;
+            continue;
+        }
+        raw_buf_.push_back((static_cast<u64>(t) << 32) | n);
+        raw_buf_.insert(raw_buf_.end(), rec, rec + n);
+    }
+}
+
+bool CpuSampler::WriteRaw(const std::wstring& path) const {
+    if (!raw_) {
+        return false;
+    }
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (f == nullptr) {
+        return false;
+    }
+    fmt::print(f, "# SecondSonPC raw CPU samples (P5.2): every {} us; samples {}, failed {}, dropped (buffer full) {}\n",
+               period_us_, samples_, failed_, raw_dropped_);
+    fmt::print(f, "guest {:#x} {:#x}\n", guest_lo_, guest_hi_);
+    for (size_t i = 0; i < thread_names_.size(); ++i) {
+        std::string name;
+        for (const wchar_t c : thread_names_[i]) {
+            name.push_back(c < 128 && c > 32 ? static_cast<char>(c) : '_');
+        }
+        fmt::print(f, "thread {} {}\n", i, name.empty() ? "?" : name);
+    }
+    for (size_t i = 0; i < raw_buf_.size();) {
+        const u64 hdr = raw_buf_[i++];
+        const u32 n = static_cast<u32>(hdr);
+        fmt::print(f, "s {}", hdr >> 32);
+        for (u32 k = 0; k < n && i < raw_buf_.size(); ++k) {
+            fmt::print(f, " {:x}", raw_buf_[i++]);
+        }
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
     return true;
 }
 
@@ -98,7 +204,11 @@ void CpuSampler::Run() {
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(exe + dos->e_lfanew);
     const u64 exe_end = exe + nt->OptionalHeader.SizeOfImage;
-    if (!name_part_.empty()) {
+    if (raw_) {
+        guest_lo_ = Engine::GuestImageBase();
+        guest_hi_ = Engine::GuestImageEnd();
+    }
+    if (!name_part_.empty() || raw_) {
         // the threads by description (the runtime names the game's: Game:Main, JobWorker4, ...)
         const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te{.dwSize = sizeof(THREADENTRY32)};
@@ -114,9 +224,15 @@ void CpuSampler::Run() {
             }
             PWSTR desc = nullptr;
             // never another sampler: two suspending each other would deadlock (review LOW 9)
-            const bool match = SUCCEEDED(GetThreadDescription(h, &desc)) && desc != nullptr &&
-                               std::wstring_view(desc).find(name_part_) != std::wstring_view::npos &&
-                               !std::wstring_view(desc).starts_with(L"SecondSonPC:CpuSampler");
+            const bool described = SUCCEEDED(GetThreadDescription(h, &desc)) && desc != nullptr;
+            const bool sampler = described && std::wstring_view(desc).starts_with(L"SecondSonPC:CpuSampler");
+            const bool match = raw_ ? !sampler
+                                    : described && std::wstring_view(desc).find(name_part_) != std::wstring_view::npos &&
+                                          !sampler;
+            if (match && raw_) {
+                thread_names_.emplace_back(described ? std::wstring(desc) + L"#" + std::to_wstring(te.th32ThreadID)
+                                                     : L"#" + std::to_wstring(te.th32ThreadID));
+            }
             if (desc != nullptr) {
                 LocalFree(desc);
             }
@@ -132,7 +248,11 @@ void CpuSampler::Run() {
     }
     u64 pcs[kDepth];
     size_t next_thread = 0;
-    while (!stop_.load(std::memory_order_acquire)) {
+    while (raw_ && !stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(period_us_));
+        RunRawTick();
+    }
+    while (!raw_ && !stop_.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::microseconds(period_us_));
         HANDLE target = thread_;
         if (!threads_.empty()) {

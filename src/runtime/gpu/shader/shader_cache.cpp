@@ -72,13 +72,24 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
             slot = {key, entry};
         }
     }
+    // P5.2: its code pages write-tracked before the read that validated it, and not written since
+    const bool tracked_clean = entry != nullptr && entry->tracked && !entry->dirty;
+    if (tracked_clean && trust_ == CodeTrust::On) {
+        ++stats_.trusted_tracked;
+        out.program = entry->program;
+        out.footer_hash = entry->footer_hash;
+        return out;
+    }
     if (entry != nullptr && !entry->dirty && validation_ == Validation::PerFrame && entry->epoch == epoch_) {
         ++stats_.trusted;
         out.program = entry->program;
         out.footer_hash = entry->footer_hash;
         return out;
     }
-    // read and compare (the first use of the address, or its revalidation)
+    // read and compare (the first use of the address, or its revalidation); P5.2: tracked first, so a write after
+    // the read is caught (a new address is tracked from its next validation, once its length is known)
+    const bool armed = trust_ != CodeTrust::Off && entry != nullptr &&
+                       track_(track_ctx_, addr, u64{entry->length} + kFooterBytes + kFooterSearchBytes);
     ++stats_.reads;
     out.read = true;
     const ProgramError e = ReadProgram(memory, addr, stage, scratch_, scan_);
@@ -98,12 +109,16 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
             ++stats_.same;
             entry->epoch = epoch_;
             entry->dirty = false;
+            entry->tracked = armed;
             entry->footer_hash = scratch_.footer.shader_hash;
             out.program = p;
             out.footer_hash = scratch_.footer.shader_hash;
             return out;
         }
         ++stats_.changed;
+        if (tracked_clean) {
+            ++stats_.trust_mismatches; // (verify) the code changed without a tracked write
+        }
         out.changed = true;
     }
     const ContentHash hash = test_hash_ != nullptr ? test_hash_(scratch_.code) : scratch_.hash;
@@ -131,7 +146,7 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
         out.created = true;
     }
     ++program->addresses;
-    addresses_[key] = AddressEntry{program, epoch_, scratch_.footer.shader_hash, id.length, false};
+    addresses_[key] = AddressEntry{program, epoch_, scratch_.footer.shader_hash, id.length, false, armed};
     addr_lo_ = std::min(addr_lo_, addr);
     addr_hi_ = std::max(addr_hi_, addr + id.length + kFooterBytes + kFooterSearchBytes);
     out.program = program;
@@ -186,9 +201,16 @@ const FetchCache::Entry& FetchCache::Get(GuestReader& memory, u64 addr, u32 sgpr
 
 const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch,
                                               Validation validation, Entry& e) {
-    if (e.epoch == epoch && validation == Validation::PerFrame && e.epoch != 0) {
+    // P5.2: tracked before the read that validated it, not written since (see ProgramCache::Get)
+    const bool tracked_clean = e.epoch != 0 && e.tracked && !e.dirty;
+    if (tracked_clean && trust_ == CodeTrust::On) {
+        ++trusted_tracked;
         return e;
     }
+    if (e.epoch == epoch && validation == Validation::PerFrame && e.epoch != 0 && !e.dirty) {
+        return e;
+    }
+    const bool armed = trust_ != CodeTrust::Off && e.epoch != 0 && track_(track_ctx_, addr, kMaxFetchDwords * 4ull);
     ++reads;
     // read up to the fetch shader's s_setpc_b64 (64 dwords at a time, at most kMaxFetchDwords)
     scratch_.clear();
@@ -216,6 +238,9 @@ const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32
         scratch_.resize(parsed.size / 4);
         if (e.ok && e.code != scratch_) {
             ++changed;
+            if (tracked_clean) {
+                ++trust_mismatches; // (verify) the code changed without a tracked write
+            }
         }
         e.code = scratch_;
         e.fetch = std::move(parsed);
@@ -227,7 +252,25 @@ const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32
     }
     e.ok = ok;
     e.epoch = epoch;
+    e.addr = addr;
+    e.tracked = armed;
+    e.dirty = false;
+    lo_ = std::min(lo_, addr);
+    hi_ = std::max(hi_, addr + kMaxFetchDwords * 4ull);
     return e;
+}
+
+void FetchCache::Invalidate(u64 addr, u64 size) {
+    const u64 end = addr + size;
+    if (end <= lo_ || addr >= hi_) {
+        return;
+    }
+    for (auto& [key, e] : entries_) {
+        if (e.epoch != 0 && e.addr < end && addr < e.addr + kMaxFetchDwords * 4ull) {
+            invalidations += e.dirty ? 0 : 1;
+            e.dirty = true;
+        }
+    }
 }
 
 } // namespace SecondSon::Gpu::Shader

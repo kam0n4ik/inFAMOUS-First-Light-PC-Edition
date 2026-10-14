@@ -31,6 +31,14 @@
 namespace SecondSon::Gpu::Shader {
 
 enum class Validation : u8 { PerFrame, PerBind };
+
+/// P5.2 (SSPC_P52_CODE_TRUST): a program's or fetch shader's code read once and its pages write-tracked stays trusted
+/// - no read and comparison every frame - until a write to those pages (or their unmapping) invalidates it. Off: the
+/// per-frame validation alone; Verify: tracked but read every frame as before, counting what a trusted entry missed.
+enum class CodeTrust : u8 { Off, On, Verify };
+/// Write-tracks [addr, addr + size) (before the code there is read); false: it cannot be tracked (the entry is then
+/// validated every frame as before).
+using TrackCodeFn = bool (*)(void* ctx, u64 addr, u64 size);
 enum class ModuleState : u8 { Pending, Ready, Failed };
 
 struct Module {
@@ -86,6 +94,8 @@ struct ProgramCacheStats {
     u64 new_programs = 0;
     u64 invalidations = 0;    ///< addresses marked by Invalidate
     u64 bytes_read = 0;
+    u64 trusted_tracked = 0;  ///< P5.2: trusted by write tracking (no read; any epoch)
+    u64 trust_mismatches = 0; ///< P5.2 verify: a tracked, unwritten entry's code had changed (tracking missed a write)
     std::array<u64, static_cast<size_t>(ProgramError::Count)> errors{};
 };
 
@@ -107,6 +117,11 @@ public:
     void Invalidate(u64 addr, u64 size);
     void SetValidation(Validation v) { validation_ = v; }
     Validation GetValidation() const { return validation_; }
+    void SetCodeTrust(CodeTrust trust, TrackCodeFn track, void* ctx) {
+        trust_ = track != nullptr ? trust : CodeTrust::Off;
+        track_ = track;
+        track_ctx_ = ctx;
+    }
 
     const ProgramCacheStats& Stats() const { return stats_; }
     size_t Programs() const { return programs_.size(); }
@@ -124,7 +139,11 @@ private:
         u64 footer_hash = 0;
         u32 length = 0;
         bool dirty = false;
+        bool tracked = false; ///< P5.2: its code and footer were write-tracked before the read that validated them
     };
+    CodeTrust trust_ = CodeTrust::Off;
+    TrackCodeFn track_ = nullptr;
+    void* track_ctx_ = nullptr;
     std::unordered_map<u64, AddressEntry> addresses_; ///< key: address << 3 | stage
     /// P4.9: the entries looked up last (direct-mapped by key) - the map's hashing and bucket walk on every stage of every
     /// draw were ~1.4% of the GPU thread (village); its entries are never erased, so the pointers stay valid
@@ -150,12 +169,27 @@ public:
         FetchShader fetch;
         std::vector<u32> code;
         u64 epoch = 0;
+        u64 addr = 0;         ///< P5.2: where it was read (Invalidate)
+        bool tracked = false; ///< P5.2: its bytes were write-tracked before the read that validated them
+        bool dirty = false;   ///< P5.2: written since (read again at the next use)
     };
     const Entry& Get(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation);
     size_t Size() const { return entries_.size(); }
     u64 reads = 0, changed = 0;
+    u64 trusted_tracked = 0, trust_mismatches = 0, invalidations = 0; ///< P5.2 (see ProgramCacheStats)
+    void SetCodeTrust(CodeTrust trust, TrackCodeFn track, void* ctx) {
+        trust_ = track != nullptr ? trust : CodeTrust::Off;
+        track_ = track;
+        track_ctx_ = ctx;
+    }
+    /// [addr, addr + size) was written: fetch shaders there are read again at their next use.
+    void Invalidate(u64 addr, u64 size);
 
 private:
+    CodeTrust trust_ = CodeTrust::Off;
+    TrackCodeFn track_ = nullptr;
+    void* track_ctx_ = nullptr;
+    u64 lo_ = ~0ull, hi_ = 0; ///< the bytes any entry covers
     const Entry& GetEntry(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation, Entry& e);
     std::unordered_map<u64, Entry> entries_;
     std::array<std::pair<u64, Entry*>, 256> memo_{}; ///< P4.9: entries looked up last (never erased: stable pointers)

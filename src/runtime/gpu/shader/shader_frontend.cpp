@@ -242,8 +242,16 @@ void ShaderFrontend::NewFrame() {
     w_translate_ = {};
 }
 
+void ShaderFrontend::SetCodeTracker(TrackCodeFn track, void* ctx) {
+    programs_.SetCodeTrust(options_.code_trust, track, ctx);
+    fetches_.SetCodeTrust(options_.code_trust, track, ctx);
+}
+
 void ShaderFrontend::Invalidate(u64 addr, u64 size) {
     programs_.Invalidate(addr, size);
+    if (options_.code_trust != CodeTrust::Off) {
+        fetches_.Invalidate(addr, size); // (P5.2: off, the fetch shaders keep the per-frame validation alone)
+    }
     stage_epoch_.fill(0); // no stage keeps its program without asking the cache
     ++memory_gen_;        // nor its memoized preparation (P4.7)
 }
@@ -825,6 +833,13 @@ std::string ShaderFrontend::Report() const {
     }
     t += fmt::format("\nfetch shaders: {} (reads {}, changed {})\n", fetches_.Size(), fetches_.reads,
                      fetches_.changed);
+    t += fmt::format("code trust (P5.2, SSPC_P52_CODE_TRUST={}): programs trusted by write tracking {}, missed writes "
+                     "{}; fetch shaders trusted {}, invalidated {}, missed writes {}\n",
+                     options_.code_trust == CodeTrust::On       ? "1"
+                     : options_.code_trust == CodeTrust::Verify ? "verify"
+                                                                : "0",
+                     pc.trusted_tracked, pc.trust_mismatches, fetches_.trusted_tracked, fetches_.invalidations,
+                     fetches_.trust_mismatches);
     t += fmt::format("runtime parameters: built {}, kept {}\n", st.runtime_builds, st.runtime_reuse);
     t += fmt::format("modules: {} (layouts {}); key hits {}, misses {}, hash collisions {}, layout changed by the "
                      "specialization {}\n",

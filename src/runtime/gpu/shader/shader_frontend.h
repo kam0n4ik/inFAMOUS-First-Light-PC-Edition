@@ -138,6 +138,9 @@ struct FrontendOptions {
     /// P4.7: a stage with the inputs of its last ready preparation takes it again. Only for an owner that reports every
     /// guest memory change through GuestMemoryChanged() (the native backend's executor).
     bool stage_memo = false;
+    /// P5.2 (SSPC_P52_CODE_TRUST): programs and fetch shaders whose code pages are write-tracked are not read again
+    /// every frame while those pages stay unwritten (needs SetCodeTracker; Off: the per-frame validation alone).
+    CodeTrust code_trust = CodeTrust::Off;
 };
 
 struct FrontendStats {
@@ -181,6 +184,9 @@ public:
     void NewFrame();
     /// Guest memory written (P4.4's listener): programs there are read again at their next use.
     void Invalidate(u64 addr, u64 size);
+    /// P5.2: the write tracker for FrontendOptions::code_trust (its writes come back through Invalidate). Before the
+    /// first draw, on the thread that prepares draws.
+    void SetCodeTracker(TrackCodeFn track, void* ctx);
     /// Guest memory may have changed (a GPU command's write, the command processor's, a met wait, a new submission):
     /// no stage takes its memoized preparation again - its resources are read anew (P4.7).
     void GuestMemoryChanged() { memory_gen_.fetch_add(1, std::memory_order_relaxed); }

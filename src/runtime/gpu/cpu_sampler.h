@@ -25,6 +25,14 @@ public:
     /// without the unwinder (a game thread may be inside exception dispatch, holding what RtlLookupFunctionEntry
     /// takes): the instruction pointer and the nearest return address into the executable found on the stack.
     bool StartByName(const std::wstring& name_part, u32 period_us, u32 delay_s);
+    /// P5.2 (SSPC_DIAG_SAMPLE_RAW=1): every thread of the process (found once `delay_s` have passed) each period,
+    /// kept raw for attribution to the game's functions offline (tools/native-reconstruction/cpu_profile.py): the
+    /// thread, the instruction pointer, the nearest return address into the eboot on the stack (when the thread is in
+    /// SecondSonPC's or a system's code) and the eboot's frame-pointer chain from RBP (the game keeps frame pointers).
+    /// The eboot's range comes from Engine::GuestImageBase/End.
+    bool StartRaw(u32 period_us, u32 delay_s);
+    /// The raw samples as text (StartRaw): `thread <i> <name>` lines, then `s <thread> <ip> <eboot caller or 0> <chain>...`
+    bool WriteRaw(const std::wstring& path) const;
     /// Stops sampling (before the target thread ends).
     void Stop();
     bool Running() const { return started_; }
@@ -61,6 +69,13 @@ private:
     bool started_ = false;
     std::vector<Entry> table_;
     u64 samples_ = 0, failed_ = 0, dropped_ = 0;
+    // StartRaw
+    void RunRawTick();
+    bool raw_ = false;
+    u64 guest_lo_ = 0, guest_hi_ = 0;
+    std::vector<std::wstring> thread_names_;
+    std::vector<u64> raw_buf_; ///< records: (thread << 32 | count), then `count` addresses (reserved, never grows)
+    u64 raw_dropped_ = 0;
 };
 
 } // namespace SecondSon::Gpu

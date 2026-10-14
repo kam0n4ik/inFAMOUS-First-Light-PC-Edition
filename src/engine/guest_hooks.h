@@ -24,6 +24,12 @@ struct GuestFunction {
 
 u64 HashBytes(const void* data, size_t size);
 
+/// The eboot's mapped range (set by the loader once the eboot is loaded; 0/0 before): diagnostics that attribute
+/// addresses to the game's code (the CPU sampler's raw mode) read it.
+void SetGuestImage(u64 base, u64 size);
+u64 GuestImageBase();
+u64 GuestImageEnd();
+
 /// True when the loaded function at base + f.rva hashes to f.fnv1a64; otherwise `error` says which.
 bool VerifyGuestFunction(u64 module_base, const GuestFunction& f, std::string& error);
 

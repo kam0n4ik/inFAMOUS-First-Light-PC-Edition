@@ -43,7 +43,8 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
         New-Item -ItemType Directory -Force $profileDir | Out-Null
         Copy-Item $sources[$scene] "$profileDir\home" -Recurse
         foreach ($f in "gpu_device_lost.txt", "vk_validation.log", "gpu_native.txt", "gpu_frames.csv",
-                    "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt") {
+                    "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt",
+                    "gpu_cpu_profile.txt", "gpu_cpu_profile_game.txt", "cpu_samples_raw.txt") {
             Remove-Item "$root\logs\$f" -ErrorAction SilentlyContinue
         }
         $press = "space@12,space@22,move:-3000:0@56:0.25,move:-3000:0@58:0.25,move:-3000:0@60:0.25"
@@ -71,7 +72,8 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
         $out = "$outRoot\${scene}_$rep"
         New-Item -ItemType Directory -Force $out | Out-Null
         foreach ($f in "gpu_device_lost.txt", "gpu_native.txt", "gpu_frames.csv", "SecondSonPC.log", "vk_validation.log",
-                    "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt") {
+                    "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt",
+                    "gpu_cpu_profile.txt", "gpu_cpu_profile_game.txt", "cpu_samples_raw.txt") { # (P5.2: the samplers' output)
             if (Test-Path "$root\logs\$f") { Copy-Item "$root\logs\$f" $out }
         }
         foreach ($f in "screen.png", "run.json") {

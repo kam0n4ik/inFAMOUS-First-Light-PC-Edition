@@ -1,12 +1,31 @@
 // SecondSonPC — replacing functions of the game's own code with native ones (see guest_hooks.h).
 #include "engine/guest_hooks.h"
 
+#include <atomic>
 #include <cstring>
 
 #include <fmt/format.h>
 #include <windows.h>
 
 namespace SecondSon::Engine {
+
+namespace {
+std::atomic<u64> g_image_base{0};
+std::atomic<u64> g_image_end{0};
+} // namespace
+
+void SetGuestImage(u64 base, u64 size) {
+    g_image_base.store(base, std::memory_order_release);
+    g_image_end.store(base + size, std::memory_order_release);
+}
+
+u64 GuestImageBase() {
+    return g_image_base.load(std::memory_order_acquire);
+}
+
+u64 GuestImageEnd() {
+    return g_image_end.load(std::memory_order_acquire);
+}
 
 u64 HashBytes(const void* data, size_t size) {
     u64 h = 0xCBF29CE484222325ull;

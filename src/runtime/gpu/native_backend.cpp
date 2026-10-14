@@ -344,6 +344,7 @@ private:
     std::thread thread_;
     CpuSampler game_sampler_; ///< SSPC_DIAG_SAMPLE_GAME=<name part>: the game's threads (gpu_cpu_profile_game.txt)
     CpuSampler sampler_; ///< SSPC_DIAG_SAMPLE=1: where the GPU thread's CPU time goes (logs\gpu_cpu_profile.txt)
+    CpuSampler raw_sampler_; ///< P5.2 SSPC_DIAG_SAMPLE_RAW=1: every thread, raw (logs\cpu_samples_raw.txt)
     bool submit_done_ = false;
     std::array<bool, Cp::kNumQueues> mapped_{};
     std::mutex inval_mutex_;
@@ -478,6 +479,16 @@ bool Backend::Start(const Options& o, std::string& error) {
         }
     }
     fo.profile = &profile_;
+    // P5.2: SSPC_P52_CODE_TRUST=1 - programs and fetch shaders trusted while their write-tracked code pages stay
+    // unwritten (not read and compared again every frame); verify - tracked and still read, counting missed writes
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_P52_CODE_TRUST", v, sizeof(v)) > 0) {
+        const std::string_view s(v);
+        fo.code_trust = s == "1" ? GS::CodeTrust::On : s == "verify" ? GS::CodeTrust::Verify : GS::CodeTrust::Off;
+        if (fo.code_trust != GS::CodeTrust::Off) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P52_CODE_TRUST={} - shader code trusted while its write-tracked "
+                                   "pages stay unwritten", s);
+        }
+    }
     frontend_ = std::make_unique<GS::ShaderFrontend>(fo);
     // P4.14: SSPC_SHADER_STALL_TRACE (its times are moved to the frame log's origin once that starts, below)
     ShaderTrace::Start(o.logs_dir);
@@ -622,6 +633,16 @@ bool Backend::Start(const Options& o, std::string& error) {
     }
     images_->SetTracker(&tracker_);
     guest_->SetTracker(&tracker_);
+    frontend_->SetCodeTracker(
+        [](void* ctx, u64 addr, u64 size) {
+            auto* t = static_cast<PageTracker*>(ctx);
+            if (!t->CanArm(addr, size)) {
+                return false;
+            }
+            t->Arm(addr, size);
+            return true;
+        },
+        &tracker_);
     memory_.tracker = &tracker_;
     memory_.buffers = buffers_.get();
     memory_.executor = executor_.get();
@@ -690,6 +711,22 @@ bool Backend::Start(const Options& o, std::string& error) {
         if (sampler_.Start(reinterpret_cast<HANDLE>(thread_.native_handle()), 1000, after)) {
             SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SAMPLE=1 - the GPU thread is sampled every 1 ms from {} s "
                                    "(logs\\gpu_cpu_profile.txt at the end)", after);
+        }
+    }
+    // P5.2: every thread of the process sampled raw, for attribution to the game's functions offline
+    // (tools/native-reconstruction/cpu_profile.py); SSPC_DIAG_SAMPLE_RAW_US = period (default 2000), _AFTER = start.
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_RAW", v, sizeof(v)) > 0 && v[0] == '1') {
+        char s[16] = {};
+        const u32 period = GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_RAW_US", s, sizeof(s)) > 0
+                               ? static_cast<u32>(std::strtoul(s, nullptr, 10))
+                               : 2000;
+        char d[16] = {};
+        const u32 after = GetEnvironmentVariableA("SSPC_DIAG_SAMPLE_AFTER", d, sizeof(d)) > 0
+                              ? static_cast<u32>(std::strtoul(d, nullptr, 10))
+                              : 30;
+        if (raw_sampler_.StartRaw(period, after)) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SAMPLE_RAW=1 - every thread is sampled every {} us from {} s "
+                                   "(logs\\cpu_samples_raw.txt at the end)", period, after);
         }
     }
     SSPC_LOG(GPU, Info, "native backend started on {} (the game's GPU work runs on SecondSonPC's Vulkan backend)",
@@ -1207,6 +1244,7 @@ void Backend::Stop() {
     Inspector::StopSampling(); // while the sampled thread still exists
     sampler_.Stop(); // while the sampled thread still exists
     game_sampler_.Stop();
+    raw_sampler_.Stop();
     stop_.store(true, std::memory_order_release);
     cv_.notify_all();
     if (thread_.joinable()) {
@@ -1249,6 +1287,9 @@ void Backend::Stop() {
     Inspector::Stop();
     if (sampler_.Running()) {
         std::ofstream(options_.logs_dir / "gpu_cpu_profile.txt", std::ios::trunc) << sampler_.Report(60);
+    }
+    if (raw_sampler_.Running()) {
+        raw_sampler_.WriteRaw((options_.logs_dir / "cpu_samples_raw.txt").wstring());
     }
     if (game_sampler_.Running()) {
         std::ofstream(options_.logs_dir / "gpu_cpu_profile_game.txt", std::ios::trunc) << game_sampler_.Report(60);
@@ -1729,6 +1770,9 @@ std::string Backend::Report() {
         const auto p = presenter_->GetStats();
         out += fmt::format("presented {} (black {}), copies {}, captures {}, swapchain recreated {}{}\n", p.presented,
                            p.black, p.copies, p.captures, p.swapchain_recreated, p.device_lost ? ", DEVICE LOST" : "");
+    }
+    if (frontend_) { // (P5.2: the shader frontend's own counters - programs read again per frame, fetch shaders, ...)
+        out += "--- shader frontend ---\n" + frontend_->Report();
     }
     return out;
 }
