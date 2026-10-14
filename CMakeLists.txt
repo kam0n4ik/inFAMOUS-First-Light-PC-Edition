@@ -24,6 +24,8 @@ add_library(sspc_runtime STATIC
     src/base/lifecycle.cpp
     src/base/log.cpp
     src/base/vram_monitor.cpp
+    src/engine/guest_hooks.cpp
+    src/engine/job_system.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
     src/input/settings.cpp
@@ -221,3 +223,17 @@ target_compile_definitions(sspc_settings_tests PRIVATE NOMINMAX WIN32_LEAN_AND_M
 target_compile_options(sspc_settings_tests PRIVATE /utf-8 /W4)
 target_link_libraries(sspc_settings_tests PRIVATE fmt::fmt toml11::toml11 SDL3::SDL3 d2d1 dwrite windowscodecs ole32 uuid)
 set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Standalone tests of the reconstructed engine code (src/engine; docs/native-reconstruction): no bridge, no game
+# (cmake --build <dir> --target sspc_engine_tests; tools/engine_tests/main.cpp [--bench]).
+add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
+    tools/engine_tests/main.cpp
+    src/engine/guest_hooks.cpp
+    src/engine/job_system.cpp
+    src/base/log.cpp
+)
+target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(sspc_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_options(sspc_engine_tests PRIVATE /utf-8 /W4)
+target_link_libraries(sspc_engine_tests PRIVATE fmt::fmt)
+set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

@@ -56,6 +56,7 @@
 #include "bridge/shadps4/settings_host.h"
 #include "ui/menu_controller.h"
 #include "bridge/shadps4/track_diag.h"
+#include "engine/job_system.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
 #include "loader/linker.h"
@@ -793,9 +794,13 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                         },
                         &bindings);
 
-    if (linker.LoadModule(guest_eboot_path, false) < 0) {
+    const s32 eboot_index = linker.LoadModule(guest_eboot_path, false);
+    if (eboot_index < 0) {
         Fatal(fmt::format("failed to load {}", guest_eboot_path));
     }
+    // Native Engine Reconstruction (docs/native-reconstruction): reconstructed engine functions replace the game's
+    // own before any guest code runs; each one is off unless its switch is set (SSPC_NATIVE_JOBS=1).
+    Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }

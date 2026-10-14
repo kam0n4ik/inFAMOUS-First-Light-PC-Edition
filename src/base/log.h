@@ -26,6 +26,7 @@ enum class Category : unsigned char {
     Trace,  // import call counter
     Memory, // guest memory (direct memory, P2.3)
     Cpu,    // guest TCB slot, FS instruction patcher (P3.3)
+    Engine, // reconstructed engine functions replacing the game's own (src/engine)
     Count,
 };
 
