@@ -23,7 +23,10 @@ namespace SecondSon::Engine::Render {
 
 inline constexpr u32 kMarkerMagic = 0x43505353u; ///< "SSPC" (little endian) - no driver NOP payload starts with it
 
-enum class OpKind : u16 { Draw = 1 };
+enum class OpKind : u16 {
+    Draw = 1,      ///< DrawOp: verified (kVerify) and/or executed (kApply) by the processor
+    Registers = 2, ///< kApply: register writes of the engine's CUE commit done natively (RegWrite list)
+};
 
 enum OpFlags : u16 {
     kVerify = 1,
@@ -82,6 +85,24 @@ bool IsMarker(std::span<const u32> packet);
 /// The marker's draw operation; false if it is not a well-formed one (the caller counts it).
 bool DecodeDrawMarker(std::span<const u32> packet, DrawOp& out, u16& flags);
 
+/// One register write of a native commit: hardware register index (0x2C0C.. user data, 0xA191.. PS input, ...).
+struct RegWrite {
+    u32 reg = 0;
+    u32 value = 0;
+};
+inline constexpr u32 kMaxRegWrites = 128;
+constexpr u32 RegistersMarkerDwords(u32 writes) {
+    return 1 + 3 + 2 * writes; ///< header, magic, kind | flags, count, pairs
+}
+/// Writes the NOP for `writes` (at most kMaxRegWrites). Returns RegistersMarkerDwords(n).
+u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out);
+/// The marker's writes into `out` (kMaxRegWrites); false if it is not a well-formed one.
+bool DecodeRegistersMarker(std::span<const u32> packet, RegWrite* out, u32& count, u16& flags);
+/// The operation kind of a marker (IsMarker true).
+inline OpKind MarkerKind(std::span<const u32> packet) {
+    return static_cast<OpKind>(packet[2] & 0xFFFF);
+}
+
 /// What the command processor built for the draw that follows the marker.
 struct DrawView {
     bool indexed = false;
@@ -127,6 +148,9 @@ struct DrawCounters {
     std::atomic<u64> tables_checked{0}; ///< stage tables compared by content (references and dwords present)
     std::atomic<u64> canaries{0};       ///< markers the engine side spoiled on purpose (SSPC_P53_NATIVE_DRAW_CANARY)
     std::atomic<u64> canaries_caught{0};
+    std::atomic<u64> applied_draws{0};     ///< kApply draws executed from their operation (no draw packet)
+    std::atomic<u64> applied_registers{0}; ///< register writes of native commits (no SET_*_REG packet)
+    std::atomic<u64> applied_commits{0};
     std::atomic<u64> pass_verified[kPassSlots] = {};
     std::atomic<u64> pass_mismatched[kPassSlots] = {};
 };

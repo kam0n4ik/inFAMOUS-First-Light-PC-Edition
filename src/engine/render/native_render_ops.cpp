@@ -1,6 +1,7 @@
 // SecondSonPC — native render operations (see native_render_ops.h).
 #include "engine/render/native_render_ops.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include <windows.h>
@@ -89,6 +90,36 @@ bool DecodeDrawMarker(std::span<const u32> packet, DrawOp& op, u16& flags) {
                 return false;
             }
         }
+    }
+    return true;
+}
+
+u32 EncodeRegistersMarker(std::span<const RegWrite> writes, u16 flags, u32* out) {
+    const u32 n = static_cast<u32>(std::min<size_t>(writes.size(), kMaxRegWrites));
+    const u32 total = RegistersMarkerDwords(n);
+    u32* p = out;
+    *p++ = kNopHeader | ((total - 2) << 16);
+    *p++ = kMarkerMagic;
+    *p++ = static_cast<u32>(OpKind::Registers) | (u32{flags} << 16);
+    *p++ = n;
+    for (u32 i = 0; i < n; ++i) {
+        *p++ = writes[i].reg;
+        *p++ = writes[i].value;
+    }
+    return total;
+}
+
+bool DecodeRegistersMarker(std::span<const u32> packet, RegWrite* out, u32& count, u16& flags) {
+    if (!IsMarker(packet) || packet.size() < 4 || MarkerKind(packet) != OpKind::Registers) {
+        return false;
+    }
+    flags = static_cast<u16>(packet[2] >> 16);
+    count = packet[3];
+    if (count > kMaxRegWrites || packet.size() != RegistersMarkerDwords(count)) {
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        out[i] = RegWrite{packet[4 + 2 * i], packet[5 + 2 * i]};
     }
     return true;
 }

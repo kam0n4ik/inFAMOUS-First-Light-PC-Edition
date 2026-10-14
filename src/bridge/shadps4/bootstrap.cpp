@@ -806,7 +806,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::SetGuestImage(linker.GetModule(eboot_index)->Base(), linker.GetModule(eboot_index)->aligned_base_size);
     Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
-    Engine::Render::NativeDraw::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+    Engine::Render::NativeDraw::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }

@@ -484,8 +484,8 @@ void TestNativeDrawShadow() {
     put64(cue + L::kCueDcb, r + L::kContextGfx);
 
     // Shader objects: register block at +8 (sceGnmSetVsShader / SetPsShader350 order).
-    static u32 vs_obj[2 + 7] = {0, 0, 0x1000, 0, 0x2C0000, 0x55, 0x2, 0x4, 0x10};
-    static u32 ps_obj[2 + 12] = {0, 0, 0x2000, 0, 0x2A, 0x3, 0, 0x4, 0x2, 0x2, 0, 0, 0x10, 0xF};
+    static u32 vs_obj[16] = {0, 0, 0x1000, 0, 0x2C0000, 0x55, 0x2, 0x4, 0x10};
+    static u32 ps_obj[16] = {0, 0, 0x2000, 0, 0x2A, 0x3, 0, 0x4, 0x2, 0x2, 0, 0, 0x10, 0xF};
     put64(cue + 0xC0B0, reinterpret_cast<u64>(vs_obj));
     put64(cue + 0xC0A8, reinterpret_cast<u64>(ps_obj));
     std::memcpy(reinterpret_cast<void*>(cue + 0xC168), "\0\0\0\0", 4); // no VS modifier
@@ -572,6 +572,57 @@ void TestNativeDrawShadow() {
     vs_snapshot[5] ^= 1;
     vs_ud[6] += 4; // the vertex table pointer disagrees with the whole-table pointer
     CHECK(VerifyDraw(back, view, &HashGuestMemory) == kMismatchVsTable);
+
+    // P5.3C: the native commit of the same CUE (VS/PS mode), every part dirty.
+    for (const u64 flag : {0xC1C9ull, 0xC1CAull, 0xC1D1ull, 0xC1D2ull}) {
+        *reinterpret_cast<u8*>(cue + flag) = 1;
+    }
+    CHECK(NativeDraw::CheckNativeCommit(cue) == NativeDraw::CommitCheck::Native);
+    *reinterpret_cast<u32*>(cue + 0xC1E0) = 0x20; // ES/GS mode: the game's commit must run
+    CHECK(NativeDraw::CheckNativeCommit(cue) == NativeDraw::CommitCheck::StageMode);
+    *reinterpret_cast<u32*>(cue + 0xC1E0) = 0;
+    ps_obj[2 + 0xC] = 0; // (char)ps[0xe] = 0 PS inputs: no SPI_PS_INPUT_CNTL writes
+    static std::vector<u32> arena(0x1000);
+    static u32 arena_used = 0;
+    arena_used = 0;
+    NativeDraw::CommitEnv env;
+    env.alloc = [](u64, u32 dwords) SSPC_SYSV_ABI -> u64 {
+        const u64 at = reinterpret_cast<u64>(arena.data() + arena_used);
+        arena_used += dwords;
+        return at;
+    };
+    RegWrite writes[kMaxRegWrites];
+    const u32 n = NativeDraw::NativeCommit(cue, env, writes);
+    CHECK(n == 7 + 12 + 4 + 2); // VS + PS registers, VS table (2 pointers), PS table (1 pointer)
+    CHECK(arena_used == 0x40 + 0x20 && arena[5] == vs_shadow[5] && arena[0x40 + 3] == ps_shadow[3]);
+    CHECK(*reinterpret_cast<u8*>(cue + 0xC1C9) == 0 && *reinterpret_cast<u8*>(cue + 0xC1D2) == 0);
+    CHECK((*reinterpret_cast<u16*>(cue + 0xC1E4) & 6) == 6);
+    // The register file after the writes, as the processor applies them, is the draw the engine describes.
+    u32 file[0x10000] = {};
+    for (u32 i = 0; i < n; ++i) {
+        file[writes[i].reg] = writes[i].value;
+    }
+    DrawOp after;
+    CHECK(NativeDraw::BuildDrawOp(base, r, false, 3, 0, after));
+    DrawView applied;
+    applied.index_count = 3;
+    for (u32 i = 0; i < kVsRegs; ++i) {
+        applied.vs[i] = file[kVsRegIndex[i]];
+    }
+    for (u32 i = 0; i < kPsRegs; ++i) {
+        applied.ps[i] = file[kPsRegIndex[i]];
+    }
+    applied.user_data[kStageVs] = file + 0x2C4C;
+    applied.user_data[kStagePs] = file + 0x2C0C;
+    CHECK(VerifyDraw(after, applied, &HashGuestMemory) == 0);
+    CHECK(NativeDraw::NativeCommit(cue, env, writes) == 0); // nothing dirty any more
+    u32 marker2[RegistersMarkerDwords(kMaxRegWrites)] = {};
+    CHECK(EncodeRegistersMarker({writes, 3}, kApply, marker2) == RegistersMarkerDwords(3));
+    RegWrite decoded[kMaxRegWrites];
+    u32 decoded_n = 0;
+    CHECK(IsMarker({marker2, RegistersMarkerDwords(3)}) &&
+          DecodeRegistersMarker({marker2, RegistersMarkerDwords(3)}, decoded, decoded_n, flags) && decoded_n == 3 &&
+          flags == kApply && decoded[2].reg == writes[2].reg);
     VirtualFree(image, 0, MEM_RELEASE);
 }
 

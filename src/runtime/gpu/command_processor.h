@@ -459,7 +459,7 @@ private:
     void ExtentHint(const Frame& f, u32 reg, u32 count);
     void BuildDraw(DrawDescriptor& d);
     /// P5.3B: a SecondSonPC operation in the stream (engine/render/native_render_ops.h) / the draw it describes.
-    void NativeMarker(Queue& q, std::span<const u32> p);
+    StepStatus NativeMarker(Queue& q, u64 addr, std::span<const u32> p);
     void VerifyNativeDraw(const DrawDescriptor& d);
     u32 PatchCommands(Queue& q, u64 dst, const u8* bytes_known, u32 bytes, u64 src_addr);
     /// [dst, dst + bytes) holds packets of this queue not processed yet.

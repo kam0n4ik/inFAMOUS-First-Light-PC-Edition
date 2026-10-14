@@ -586,8 +586,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
     switch (op) {
     case O::Nop: {
         if (Engine::Render::IsMarker(p)) {
-            NativeMarker(q, p);
-            return StepStatus::Packet;
+            return NativeMarker(q, addr, p);
         }
         const Pm4::NopMarker m = Pm4::ClassifyNop(p);
         if (m == Pm4::NopMarker::PatchedFlip) {
@@ -1054,21 +1053,70 @@ void CommandProcessor::BuildDraw(DrawDescriptor& d) {
     d.db_extent = db_extent_;
 }
 
-void CommandProcessor::NativeMarker(Queue& q, std::span<const u32> p) {
+StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u32> p) {
     namespace R = Engine::Render;
     R::DrawCounters& c = R::Counters();
     c.markers.fetch_add(1, std::memory_order_relaxed);
-    auto op = std::make_unique<R::DrawOp>();
     u16 flags = 0;
-    if (!R::DecodeDrawMarker(p, *op, flags) || (flags & R::kVerify) == 0) {
+    if (R::MarkerKind(p) == R::OpKind::Registers) {
+        // A native CUE commit (P5.3C): its register writes go straight to the register file, as SET_SH_REG /
+        // SET_CONTEXT_REG would have put them (user-data slots written this way hold no inline V#/T#/S#).
+        R::RegWrite writes[R::kMaxRegWrites];
+        u32 count = 0;
+        if (q.compute || !R::DecodeRegistersMarker(p, writes, count, flags) || (flags & R::kApply) == 0) {
+            c.malformed.fetch_add(1, std::memory_order_relaxed);
+            return StepStatus::Packet;
+        }
+        for (u32 i = 0; i < count; ++i) {
+            const u32 reg = writes[i].reg;
+            if (!regs_.WriteReg(reg, writes[i].value)) {
+                c.malformed.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            for (u32 s = 0; s < static_cast<u32>(Stage::Count); ++s) {
+                const u32 ud = kStageBase[s] + 4;
+                if (reg >= ud && reg < ud + 16) {
+                    inline_sharps_[s] = static_cast<u16>(inline_sharps_[s] & ~(1u << (reg - ud)));
+                }
+            }
+        }
+        c.applied_commits.fetch_add(1, std::memory_order_relaxed);
+        c.applied_registers.fetch_add(count, std::memory_order_relaxed);
+        return StepStatus::Packet;
+    }
+    auto op = std::make_unique<R::DrawOp>();
+    if (!R::DecodeDrawMarker(p, *op, flags) || (flags & (R::kVerify | R::kApply)) == 0) {
         c.malformed.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return StepStatus::Packet;
     }
     if (native_expect_ != nullptr) {
         c.orphaned.fetch_add(1, std::memory_order_relaxed); // the previous marker met no draw
+        native_expect_.reset();
     }
-    native_expect_ = std::move(op);
-    native_expect_queue_ = q.id;
+    const bool apply = (flags & R::kApply) != 0;
+    const bool indexed = op->indexed;
+    const u32 count = op->index_count;
+    const u64 base = op->index_base;
+    if ((flags & R::kVerify) != 0) {
+        native_expect_ = std::move(op);
+        native_expect_queue_ = q.id;
+    }
+    if (!apply) {
+        return StepStatus::Packet;
+    }
+    // P5.3C: the engine issued no draw packet; the draw is executed from the operation through the same draw entry
+    // (registers, BuildDraw, the executor) the packet would have reached - what sceGnmDrawIndex/DrawIndexAuto write.
+    c.applied_draws.fetch_add(1, std::memory_order_relaxed);
+    const auto header = [](u8 opcode, u32 body_dwords) {
+        return 0xC0000000u | ((body_dwords - 1) << 16) | (u32{opcode} << 8);
+    };
+    if (indexed) {
+        const u32 body[6] = {header(Pm4::Op::DrawIndex2, 5), count, static_cast<u32>(base),
+                             static_cast<u32>(base >> 32), count, 0u};
+        return Draw(q, addr, body, DrawKind::Index2);
+    }
+    const u32 body[3] = {header(Pm4::Op::DrawIndexAuto, 2), count, 2u};
+    return Draw(q, addr, body, DrawKind::IndexAuto);
 }
 
 void CommandProcessor::VerifyNativeDraw(const DrawDescriptor& d) {

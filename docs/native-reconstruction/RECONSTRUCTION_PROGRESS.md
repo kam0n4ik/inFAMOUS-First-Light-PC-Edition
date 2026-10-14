@@ -11,7 +11,8 @@
 | Job System (очередь движка) | 13 функций разобраны (Init, Worker, NextJob, TryNextJob, WaitBatch, Submit, KickGroup, Release, ResetGroup, Shutdown, delay, итераторы, объект потока) | анализ [A] + игра/тесты [E] |
 | Havok hkTaskScheduler | найден по строкам | — |
 | Memory System | 3 функции поточных арен видны в коде воркера | гипотеза [H] |
-| Render Pipeline (гостевая сторона) | P5.2B: цепочка «модель → экземпляр рендера (0x80) → 41 проход → контекст из пула (254) → материал → тень ресурсов / раскладка → draw → SubmitFrame», ~90 функций (RENDER_ENGINE_ARCHITECTURE.md) | анализ [A]; сброс слотов пула между кадрами и назначение проходов — открыты |
+| Render Pipeline (гостевая сторона) | P5.2B: цепочка «модель → экземпляр рендера (0x80) → 41 проход → контекст из пула (254) → материал → тень ресурсов / раскладка → draw → SubmitFrame», ~90 функций (RENDER_ENGINE_ARCHITECTURE.md) | анализ [A]; P5.3A: сброс слотов (`BeginFrame 0x1f0be0`), 41 проход, зависимости — измерены (RENDER_ENGINE_PASSES.md) |
+| Native Render Interface | P5.3B: draw движка из его объектов, маркер в DCB, сверка в CP (shadow, `SSPC_P53_NATIVE_DRAW=shadow`); P5.3C: нативные commit CUE + draw выбранных проходов (`apply:1,9` проверено), без своего PM4 (NATIVE_RENDER_INTERFACE.md) | эксперимент [E], выкл. по умолчанию; состояние прохода (цели, блендинг, viewport) — ещё PM4 |
 | Streaming / Resource / World | — | — |
 
 ## 2. Фактически проверенная нативизация
