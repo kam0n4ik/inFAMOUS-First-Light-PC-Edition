@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "base/abi.h"
+#include "engine/render/native_render_ops.h"
 #include "runtime/gpu/cp_registers.h"
 #include "runtime/gpu/pm4.h"
 
@@ -457,6 +458,9 @@ private:
     StepStatus IndirectBuffer(Queue& q, u64 addr, std::span<const u32> p);
     void ExtentHint(const Frame& f, u32 reg, u32 count);
     void BuildDraw(DrawDescriptor& d);
+    /// P5.3B: a SecondSonPC operation in the stream (engine/render/native_render_ops.h) / the draw it describes.
+    void NativeMarker(Queue& q, std::span<const u32> p);
+    void VerifyNativeDraw(const DrawDescriptor& d);
     u32 PatchCommands(Queue& q, u64 dst, const u8* bytes_known, u32 bytes, u64 src_addr);
     /// [dst, dst + bytes) holds packets of this queue not processed yet.
     bool OverlapsPendingCommands(const Queue& q, u64 dst, u32 bytes) const;
@@ -477,6 +481,9 @@ private:
     u32 pipeline_version_ = 0, dynamic_version_ = 0, targets_version_ = 0;
     u32 inline_marker_ = 0; ///< a "V#/T#/S# in user data" NOP marker waiting for its SET_SH_REG
     std::array<u16, static_cast<size_t>(Stage::Count)> inline_sharps_{};
+    std::unique_ptr<Engine::Render::DrawOp> native_expect_; ///< kVerify marker waiting for its draw (P5.3B)
+    u32 native_expect_queue_ = 0;
+    u32 native_logged_ = 0;
     PacketObserver* observer_ = nullptr;
     CpError last_error_;
     Counters stats_;

@@ -29,6 +29,8 @@ add_library(sspc_runtime STATIC
     src/engine/job_system.cpp
     src/engine/render/dcb_scan.cpp
     src/engine/render/frame_trace.cpp
+    src/engine/render/native_draw.cpp
+    src/engine/render/native_render_ops.cpp
     src/engine/render/pass_graph.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
@@ -236,6 +238,8 @@ add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp
     src/engine/render/dcb_scan.cpp
+    src/engine/render/native_draw.cpp
+    src/engine/render/native_render_ops.cpp
     src/engine/render/pass_graph.cpp
     src/runtime/gpu/pm4.cpp
     src/base/log.cpp

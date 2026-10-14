@@ -19,7 +19,10 @@
 #include "engine/guest_probe.h"
 #include "engine/job_system.h"
 #include "engine/render/dcb_scan.h"
+#include "engine/render/native_draw.h"
+#include "engine/render/native_render_ops.h"
 #include "engine/render/pass_graph.h"
+#include "engine/render/render_layout.h"
 
 using namespace SecondSon;
 using namespace SecondSon::Engine;
@@ -465,6 +468,113 @@ void TestPassGraph() {
     CHECK(b != g.lifetimes.end() && !b->target && b->first_write == 1 && b->first_read == 2 && b->readers == 1);
 }
 
+// --- P5.3B: the engine's draw described from its objects, carried as a marker, verified against the PM4 view --------
+
+void TestNativeDrawShadow() {
+    using namespace Render;
+    namespace L = Render::Layout;
+    // A stand-in eboot image large enough for the frame object; the pre-context R is the draw's context.
+    const u64 size = L::kFrame + L::kFramePool + 0x10000;
+    auto* image = static_cast<u8*>(VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    CHECK(image != nullptr);
+    const u64 base = reinterpret_cast<u64>(image);
+    const u64 r = base + L::kFrame + L::kFramePreContext;
+    const u64 cue = r + L::kContextCue;
+    const auto put64 = [](u64 at, u64 v) { std::memcpy(reinterpret_cast<void*>(at), &v, 8); };
+    put64(cue + L::kCueDcb, r + L::kContextGfx);
+
+    // Shader objects: register block at +8 (sceGnmSetVsShader / SetPsShader350 order).
+    static u32 vs_obj[2 + 7] = {0, 0, 0x1000, 0, 0x2C0000, 0x55, 0x2, 0x4, 0x10};
+    static u32 ps_obj[2 + 12] = {0, 0, 0x2000, 0, 0x2A, 0x3, 0, 0x4, 0x2, 0x2, 0, 0, 0x10, 0xF};
+    put64(cue + 0xC0B0, reinterpret_cast<u64>(vs_obj));
+    put64(cue + 0xC0A8, reinterpret_cast<u64>(ps_obj));
+    std::memcpy(reinterpret_cast<void*>(cue + 0xC168), "\0\0\0\0", 4); // no VS modifier
+
+    // User-data layouts: VS table 0x40 dwords, whole-table pointer in SGPR 2, vertex table at +0x10 in SGPR 6.
+    static u8 vs_layout[0x40] = {};
+    static u8 ps_layout[0x40] = {};
+    std::memset(vs_layout, 0xFF, sizeof(vs_layout));
+    std::memset(ps_layout, 0xFF, sizeof(ps_layout));
+    vs_layout[0] = 0x40;
+    vs_layout[1] = 0;
+    vs_layout[7] = 2;
+    vs_layout[5] = 6;
+    vs_layout[0x18] = 0x10;
+    vs_layout[0x19] = 0;
+    ps_layout[0] = 0x20;
+    ps_layout[1] = 0;
+    ps_layout[7] = 0;
+    put64(cue + L::kCueLayout + 2 * 8, reinterpret_cast<u64>(vs_layout));
+    put64(cue + L::kCueLayout + 1 * 8, reinterpret_cast<u64>(ps_layout));
+    auto* vs_shadow = reinterpret_cast<u32*>(cue + L::kCueShadow + 2 * L::kCueShadowStride);
+    auto* ps_shadow = reinterpret_cast<u32*>(cue + L::kCueShadow + 1 * L::kCueShadowStride);
+    for (u32 i = 0; i < 0x40; ++i) {
+        vs_shadow[i] = 0xA0000 + i;
+        ps_shadow[i] = 0xB0000 + i;
+    }
+
+    DrawOp op;
+    CHECK(NativeDraw::BuildDrawOp(base, r, true, 36, 0x123400, op));
+    CHECK(op.pass == -2 && op.indexed && op.index_count == 36 && op.index_base == 0x123400);
+    CHECK(op.shaders && op.has_ps && op.vs[0] == 0x1000 && op.vs[4] == 0x2 && op.vs[6] == 0x10);
+    CHECK(op.ps[0] == 0x2000 && op.ps[11] == 0xF);
+    CHECK(op.table[kStageVs].present && op.table[kStageVs].dwords == 0x40 && op.table[kStageVs].refs == 2);
+    CHECK(op.table[kStageVs].ref[0].sgpr == 2 && op.table[kStageVs].ref[1].sgpr == 6 &&
+          op.table[kStageVs].ref[1].offset == 0x10);
+    CHECK(op.table[kStagePs].refs == 1 && op.table[kStagePs].dwords == 0x20);
+    DrawOp other;
+    CHECK(!NativeDraw::BuildDrawOp(base, r + 8, true, 36, 0, other)); // not a context of the frame
+
+    // Through the command buffer and back.
+    u32 marker[kDrawMarkerDwords + 4] = {};
+    CHECK(EncodeDrawMarker(op, kVerify, marker) == kDrawMarkerDwords);
+    CHECK(((marker[0] >> 16) & 0x3FFF) + 2 == kDrawMarkerDwords); // a NOP of exactly this length
+    CHECK(IsMarker({marker, kDrawMarkerDwords}));
+    DrawOp back;
+    u16 flags = 0;
+    CHECK(DecodeDrawMarker({marker, kDrawMarkerDwords}, back, flags) && flags == kVerify);
+    CHECK(back.index_count == 36 && back.table[kStageVs].hash == op.table[kStageVs].hash &&
+          back.table[kStageVs].ref[1].offset == 0x10 && std::memcmp(back.ps, op.ps, sizeof(op.ps)) == 0);
+    CHECK(!DecodeDrawMarker({marker, kDrawMarkerDwords - 1}, back, flags));
+    CHECK(!back.canary);
+    DrawOp spoiled = op;
+    spoiled.canary = true;
+    EncodeDrawMarker(spoiled, kVerify, marker);
+    DrawOp spoiled_back;
+    CHECK(DecodeDrawMarker({marker, kDrawMarkerDwords}, spoiled_back, flags) && spoiled_back.canary);
+
+    // The PM4 path's view: the commit copied the shadows and put pointers in user data.
+    std::vector<u32> vs_snapshot(vs_shadow, vs_shadow + 0x40), ps_snapshot(ps_shadow, ps_shadow + 0x20);
+    u32 vs_ud[16] = {}, ps_ud[16] = {};
+    const u64 vsp = reinterpret_cast<u64>(vs_snapshot.data()), psp = reinterpret_cast<u64>(ps_snapshot.data());
+    vs_ud[2] = static_cast<u32>(vsp);
+    vs_ud[3] = static_cast<u32>(vsp >> 32);
+    vs_ud[6] = static_cast<u32>(vsp + 0x40);
+    vs_ud[7] = static_cast<u32>((vsp + 0x40) >> 32);
+    ps_ud[0] = static_cast<u32>(psp);
+    ps_ud[1] = static_cast<u32>(psp >> 32);
+    DrawView view;
+    view.indexed = true;
+    view.index_count = 36;
+    view.index_base = 0x123400;
+    std::memcpy(view.vs, op.vs, sizeof(view.vs));
+    std::memcpy(view.ps, op.ps, sizeof(view.ps));
+    view.user_data[kStageVs] = vs_ud;
+    view.user_data[kStagePs] = ps_ud;
+    CHECK(VerifyDraw(back, view, &HashGuestMemory) == 0);
+
+    DrawView bad = view;
+    bad.index_count = 35;
+    bad.ps[11] = 0x3;
+    CHECK(VerifyDraw(back, bad, &HashGuestMemory) == (kMismatchIndexCount | kMismatchPsRegs));
+    vs_snapshot[5] ^= 1; // a resource the shader sees differs from the engine's
+    CHECK(VerifyDraw(back, view, &HashGuestMemory) == kMismatchVsTable);
+    vs_snapshot[5] ^= 1;
+    vs_ud[6] += 4; // the vertex table pointer disagrees with the whole-table pointer
+    CHECK(VerifyDraw(back, view, &HashGuestMemory) == kMismatchVsTable);
+    VirtualFree(image, 0, MEM_RELEASE);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -478,6 +588,7 @@ int main(int argc, char** argv) {
     TestEntryProbe();
     TestDcbScan();
     TestPassGraph();
+    TestNativeDrawShadow();
     if (bench) {
         Bench();
     }

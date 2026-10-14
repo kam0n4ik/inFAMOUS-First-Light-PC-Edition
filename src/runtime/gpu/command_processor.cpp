@@ -8,6 +8,8 @@
 
 #include <fmt/format.h>
 
+#include "base/log.h"
+
 // Descriptors and fence records are filled naming only the fields a packet sets.
 #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
 
@@ -583,6 +585,10 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
     namespace O = Pm4::Op;
     switch (op) {
     case O::Nop: {
+        if (Engine::Render::IsMarker(p)) {
+            NativeMarker(q, p);
+            return StepStatus::Packet;
+        }
         const Pm4::NopMarker m = Pm4::ClassifyNop(p);
         if (m == Pm4::NopMarker::PatchedFlip) {
             ++stats_.flips;
@@ -974,6 +980,9 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
     d.queue = q.id;
     d.packet_addr = addr;
     BuildDraw(d);
+    if (native_expect_ != nullptr && native_expect_queue_ == q.id) {
+        VerifyNativeDraw(d);
+    }
     d.seq = ++q.work_seq;
     ++stats_.draws;
     options_.work->Draw(d);
@@ -1043,6 +1052,94 @@ void CommandProcessor::BuildDraw(DrawDescriptor& d) {
     d.inline_sharps = inline_sharps_;
     d.cb_extent = cb_extent_;
     d.db_extent = db_extent_;
+}
+
+void CommandProcessor::NativeMarker(Queue& q, std::span<const u32> p) {
+    namespace R = Engine::Render;
+    R::DrawCounters& c = R::Counters();
+    c.markers.fetch_add(1, std::memory_order_relaxed);
+    auto op = std::make_unique<R::DrawOp>();
+    u16 flags = 0;
+    if (!R::DecodeDrawMarker(p, *op, flags) || (flags & R::kVerify) == 0) {
+        c.malformed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (native_expect_ != nullptr) {
+        c.orphaned.fetch_add(1, std::memory_order_relaxed); // the previous marker met no draw
+    }
+    native_expect_ = std::move(op);
+    native_expect_queue_ = q.id;
+}
+
+void CommandProcessor::VerifyNativeDraw(const DrawDescriptor& d) {
+    namespace R = Engine::Render;
+    const std::unique_ptr<R::DrawOp> op = std::move(native_expect_);
+    R::DrawView view;
+    view.indexed = d.indexed;
+    view.index_count = d.index_count;
+    view.index_base = d.index_base;
+    for (u32 i = 0; i < R::kVsRegs; ++i) {
+        view.vs[i] = regs_.Get(R::kVsRegIndex[i]);
+    }
+    for (u32 i = 0; i < R::kPsRegs; ++i) {
+        view.ps[i] = regs_.Get(R::kPsRegIndex[i]);
+    }
+    view.user_data[R::kStageVs] = d.user_data[static_cast<size_t>(Stage::Vs)].data();
+    view.user_data[R::kStagePs] = d.user_data[static_cast<size_t>(Stage::Ps)].data();
+    const u32 mismatch = R::VerifyDraw(*op, view, &R::HashGuestMemory);
+
+    R::DrawCounters& c = R::Counters();
+    if (op->canary) {
+        // Spoiled on purpose by the engine side: proves the comparison sees what it should; not a real mismatch.
+        c.canaries.fetch_add(1, std::memory_order_relaxed);
+        if ((mismatch & R::kMismatchIndexCount) != 0) {
+            c.canaries_caught.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    for (const R::StageTable& t : op->table) {
+        if (t.present && t.refs != 0 && t.dwords != 0) {
+            c.tables_checked.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const u32 slot = R::PassSlot(op->pass);
+    c.verified.fetch_add(1, std::memory_order_relaxed);
+    c.pass_verified[slot].fetch_add(1, std::memory_order_relaxed);
+    if (!op->shaders) {
+        c.shaders_unknown.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (mismatch == 0) {
+        c.matched.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c.mismatched.fetch_add(1, std::memory_order_relaxed);
+    c.pass_mismatched[slot].fetch_add(1, std::memory_order_relaxed);
+    for (u32 i = 0; i < R::kMismatchFields; ++i) {
+        if ((mismatch & (1u << i)) != 0) {
+            c.field[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (native_logged_ < 20) {
+        ++native_logged_;
+        std::string regs;
+        for (u32 i = 0; i < R::kVsRegs; ++i) {
+            if (op->shaders && op->vs[i] != view.vs[i]) {
+                regs += fmt::format(" VS[{:#x}] {:#x}!={:#x}", R::kVsRegIndex[i], op->vs[i], view.vs[i]);
+            }
+        }
+        for (u32 i = 0; i < R::kPsRegs; ++i) {
+            if (op->shaders && op->has_ps && op->ps[i] != view.ps[i]) {
+                regs += fmt::format(" PS[{:#x}] {:#x}!={:#x}", R::kPsRegIndex[i], op->ps[i], view.ps[i]);
+            }
+        }
+        SSPC_LOG(GPU, Warning,
+                 "native draw mismatch {:#x} at {:#x} (pass {} sub {}): engine {} count {} base {:#x}, PM4 {} count {} "
+                 "base {:#x}; tables VS {}x{} PS {}x{}{}",
+                 mismatch, d.packet_addr, op->pass, op->sub, op->indexed ? "indexed" : "auto", op->index_count,
+                 op->index_base, d.indexed ? "indexed" : "auto", d.index_count, d.index_base,
+                 op->table[R::kStageVs].refs, op->table[R::kStageVs].dwords, op->table[R::kStagePs].refs,
+                 op->table[R::kStagePs].dwords, regs);
+    }
 }
 
 StepStatus CommandProcessor::Dispatch(Queue& q, u64 addr, std::span<const u32> p, bool indirect) {
