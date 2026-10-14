@@ -72,7 +72,23 @@
 раз за кадр, весь разбор PM4 стоит ~3,2 мс/кадр (P52_PERFORMANCE.md §1.4) — выигрыша нет; годится только как проверка
 механизма прямого пути.
 
+### 3.2 Дополнено в P5.2B [A]
+
+| Адрес | Наше имя | PM4 |
+|---|---|---|
+| `0x625e80` | acquireMem | `0xC0055800` ACQUIRE_MEM, 7 dword: `CP_COHER_CNTL`, размер `0xFFFFFFFF`, база, опрос 10 |
+| `0x627aa0` | writeEventEop | `0xC0044700` EVENT_WRITE_EOP: событие, индекс 5, адрес, 32/64-битные данные |
+| `0x626150` | allocateFromCommandBuffer | `NOP` (`0xC0001000 \| n<<16`, `0x6875000 \| align<<12`) + данные внутри буфера |
+| `0x623740` | setPrimitiveType | `SET_UCONFIG_REG 0x242` (VGT_PRIMITIVE_TYPE) |
+| `0x624f80` | setIndexSize | op `0x2A` INDEX_TYPE |
+| `0x6250b0` | setNumInstances | op `0x2F` NUM_INSTANCES |
+| `0x6227e0` | setRenderTargetMask | ctx reg `0x8E` CB_TARGET_MASK |
+| `0x626c60` | setDbRenderControl | ctx reg `0x000` DB_RENDER_CONTROL |
+| `0x6286a0` | вставка NOP 63 dword | `0xC03E1000` |
+
 ## 5. Что дальше по реконструкции
+
+Пункты 1–3 закрыты в RENDER_ENGINE_ARCHITECTURE.md (P5.2B). Ниже — исходный план:
 
 1. Объект контекста, владеющий CommandBuffer (GfxContext-подобный): вызывающие методов §3, состояние между draw.
 2. Draw-обёртки `0x623810…` и подготовка user data/таблиц ресурсов перед draw (связь с тем, что фронтенд SecondSonPC
