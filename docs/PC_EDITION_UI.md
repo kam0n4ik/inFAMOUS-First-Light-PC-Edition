@@ -64,3 +64,17 @@ settings say why ("Недоступно" with the reason), none is shown working
   `en_900_page.png`).
 - In the game (2026-10-16, user): the item, the page, the mouse, saving — "всё работает"; log: the strings replaced,
   the page open 3.5 min (986 renders, slowest 20 ms), settings.toml written.
+
+# Stage 2: the window title
+
+The game window is titled exactly **`inFAMOUS: Second Son — PC Edition`** (UTF-8, the dash is U+2014 EM DASH).
+
+- One definition: `SecondSon::App::kWindowTitle` in `src/app/product.h` (a `static_assert` checks its bytes).
+- The only path that creates the game window, `src/bridge/shadps4/bootstrap.cpp`, uses it; full screen (F11), a new
+  swapchain and a resize keep the same window, so the title never changes while the game runs.
+- After the window is made, the title is read back through SDL and Win32 (`GetWindowTextW`) and compared with the
+  definition; log: `game window title verified (SDL and Win32, 33 UTF-16 units)`, an error otherwise.
+- Not changed: save paths, the title id CUSA00004, internal names. The debugging path `--stock-bootstrap` (shadPS4's own
+  start, kept for comparisons only) keeps shadPS4's title: it is not the PC Edition.
+- Checked in the game (2026-10-16): windowed 1296×759 and full screen 1920×1080 after F11 — the title exact, with the
+  dash; the user confirmed.

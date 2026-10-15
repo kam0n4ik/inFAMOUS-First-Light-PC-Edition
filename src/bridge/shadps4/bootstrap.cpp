@@ -41,7 +41,9 @@
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_timer.h>
+#include <SDL3/SDL_video.h>
 
 #include "app/config.h"
 #include "base/crash.h"
@@ -63,6 +65,7 @@
 #include "engine/render/frame_trace.h"
 #include "engine/render/native_draw.h"
 #include "engine/render/render_resolution.h"
+#include "app/product.h"
 #include "engine/ui/game_menu.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "settings/settings_service.h"
@@ -1329,8 +1332,10 @@ void RunGame(const App::Config& cfg) {
     Common::SecondSonBootstrap::SetTrophyIndexMap(
         Core::ExtractTrophies("/app0/sce_sys/npbind.dat", "/app0/sce_sys/trophy"));
 
-    const auto window_title = fmt::format("SecondSonPC (Phase 1, {} loader) | {} - {} <{}>",
-                                          own_loader ? "sspc" : "shadps4", id, title, app_version);
+    // PC Edition: the product's name (app/product.h); the loader, title id and version go to the log
+    const std::string window_title(App::kWindowTitle);
+    SSPC_LOG(Bridge, Info, "game window \"{}\" ({} loader, {} - {} <{}>)", window_title,
+             own_loader ? "sspc" : "shadps4", id, title, app_version);
     // The window's first controller check logs in the user of slot 1.
     if (own_loader && std::ranges::find(cfg.bridged_groups, "user") == cfg.bridged_groups.end()) {
         InstallUserHost();
@@ -1340,6 +1345,26 @@ void RunGame(const App::Config& cfg) {
         static_cast<s32>(EmulatorSettings.GetWindowHeight()), g_controllers, window_title);
     g_window = window.get();
     window->SetIcon(meta.icon);
+    {
+        // the title as SDL and Windows hold it (UTF-8 -> UTF-16: the em dash survives)
+        const char* sdl_title = SDL_GetWindowTitle(window->GetSDLWindow());
+        const auto hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window->GetSDLWindow()),
+                                                                   SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+        wchar_t shown[128] = {};
+        const int n = hwnd != nullptr ? GetWindowTextW(hwnd, shown, static_cast<int>(std::size(shown))) : 0;
+        wchar_t expected[128] = {};
+        const int en = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, App::kWindowTitle.data(),
+                                           static_cast<int>(App::kWindowTitle.size()), expected,
+                                           static_cast<int>(std::size(expected)));
+        if (sdl_title != nullptr && std::string_view(sdl_title) == App::kWindowTitle &&
+            en > 0 && std::wstring_view(shown, static_cast<size_t>(n)) ==
+                          std::wstring_view(expected, static_cast<size_t>(en))) {
+            SSPC_LOG(Bridge, Info, "game window title verified (SDL and Win32, {} UTF-16 units)", n);
+        } else {
+            SSPC_LOG(Bridge, Error, "game window title is not the PC Edition's (SDL \"{}\", Win32 {} units)",
+                     sdl_title != nullptr ? sdl_title : "", n);
+        }
+    }
     if (!cfg.test_presses.empty()) {
         StartTestInput(cfg.test_presses, cfg.logs_dir);
     }
