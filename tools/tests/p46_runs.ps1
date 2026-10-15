@@ -29,6 +29,8 @@ $sources = @{
     early    = "$root\userdata\savedata_backups\2026-10-10_03-44-58_before_manual_sspc"
     # (logs\p32\scene_user_1022 was removed in the 2026-10-14 log cleanup; this backup holds the same 10:22 autosave)
     user1022 = "$root\userdata\savedata_backups\2026-10-10_12-47-35_before_manual_sspc"
+    # the autosave 2026-10-15 22:41 before the mission smi_torture_a10 (its first frames use occlusion counting)
+    mission  = "E:\SecondSonPC-upscale\logs\upscale\scene_mission_a10\home"
 }
 $outRoot = if ($OutRoot) { "$OutRoot\$Tag" } else { "$root\logs\p46\$Tag" }
 New-Item -ItemType Directory -Force $outRoot | Out-Null

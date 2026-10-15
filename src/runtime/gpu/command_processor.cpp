@@ -2,11 +2,13 @@
 #include "runtime/gpu/command_processor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstring>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <intrin.h>  // __rdtsc (the native operations' time)
 #include <windows.h> // GetEnvironmentVariableA (SSPC_P53_CAPTURE_*)
 
@@ -691,6 +693,56 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
             return short_packet(1);
         }
         const u32 index = (body[0] >> 8) & 0xF;
+        const u32 type = body[0] & 0x3F;
+        if (index == 1 && type == 0x38) {
+            // PIXEL_PIPE_STAT_CONTROL (the game's mission smi_torture_a10: 0x7fc00 = counter 0 (occlusion), stride
+            // 128 bits, DBs 0..7): the address dwords hold the control fields, nothing is written to memory
+            if (body.size() >= 2 && ((body.size() < 3 ? 0u : body[2]) & 0x70000000u) == 0) {
+                static constexpr u32 kStride[4] = {4, 8, 16, 32};
+                pipe_stat_stride_ = kStride[(body[1] >> 9) & 3];
+                pipe_stat_mask_ = (body[1] >> 11) & 0xFFFF;
+            }
+            ++stats_.cache_actions;
+            return StepStatus::Packet;
+        }
+        if (index == 1 && (type == 0x15 || type == 0x39)) {
+            // ZPASS_DONE / PIXEL_PIPE_STAT_DUMP: each enabled DB writes its 64-bit pass count (bit 63: valid) at
+            // addr + DB * stride. Not counted on the host GPU: the count written only grows, so every query's
+            // end - begin is positive (the object reads as visible: conservative, nothing is culled wrongly)
+            if (body.size() < 3) {
+                return short_packet(3);
+            }
+            const u64 dst = (body[1] & ~7u) | (u64{body[2] & 0xFFFF} << 32);
+            zpass_count_ += 0x10000;
+            const u64 value = zpass_count_ | (1ull << 63);
+            const u32 mask = type == 0x39 ? pipe_stat_mask_ : 0xFFu;
+            const u32 stride = type == 0x39 ? pipe_stat_stride_ : 16u;
+            for (u32 db = 0; db < 16; ++db) {
+                if ((mask >> db & 1) == 0) {
+                    continue;
+                }
+                const u64 at = dst + u64{db} * stride;
+                if (options_.mode == Mode::Isolated) {
+                    if (options_.work->WriteOnTimeline(q.id, q.work_seq + 1, at, &value, sizeof(value))) {
+                        ++q.work_seq;
+                        ++stats_.timeline_writes;
+                    } else {
+                        options_.work->Synchronize(q.id);
+                        if (!options_.memory->Write(at, &value, sizeof(value))) {
+                            return Fail(q, CpErrorKind::MemoryWriteFailed, addr, op, n,
+                                        fmt::format("occlusion count at {:#x}", at));
+                        }
+                    }
+                }
+                PatchCommands(q, at, reinterpret_cast<const u8*>(&value), sizeof(value), 0);
+            }
+            if (zpass_writes_++ == 0) {
+                SSPC_LOG(GPU, Info, "command processor: occlusion queries ({} at {:#x}, DBs {:#x}, stride {}): counts "
+                                    "not measured on the host GPU - every query reads as visible",
+                         type == 0x39 ? "PIXEL_PIPE_STAT_DUMP" : "ZPASS_DONE", dst, mask, stride);
+            }
+            return StepStatus::Packet;
+        }
         if (index != 0 && index != 4 && index != 7) {
             // ZPASS_DONE, statistics samples: they write counters to memory (not implemented)
             return unsupported(fmt::format("event index {} (type {})", index, body[0] & 0x3F));

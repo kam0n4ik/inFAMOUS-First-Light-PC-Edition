@@ -545,6 +545,12 @@ private:
     PacketObserver* observer_ = nullptr;
     CpError last_error_;
     Counters stats_;
+    /// Occlusion counting (EVENT_WRITE index 1): PIXEL_PIPE_STAT_CONTROL's DB mask and stride (bytes), and the
+    /// count a ZPASS_DONE / PIXEL_PIPE_STAT_DUMP writes (it only grows: every query reads as visible)
+    u32 pipe_stat_mask_ = 0xFF;
+    u32 pipe_stat_stride_ = 16;
+    u64 zpass_count_ = 0;
+    u64 zpass_writes_ = 0;
 };
 
 } // namespace SecondSon::Gpu::Cp
