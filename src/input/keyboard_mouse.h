@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <mutex>
 
 #include "base/abi.h"
@@ -78,6 +79,21 @@ public:
     /// (the menu takes every keyboard/mouse event meanwhile). Closed: nothing pressed, the cursor is captured again
     /// if it was before and the window has focus.
     void SetMenuOpen(bool open);
+    /// Main thread: one of the game's own menus (a screen that pauses the game: pause, settings, map) is shown or
+    /// gone. Shown: the cursor is free and stays free (a click does not take it), the right mouse button is the
+    /// controller's circle, a wheel notch up/down a d-pad press up/down, the left button is the menu controller's
+    /// (MenuPress: the item under the cursor); the mouse's own bindings rest. Gone: the cursor is captured again
+    /// when the window has focus (docs/PC_EDITION_UI.md).
+    void SetGameMenuOpen(bool open);
+    /// Main thread, in a game menu: controller buttons (Button bits) pressed for one reading each, in order, with a
+    /// reading released between them (the game sees each as a new press).
+    void MenuPress(u32 buttons);
+    /// Presses still queued (0: all were read).
+    size_t MenuPressesQueued() const;
+    /// The first keyboard key bound to `a` (SDL scancode), 0 if none.
+    u16 KeyFor(Action a) const;
+    /// `scancode` is bound to `a`.
+    bool KeyTriggers(u16 scancode, Action a) const;
     /// The window the mouse is captured in: captured (hidden, kept inside the window, raw
     /// movement) whenever the window gets focus; Esc gives it back (pause menu) and takes it again,
     /// a click takes it too; focus loss (Alt+Tab) gives it back until the window has focus again.
@@ -126,6 +142,11 @@ private:
     u32 mouse_down_ = 0; // bit = SDL mouse button
     u32 wheel_pending_ = 0; // bit = wheel direction: notches since the last reading
     u32 wheel_latched_ = 0; // the notches this reading presses (one reading each)
+    bool game_menu_ = false;     // one of the game's menus is shown (SetGameMenuOpen)
+    u32 menu_mouse_ = 0;         // Button bits the mouse holds in a game menu (left: cross, right: circle)
+    std::deque<u32> menu_queue_; // MenuPress and wheel notches in a game menu: Button bits, one reading each
+    u32 menu_latched_ = 0;       // the press of this reading
+    bool menu_gap_ = false;      // the reading after a press is released
     std::array<u64, kActionCount> action_seq_{}; // order of presses (last of opposite keys wins)
     u64 seq_ = 0;
 

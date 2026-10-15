@@ -10,8 +10,7 @@ namespace SecondSon::Input {
 
 namespace {
 
-constexpr std::array<InputCode, 3> kReserved{{
-    {InputCode::Kind::Key, static_cast<u16>(SDL_SCANCODE_F1)},
+constexpr std::array<InputCode, 2> kReserved{{
     {InputCode::Kind::Key, static_cast<u16>(SDL_SCANCODE_F10)},
     {InputCode::Kind::Key, static_cast<u16>(SDL_SCANCODE_F11)},
 }};

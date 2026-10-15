@@ -98,6 +98,7 @@ int Shots(const fs::path& out) {
         return 1;
     }
     int failures = 0;
+    bool game_page = false; // the PC Edition's "Additional settings" page over the game's Settings panel
     const auto shot = [&](const char* name, float w, float h, bool ru, Settings::Category cat, u32 caps,
                           Input::PromptStyle prompts, const char* focus, int action) {
         Settings::Service s;
@@ -122,9 +123,15 @@ int Shots(const fs::path& out) {
         env.shader_cache_run = ru ? "заранее 546 из 546 (0.9 с), из кэша: 793, новых: 39"
                                   : "prepared 546 of 546 (0.9 s), read 793, new 39";
         env.now_ns = 1'000'000'000;
+        if (game_page) {
+            const float k = w / 1920.0f;
+            env.game_panel = {315.0f * k, 92.0f * k, 742.0f * k, 895.0f * k};
+        }
         menu.SetEnv(env);
         menu.Open();
-        menu.SelectCategory(cat);
+        if (!game_page) {
+            menu.SelectCategory(cat);
+        }
         if (focus != nullptr) {
             menu.Focus(focus);
         }
@@ -172,6 +179,14 @@ int Shots(const fs::path& out) {
     shot("ru_720_display.png", 1280, 720, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
     shot("ru_1440_mouse.png", 2560, 1440, true, C::Controls, kAllCaps, P::Keyboard, nullptr, 0);
     shot("ru_2160_keys.png", 3840, 2160, true, C::Keyboard, kAllCaps, P::PlayStation, nullptr, 0);
+    game_page = true;
+    shot("ru_1080_page.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
+    shot("ru_1080_page_upscaling.png", 1920, 1080, true, C::Upscaling, kAllCaps | Settings::Capability::Dlss,
+         P::Keyboard, "upscaling.sharpness", 0);
+    shot("ru_1080_page_keys.png", 1920, 1080, true, C::Keyboard, kAllCaps, P::Keyboard, "keyboard.cross", 1);
+    shot("ru_1080_page_confirm.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, "display.fullscreen", 1);
+    shot("en_900_page.png", 1600, 900, false, C::Display, kAllCaps, P::Keyboard, "audio.volume", 0);
+    game_page = false;
     return failures;
 }
 

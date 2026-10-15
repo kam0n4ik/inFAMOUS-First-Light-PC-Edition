@@ -9,7 +9,7 @@
 
 #include <windows.h>
 #include <d2d1.h>
-#include <dwrite.h>
+#include <dwrite_3.h>
 
 namespace SecondSon::Ui {
 
@@ -48,6 +48,8 @@ constexpr wchar_t kClassName[] = L"SecondSonPCMenuOverlay";
 struct Win32Overlay::Impl final : TextMeasure {
     ID2D1Factory* d2d = nullptr;
     IDWriteFactory* dwrite = nullptr;
+    bool have_bahnschrift = false;
+    IDWriteFontCollection* game_fonts = nullptr; // assets/fonts next to the exe (Roboto Slab, Roboto Condensed)
     ID2D1DCRenderTarget* rt = nullptr;
     ID2D1SolidColorBrush* brush = nullptr;
     std::map<std::tuple<int, int, bool>, IDWriteTextFormat*> formats; // (size * 4, weight, wrap)
@@ -75,6 +77,7 @@ struct Win32Overlay::Impl final : TextMeasure {
         }
         Release(brush);
         Release(rt);
+        Release(game_fonts);
         Release(dwrite);
         Release(d2d);
     }
@@ -117,9 +120,26 @@ struct Win32Overlay::Impl final : TextMeasure {
             return it->second;
         }
         IDWriteTextFormat* f = nullptr;
-        const auto w = weight == FontWeight::Semibold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
-        if (FAILED(dwrite->CreateTextFormat(L"Segoe UI", nullptr, w, DWRITE_FONT_STYLE_NORMAL,
-                                            DWRITE_FONT_STRETCH_NORMAL, std::max(1.0f, size), L"", &f))) {
+        if ((weight == FontWeight::GameSlab || weight == FontWeight::GameItem) && game_fonts != nullptr) {
+            if (FAILED(dwrite->CreateTextFormat(weight == FontWeight::GameSlab ? L"Roboto Slab" : L"Roboto Condensed",
+                                                game_fonts, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                DWRITE_FONT_STRETCH_NORMAL, std::max(1.0f, size), L"", &f))) {
+                return nullptr;
+            }
+        } else if (weight == FontWeight::GameSlab || weight == FontWeight::GameItem) {
+            weight = weight == FontWeight::GameSlab ? FontWeight::Title : FontWeight::Regular; // no font files
+        }
+        // Bahnschrift (Windows 10+) narrowed: close to the game's condensed menu faces; Segoe UI where it is missing
+        const auto w = weight == FontWeight::Title      ? DWRITE_FONT_WEIGHT_BOLD
+                       : weight == FontWeight::Semibold ? DWRITE_FONT_WEIGHT_SEMI_BOLD
+                                                        : DWRITE_FONT_WEIGHT_NORMAL;
+        const auto stretch =
+            weight == FontWeight::Title ? DWRITE_FONT_STRETCH_CONDENSED : DWRITE_FONT_STRETCH_SEMI_CONDENSED;
+        if (f == nullptr &&
+            FAILED(dwrite->CreateTextFormat(have_bahnschrift ? L"Bahnschrift" : L"Segoe UI", nullptr, w,
+                                            DWRITE_FONT_STYLE_NORMAL, have_bahnschrift ? stretch
+                                                                                       : DWRITE_FONT_STRETCH_NORMAL,
+                                            std::max(1.0f, size), L"", &f))) {
             return nullptr;
         }
         if (wrap) {
@@ -139,6 +159,39 @@ struct Win32Overlay::Impl final : TextMeasure {
         return f;
     }
 
+    /// The game's menu faces from <exe dir>\\fonts (copied from assets/fonts at build time; Windows 10 1703+).
+    void LoadGameFonts() {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring dir(exe);
+        dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"fonts\\";
+        IDWriteFactory5* f5 = nullptr;
+        IDWriteFontSetBuilder1* builder = nullptr;
+        IDWriteFontSet* set = nullptr;
+        IDWriteFontCollection1* collection = nullptr;
+        int added = 0;
+        if (SUCCEEDED(dwrite->QueryInterface(__uuidof(IDWriteFactory5), reinterpret_cast<void**>(&f5))) &&
+            SUCCEEDED(f5->CreateFontSetBuilder(&builder))) {
+            for (const wchar_t* name : {L"RobotoSlab[wght].ttf", L"RobotoCondensed[wght].ttf"}) {
+                IDWriteFontFile* file = nullptr;
+                if (SUCCEEDED(f5->CreateFontFileReference((dir + name).c_str(), nullptr, &file)) &&
+                    SUCCEEDED(builder->AddFontFile(file))) {
+                    ++added;
+                }
+                Release(file);
+            }
+            if (added == 2 && SUCCEEDED(builder->CreateFontSet(&set)) &&
+                SUCCEEDED(f5->CreateFontCollectionFromFontSet(set, &collection))) {
+                game_fonts = collection;
+                collection = nullptr;
+            }
+        }
+        Release(collection);
+        Release(set);
+        Release(builder);
+        Release(f5);
+    }
+
     float Width(std::string_view utf8, float size, FontWeight weight) override {
         IDWriteTextFormat* f = Format(size, weight, true);
         if (f == nullptr || utf8.empty()) {
@@ -154,7 +207,7 @@ struct Win32Overlay::Impl final : TextMeasure {
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);
         layout->Release();
-        return m.widthIncludingTrailingWhitespace;
+        return m.widthIncludingTrailingWhitespace * (game_fonts != nullptr ? FontStretch(weight) : 1.0f);
     }
 
     void Triangle(const float* p, bool fill, float width) {
@@ -240,8 +293,20 @@ struct Win32Overlay::Impl final : TextMeasure {
                                     : c.align == Align::Right ? DWRITE_TEXT_ALIGNMENT_TRAILING
                                                               : DWRITE_TEXT_ALIGNMENT_CENTER);
                 const auto text = Wide(c.text);
-                rt->DrawText(text.c_str(), static_cast<UINT32>(text.size()), f, ToD2D(c.rect), brush,
-                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                const float sx = game_fonts != nullptr ? FontStretch(c.weight) : 1.0f;
+                if (sx != 1.0f) {
+                    // narrowed: drawn in a box sx times wider under a horizontal scale
+                    D2D1_MATRIX_3X2_F old{};
+                    rt->GetTransform(&old);
+                    rt->SetTransform(D2D1::Matrix3x2F::Scale(sx, 1.0f) * old);
+                    const Rect r{c.rect.x / sx, c.rect.y, c.rect.w / sx, c.rect.h};
+                    rt->DrawText(text.c_str(), static_cast<UINT32>(text.size()), f, ToD2D(r), brush,
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                    rt->SetTransform(old);
+                } else {
+                    rt->DrawText(text.c_str(), static_cast<UINT32>(text.size()), f, ToD2D(c.rect), brush,
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                }
                 break;
             }
             case DrawCmd::Kind::PushClip:
@@ -370,6 +435,13 @@ bool Win32Overlay::Init(std::string& error) {
         error = "DirectWrite factory";
         return false;
     }
+    if (IDWriteFontCollection* fonts = nullptr; SUCCEEDED(m.dwrite->GetSystemFontCollection(&fonts, FALSE))) {
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        m.have_bahnschrift = SUCCEEDED(fonts->FindFamilyName(L"Bahnschrift", &index, &exists)) && exists;
+        fonts->Release();
+    }
+    m.LoadGameFonts();
     if (!m.CreateRenderTarget()) {
         error = "Direct2D software render target";
         return false;

@@ -36,7 +36,7 @@ struct PcSettings {
     double camera_sensitivity = 1.0; // right stick deflection multiplier, on top of the game's own option
     bool invert_camera_x = false;    // mirrors the right stick (the game has its own inversion options too)
     bool invert_camera_y = false;
-    std::string menu_button = "guide"; // opens the settings menu: "guide" (PS button) | "l3r3" (held) | "off"
+    std::string menu_button = "off"; // a shortcut to the PC settings besides the game's Settings screen: "guide" | "l3r3" | "off"
 
     // [Interface]: SecondSonPC's own menu (the game's menus and prompts are the game's)
     std::string ui_language = "auto"; // "auto" (as [Language] system) | "ru" | "en"

@@ -49,6 +49,10 @@ struct MenuEnv {
     // P4.14: the shader cache's statistics (empty: no native backend's cache in this run)
     std::string shader_cache_size, shader_cache_content, shader_cache_run;
     u64 now_ns = 0;
+    /// PC Edition: the game's Settings panel in client pixels (frame 315,92 742x895 of 1920x1080). Set: the menu is
+    /// "Additional settings", a page of the game's own Settings screen drawn as the game draws it over that panel
+    /// (one list of every section, the game's faces, sizes and colours); empty: the standalone menu.
+    Rect game_panel{};
 };
 
 class SettingsMenu {
@@ -106,6 +110,8 @@ private:
     struct Row {
         enum class Kind : u8 { Header, Setting, WindowSize, Info, ResetCategory, Command };
         Kind kind = Kind::Setting;
+        Settings::Category cat = Settings::Category::Display; // the section it belongs to
+        bool section = false;    // a Header naming a whole section (the game-page list)
         const Settings::Desc* desc = nullptr;
         std::string_view en, ru; // Header/Info/ResetCategory label
         std::string tag;         // FocusedId of non-setting rows
@@ -128,6 +134,12 @@ private:
         return env_.ru ? ru : en;
     }
     void RebuildRows();
+    void AppendCategory(Settings::Category category);
+    void SyncCategory(); // the game page: the focused row's section is the current category
+    void BuildGame(TextMeasure& measure, DrawList& out);
+    bool GameStyle() const {
+        return env_.game_panel.w > 0;
+    }
     bool Focusable(size_t row) const;
     void MoveFocus(int delta);
     void Adjust(int dir);           // Left/Right on the focused row
@@ -155,6 +167,8 @@ private:
     size_t focus_ = 0;
     int slot_ = 0;
     int scroll_ = 0;         // first visible row
+    float game_scroll_ = 0;  // the game page: the list's offset (frame pixels)
+    bool game_style_ = false; // the rows are the game page's
     int visible_rows_ = 8;   // from the last Build
     int hover_row_ = -1;
     int dragging_row_ = -1;  // a slider being dragged with the mouse

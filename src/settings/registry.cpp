@@ -633,11 +633,11 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "gamepad.menuButton", .table = "Gamepad", .key = "menuButton", .category = Category::Gamepad,
-        .type = Type::Choice, .apply = Apply::Live, .choices = kMenuButtons, .en = "Open this menu from a controller",
-        .ru = "Открытие меню с контроллера",
-        .help_en = "The PS (Guide) button never reaches a PS4 game, so it is free; on Windows the Xbox Guide button "
+        .type = Type::Choice, .apply = Apply::Live, .choices = kMenuButtons, .en = "Controller shortcut to this menu",
+        .ru = "Быстрый вызов с контроллера",
+        .help_en = "This menu is in the game's Settings screen (Options / Esc, then △ or F); a shortcut besides it. The PS (Guide) button never reaches a PS4 game, so it is free; on Windows the Xbox Guide button "
                    "may open the Game Bar, and Steam may take the PS button.",
-        .help_ru = "Кнопка PS (Guide) не доходит до игр PS4, поэтому свободна; в Windows кнопка Guide Xbox может "
+        .help_ru = "Это меню открывается из экрана «Настройки» игры (Options / Esc, затем △ или F); здесь — дополнительный быстрый вызов. Кнопка PS (Guide) не доходит до игр PS4, поэтому свободна; в Windows кнопка Guide Xbox может "
                    "открыть Game Bar, а Steam — забрать кнопку PS.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.menu_button; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.menu_button = std::get<std::string>(x); },
@@ -909,7 +909,7 @@ bool Validate(const Desc& desc, const Value& value, std::string& error) {
                 return false;
             }
             if (Input::IsReservedInput(in)) {
-                error = fmt::format("{} is SecondSonPC's own hotkey (F1 menu, F10 FPS, F11 full screen)",
+                error = fmt::format("{} is SecondSonPC's own hotkey (F10 FPS, F11 full screen)",
                                     Input::InputName(in));
                 return false;
             }

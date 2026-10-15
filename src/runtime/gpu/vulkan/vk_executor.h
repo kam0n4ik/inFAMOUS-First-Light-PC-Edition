@@ -499,6 +499,18 @@ private:
     /// SSPC_DIAG_CAPTURE_FRAMES: the displayed image of this flip read back (recorded after its copy; P4.5).
     void CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h);
     std::unique_ptr<ImageReadback> readback_;
+    /// PC Edition mouse in the game's menus: while wanted (runtime/gpu/menu_focus.h), a strip of the displayed image
+    /// is copied at each flip to one of these buffers and read once its submission completed (no stall, no file).
+    void MenuFocusProbe(const CachedImage& img, VkFormat shown, u32 w, u32 h);
+    void CollectMenuFocus(u64 completed);
+    struct FocusRead {
+        OwnedBuffer buffer;
+        u64 value = 0; ///< the submission the copy is in (0: free)
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        u32 w = 0, bw = 0, h = 0, texel = 4; ///< the item strip, the scroll bar strip (after it), their rows
+        float y0 = 0, scale = 1;
+    };
+    std::array<FocusRead, 3> focus_reads_{};
     /// SSPC_DIAG_CAPTURE_IMAGE: a GPU-written image read back at a flip (P4.5)
     void CaptureImageAt();
     /// SSPC_DIAG_DRAW_HISTO: the frame's draws by pipeline / dispatches by program, written at the flip (P4.5)

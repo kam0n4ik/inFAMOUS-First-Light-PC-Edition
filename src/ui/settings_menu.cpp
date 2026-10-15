@@ -19,23 +19,57 @@ using Settings::Desc;
 using Settings::Type;
 using Settings::Value;
 
-constexpr Color kPanel{21, 23, 28, 250};
-constexpr Color kSidebar{27, 30, 37, 255};
-constexpr Color kLine{44, 49, 61, 255};
-constexpr Color kRowFocus{40, 48, 66, 255};
-constexpr Color kRowHover{31, 35, 45, 255};
-constexpr Color kAccent{76, 141, 255, 255};
-constexpr Color kText{232, 234, 240, 255};
-constexpr Color kText2{154, 163, 181, 255};
-constexpr Color kDisabled{96, 103, 118, 255};
+// The game's menu look (its settings screen, measured on a 1920x1080 frame): a dark see-through panel with a thin
+// white frame, a yellow title in capitals, white section names in capitals, white items, the chosen item yellow.
+constexpr Color kPanel{14, 14, 14, 228};
+constexpr Color kFrame{235, 235, 235, 255};
+constexpr Color kSidebar{0, 0, 0, 70};
+constexpr Color kLine{255, 255, 255, 46};
+constexpr Color kRowFocus{255, 255, 255, 20};
+constexpr Color kRowHover{255, 255, 255, 10};
+constexpr Color kAccent{245, 184, 0, 255};
+constexpr Color kText{240, 240, 240, 255};
+constexpr Color kText2{168, 168, 168, 255};
+constexpr Color kDisabled{100, 100, 100, 255};
 constexpr Color kWarn{255, 107, 94, 255};
-constexpr Color kAmber{242, 181, 61, 255};
-constexpr Color kTrackOff{58, 64, 80, 255};
+constexpr Color kAmber{245, 184, 0, 255};
+constexpr Color kTrackOff{80, 80, 80, 255};
 constexpr Color kWhite{255, 255, 255, 255};
-constexpr Color kKeycap{44, 50, 64, 255};
-constexpr Color kKeycapLine{86, 95, 115, 255};
-constexpr Color kGlyphBg{38, 42, 54, 255};
+constexpr Color kKeycap{38, 38, 38, 255};
+constexpr Color kKeycapLine{120, 120, 120, 255};
+constexpr Color kGlyphBg{38, 38, 38, 255};
 constexpr Color kShade{0, 0, 0, 150};
+
+/// Capitals as the game writes its titles (ASCII and Russian; other text unchanged).
+std::string Caps(std::string_view utf8) {
+    std::string out;
+    out.reserve(utf8.size());
+    for (size_t i = 0; i < utf8.size(); ++i) {
+        const auto c = static_cast<unsigned char>(utf8[i]);
+        if (c >= 'a' && c <= 'z') {
+            out += static_cast<char>(c - 32);
+        } else if ((c == 0xD0 || c == 0xD1) && i + 1 < utf8.size()) {
+            const auto d = static_cast<unsigned char>(utf8[i + 1]);
+            if (c == 0xD0 && d >= 0xB0 && d <= 0xBF) { // а..п
+                out += static_cast<char>(0xD0);
+                out += static_cast<char>(d - 0x20);
+            } else if (c == 0xD1 && d >= 0x80 && d <= 0x8F) { // р..я
+                out += static_cast<char>(0xD0);
+                out += static_cast<char>(d + 0x20);
+            } else if (c == 0xD1 && d == 0x91) { // ё
+                out += static_cast<char>(0xD0);
+                out += static_cast<char>(0x81);
+            } else {
+                out += static_cast<char>(c);
+                out += static_cast<char>(d);
+            }
+            ++i;
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
 
 constexpr Category kOrder[] = {Category::Display,  Category::Graphics, Category::Upscaling, Category::Audio,     Category::Controls,
                                Category::Keyboard, Category::Gamepad,  Category::Interface, Category::Shaders,
@@ -213,6 +247,19 @@ bool SettingsMenu::TakeCloseRequest() {
 
 void SettingsMenu::SetEnv(MenuEnv env) {
     env_ = std::move(env);
+    if (GameStyle() != game_style_) {
+        game_style_ = GameStyle();
+        RebuildRows();
+        focus_ = 0;
+        MoveFocus(0);
+        game_scroll_ = 0;
+    }
+}
+
+void SettingsMenu::SyncCategory() {
+    if (game_style_ && focus_ < rows_.size()) {
+        category_ = rows_[focus_].cat;
+    }
 }
 
 void SettingsMenu::SelectCategory(Category category) {
@@ -229,6 +276,23 @@ void SettingsMenu::SelectCategory(Category category) {
 
 void SettingsMenu::RebuildRows() {
     rows_.clear();
+    if (game_style_) {
+        // the game page: every section in one list, as the game's Settings screen lists its own
+        for (const auto c : kOrder) {
+            rows_.push_back({.kind = Row::Kind::Header, .cat = c, .section = true,
+                             .en = Settings::CategoryLabel(c, false), .ru = Settings::CategoryLabel(c, true)});
+            AppendCategory(c);
+        }
+    } else {
+        AppendCategory(category_);
+    }
+    if (focus_ >= rows_.size()) {
+        focus_ = rows_.size() - 1;
+    }
+}
+
+void SettingsMenu::AppendCategory(Category category_) {
+    const size_t first = rows_.size();
     const auto info = [this](std::string_view en, std::string_view ru, std::string tag) {
         rows_.push_back({.kind = Row::Kind::Info, .en = en, .ru = ru, .tag = std::move(tag)});
     };
@@ -272,8 +336,8 @@ void SettingsMenu::RebuildRows() {
     }
     rows_.push_back({.kind = Row::Kind::ResetCategory, .en = "Reset this section", .ru = "Сбросить раздел",
                      .tag = "reset.category"});
-    if (focus_ >= rows_.size()) {
-        focus_ = rows_.size() - 1;
+    for (size_t i = first; i < rows_.size(); ++i) {
+        rows_[i].cat = category_;
     }
 }
 
@@ -443,6 +507,7 @@ void SettingsMenu::StepText(const Desc& desc, int dir) {
 }
 
 void SettingsMenu::Adjust(int dir) {
+    SyncCategory();
     if (focus_ >= rows_.size()) {
         return;
     }
@@ -502,6 +567,7 @@ void SettingsMenu::Adjust(int dir) {
 }
 
 void SettingsMenu::Activate() {
+    SyncCategory();
     if (focus_ >= rows_.size()) {
         return;
     }
@@ -555,6 +621,7 @@ void SettingsMenu::Activate() {
 }
 
 void SettingsMenu::ResetFocused() {
+    SyncCategory();
     if (focus_ >= rows_.size()) {
         return;
     }
@@ -666,6 +733,24 @@ void SettingsMenu::OnNav(Nav nav) {
             }
         }
         idx = ((idx + (nav == Nav::NextTab ? 1 : -1)) % n + n) % n;
+        if (game_style_) {
+            // the game page: to the next / previous section's first item
+            SyncCategory();
+            for (int i = 0; i < n; ++i) {
+                if (kOrder[i] == category_) {
+                    idx = ((i + (nav == Nav::NextTab ? 1 : -1)) % n + n) % n;
+                }
+            }
+            for (size_t r = 0; r < rows_.size(); ++r) {
+                if (rows_[r].section && rows_[r].cat == kOrder[idx]) {
+                    focus_ = r;
+                    MoveFocus(0);
+                    slot_ = 0;
+                    break;
+                }
+            }
+            break;
+        }
         SelectCategory(kOrder[idx]);
         break;
     }
@@ -691,8 +776,8 @@ void SettingsMenu::OnCaptureInput(Input::InputCode input) {
     capture_.reset();
     if (Input::IsReservedInput(input)) {
         status_ = fmt::format("{}: {}", BindingText(input),
-                              T("a SecondSonPC hotkey (F1 menu, F10 FPS, F11 full screen) - not assigned",
-                                "горячая клавиша SecondSonPC (F1 меню, F10 FPS, F11 полный экран) — не назначена"));
+                              T("a SecondSonPC hotkey (F10 FPS, F11 full screen) - not assigned",
+                                "горячая клавиша SecondSonPC (F10 FPS, F11 полный экран) — не назначена"));
         return;
     }
     auto settings = service_.Current().input;
@@ -730,6 +815,12 @@ void SettingsMenu::OnMouseMove(float x, float y) {
         if (h.kind == Hit::Kind::Row && h.rect.Contains(x, y)) {
             hover_row_ = h.index;
         }
+    }
+    // the game page: the item under the pointer is the chosen one (as the game's own menus with a cursor)
+    if (game_style_ && hover_row_ >= 0 && modal_ == Modal::None && !capture_ && dragging_row_ < 0 &&
+        Focusable(static_cast<size_t>(hover_row_)) && focus_ != static_cast<size_t>(hover_row_)) {
+        focus_ = static_cast<size_t>(hover_row_);
+        slot_ = 0;
     }
     if (dragging_row_ >= 0) {
         SetSliderFromX(static_cast<size_t>(dragging_row_), x);
@@ -828,6 +919,10 @@ void SettingsMenu::OnWheel(float notches) {
     if (modal_ != Modal::None || notches == 0.0f) {
         return;
     }
+    if (game_style_) {
+        MoveFocus(notches > 0 ? -1 : 1); // as the game's lists: a notch is a step up / down
+        return;
+    }
     scroll_ -= static_cast<int>(std::lround(notches * 3.0f));
     scroll_ = std::max(0, scroll_);
     // keep the focus in view so the next Build does not scroll back
@@ -905,6 +1000,10 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
     if (!open_) {
         return;
     }
+    if (game_style_) {
+        BuildGame(measure, out);
+        return;
+    }
     const auto cfg = service_.Current();
     float s = H / 1080.0f * static_cast<float>(cfg.pc.ui_scale) / 100.0f;
     s = std::clamp(s, 0.5f, 4.0f);
@@ -915,13 +1014,14 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
     const Rect panel{std::floor((W - pw) / 2), std::floor((H - ph) / 2), std::floor(pw), std::floor(ph)};
     out.SetSurface(panel);
     out.SetDim(150);
-    out.FillRect(panel, kPanel, 14.0f * s);
-    out.StrokeRect(panel, kLine, std::max(1.0f, s), 14.0f * s);
+    out.FillRect(panel, kPanel);
+    out.StrokeRect(panel, kFrame, std::max(1.0f, 1.5f * s));
+    out.FillRect({panel.x - 3 * s, panel.y - 3 * s, 7 * s, 7 * s}, kFrame); // the corner mark of the game's panels
 
     // ---- header
-    const float hh = 76.0f * s;
-    out.Text({panel.x + 28 * s, panel.y, pw * 0.5f, hh}, T("SecondSonPC · Settings", "SecondSonPC · Настройки"),
-             26.0f * s, kText, Align::Left, FontWeight::Semibold);
+    const float hh = 96.0f * s;
+    out.Text({panel.x + 32 * s, panel.y + 6 * s, pw * 0.6f, hh}, Caps(T("PC settings", "ПК-настройки")), 54.0f * s,
+             kAccent, Align::Left, FontWeight::Title);
     const Rect close{panel.Right() - 58 * s, panel.y + 18 * s, 40 * s, 40 * s};
     out.FillRect(close, kKeycap, 8 * s);
     out.Line(close.x + 13 * s, close.y + 13 * s, close.Right() - 13 * s, close.Bottom() - 13 * s, kText, 2 * s);
@@ -937,19 +1037,18 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
     out.Line(panel.x, fy, panel.Right(), fy, kLine, std::max(1.0f, s));
 
     // ---- sidebar
-    const float sw = 250.0f * s;
+    const float sw = 330.0f * s;
     const Rect side{panel.x, panel.y + hh, sw, fy - panel.y - hh};
     out.FillRect({side.x + 1, side.y + 1, side.w, side.h - 1}, kSidebar);
     for (size_t i = 0; i < std::size(kOrder); ++i) {
         const Rect item{side.x + 12 * s, side.y + 12 * s + static_cast<float>(i) * 50 * s, sw - 24 * s, 44 * s};
         const bool selected = kOrder[i] == category_;
         if (selected) {
-            out.FillRect(item, kRowFocus, 8 * s);
-            out.FillRect({item.x, item.y + 10 * s, 4 * s, item.h - 20 * s}, kAccent, 2 * s);
+            out.FillRect(item, kRowFocus);
         }
-        out.Text({item.x + 18 * s, item.y, item.w - 24 * s, item.h}, Settings::CategoryLabel(kOrder[i], env_.ru),
-                 18.0f * s, selected ? kText : kText2, Align::Left,
-                 selected ? FontWeight::Semibold : FontWeight::Regular);
+        out.Text({item.x + 18 * s, item.y, item.w - 24 * s, item.h},
+                 Caps(Settings::CategoryLabel(kOrder[i], env_.ru)), 21.0f * s, selected ? kAccent : kText,
+                 Align::Left, FontWeight::Title);
         hits_.push_back({.kind = Hit::Kind::Category, .rect = item, .index = static_cast<int>(i)});
     }
 
@@ -989,16 +1088,15 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
         const Rect rr{cx0 + 16 * s, y, cw0 - 32 * s, row_h - 4 * s};
         const float cy = rr.y + rr.h / 2;
         if (row.kind == Row::Kind::Header) {
-            out.Text({rr.x + 12 * s, rr.y + 10 * s, rr.w, rr.h - 10 * s}, T(row.en, row.ru), 15.0f * s, kAccent,
-                     Align::Left, FontWeight::Semibold);
+            out.Text({rr.x + 12 * s, rr.y + 10 * s, rr.w, rr.h - 10 * s}, Caps(T(row.en, row.ru)), 22.0f * s, kText,
+                     Align::Left, FontWeight::Title);
             continue;
         }
         const bool focused = static_cast<size_t>(ri) == focus_;
         if (focused) {
-            out.FillRect(rr, kRowFocus, 8 * s);
-            out.FillRect({rr.x, rr.y + 10 * s, 4 * s, rr.h - 20 * s}, kAccent, 2 * s);
+            out.FillRect(rr, kRowFocus);
         } else if (ri == hover_row_) {
-            out.FillRect(rr, kRowHover, 8 * s);
+            out.FillRect(rr, kRowHover);
         }
         hits_.push_back({.kind = Hit::Kind::Row, .rect = rr, .index = ri, .part = Hit::Part::Body});
 
@@ -1040,8 +1138,8 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
         if (row.kind == Row::Kind::ResetCategory) {
             label_text = fmt::format("{} «{}»", label, Settings::CategoryLabel(category_, env_.ru));
         }
-        out.Text({rr.x + 26 * s, rr.y, label_right - (rr.x + 26 * s), rr.h}, label_text, 18.0f * s,
-                 dimmed ? kDisabled : kText);
+        out.Text({rr.x + 26 * s, rr.y, label_right - (rr.x + 26 * s), rr.h}, label_text, 21.0f * s,
+                 dimmed ? kDisabled : focused ? kAccent : kText);
 
         const auto arrows = [&](std::string_view value_text, bool enabled) {
             const Color c = enabled ? kText : kDisabled;
@@ -1069,7 +1167,8 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
             } else if (row.tag == "info.device") {
                 text = env_.device_label;
             } else if (row.tag == "info.hotkeys") {
-                text = std::string(T("F1 menu · F10 FPS · F11 full screen", "F1 меню · F10 FPS · F11 полный экран"));
+                text = std::string(T("Esc: Settings · F10 FPS · F11 full screen",
+                                     "Esc → «Настройки» · F10 FPS · F11 полный экран"));
             } else if (row.tag == "info.render") {
                 text = std::string(T("1920 × 1080 (the window scales the frame)", "1920 × 1080 (окно масштабирует кадр)"));
             } else if (row.tag == "info.cache.size") {
@@ -1272,7 +1371,7 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
     } else {
         hints = {{Hint::Navigate, "Select", "Выбор"}, {Hint::Adjust, "Change", "Изменить"},
                  {Hint::Accept, "Apply", "Выбрать"},  {Hint::Reset, "Default", "По умолчанию"},
-                 {Hint::Tabs, "Section", "Раздел"},   {Hint::Back, "Close", "Закрыть"}};
+                 {Hint::Tabs, "Section", "Раздел"},   {Hint::Back, "Back", "Назад"}};
     }
     float hx = panel.x + 24 * s;
     const float hcy = fy + fh / 2;
@@ -1301,11 +1400,11 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
 
     // ---- dialogs
     if (modal_ != Modal::None) {
-        out.FillRect(panel, kShade, 14 * s);
+        out.FillRect(panel, kShade);
         const float mw = std::min(660 * s, pw - 40 * s), mh = 250 * s;
         const Rect box{panel.x + (pw - mw) / 2, panel.y + (ph - mh) / 2, mw, mh};
-        out.FillRect(box, kSidebar, 12 * s);
-        out.StrokeRect(box, kLine, std::max(1.0f, s), 12 * s);
+        out.FillRect(box, Color{14, 14, 14, 245});
+        out.StrokeRect(box, kFrame, std::max(1.0f, 1.5f * s));
         std::string title, text;
         std::string_view yes, no;
         if (modal_ == Modal::ConfirmDisplay) {
@@ -1324,8 +1423,8 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
             yes = T("Reset", "Сбросить");
             no = T("Cancel", "Отмена");
         }
-        out.Text({box.x + 28 * s, box.y + 20 * s, box.w - 56 * s, 40 * s}, title, 21.0f * s, kText, Align::Left,
-                 FontWeight::Semibold);
+        out.Text({box.x + 28 * s, box.y + 20 * s, box.w - 56 * s, 40 * s}, Caps(title), 26.0f * s, kAccent,
+                 Align::Left, FontWeight::Title);
         out.Text({box.x + 28 * s, box.y + 70 * s, box.w - 56 * s, 80 * s}, text, 16.0f * s, kText2, Align::Left,
                  FontWeight::Regular, true);
         const float bw = 170 * s, bh = 46 * s, by = box.Bottom() - bh - 24 * s;
@@ -1333,8 +1432,334 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
             const Rect b{box.Right() - 28 * s - bw * static_cast<float>(2 - i) - 14 * s * static_cast<float>(1 - i),
                          by, bw, bh};
             const bool sel = modal_button_ == i;
-            out.FillRect(b, sel ? kAccent : kKeycap, 8 * s);
-            out.Text(b, i == 0 ? yes : no, 17.0f * s, sel ? kWhite : kText, Align::Center, FontWeight::Semibold);
+            out.FillRect(b, kKeycap);
+            out.StrokeRect(b, sel ? kAccent : kKeycapLine, std::max(1.0f, (sel ? 2.0f : 1.0f) * s));
+            out.Text(b, i == 0 ? yes : no, 19.0f * s, sel ? kAccent : kText, Align::Center, FontWeight::Semibold);
+            hits_.push_back({.kind = Hit::Kind::ModalButton, .rect = b, .index = i});
+        }
+    }
+}
+
+
+// ---- the game page: "Additional settings" drawn as the game draws its Settings screen
+//
+// Measured on the game's 1920x1080 frame (its Settings screen, 2026-10-15/16): the panel 315,92 742x895 (a thin white
+// frame, a white square at its top-left corner, a white tab over its top-right end, a fine grid over a dark see-through
+// fill); the title at x 347 (yellow slab serif capitals, ~66 px); section names at x 387 (white slab capitals, ~34 px);
+// items at x 415 and values ending at x 984 (a condensed sans, ~28 px; the chosen item and its value yellow); rows
+// 35 px apart, a section's first item 36 px under its name, the next section's name 64 px under its last item; the
+// list shows frame y 225..985; volume-like values are ten dashes 26x7 every 30 px from x 690; the scroll bar at x
+// 1026..1040 (its thumb grey 79). The game's own screen stays under it: its controller picture and "(O) Back".
+void SettingsMenu::BuildGame(TextMeasure& measure, DrawList& out) {
+    constexpr Color kYellow{245, 184, 0, 255};
+    constexpr Color kWhiteText{240, 240, 240, 255};
+    constexpr Color kGreyText{120, 120, 120, 255};
+    constexpr Color kDashOff{62, 62, 62, 255};
+    const Rect P = env_.game_panel;
+    const float k = P.w / 742.0f;
+    const auto X = [&](float fx) { return P.x + (fx - 315.0f) * k; };
+    const auto Y = [&](float fy) { return P.y + (fy - 92.0f) * k; };
+    const auto F = [&](float fx, float fy, float fw, float fh) { return Rect{X(fx), Y(fy), fw * k, fh * k}; };
+    const auto cfg = service_.Current();
+
+    out.SetSurface({X(305), Y(80), 790 * k, 920 * k});
+    out.SetDim(0);
+    // the panel: an opaque copy of the game's (its own list is under it)
+    out.FillRect(F(316, 93, 740, 893), Color{40, 40, 41, 250});
+    for (float gx = 316; gx < 1056; gx += 8) {
+        out.Line(X(gx), Y(93), X(gx), Y(986), Color{255, 255, 255, 7}, std::max(1.0f, k));
+    }
+    for (float gy = 93; gy < 986; gy += 8) {
+        out.Line(X(316), Y(gy), X(1056), Y(gy), Color{255, 255, 255, 7}, std::max(1.0f, k));
+    }
+    out.StrokeRect(F(315, 92, 742, 895), kWhiteText, std::max(1.0f, 1.5f * k));
+    out.FillRect(F(311, 88, 8, 8), kWhiteText);
+    out.FillRect(F(925, 85, 132, 7), kWhiteText);
+
+    // the title, narrowed to the panel when long
+    const std::string title = Caps(T("Additional settings", "Дополнительные настройки"));
+    float title_size = 66.0f * k;
+    while (title_size > 30.0f * k && measure.Width(title, title_size, FontWeight::GameSlab) > 690.0f * k) {
+        title_size -= 2.0f * k;
+    }
+    out.Text(F(347, 118, 700, 84), title, title_size, kYellow, Align::Left, FontWeight::GameSlab);
+
+    // ---- the list: each row's centre in list coordinates
+    const int n = static_cast<int>(rows_.size());
+    std::vector<float> cy(rows_.size());
+    float y = 0;
+    for (int i = 0; i < n; ++i) {
+        const auto& r = rows_[static_cast<size_t>(i)];
+        if (i == 0) {
+            y = 0;
+        } else if (r.kind == Row::Kind::Header) {
+            y += rows_[static_cast<size_t>(i) - 1].kind == Row::Kind::Header ? 40.0f : 64.0f;
+        } else {
+            y += rows_[static_cast<size_t>(i) - 1].kind == Row::Kind::Header ? 36.0f : 35.0f;
+        }
+        cy[static_cast<size_t>(i)] = y;
+    }
+    const float list_top = 225, list_bottom = 985, first_y = 260;
+    const float content_end = n > 0 ? cy.back() + 30 : 0;
+    const float max_scroll = std::max(0.0f, content_end - (list_bottom - first_y));
+    if (focus_ < rows_.size()) {
+        // the chosen item in view, with its section's name when it is the first item
+        float want_top = cy[focus_] - 40;
+        if (focus_ > 0 && rows_[focus_ - 1].kind == Row::Kind::Header) {
+            want_top = cy[focus_ - 1] - 40;
+        }
+        const float want_bottom = cy[focus_] + 40;
+        if (want_top - game_scroll_ < 0) {
+            game_scroll_ = want_top;
+        }
+        if (want_bottom - game_scroll_ > list_bottom - first_y) {
+            game_scroll_ = want_bottom - (list_bottom - first_y);
+        }
+    }
+    game_scroll_ = std::clamp(game_scroll_, 0.0f, max_scroll);
+
+    out.PushClip({X(316), Y(list_top), 740 * k, (list_bottom - list_top) * k});
+    for (int i = 0; i < n; ++i) {
+        const auto& row = rows_[static_cast<size_t>(i)];
+        const float fy = first_y + cy[static_cast<size_t>(i)] - game_scroll_;
+        if (fy < list_top - 40 || fy > list_bottom + 40) {
+            continue;
+        }
+        if (row.kind == Row::Kind::Header) {
+            const std::string name = Caps(T(row.en, row.ru));
+            float size = (row.section ? 34.0f : 28.0f) * k;
+            while (size > 20.0f * k && measure.Width(name, size, FontWeight::GameSlab) > 620.0f * k) {
+                size -= 1.0f * k; // a long section name fits the panel as the game's do
+            }
+            out.Text(F(387, fy - 24, 630, 48), name, size, row.section ? kWhiteText : kGreyText, Align::Left,
+                     FontWeight::GameSlab);
+            continue;
+        }
+        const bool focused = static_cast<size_t>(i) == focus_;
+        const Desc* d = row.desc;
+        const bool available = d == nullptr || service_.Available(*d).available;
+        bool dimmed = !available;
+        if (d != nullptr && !d->requires_on.empty()) {
+            if (const Desc* dep = Settings::Find(d->requires_on)) {
+                const Value dv = service_.Get(*dep);
+                dimmed = dimmed || (std::holds_alternative<bool>(dv) && !std::get<bool>(dv));
+            }
+        }
+        const Color color = focused ? kYellow : dimmed ? kGreyText : kWhiteText;
+        std::string label = d != nullptr ? std::string(env_.ru ? d->ru : d->en) : std::string(T(row.en, row.ru));
+        if (row.kind == Row::Kind::ResetCategory) {
+            label = fmt::format("{} «{}»", label, Settings::CategoryLabel(row.cat, env_.ru));
+        }
+        if (d != nullptr && service_.NeedsRestart(*d)) {
+            label += " *"; // takes effect after a restart (the description says so)
+        }
+        const Rect body = F(387, fy - 17.5f, 613, 35);
+        hits_.push_back({.kind = Hit::Kind::Row, .rect = body, .index = i, .part = Hit::Part::Body});
+        constexpr float kItem = 27.0f;
+        // the label ends where its value begins (measured below): drawn last so it knows the room it has
+        float label_right = 974; // frame x
+        const auto label_text = [&] {
+            out.Text(F(415, fy - 20, std::max(120.0f, label_right - 415), 40), label, kItem * k, color, Align::Left,
+                     FontWeight::GameItem);
+        };
+
+        // the value, right-aligned at x 984 (choices: a click on its left half steps back, on its right half on)
+        const auto value_text = [&](const std::string& text, Color c, float right = 984) {
+            const float vw = std::min(420.0f * k, measure.Width(text, kItem * k, FontWeight::GameItem)) / k;
+            out.Text(F(right - vw - 4, fy - 20, vw + 4, 40), text, kItem * k, c, Align::Right, FontWeight::GameItem);
+            label_right = std::min(label_right, right - vw - 18);
+        };
+        // the game's cross button glyph (its "Press (X)")
+        const auto cross_glyph = [&](Color c) {
+            const float gx = X(969), gy = Y(fy), r = 11.0f * k;
+            out.FillCircle(gx, gy, r, c);
+            const float a = 4.5f * k;
+            out.Line(gx - a, gy - a, gx + a, gy + a, Color{40, 40, 41, 255}, std::max(1.0f, 2.6f * k));
+            out.Line(gx - a, gy + a, gx + a, gy - a, Color{40, 40, 41, 255}, std::max(1.0f, 2.6f * k));
+        };
+        const auto step_hits = [&] {
+            hits_.push_back({.kind = Hit::Kind::Row, .rect = F(690, fy - 17.5f, 147, 35), .index = i,
+                             .part = Hit::Part::Prev});
+            hits_.push_back({.kind = Hit::Kind::Row, .rect = F(837, fy - 17.5f, 163, 35), .index = i,
+                             .part = Hit::Part::Next});
+        };
+        switch (row.kind) {
+        case Row::Kind::Header:
+            break;
+        case Row::Kind::Info: {
+            std::string text;
+            if (row.tag == "info.backend") {
+                text = env_.backend_label;
+            } else if (row.tag == "info.device") {
+                text = env_.device_label;
+            } else if (row.tag == "info.hotkeys") {
+                text = std::string(T("F10 FPS · F11 full screen", "F10 FPS · F11 полный экран"));
+            } else if (row.tag == "info.render") {
+                text = "1920 × 1080";
+            } else if (row.tag == "info.cache.size") {
+                text = env_.shader_cache_size;
+            } else if (row.tag == "info.cache.content") {
+                text = env_.shader_cache_content;
+            } else if (row.tag == "info.cache.run") {
+                text = env_.shader_cache_run;
+            }
+            value_text(text, focused ? kYellow : kWhiteText);
+            break;
+        }
+        case Row::Kind::Command:
+        case Row::Kind::ResetCategory: {
+            const bool armed = armed_ == row.tag && env_.now_ns - armed_ns_ < kConfirmCommandNs;
+            value_text(armed ? std::string(T("Press again", "Нажмите ещё раз")) : std::string(T("Press", "Нажмите")),
+                       color, 951);
+            cross_glyph(color);
+            hits_.push_back({.kind = Hit::Kind::Row, .rect = F(690, fy - 17.5f, 310, 35), .index = i,
+                             .part = Hit::Part::Button});
+            break;
+        }
+        case Row::Kind::WindowSize:
+            value_text(fmt::format("{} × {}", cfg.window_width, cfg.window_height), color);
+            step_hits();
+            break;
+        case Row::Kind::Setting: {
+            if (d == nullptr) {
+                break;
+            }
+            if (!available) {
+                value_text(std::string(T("Unavailable", "Недоступно")), focused ? kYellow : kGreyText);
+                break;
+            }
+            const Value v = service_.Get(*d);
+            switch (d->type) {
+            case Type::Bool:
+                value_text(std::get<bool>(v) ? std::string(T("On", "Вкл.")) : std::string(T("Off", "Выкл.")), color);
+                hits_.push_back({.kind = Hit::Kind::Row, .rect = F(690, fy - 17.5f, 310, 35), .index = i,
+                                 .part = Hit::Part::Value});
+                break;
+            case Type::Int:
+            case Type::Float: {
+                // as the game's volume: ten dashes, as many lit as the value
+                const double x = std::holds_alternative<s64>(v) ? static_cast<double>(std::get<s64>(v))
+                                                                : std::get<double>(v);
+                const double f = std::clamp((x - d->ui_min) / std::max(1e-9, d->ui_max - d->ui_min), 0.0, 1.0);
+                const int lit = static_cast<int>(std::lround(f * 10.0));
+                label_right = 676;
+                for (int j = 0; j < 10; ++j) {
+                    out.FillRect(F(690 + 30.0f * static_cast<float>(j), fy - 4, 26, 7),
+                                 j < lit ? (focused ? kYellow : (dimmed ? kGreyText : kWhiteText)) : kDashOff);
+                }
+                hits_.push_back({.kind = Hit::Kind::Row, .rect = F(690, fy - 17.5f, 296, 35), .index = i,
+                                 .part = Hit::Part::Track});
+                break;
+            }
+            case Type::Choice:
+            case Type::Text:
+                value_text(ValueText(*d, v), color);
+                step_hits();
+                break;
+            case Type::Binding: {
+                const auto& b = std::get<Settings::Bindings>(v);
+                const auto action = static_cast<Input::Action>(d->action);
+                const bool capturing = capture_ && capture_->action == action;
+                std::string text;
+                if (capturing) {
+                    text = std::string(T("Press a key…", "Нажмите клавишу…"));
+                } else {
+                    for (size_t j = 0; j < std::min<size_t>(b.size(), 2); ++j) {
+                        const std::string one = BindingText(b[j]);
+                        text += (j == 0 ? "" : " / ") +
+                                (focused && slot_ == static_cast<int>(j) ? "[" + one + "]" : one);
+                    }
+                    if (text.empty()) {
+                        text = "—";
+                    }
+                }
+                value_text(text, capturing ? kYellow : color);
+                hits_.push_back({.kind = Hit::Kind::Row, .rect = F(690, fy - 17.5f, 155, 35), .index = i,
+                                 .part = Hit::Part::Slot0});
+                hits_.push_back({.kind = Hit::Kind::Row, .rect = F(845, fy - 17.5f, 155, 35), .index = i,
+                                 .part = Hit::Part::Slot1});
+                break;
+            }
+            }
+            break;
+        }
+        }
+        label_text();
+    }
+    out.PopClip();
+
+    // the scroll bar
+    if (max_scroll > 0) {
+        const float track = list_bottom - list_top;
+        const float thumb = std::max(40.0f, track * (list_bottom - first_y) / (content_end + 1));
+        const float ty = list_top + (track - thumb) * (game_scroll_ / max_scroll);
+        out.FillRect(F(1028, list_top, 9, track), Color{30, 30, 30, 255});
+        out.FillRect(F(1028, ty, 9, thumb), Color{79, 79, 79, 255});
+    }
+
+    // ---- the chosen item's description: right of the panel, under the game's controller picture
+    std::string help;
+    if (focus_ < rows_.size()) {
+        const auto& row = rows_[focus_];
+        if (capture_) {
+            help = fmt::format("{} «{}». {}", T("Press a key or a mouse button for", "Нажмите клавишу или кнопку мыши для"),
+                               Settings::ActionLabel(capture_->action, env_.ru), T("Esc cancels.", "Esc — отмена."));
+        } else if (row.desc != nullptr) {
+            const auto a = service_.Available(*row.desc);
+            help = a.available ? std::string(T(row.desc->help_en, row.desc->help_ru))
+                               : fmt::format("{} {}", T("Unavailable.", "Недоступно."), T(a.why_en, a.why_ru));
+            if (service_.NeedsRestart(*row.desc)) {
+                help += std::string(help.empty() ? "" : " ") +
+                        std::string(T("* Takes effect after a restart.", "* Вступит в силу после перезапуска."));
+            }
+        } else if (row.kind == Row::Kind::WindowSize) {
+            help = std::string(T("The window's size when not in full screen.", "Размер окна вне полноэкранного режима."));
+        } else if (row.kind == Row::Kind::ResetCategory) {
+            help = std::string(T("Every setting of this section back to its default.",
+                                 "Все настройки раздела вернутся к значениям по умолчанию."));
+        }
+    }
+    if (!status_.empty()) {
+        help = status_ + (help.empty() ? "" : "\n") + help;
+    } else if (!env_.save_note.empty()) {
+        help = env_.save_note + (help.empty() ? "" : "\n") + help;
+    }
+    if (!help.empty()) {
+        out.SetSurface({X(305), Y(80), (1820 - 305) * k, 920 * k});
+        out.Text(F(1108, 700, 690, 200), help, 24.0f * k, Color{220, 220, 220, 255}, Align::Left,
+                 FontWeight::GameItem, true);
+    }
+
+    // ---- dialogs: a smaller panel of the same kind over the list
+    if (modal_ != Modal::None) {
+        out.FillRect(F(316, 93, 740, 893), Color{0, 0, 0, 150});
+        const Rect box = F(355, 380, 664, 300);
+        out.FillRect(box, Color{40, 40, 41, 252});
+        out.StrokeRect(box, kWhiteText, std::max(1.0f, 1.5f * k));
+        std::string mtitle, text;
+        std::string_view yes, no;
+        if (modal_ == Modal::ConfirmDisplay) {
+            const u64 left_ns = modal_deadline_ns_ > env_.now_ns ? modal_deadline_ns_ - env_.now_ns : 0;
+            const auto left_s = (left_ns + 999'999'999) / 1'000'000'000;
+            mtitle = std::string(T("Keep these display settings?", "Сохранить параметры экрана?"));
+            text = fmt::format("{} {} {}.", T("If the picture is wrong, do nothing: they are restored in",
+                                              "Если изображение неправильное, ничего не нажимайте: параметры вернутся через"),
+                               left_s, T("s", "с"));
+            yes = T("Keep", "Сохранить");
+            no = T("Restore", "Вернуть");
+        } else {
+            mtitle = fmt::format("{} «{}»?", T("Reset", "Сбросить раздел"), Settings::CategoryLabel(category_, env_.ru));
+            text = std::string(T("Every setting of this section goes back to its default.",
+                                 "Все настройки раздела вернутся к значениям по умолчанию."));
+            yes = T("Reset", "Сбросить");
+            no = T("Cancel", "Отмена");
+        }
+        out.Text(F(380, 395, 620, 60), Caps(mtitle), 34.0f * k, kYellow, Align::Left, FontWeight::GameSlab);
+        out.Text(F(380, 460, 620, 110), text, 26.0f * k, kWhiteText, Align::Left, FontWeight::GameItem, true);
+        for (int i = 0; i < 2; ++i) {
+            const Rect b = F(415, 590.0f + 35.0f * static_cast<float>(i), 400, 35);
+            out.Text(b, i == 0 ? yes : no, 28.0f * k, modal_button_ == i ? kYellow : kWhiteText, Align::Left,
+                     FontWeight::GameItem);
             hits_.push_back({.kind = Hit::Kind::ModalButton, .rect = b, .index = i});
         }
     }

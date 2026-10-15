@@ -18,8 +18,10 @@
 #include <windows.h>
 
 #include "base/log.h"
+#include "engine/ui/game_menu.h"
 #include "input/device_tracker.h"
 #include "input/keyboard_mouse.h"
+#include "runtime/gpu/menu_focus.h"
 #include "runtime/gpu/native_backend.h"
 #include "runtime/pad/pad.h"
 #include "settings/registry.h"
@@ -36,6 +38,16 @@ constexpr u64 kRepeatPeriodNs = 110'000'000;
 constexpr u64 kRenderGapNs = 12'000'000; // at most ~80 renders/s: a dragged slider does not flood the main thread
 constexpr u64 kChordNs = 1'000'000'000;  // L3 + R3 held this long opens the menu
 constexpr unsigned kTimerMs = 50;
+constexpr u32 kGamePollMs = 33; // how often the game's own menus are looked at (pause, its Settings screen)
+// The game's Settings screen (1920x1080 frame, measured 2026-10-15): the list's items, their values, the row pitch
+constexpr float kListLeft = 330, kListRight = 1000, kListTop = 215, kListBottom = 990;
+constexpr float kValueLeft = 690;  // values / volume bars start here (a click there: left / right)
+constexpr float kValueMiddle = 838;
+constexpr float kRowPitch = 35;    // between two items of a section
+constexpr float kLastRowY = 959;   // the list's last item when it is scrolled to its end
+constexpr float kThumbAtEnd = 955; // the scroll bar's thumb ends below this: the list's end is shown
+constexpr u64 kHoverRestNs = 90'000'000; // the pointer rests this long before the focus follows it
+constexpr int kMaxBurst = 6;       // d-pad presses at once before the focus is looked at again
 
 struct State {
     MenuController::Options opt;
@@ -64,6 +76,24 @@ struct State {
     bool exclusive_lifted = false; // exclusive full screen turned borderless while the menu is shown
     std::vector<std::string> displays, audio_devices;
     std::vector<std::pair<u32, u32>> window_sizes;
+    // PC Edition: the PC settings are an entry of the game's own Settings screen (Esc / Options during play)
+    u32 poll_event = 0;          // SDL user event of the game-menu poll timer
+    bool dev_f1 = false;         // SSPC_DEV_F1=1 (development): F1 opens the menu anywhere
+    bool game_menu_open = false; // one of the game's pausing screens is shown
+    bool entry_shown = false;    // the game's Settings screen is in front (its "Additional settings" item opens ours)
+    bool hover_pending = false;  // the pointer moved over the list: the focus follows once it rests
+    float hover_target = 0;      // frame y
+    u64 hover_since_ns = 0;
+    // the mouse in the game's Settings list: its focus (the yellow row, Gpu::MenuFocus) is moved under the cursor
+    bool nav_active = false;
+    bool nav_click = false;      // then pressed (nav_button) once it is there
+    u32 nav_button = 0;
+    float nav_target = 0;        // frame y
+    int nav_rounds = 0;
+    bool nav_draining = false;   // presses queued: wait for them to be read
+    u64 nav_wait_seq = 0;        // then for a frame read after them
+    float nav_last_center = -1;
+    int nav_last_dir = 0;
 };
 
 /// Marks the main thread busy in the menu for a scope: WM_TIMER dispatched by SDL calls inside it only sets `dirty`.
@@ -196,6 +226,8 @@ void ApplyDisplay(SDL_Window* w, const App::Config& c, bool move_display) {
              c.window_width, c.window_height, c.pc.monitor.empty() ? std::string("primary") : c.pc.monitor);
 }
 
+Rect GameFrame();
+
 MenuEnv BuildEnv() {
     auto& st = S();
     const auto cfg = Settings::Instance().Current();
@@ -206,6 +238,14 @@ MenuEnv BuildEnv() {
         env.height = static_cast<float>(cr.bottom);
     }
     env.ru = Ru(cfg);
+    // opened from the game's Settings screen: "Additional settings", drawn over that screen's panel as a page of it
+    if (Engine::GameMenu::SettingsScreenOnTop()) {
+        const Rect f = GameFrame();
+        const float k = f.w / 1920.0f;
+        if (f.w > 0) {
+            env.game_panel = {f.x + 315.0f * k, f.y + 92.0f * k, 742.0f * k, 895.0f * k};
+        }
+    }
     env.prompts = Input::ResolvePrompts(cfg.pc.prompts, st.tracker.Active());
     env.confirm_is_circle = !cfg.enter_button_cross;
     env.device_label = st.tracker.Active() == Input::Device::KeyboardMouse
@@ -477,6 +517,151 @@ void TrackPad(const SDL_Event& e, bool down) {
     }
 }
 
+u32 GamePollTimer(void*, SDL_TimerID, u32 interval) {
+    SDL_Event ev{};
+    ev.type = S().poll_event;
+    SDL_PushEvent(&ev);
+    return interval;
+}
+
+/// The game's 1920x1080 frame inside the window's client area (the presenter keeps its proportions, centred).
+Rect GameFrame() {
+    RECT cr{};
+    if (S().hwnd == nullptr || !GetClientRect(S().hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) {
+        return {};
+    }
+    const float pw = static_cast<float>(cr.right), ph = static_cast<float>(cr.bottom);
+    const float fw = std::min(pw, ph * 16.0f / 9.0f), fh = fw * 9.0f / 16.0f;
+    return {std::floor((pw - fw) / 2), std::floor((ph - fh) / 2), fw, fh};
+}
+
+/// The game's Settings list shows its last item, "Additional settings" (the PC Edition's text for the PC-less HDR
+/// option, runtime/filesystem/content_patch.h), chosen: the list is at its end (the scroll bar's thumb at the bottom)
+/// and the yellow row is the last row (frame y ~958).
+bool AdditionalItemChosen(const Gpu::MenuFocus::Row& r) {
+    if (!r.valid || !r.found || !r.bar || r.thumb_bottom < kThumbAtEnd) {
+        return false;
+    }
+    const float center = (r.top + r.bottom) / 2;
+    return std::abs(center - kLastRowY) <= kRowPitch / 2;
+}
+
+/// Client pixels -> the game's 1920x1080 frame.
+std::pair<float, float> ToFrame(float x, float y) {
+    const Rect f = GameFrame();
+    if (f.w <= 0) {
+        return {-1, -1};
+    }
+    return {(x - f.x) * 1920.0f / f.w, (y - f.y) * 1080.0f / f.h};
+}
+
+bool InList(float fx, float fy) {
+    return fx >= kListLeft && fx < kListRight && fy >= kListTop && fy < kListBottom;
+}
+
+void NavTo(float target, bool click, u32 button) {
+    auto& st = S();
+    st.nav_active = true;
+    st.nav_click = click;
+    st.nav_button = button;
+    st.nav_target = target;
+    st.nav_rounds = 0;
+    st.nav_last_dir = 0;
+    st.nav_last_center = -1;
+    st.nav_draining = false;
+    st.nav_wait_seq = 0;
+}
+
+/// One step of moving the game's focus to the row under the cursor (main thread, each poll): the yellow row of a
+/// frame read after the last presses, d-pad presses towards the target, at most a few rounds (a section name or the
+/// gap between two items has no item: the focus stops next to it).
+void NavStep() {
+    auto& st = S();
+    if (!st.nav_active) {
+        return;
+    }
+    auto& km = Input::Player1();
+    if (km.MenuPressesQueued() > 0) {
+        return;
+    }
+    const auto row = Gpu::MenuFocus::Latest();
+    if (st.nav_draining) {
+        st.nav_draining = false;
+        st.nav_wait_seq = row.seq + 3; // the game shows the presses a frame or two later
+        return;
+    }
+    if (!row.valid || row.seq < st.nav_wait_seq) {
+        return;
+    }
+    if (!row.found) {
+        st.nav_active = false;
+        return;
+    }
+    const float center = (row.top + row.bottom) / 2;
+    const float d = st.nav_target - center;
+    // the list wrapped around (from its last item to its first or back): the target is past its end
+    const bool wrapped = st.nav_last_center >= 0 && ((st.nav_last_dir > 0 && center < st.nav_last_center - 120) ||
+                                                     (st.nav_last_dir < 0 && center > st.nav_last_center + 120));
+    if (wrapped) {
+        st.nav_active = false;
+        return;
+    }
+    if (std::abs(d) <= kRowPitch / 2) {
+        st.nav_active = false;
+        if (st.nav_click) {
+            if (st.nav_button == Input::Button::Cross && AdditionalItemChosen(row)) {
+                Menu().Open(); // the game's "Additional settings": SecondSonPC's settings
+            } else {
+                km.MenuPress(st.nav_button);
+            }
+        }
+        return;
+    }
+    if (++st.nav_rounds > 5) {
+        st.nav_active = false; // between two items (a section name): the focus stays on the nearest
+        return;
+    }
+    int n = static_cast<int>(std::lround(d / kRowPitch));
+    n = std::clamp(n == 0 ? (d > 0 ? 1 : -1) : n, -kMaxBurst, kMaxBurst);
+    for (int i = 0; i < std::abs(n); ++i) {
+        km.MenuPress(n > 0 ? Input::Button::Down : Input::Button::Up);
+    }
+    st.nav_last_dir = n > 0 ? 1 : -1;
+    st.nav_last_center = center;
+    st.nav_draining = true;
+}
+
+/// Every kGamePollMs (main thread): the game's menus as GameMenu sees them.
+void OnGamePoll() {
+    auto& st = S();
+    if (!Engine::GameMenu::Installed()) {
+        return;
+    }
+    const bool open = Engine::GameMenu::Current().open > 0;
+    if (open != st.game_menu_open) {
+        st.game_menu_open = open;
+        Input::Player1().SetGameMenuOpen(open);
+    }
+    const bool menu_open = st.menu && st.menu->IsOpen();
+    const bool settings = Engine::GameMenu::SettingsScreenOnTop();
+    Gpu::MenuFocus::SetWanted(settings && !menu_open);
+    if (!settings || menu_open) {
+        st.nav_active = false;
+    }
+    st.entry_shown = st.overlay_ok && !menu_open && settings && GetForegroundWindow() == st.hwnd;
+    if (!st.entry_shown) {
+        st.hover_pending = false;
+    }
+    // the pointer rested over an item: the focus follows it (not while a click is being carried out)
+    if (st.hover_pending && !(st.nav_active && st.nav_click) && NowNs() - st.hover_since_ns >= kHoverRestNs) {
+        st.hover_pending = false;
+        if (!st.nav_active || std::abs(st.nav_target - st.hover_target) > kRowPitch / 4) {
+            NavTo(st.hover_target, false, 0);
+        }
+    }
+    NavStep();
+}
+
 u32 ChordTimer(void*, SDL_TimerID, u32) {
     SDL_Event ev{};
     ev.type = S().chord_event;
@@ -566,6 +751,14 @@ void MenuController::Install(const Options& options) {
     st.overlay.SetTimer(&OnTimer, nullptr, kTimerMs);
     st.menu = std::make_unique<SettingsMenu>(Settings::Instance());
     st.chord_event = SDL_RegisterEvents(1);
+    st.poll_event = SDL_RegisterEvents(1);
+    {
+        char v[4] = {};
+        st.dev_f1 = GetEnvironmentVariableA("SSPC_DEV_F1", v, sizeof(v)) == 1 && v[0] == '1';
+    }
+    if (st.poll_event != 0) {
+        SDL_AddTimer(kGamePollMs, &GamePollTimer, nullptr);
+    }
     auto& service = Settings::Instance();
     service.SetCapabilities(options.capabilities);
     // Appliers SecondSonPC owns: keyboard/mouse, real controllers, the window.
@@ -600,11 +793,13 @@ void MenuController::Install(const Options& options) {
     }
     installed_ = true;
     if (st.overlay_ok) {
-        SSPC_LOG(App, Info, "settings menu: F1{} (overlay: Win32 layered window, Direct2D software; capabilities 0x{:x})",
-                 cfg.pc.menu_button == "guide"  ? ", controller PS/Guide"
-                 : cfg.pc.menu_button == "l3r3" ? ", controller L3+R3 held"
+        SSPC_LOG(App, Info,
+                 "PC settings: an entry of the game's Settings screen (Esc / Options, then triangle, its key or a "
+                 "click){}{} (overlay: Win32 layered window, Direct2D software; capabilities 0x{:x})",
+                 cfg.pc.menu_button == "guide"  ? "; controller PS/Guide"
+                 : cfg.pc.menu_button == "l3r3" ? "; controller L3+R3 held"
                                                 : "",
-                 options.capabilities);
+                 st.dev_f1 ? "; F1 (SSPC_DEV_F1, development)" : "", options.capabilities);
     } else {
         SSPC_LOG(App, Error, "settings menu: cannot be shown ({}); hotkeys F10/F11 still work", st.overlay_error);
     }
@@ -628,6 +823,9 @@ void MenuController::Open() {
         return;
     }
     const BusyScope busy;
+    st.entry_shown = false;
+    st.hover_pending = false;
+    st.nav_active = false;
     st.displays = DisplayNames();
     st.audio_devices = AudioDeviceNames();
     st.window_sizes = WindowSizes(st.opt.window);
@@ -680,6 +878,61 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         ForgetPadState(); // a release that never came (unplugged, missed event): the game gets the pad back
     }
 
+    // ---- the game's Settings screen: its "Additional settings" item opens SecondSonPC's settings (cross: its key,
+    // the controller's, a click on it); the mouse chooses and clicks the game's items
+    if (st.poll_event != 0 && e.type == st.poll_event) {
+        OnGamePoll();
+        return EventRoute::Consumed;
+    }
+    // F1 only for development (SSPC_DEV_F1=1), or when the game's screens cannot be seen (another eboot)
+    const bool f1_opens = st.dev_f1 || !Engine::GameMenu::Installed();
+    if (!open && st.entry_shown) {
+        const bool on_item = AdditionalItemChosen(Gpu::MenuFocus::Latest());
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && on_item &&
+            Input::Player1().KeyTriggers(static_cast<u16>(e.key.scancode), Input::Action::Cross)) {
+            st.tracker.KeyOrMouseButton(now);
+            Open();
+            return EventRoute::Consumed;
+        }
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && on_item) {
+            const bool cross_confirms = Settings::Instance().Current().enter_button_cross;
+            if (e.gbutton.button == (cross_confirms ? SDL_GAMEPAD_BUTTON_SOUTH : SDL_GAMEPAD_BUTTON_EAST)) {
+                TrackPad(e, true);
+                Open();
+                return EventRoute::BridgeOnly; // the game reads an intercepted controller while the menu is open
+            }
+        }
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            const auto [x, y] = ToPixels(e.motion.x, e.motion.y);
+            const auto [fx, fy] = ToFrame(x, y);
+            if (InList(fx, fy) && Gpu::MenuFocus::Latest().valid) {
+                st.hover_pending = true; // followed once the pointer rests (OnGamePoll)
+                st.hover_target = fy;
+                st.hover_since_ns = now;
+            } else {
+                st.hover_pending = false;
+            }
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
+            const auto [x, y] = ToPixels(e.button.x, e.button.y);
+            const auto [fx, fy] = ToFrame(x, y);
+            if (InList(fx, fy)) {
+                st.tracker.KeyOrMouseButton(now);
+                st.hover_pending = false;
+                // the item: cross; its value (a choice, a volume bar): left / right
+                const u32 button = fx < kValueLeft     ? Input::Button::Cross
+                                   : fx < kValueMiddle ? Input::Button::Left
+                                                       : Input::Button::Right;
+                if (Gpu::MenuFocus::Latest().valid) {
+                    NavTo(fy, true, button);
+                } else {
+                    Input::Player1().MenuPress(button); // no frame reading (the bridge's presenter): the chosen item
+                }
+                return EventRoute::Consumed;
+            }
+        }
+    }
+
     // ---- the chord timer (L3 + R3)
     if (st.chord_event != 0 && e.type == st.chord_event) {
         const u32 both = (1u << SDL_GAMEPAD_BUTTON_LEFT_STICK) | (1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK);
@@ -701,7 +954,7 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
             if (!down || e.key.repeat) {
                 return EventRoute::Normal;
             }
-            if (sc == SDL_SCANCODE_F1) {
+            if (sc == SDL_SCANCODE_F1 && f1_opens) {
                 Open();
                 return EventRoute::Consumed;
             }
@@ -717,7 +970,7 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
             return EventRoute::Normal;
         }
         if (down) {
-            if (sc == SDL_SCANCODE_F1 && !e.key.repeat) {
+            if (sc == SDL_SCANCODE_F1 && !e.key.repeat && f1_opens) {
                 Close();
                 return EventRoute::Consumed;
             }

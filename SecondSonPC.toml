@@ -93,7 +93,7 @@ vibration = 100                    # % of the rumble the game asks for; 0 = off
 cameraSensitivity = 1.0            # right stick multiplier (0.25..2.0), on top of the game's own option
 invertCameraX = false
 invertCameraY = false
-menuButton = "guide"               # opens the settings menu: "guide" (PS button) | "l3r3" (held 1 s) | "off"
+menuButton = "off"                 # PC settings are in the game's Settings screen (Esc / Options); a shortcut besides: "guide" (PS button) | "l3r3" (held 1 s) | "off"
 
 [Interface]                        # SecondSonPC's settings menu (F1)
 language = "auto"                  # "auto" (as [Language] system) | "ru" | "en"

@@ -125,7 +125,8 @@ void KeyboardMouse::SetMenuOpen(bool open) {
             motion_mode_ = false;
             motion_.SetSideways(false, settings_.sideways_right_up);
         }
-        capture = !open && !test_mode_ && want_capture_ && settings_.capture_mouse;
+        // back to one of the game's menus (the PC settings open from its settings screen): the cursor stays free
+        capture = !open && !test_mode_ && want_capture_ && settings_.capture_mouse && !game_menu_;
     }
     if (open) {
         SetCapture(false);
@@ -134,6 +135,65 @@ void KeyboardMouse::SetMenuOpen(bool open) {
     }
     SSPC_LOG(Input, Info, "settings menu {}: keyboard/mouse {}", open ? "open" : "closed",
              open ? "go to the menu" : "back to the game");
+}
+
+void KeyboardMouse::SetGameMenuOpen(bool open) {
+    bool capture = false;
+    {
+        std::scoped_lock lock{mutex_};
+        if (game_menu_ == open) {
+            return;
+        }
+        game_menu_ = open;
+        menu_mouse_ = 0;
+        menu_queue_.clear();
+        menu_latched_ = 0;
+        menu_gap_ = false;
+        mouse_down_ = 0; // a button held into or out of the menu is not a press on the other side
+        swallowed_button_ = 0;
+        if (!open) {
+            want_capture_ = true; // back in the game: the mouse turns the camera again
+        }
+        capture = !open && !test_mode_ && settings_.capture_mouse;
+    }
+    if (test_mode_) {
+        return;
+    }
+    if (open) {
+        SetCapture(false);
+    } else if (capture && WindowHasFocus()) {
+        SetCapture(true);
+    }
+    SSPC_LOG(Input, Info, "game menu {}: {}", open ? "shown" : "gone",
+             open ? "cursor free, left button = cross, right = circle, wheel = d-pad up/down"
+                  : "the mouse is the game's again");
+}
+
+void KeyboardMouse::MenuPress(u32 buttons) {
+    std::scoped_lock lock{mutex_};
+    if (game_menu_ && buttons != 0 && menu_queue_.size() < 32) {
+        menu_queue_.push_back(buttons);
+    }
+}
+
+size_t KeyboardMouse::MenuPressesQueued() const {
+    std::scoped_lock lock{mutex_};
+    return menu_queue_.size() + (menu_latched_ != 0 ? 1 : 0);
+}
+
+u16 KeyboardMouse::KeyFor(Action a) const {
+    std::scoped_lock lock{mutex_};
+    for (const auto& in : settings_.bindings[static_cast<size_t>(a)]) {
+        if (in.kind == InputCode::Kind::Key) {
+            return in.code;
+        }
+    }
+    return 0;
+}
+
+bool KeyboardMouse::KeyTriggers(u16 scancode, Action a) const {
+    std::scoped_lock lock{mutex_};
+    return scancode < key_actions_.size() && (key_actions_[scancode] & (1u << static_cast<size_t>(a))) != 0;
 }
 
 void KeyboardMouse::AttachWindow(SDL_Window* window, bool test_mode) {
@@ -177,6 +237,10 @@ void KeyboardMouse::ClearInputs() {
     mouse_down_ = 0;
     wheel_pending_ = wheel_latched_ = 0;
     swallowed_button_ = 0;
+    menu_mouse_ = 0;
+    menu_queue_.clear();
+    menu_latched_ = 0;
+    menu_gap_ = false;
     mouse_dx_ = mouse_dy_ = 0.0;
 }
 
@@ -290,7 +354,7 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
                 }
                 // Esc gives the cursor back (the pause menu opens with it) and takes it again
                 // (the menu closes).
-                if ((actions & Bit(Action::ReleaseMouse)) != 0 && !test_mode_) {
+                if ((actions & Bit(Action::ReleaseMouse)) != 0 && !test_mode_ && !game_menu_) {
                     toggle_capture = true;
                     want_capture_ = !captured_;
                     capture = want_capture_;
@@ -319,7 +383,12 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
                 down && focus_gained_ns_ != 0 && e.button.timestamp >= focus_gained_ns_ &&
                 e.button.timestamp - focus_gained_ns_ < kFocusClickNs;
             focus_gained_ns_ = 0;
-            if (down && ((!captured_ && settings_.capture_mouse) || focus_click)) {
+            if (game_menu_) {
+                // the game's menu: right = circle (back); the left button is the menu controller's (the item
+                // under the cursor, MenuPress); nothing else, and the cursor stays free
+                const u32 bit = button == SDL_BUTTON_RIGHT ? Button::Circle : 0;
+                menu_mouse_ = down ? (menu_mouse_ | bit) : (menu_mouse_ & ~bit);
+            } else if (down && ((!captured_ && settings_.capture_mouse) || focus_click)) {
                 // The click that captures the mouse is not a press for the game.
                 swallowed_button_ = button;
                 capture = !captured_;
@@ -358,6 +427,14 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         // A notch is a press of the bound action for one controller reading (never lost between readings).
         result.consumed = true;
         std::scoped_lock lock{mutex_};
+        if (game_menu_) {
+            // the game's menu: a notch is one d-pad press (up / down)
+            const float wy = e.wheel.y * (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f);
+            if (wy != 0.0f && menu_queue_.size() < 32) {
+                menu_queue_.push_back(wy > 0.0f ? Button::Up : Button::Down);
+            }
+            break;
+        }
         if (!captured_ && settings_.capture_mouse) {
             break; // the cursor is free (pause, another window's turn): the wheel is not the game's
         }
@@ -441,6 +518,15 @@ PadState KeyboardMouse::Read(u64 now_us) {
     // Wheel notches since the previous reading press their actions for this reading only.
     wheel_latched_ = wheel_pending_;
     wheel_pending_ = 0;
+    // a queued game-menu press lasts one reading, the reading after it is released (a new press for the game)
+    menu_latched_ = 0;
+    if (menu_gap_) {
+        menu_gap_ = false;
+    } else if (!menu_queue_.empty()) {
+        menu_latched_ = menu_queue_.front();
+        menu_queue_.pop_front();
+        menu_gap_ = true;
+    }
 
     PadState s;
     for (const auto& b : kButtons) {
@@ -448,6 +534,7 @@ PadState KeyboardMouse::Read(u64 now_us) {
             s.buttons |= b.bit;
         }
     }
+    s.buttons |= menu_mouse_ | menu_latched_;
     s.l2 = Pressed(Action::L2) ? 255 : 0;
     s.r2 = Pressed(Action::R2) ? 255 : 0;
 
@@ -541,6 +628,22 @@ PadState KeyboardMouse::Read(u64 now_us) {
         s.touch[0] = {true, kTouchWidth / 2, kTouchHeight / 2, finger_id_};
     }
 
+    if (s.buttons != last_.buttons) {
+        // every press and release the game is sent (two buttons at once, a missed press: the order is in the log)
+        static constexpr std::pair<u32, const char*> kNames[] = {
+            {Button::Cross, "cross"}, {Button::Circle, "circle"}, {Button::Square, "square"},
+            {Button::Triangle, "triangle"}, {Button::L1, "L1"}, {Button::R1, "R1"}, {Button::L2, "L2"},
+            {Button::R2, "R2"}, {Button::L3, "L3"}, {Button::R3, "R3"}, {Button::Options, "options"},
+            {Button::TouchPad, "touchpad"}, {Button::Up, "up"}, {Button::Down, "down"}, {Button::Left, "left"},
+            {Button::Right, "right"}};
+        std::string change;
+        for (const auto& [bit, name] : kNames) {
+            if ((s.buttons & bit) != (last_.buttons & bit)) {
+                change += fmt::format(" {}{}", (s.buttons & bit) != 0 ? '+' : '-', name);
+            }
+        }
+        SSPC_LOG(Input, Info, "keyboard/mouse buttons:{} (now 0x{:x})", change, s.buttons);
+    }
     last_ = s;
     last_read_us_ = now_us;
     has_last_ = true;

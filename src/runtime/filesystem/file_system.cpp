@@ -22,6 +22,7 @@
 #include "base/log.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/exports.h"
+#include "runtime/filesystem/content_patch.h"
 #include "runtime/filesystem/directory.h"
 #include "runtime/filesystem/fs_host.h"
 #include "runtime/filesystem/fs_observer.h"
@@ -92,6 +93,7 @@ struct File {
     Access access = Access::Read;
     u64 pos = 0;
     std::unique_ptr<Directory> dir;
+    std::vector<ContentPatch::Edit> edits; // the PC Edition's replacements in what the game reads (read only)
     std::mutex mutex;
 
     bool WriteOnly() const {
@@ -212,6 +214,9 @@ s64 ReadRegular(File& f, void* buf, u64 nbytes, u64 offset) {
         t_bounce.resize(nbytes);
     }
     const u64 got = ReadAt(f.handle, offset, t_bounce.data(), nbytes);
+    if (!f.edits.empty()) {
+        ContentPatch::Apply(f.edits, offset, t_bounce.data(), got);
+    }
     std::memcpy(buf, t_bounce.data(), got);
     return static_cast<s64>(got);
 }
@@ -306,6 +311,9 @@ s32 PosixOpen(const char* raw_path, s32 flags, u16 mode) {
         file->access = access;
         if (r) {
             file->handle = OpenHost(r->host, access);
+            if (access == Access::Read && file->handle != INVALID_HANDLE_VALUE) {
+                file->edits = ContentPatch::ForFile(file->guest, r->host);
+            }
         }
         if (file->handle == INVALID_HANDLE_VALUE) {
             return SetErrno(r ? ((write || rdwr || truncate) && read_only ? kEROFS : kEIO) : kEINVAL);

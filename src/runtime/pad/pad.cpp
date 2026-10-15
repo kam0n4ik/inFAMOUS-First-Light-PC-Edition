@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -297,6 +298,8 @@ struct InputLog {
     u32 game_reads = 0, game_right = 0, game_left = 0; // game filter: reads, non-zero sticks
     Range<float> game_rx, game_ry;
     float game_rmag = 0.0f, game_lmag = 0.0f;
+    u32 buttons_seen = 0; // every button sent this second (OR), and the most held at once
+    int buttons_together = 0;
 };
 InputLog g_log;
 
@@ -324,6 +327,8 @@ void LogInput(const PadData& d, const Input::ReadInfo& info, const GameSticks& g
     }
     l.rx.Add(d.right_x);
     l.ry.Add(d.right_y);
+    l.buttons_seen |= d.buttons;
+    l.buttons_together = std::max(l.buttons_together, std::popcount(d.buttons));
     if (game.known) {
         ++l.game_reads;
         l.game_right += std::abs(game.rmag) > 0.01f ? 1 : 0;
@@ -337,7 +342,7 @@ void LogInput(const PadData& d, const Input::ReadInfo& info, const GameSticks& g
         return;
     }
     const bool active = l.right_sent != 0 || l.mouse_dx != 0.0 || l.mouse_dy != 0.0 ||
-                        l.game_right != 0 || l.game_left != 0;
+                        l.game_right != 0 || l.game_left != 0 || l.buttons_seen != 0;
     if (active) {
         const std::string game_part =
             l.game_reads == 0
@@ -349,10 +354,10 @@ void LogInput(const PadData& d, const Input::ReadInfo& info, const GameSticks& g
         SSPC_LOG(Input, Info,
                  "input {:.1f} s: {} reads (dt {:.1f}..{:.1f} ms, {} repeated); mouse {:+.0f}/{:+.0f} "
                  "counts, captured {}/{}, motion mode {}/{}; sent right stick: away from centre {}/{}, "
-                 "x {}..{}, y {}..{} | game filter: {}",
+                 "x {}..{}, y {}..{}; buttons sent 0x{:x} (at most {} at once) | game filter: {}",
                  (now - l.start_us) / 1e6, l.reads, l.dt_ms.lo, l.dt_ms.hi, l.repeated, l.mouse_dx,
                  l.mouse_dy, l.captured, l.reads, l.motion_mode, l.reads, l.right_sent, l.reads,
-                 l.rx.lo, l.rx.hi, l.ry.lo, l.ry.hi, game_part);
+                 l.rx.lo, l.rx.hi, l.ry.lo, l.ry.hi, l.buttons_seen, l.buttons_together, game_part);
     }
     const bool enabled = l.enabled, reported = l.site_reported;
     l = {};

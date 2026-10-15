@@ -30,7 +30,21 @@ struct Rect {
 };
 
 enum class Align : u8 { Left, Center, Right };
-enum class FontWeight : u8 { Regular, Semibold };
+/// The PC Edition's menus use the game's look: a narrow sans for text (Regular, Semibold) and a bold condensed face for
+/// titles (Title, written in capitals by the caller).
+enum class FontWeight : u8 {
+    Regular,
+    Semibold,
+    Title,
+    // the game's menu faces (its Settings screen, measured): titles and section names in a slab serif narrowed to
+    // 84 %, items and values in a condensed sans narrowed to 92 % (assets/fonts: Roboto Slab, Roboto Condensed)
+    GameSlab,
+    GameItem,
+};
+/// How much narrower than the face a weight is drawn (1: as the face).
+inline float FontStretch(FontWeight w) {
+    return w == FontWeight::GameSlab ? 0.84f : w == FontWeight::GameItem ? 0.92f : 1.0f;
+}
 
 struct DrawCmd {
     enum class Kind : u8 {

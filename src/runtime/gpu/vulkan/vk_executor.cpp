@@ -24,6 +24,7 @@
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/image_layout.h"
+#include "runtime/gpu/menu_focus.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/vulkan/vk_reflex.h"
 #include "runtime/gpu/shader/shader_frontend.h"
@@ -267,6 +268,11 @@ Executor::~Executor() {
     }
     const auto& f = Fn();
     const VkDevice dev = ctx_.Device();
+    for (auto& r : focus_reads_) {
+        if (r.buffer.buffer != VK_NULL_HANDLE) {
+            DestroyBuffer(ctx_, r.buffer);
+        }
+    }
     if (queries_ != VK_NULL_HANDLE) {
         f.vkDestroyQueryPool(dev, queries_, nullptr);
     }
@@ -913,6 +919,7 @@ void Executor::Poll() {
     if (readback_) {
         readback_->Collect(completed);
     }
+    CollectMenuFocus(completed);
     while (!args_rb_.empty() && args_rb_.front().value <= completed) {
         auto& a = args_rb_.front();
         u32 v[5] = {};
@@ -4159,6 +4166,99 @@ void Executor::CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 
                       false, static_cast<u32>(std::clamp<u64>(series[3], 1, 16)));
 }
 
+void Executor::MenuFocusProbe(const CachedImage& img, VkFormat shown, u32 w, u32 h) {
+    if (!MenuFocus::Wanted() || w < 640 || h < 360) {
+        return;
+    }
+    const u32 texel = std::max<u32>(img.layout.num_bits / 8, 1);
+    if (texel != 4 && texel != 8) {
+        return;
+    }
+    FocusRead* slot = nullptr;
+    for (auto& r : focus_reads_) {
+        if (r.value == 0) {
+            slot = &r;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        return; // the GPU is behind: this flip is not read (the next one is)
+    }
+    // the strip in this image's pixels (the game draws its menus for 1920x1080; other sizes scale)
+    const float sx = static_cast<float>(w) / 1920.0f, sy = static_cast<float>(h) / 1080.0f;
+    const u32 x0 = static_cast<u32>(MenuFocus::kStripX * sx), y0 = static_cast<u32>(MenuFocus::kStripY * sy);
+    const u32 sw = std::max<u32>(1, std::min<u32>(static_cast<u32>(MenuFocus::kStripW * sx), w - x0));
+    const u32 sh = std::max<u32>(1, std::min<u32>(static_cast<u32>(MenuFocus::kStripH * sy), h - y0));
+    const u32 bx = static_cast<u32>(MenuFocus::kBarX * sx);
+    const u32 bw = std::max<u32>(1, std::min<u32>(static_cast<u32>(MenuFocus::kBarW * sx), w > bx ? w - bx : 1));
+    if (bx >= w) {
+        return;
+    }
+    const u64 list_bytes = u64{sw} * sh * texel;
+    const u64 bytes = list_bytes + u64{bw} * sh * texel;
+    if (slot->buffer.buffer == VK_NULL_HANDLE || slot->buffer.size < bytes) {
+        if (slot->buffer.buffer != VK_NULL_HANDLE) {
+            DestroyBuffer(ctx_, slot->buffer);
+        }
+        std::string error;
+        if (!CreateBuffer(ctx_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, slot->buffer, error, true,
+                          HostPlacement::Cached)) {
+            SSPC_LOG(GPU, Warning, "menu focus readback: no buffer ({})", error);
+            return;
+        }
+    }
+    const auto& f = Fn();
+    const VkBufferImageCopy regions[2] = {
+        {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageOffset = {static_cast<s32>(x0), static_cast<s32>(y0), 0},
+         .imageExtent = {sw, sh, 1}},
+        {.bufferOffset = list_bytes,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageOffset = {static_cast<s32>(bx), static_cast<s32>(y0), 0},
+         .imageExtent = {bw, sh, 1}}};
+    // the image is in TRANSFER_SRC_OPTIMAL for the flip copy (both only read it)
+    f.vkCmdCopyImageToBuffer(cur_.cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot->buffer.buffer, 2, regions);
+    const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                              .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                              .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                              .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                              .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                               .pMemoryBarriers = &mb};
+    f.vkCmdPipelineBarrier2(cur_.cb, &dep);
+    slot->value = cur_.value;
+    slot->format = shown;
+    slot->w = sw;
+    slot->bw = bw;
+    slot->h = sh;
+    slot->texel = texel;
+    slot->y0 = static_cast<float>(y0) / sy;
+    slot->scale = 1.0f / sy;
+}
+
+void Executor::CollectMenuFocus(u64 completed) {
+    // the oldest completed copy first: readings are published in flip order
+    for (;;) {
+        FocusRead* next = nullptr;
+        for (auto& r : focus_reads_) {
+            if (r.value != 0 && r.value <= completed && (next == nullptr || r.value < next->value)) {
+                next = &r;
+            }
+        }
+        if (next == nullptr) {
+            return;
+        }
+        std::vector<u8> rgba, bar;
+        // host-coherent memory (CreateBuffer: HOST_VISIBLE | HOST_COHERENT | HOST_CACHED): no invalidation needed
+        const u8* bar_src = next->buffer.mapped + u64{next->w} * next->h * next->texel;
+        if (ImageReadback::ToRgba8(next->format, next->buffer.mapped, next->w, next->h, rgba) &&
+            ImageReadback::ToRgba8(next->format, bar_src, next->bw, next->h, bar)) {
+            MenuFocus::Publish(rgba.data(), next->w, bar.data(), next->bw, next->h, next->y0, next->scale);
+        }
+        next->value = 0;
+    }
+}
+
 u64 Executor::RaceHash(const u8* p, u64 n) {
     u64 h = 0xCBF29CE484222325ull;
     for (u64 i = 0; i < n; ++i) {
@@ -5118,6 +5218,7 @@ void Executor::Flip(const Cp::FlipMarker&) {
                 } else {
                     UpscaleFrameGenInputs(frame, img); // (frame generation: depth, motion, the HUD-less frame)
                     CaptureSeries(*img, shown, w, h);
+                    MenuFocusProbe(*img, shown, w, h);
                 }
                 DiagEnd(cid);
                 ProfMark(2, "flip copy (frame to the presenter)");

@@ -34,6 +34,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/native_render_ops.cpp
     src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
+    src/engine/ui/game_menu.cpp
     src/engine/render/render_resolution.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
@@ -62,6 +63,8 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/cp_shadow.cpp
     src/runtime/gpu/cp_validation.cpp
     src/runtime/gpu/frame_log.cpp
+    src/runtime/gpu/menu_focus.cpp
+    src/runtime/filesystem/content_patch.cpp
     src/runtime/gpu/inspector.cpp
     src/runtime/gpu/inspector_catalog.cpp
     src/runtime/gpu/stall_trace.cpp
@@ -252,6 +255,7 @@ add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     src/engine/render/native_render_ops.cpp
     src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
+    src/engine/ui/game_menu.cpp
     src/runtime/gpu/pm4.cpp
     src/base/log.cpp
 )
@@ -296,3 +300,12 @@ if(_sspc_upscaler_dlls)
         COMMENT "SecondSonPC: upscaler runtime DLLs")
     add_dependencies(shadps4 sspc_upscaler_dlls)
 endif()
+# The game's menu faces for the PC Edition's menus (ui/overlay_win32.cpp: <exe dir>onts; OFL / Apache 2.0, licences
+# beside them).
+file(GLOB _sspc_fonts "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/*")
+add_custom_target(sspc_fonts ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin/fonts
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_sspc_fonts} ${CMAKE_BINARY_DIR}/bin/fonts
+    COMMENT "SecondSonPC: menu fonts")
+add_dependencies(shadps4 sspc_fonts)
+add_dependencies(sspc_settings_tests sspc_fonts)

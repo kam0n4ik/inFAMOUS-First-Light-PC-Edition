@@ -233,7 +233,7 @@ LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out) {
 
 std::string SerializeUserFile(const Overrides& overrides) {
     std::string out =
-        "# SecondSonPC user settings, written by the in-game settings menu (F1).\n"
+        "# SecondSonPC user settings, written by the PC settings (the game's Settings screen, Esc).\n"
         "# They override SecondSonPC.toml (the defaults); delete a line to use the SecondSonPC.toml value again.\n";
     std::string_view table;
     for (const auto& d : All()) {
