@@ -470,6 +470,9 @@ private:
     /// the upscaled scene in its place (recorded before the draw). The view in `images` is replaced.
     void UpscaleDisplayDraw(const std::array<CachedImage*, 8>& color, std::vector<VkDescriptorImageInfo>& images);
     void UpscaleOnFlip();
+    void TakeHudless(CachedImage& display);
+    /// Executor::Flip, after the frame's copy: frame generation's inputs handed to the presenter's frame.
+    void UpscaleFrameGenInputs(s32 frame, CachedImage* display);
     /// After commands an SDK recorded itself: nothing this command buffer bound or set is known any more.
     void InvalidateBoundState();
 

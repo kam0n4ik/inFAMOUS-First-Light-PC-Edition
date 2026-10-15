@@ -93,6 +93,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/vulkan/vk_stability_tests.cpp
     src/runtime/gpu/vulkan/vk_resources.cpp
     src/runtime/gpu/upscale/upscalers.cpp
+    src/runtime/gpu/upscale/fsr_framegen.cpp
     src/runtime/gpu/vulkan/vk_executor_upscale.cpp
     src/runtime/gpu/host_shaders.cpp
     src/runtime/gpu/image_layout.cpp

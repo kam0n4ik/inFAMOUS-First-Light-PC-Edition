@@ -31,6 +31,8 @@
 #include "runtime/gpu/vulkan/vk_capture.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
+#include "runtime/gpu/vulkan/vk_presenter.h"
+#include "engine/guest_hooks.h"
 
 namespace SecondSon::Gpu::Vk {
 
@@ -393,6 +395,10 @@ void Executor::UpscaleOnTargets(const Cp::DrawDescriptor& d, const std::array<Ca
     // a draw into a display buffer (the post pass)
     if (c0 != nullptr && c0->layout.size.width >= 1280 && IsRgba8(c0->format) &&
         VideoOut::IsDisplayBuffer(c0->layout.guest_address)) {
+        if (u.done_this_frame && !u.hudless_taken && presenter_ != nullptr && presenter_->FrameGenActive()) {
+            // frame generation: the frame as the upscaled scene left it, before this first UI draw
+            TakeHudless(*c0);
+        }
         up_display_draw_ = !u.done_this_frame;
         up_sampled_.clear();
         return;
@@ -584,6 +590,13 @@ void Executor::UpscaleDisplayDraw(const std::array<CachedImage*, 8>& color,
                 const float ms = static_cast<float>(static_cast<double>(ts[1] - ts[0]) *
                                                     ctx_.Caps().timestamp_period * 1e-6);
                 Upscale::UpdateStatus([&](Upscale::Status& st) { st.gpu_ms = ms; });
+                u.gpu_ms_sum += ms;
+                if (++u.gpu_ms_n == 600) { // (a log line every 600 measured evaluations: the upscaler's GPU cost)
+                    SSPC_LOG(GPU, Info, "[Upscale] {} {}: GPU {:.3f} ms per frame (mean of 600, the evaluation{})", Upscale::BackendName(s.backend), Upscale::QualityName(s.quality),
+                             u.gpu_ms_sum / 600.0, use_dlss && s.sharpness > 0.0f ? "; RCAS not included" : "");
+                    u.gpu_ms_sum = 0.0;
+                    u.gpu_ms_n = 0;
+                }
             }
         }
         f.vkCmdResetQueryPool(cb, u.queries, slot * 2, 2);
@@ -766,10 +779,90 @@ void ScanJitter(u64 flip, u32 rw, u32 rh) {
 }
 } // namespace
 
+void Executor::TakeHudless(CachedImage& display) {
+    UpscaleState& u = *up_;
+    std::string err;
+    if (!EnsureImage(ctx_, u.hudless, display.format, display.layout.size.width, display.layout.size.height,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false, err)) {
+        return;
+    }
+    EndRendering();
+    if (pending_writes_) {
+        GlobalBarrier();
+    }
+    images_.Transition(cur_.cb, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT);
+    Barrier(cur_.cb, u.hudless, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkImageCopy c{.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .extent = {u.hudless.width, u.hudless.height, 1}};
+    Fn().vkCmdCopyImage(cur_.cb, display.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, u.hudless.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    Barrier(cur_.cb, u.hudless, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    u.hudless_taken = true;
+}
+
+void Executor::UpscaleFrameGenInputs(s32 frame, CachedImage* display) {
+    if (!up_ || presenter_ == nullptr || !presenter_->FrameGenActive() || frame < 0) {
+        return;
+    }
+    UpscaleState& u = *up_;
+    if (!u.flip_done || u.depth.image == VK_NULL_HANDLE || u.motion.image == VK_NULL_HANDLE) {
+        return; // a frame without the scene's inputs: presented alone
+    }
+    if (!u.hudless_taken && display != nullptr) {
+        TakeHudless(*display); // (no UI drawn this frame: the frame itself)
+    }
+    const bool taken = u.hudless_taken;
+    u.hudless_taken = false; // (the next frame takes its own)
+    if (!taken) {
+        return;
+    }
+    u32 rw = 0, rh = 0;
+    Upscale::GetRenderSize(rw, rh);
+    Presenter::FrameGenSource src;
+    src.depth = u.depth.image;
+    src.motion = u.motion.image;
+    src.hudless = u.hudless.image;
+    src.hudless_format = u.hudless.format;
+    src.depth_w = u.depth.width;
+    src.depth_h = u.depth.height;
+    src.motion_w = u.motion.width;
+    src.motion_h = u.motion.height;
+    src.hudless_w = std::min<u32>(u.hudless.width, u.last_out_w != 0 ? u.last_out_w : u.hudless.width);
+    src.hudless_h = std::min<u32>(u.hudless.height, u.last_out_h != 0 ? u.last_out_h : u.hudless.height);
+    src.render_w = rw;
+    src.render_h = rh;
+    src.jitter_x = u.flip_jitter ? u.flip_jx * u.jitter_sign_x : 0.0f;
+    src.jitter_y = u.flip_jitter ? u.flip_jy * u.jitter_sign_y : 0.0f;
+    src.mv_scale_x = u.mv_sign * static_cast<float>(rw);
+    src.mv_scale_y = u.mv_sign * static_cast<float>(rh);
+    // the game's camera (Camera::BuildProjection 0x581c90: near +0x584, far +0x588, tan(fov/2) +0x5a4)
+    if (const u64 base = Engine::GuestImageBase(); base != 0) {
+        const u64 camera = *reinterpret_cast<const u64*>(base + 0x7f2d2b8);
+        if (camera != 0) {
+            src.camera_near = *reinterpret_cast<const float*>(camera + 0x584);
+            src.camera_far = *reinterpret_cast<const float*>(camera + 0x588);
+            src.fov_y = 2.0f * std::atan(*reinterpret_cast<const float*>(camera + 0x5a4));
+        }
+    }
+    src.depth_inverted = u.depth_inverted;
+    src.reset = u.flip_reset;
+    presenter_->RecordFrameGenInputs(cur_.cb, frame, src);
+}
+
 void Executor::UpscaleOnFlip() {
     if (!up_) {
         return;
     }
+    // (Flip copies the frame after this: frame generation reads what the frame had)
+    up_->flip_done = up_->done_this_frame;
+    up_->flip_jitter = up_->jitter_this_frame;
+    up_->flip_jx = up_->frame_jx;
+    up_->flip_jy = up_->frame_jy;
+    up_->flip_reset = up_->reset;
     {
         u32 rw = 0, rh = 0;
         Upscale::GetRenderSize(rw, rh);

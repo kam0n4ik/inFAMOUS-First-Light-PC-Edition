@@ -5113,6 +5113,7 @@ void Executor::Flip(const Cp::FlipMarker&) {
                     presenter_->ReleaseFrame(frame);
                     frame = -1;
                 } else {
+                    UpscaleFrameGenInputs(frame, img); // (frame generation: depth, motion, the HUD-less frame)
                     CaptureSeries(*img, shown, w, h);
                 }
                 DiagEnd(cid);

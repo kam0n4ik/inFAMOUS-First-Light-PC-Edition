@@ -45,6 +45,23 @@ public:
     /// GPU thread: the flip will not use `frame` (no buffer to copy).
     void ReleaseFrame(s32 frame);
 
+    /// Frame generation (FSR 3.1; docs/UPSCALING_FRAME_GENERATION.md): the inputs of the game frame copied into `frame`
+    /// - its depth and motion (render size; in SHADER_READ_ONLY_OPTIMAL, left so) and the frame without the HUD (in
+    /// TRANSFER_SRC_OPTIMAL, left so), copied into the frame's own images by commands recorded into `cb`.
+    struct FrameGenSource {
+        VkImage depth = VK_NULL_HANDLE, motion = VK_NULL_HANDLE, hudless = VK_NULL_HANDLE;
+        VkFormat hudless_format = VK_FORMAT_UNDEFINED;
+        u32 depth_w = 0, depth_h = 0, motion_w = 0, motion_h = 0, hudless_w = 0, hudless_h = 0;
+        u32 render_w = 0, render_h = 0;
+        float jitter_x = 0, jitter_y = 0, mv_scale_x = 1, mv_scale_y = 1;
+        float camera_near = 0.1f, camera_far = 10000.0f, fov_y = 1.0f;
+        bool depth_inverted = true, reset = false;
+    };
+    /// GPU thread, after RecordCopy for the same frame. false: frame generation is not on.
+    bool RecordFrameGenInputs(VkCommandBuffer cb, s32 frame, const FrameGenSource& src);
+    /// Frame generation runs (the FSR swapchain exists): the executor gathers its inputs.
+    bool FrameGenActive() const;
+
     /// Present thread: shows `frame` (or black for -1). The frame is free again once the presentation's commands
     /// completed.
     void Present(s32 frame, u64 flip_id);

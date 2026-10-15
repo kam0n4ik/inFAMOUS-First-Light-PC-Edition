@@ -36,6 +36,10 @@ struct Executor::UpscaleState {
 
     UpscaleImage color, depth, motion, output;
     UpscaleImage sharpened; ///< the output after RCAS (DLSS with sharpness > 0)
+    UpscaleImage hudless;   ///< frame generation: the display buffer after the scene, before the UI
+    bool hudless_taken = false;
+    bool flip_done = false, flip_jitter = false, flip_reset = false; ///< the frame Flip hands over
+    float flip_jx = 0.0f, flip_jy = 0.0f;
     VkDescriptorSetLayout rcas_set = VK_NULL_HANDLE;
     VkPipelineLayout rcas_layout = VK_NULL_HANDLE;
     VkPipeline rcas_pipeline = VK_NULL_HANDLE;
@@ -43,6 +47,8 @@ struct Executor::UpscaleState {
     VkQueryPool queries = VK_NULL_HANDLE; ///< two timestamps per evaluation, kQuerySlots evaluations in flight
     static constexpr u32 kQuerySlots = 8;
     u64 evals = 0;
+    double gpu_ms_sum = 0.0;
+    u32 gpu_ms_n = 0;
 
     // the frame's inputs
     CachedImage* mv_img = nullptr;    ///< the velocity pass's target (RG16F, render size)

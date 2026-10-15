@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "base/abi.h"
 #include "runtime/gpu/vulkan/vk_api.h"
@@ -86,6 +87,11 @@ public:
     VkPhysicalDevice Physical() const { return physical_; }
     VkDevice Device() const { return device_; }
     VkQueue Queue() const { return queue_; }
+    /// Frame generation (FSR 3.1: docs/UPSCALING_FRAME_GENERATION.md): more queues of the main family (present,
+    /// acquire) and an async compute queue, created only when frame generation was chosen; VK_NULL_HANDLE without.
+    VkQueue ExtraQueue(u32 index) const { return index < extra_queues_.size() ? extra_queues_[index] : VK_NULL_HANDLE; }
+    VkQueue ComputeQueue() const { return compute_queue_; }
+    u32 ComputeFamily() const { return compute_family_; }
     /// First fatal runtime error, shared by recording, presentation and timeline waiters.
     void Fail(const char* where, VkResult result);
     VkResult Failure() const { return failure_.load(std::memory_order_acquire); }
@@ -133,6 +139,9 @@ private:
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
+    std::vector<VkQueue> extra_queues_;
+    VkQueue compute_queue_ = VK_NULL_HANDLE;
+    u32 compute_family_ = ~0u;
     u32 family_ = ~0u;
     DeviceCaps caps_;
     VkPhysicalDeviceMemoryProperties memory_{};

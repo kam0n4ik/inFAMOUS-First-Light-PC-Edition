@@ -17,6 +17,8 @@
 #include "base/log.h"
 #include "runtime/gpu/png_writer.h"
 #include "runtime/gpu/stall_trace.h"
+#include "runtime/gpu/upscale/fsr_framegen.h"
+#include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 
@@ -129,6 +131,83 @@ void DrawOverlay(u8* px, std::string_view text) {
 
 } // namespace
 
+/// An image of the presenter's own (frame generation inputs), recreated for a size or format.
+struct OwnImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    u32 width = 0, height = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
+void DestroyOwn(DeviceContext& ctx, OwnImage& i) {
+    if (i.image != VK_NULL_HANDLE) {
+        Fn().vkDestroyImage(ctx.Device(), i.image, nullptr);
+    }
+    if (i.memory != VK_NULL_HANDLE) {
+        Fn().vkFreeMemory(ctx.Device(), i.memory, nullptr);
+    }
+    i = OwnImage{};
+}
+
+bool MakeOwn(DeviceContext& ctx, OwnImage& i, VkFormat format, u32 w, u32 h, VkImageUsageFlags usage) {
+    if (i.image != VK_NULL_HANDLE && i.format == format && i.width == w && i.height == h) {
+        return true;
+    }
+    DestroyOwn(ctx, i);
+    const auto& f = Fn();
+    const VkImageCreateInfo ici{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                .imageType = VK_IMAGE_TYPE_2D,
+                                .format = format,
+                                .extent = {w, h, 1},
+                                .mipLevels = 1,
+                                .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = usage,
+                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    if (f.vkCreateImage(ctx.Device(), &ici, nullptr, &i.image) != VK_SUCCESS) {
+        i.image = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements req{};
+    f.vkGetImageMemoryRequirements(ctx.Device(), i.image, &req);
+    const s32 type = ctx.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryAllocateInfo mai{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                   .allocationSize = req.size,
+                                   .memoryTypeIndex = static_cast<u32>(std::max(type, 0))};
+    if (type < 0 || f.vkAllocateMemory(ctx.Device(), &mai, nullptr, &i.memory) != VK_SUCCESS) {
+        i.memory = VK_NULL_HANDLE;
+        DestroyOwn(ctx, i);
+        return false;
+    }
+    f.vkBindImageMemory(ctx.Device(), i.image, i.memory, 0);
+    i.format = format;
+    i.width = w;
+    i.height = h;
+    return true;
+}
+
+void OwnBarrier(VkCommandBuffer cb, OwnImage& i, VkImageLayout to, VkPipelineStageFlags2 dst_stage,
+                VkAccessFlags2 dst_access) {
+    const VkImageMemoryBarrier2 b{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                  .dstStageMask = dst_stage,
+                                  .dstAccessMask = dst_access,
+                                  .oldLayout = i.layout,
+                                  .newLayout = to,
+                                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                  .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                  .image = i.image,
+                                  .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                               .pImageMemoryBarriers = &b};
+    Fn().vkCmdPipelineBarrier2(cb, &dep);
+    i.layout = to;
+}
+
 struct Presenter::Impl {
     DeviceContext& ctx;
     Timeline& timeline;
@@ -171,6 +250,19 @@ struct Presenter::Impl {
     };
     std::array<Frame, kFrames> frames{};
     std::mutex frames_mutex;
+
+    // FSR 3.1 frame generation (null: off): per frame its inputs, the HUD-less frame at the backbuffer's size
+    std::unique_ptr<Upscale::FsrFrameGen> fg;
+    struct FgFrame {
+        OwnImage depth, motion, hudless;
+        bool valid = false;
+        Upscale::FsrFrameGen::Inputs in;
+    };
+    std::array<FgFrame, kFrames> fg_frames{};
+    OwnImage fg_hudless_bb;
+    std::chrono::steady_clock::time_point fg_last_present{}, fg_window_t{};
+    u32 fg_real = 0, fg_shown = 0;
+    float fg_real_fps = 0.0f, fg_shown_fps = 0.0f;
 
     std::mutex capture_mutex;
     std::deque<std::pair<u64, std::filesystem::path>> captures; ///< requested flips (ascending) and their PNGs
@@ -262,7 +354,14 @@ struct Presenter::Impl {
         if (caps.maxImageCount != 0) {
             count = std::min(count, caps.maxImageCount);
         }
-        const VkSwapchainKHR old = swapchain;
+        const VkSwapchainKHR old = fg ? VK_NULL_HANDLE : swapchain;
+        if (fg && swapchain != VK_NULL_HANDLE) {
+            // (the FFX swapchain is replaced, not chained: the old one first, after its presents)
+            Fn().vkDeviceWaitIdle(ctx.Device());
+            DestroySwapchainObjects();
+            fg->DestroySwapchain(swapchain);
+            swapchain = VK_NULL_HANDLE;
+        }
         const VkSwapchainCreateInfoKHR sci{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
                                            .surface = surface,
                                            .minImageCount = count,
@@ -279,7 +378,9 @@ struct Presenter::Impl {
                                            .clipped = VK_TRUE,
                                            .oldSwapchain = old};
         VkSwapchainKHR created = VK_NULL_HANDLE;
-        if (const VkResult r = f.vkCreateSwapchainKHR(ctx.Device(), &sci, nullptr, &created); r != VK_SUCCESS) {
+        if (const VkResult r = fg ? fg->CreateSwapchain(sci, created)
+                                  : f.vkCreateSwapchainKHR(ctx.Device(), &sci, nullptr, &created);
+            r != VK_SUCCESS) {
             error = fmt::format("vkCreateSwapchainKHR failed ({})", static_cast<int>(r));
             // oldSwapchain may already be retired even when creation fails.
             ctx.Fail("vkCreateSwapchainKHR", r);
@@ -293,9 +394,14 @@ struct Presenter::Impl {
         swap_format = fmt.format;
         extent = ext;
         u32 ni = 0;
-        f.vkGetSwapchainImagesKHR(ctx.Device(), swapchain, &ni, nullptr);
-        images.resize(ni);
-        f.vkGetSwapchainImagesKHR(ctx.Device(), swapchain, &ni, images.data());
+        if (fg) {
+            fg->GetImages(swapchain, images);
+            ni = static_cast<u32>(images.size());
+        } else {
+            f.vkGetSwapchainImagesKHR(ctx.Device(), swapchain, &ni, nullptr);
+            images.resize(ni);
+            f.vkGetSwapchainImagesKHR(ctx.Device(), swapchain, &ni, images.data());
+        }
         done.resize(ni);
         for (auto& s : done) {
             const VkSemaphoreCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -609,6 +715,26 @@ std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timel
             return nullptr;
         }
     }
+    // FSR 3.1 frame generation (chosen at start; it owns the swapchain): its own present and acquire queues
+    if (Upscale::GetSettings().frame_gen == Upscale::FrameGen::Fsr) {
+        std::string why;
+        Upscale::FsrFrameGen::Queues q;
+        q.game = {ctx.Queue(), ctx.QueueFamily()};
+        q.present = {ctx.ExtraQueue(0), ctx.QueueFamily()};
+        q.acquire = {ctx.ExtraQueue(1), ctx.QueueFamily()};
+        q.compute = {ctx.ComputeQueue(), ctx.ComputeFamily()};
+        impl->fg = Upscale::FsrFrameGen::Create(ctx.Physical(), ctx.Device(), q, Fn().vkGetDeviceProcAddr, why);
+        if (!impl->fg) {
+            SSPC_LOG(GPU, Warning, "native presenter: FSR frame generation unavailable: {}", why);
+        }
+        Upscale::UpdateStatus([&](Upscale::Status& st) {
+            st.fsr_fg_available = impl->fg != nullptr;
+            st.fsr_fg_why = why;
+        });
+    } else {
+        // (not chosen: it would be available where the DLL and a second queue are)
+        Upscale::UpdateStatus([&](Upscale::Status& st) { st.fsr_fg_available = true; });
+    }
     if (!impl->CreateSwapchain(error)) {
         Presenter tmp(std::move(impl)); // destroys what was made
         return nullptr;
@@ -651,9 +777,21 @@ Presenter::~Presenter() {
         m.DestroyFrame(fr);
     }
     m.DestroySwapchainObjects();
-    if (m.swapchain != VK_NULL_HANDLE) {
-        f.vkDestroySwapchainKHR(m.ctx.Device(), m.swapchain, nullptr);
+    for (auto& g : m.fg_frames) {
+        DestroyOwn(m.ctx, g.depth);
+        DestroyOwn(m.ctx, g.motion);
+        DestroyOwn(m.ctx, g.hudless);
     }
+    DestroyOwn(m.ctx, m.fg_hudless_bb);
+    if (m.swapchain != VK_NULL_HANDLE) {
+        if (m.fg) {
+            f.vkDeviceWaitIdle(m.ctx.Device());
+            m.fg->DestroySwapchain(m.swapchain);
+        } else {
+            f.vkDestroySwapchainKHR(m.ctx.Device(), m.swapchain, nullptr);
+        }
+    }
+    m.fg.reset();
     for (auto& s : m.slots) {
         DestroyBuffer(m.ctx, s.overlay);
         if (s.acquire_fence != VK_NULL_HANDLE) {
@@ -817,7 +955,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
             m.ctx.Fail("reset acquire fence", r);
             return;
         }
-        r = f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, s.acquire_fence, &index);
+        r = m.fg ? m.fg->Acquire(m.swapchain, 100'000'000ull, s.acquired, VK_NULL_HANDLE, &index)
+                 : f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, s.acquire_fence,
+                                           &index);
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         m.Recreate();
@@ -835,7 +975,7 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         release();
         return;
     }
-    s.acquire_pending = true;
+    s.acquire_pending = !m.fg;
     r = f.vkResetFences(m.ctx.Device(), 1, &s.fence);
     if (r == VK_SUCCESS) {
         r = f.vkResetFences(m.ctx.Device(), 1, &s.present_fence);
@@ -947,6 +1087,50 @@ void Presenter::Present(s32 frame, u64 flip_id) {
             f.vkCmdCopyBufferToImage(s.cb, s.overlay.buffer, swap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
     }
+    if (m.fg) {
+        // frame generation: this frame's inputs (none: a frame of its own - menus, movies, loading, a reset), the
+        // frame without the HUD scaled to the backbuffer like the frame itself
+        const auto now = std::chrono::steady_clock::now();
+        const float frame_ms = m.fg_last_present.time_since_epoch().count() != 0
+                                   ? std::chrono::duration<float, std::milli>(now - m.fg_last_present).count()
+                                   : 33.3f;
+        m.fg_last_present = now;
+        Upscale::FsrFrameGen::Inputs* in = nullptr;
+        if (show && frame >= 0 && m.fg_frames[frame].valid) {
+            Impl::FgFrame& g = m.fg_frames[frame];
+            in = &g.in;
+            if (MakeOwn(m.ctx, m.fg_hudless_bb, m.swap_format, m.extent.width, m.extent.height,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+                OwnBarrier(s.cb, m.fg_hudless_bb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                const VkClearColorValue clear{.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+                const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                f.vkCmdClearColorImage(s.cb, m.fg_hudless_bb.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &all);
+                OwnBarrier(s.cb, m.fg_hudless_bb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                const double sx = static_cast<double>(m.extent.width) / g.hudless.width;
+                const double sy = static_cast<double>(m.extent.height) / g.hudless.height;
+                const double sc = std::min(sx, sy);
+                const s32 dw = static_cast<s32>(g.hudless.width * sc), dh = static_cast<s32>(g.hudless.height * sc);
+                const s32 dx = (static_cast<s32>(m.extent.width) - dw) / 2;
+                const s32 dy = (static_cast<s32>(m.extent.height) - dh) / 2;
+                const VkImageBlit hb{
+                    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .srcOffsets = {{0, 0, 0}, {static_cast<s32>(g.hudless.width), static_cast<s32>(g.hudless.height), 1}},
+                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .dstOffsets = {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+                f.vkCmdBlitImage(s.cb, g.hudless.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m.fg_hudless_bb.image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hb, VK_FILTER_LINEAR);
+                OwnBarrier(s.cb, m.fg_hudless_bb, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+                in->hudless = m.fg_hudless_bb.image;
+                in->hudless_format = m.swap_format;
+            } else {
+                in->hudless = VK_NULL_HANDLE;
+            }
+        }
+        m.fg->SetFrame(s.cb, in, m.extent, frame_ms);
+    }
     b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = 0;
@@ -997,11 +1181,17 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                                       .swapchainCount = 1,
                                       .pSwapchains = &m.swapchain,
                                       .pImageIndices = &index};
-            pr = f.vkQueuePresentKHR(m.ctx.Queue(), &pi);
+            if (m.fg) {
+                VkPresentInfoKHR fpi = pi;
+                fpi.pNext = nullptr;
+                pr = m.fg->Present(m.ctx.Queue(), fpi);
+            } else {
+                pr = f.vkQueuePresentKHR(m.ctx.Queue(), &pi);
+            }
             // WSI errors below still enqueue semaphore waits and the present fence.
-            s.present_pending = pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
+            s.present_pending = !m.fg && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
                                 pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR ||
-                                pr == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
+                                pr == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT);
         }
     }
     if (r != VK_SUCCESS) {
@@ -1017,6 +1207,25 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         std::scoped_lock lock{m.stats_mutex};
         ++m.stats.presented;
         m.stats.black += show ? 0 : 1;
+    }
+    if (m.fg) {
+        // the game's frames presented, and what reached the display for them (generated frames included)
+        ++m.fg_real;
+        m.fg_shown += m.fg->TakeShown();
+        const auto now = std::chrono::steady_clock::now();
+        if (m.fg_window_t.time_since_epoch().count() == 0) {
+            m.fg_window_t = now;
+        }
+        const float sec = std::chrono::duration<float>(now - m.fg_window_t).count();
+        if (sec >= 5.0f) {
+            m.fg_real_fps = static_cast<float>(m.fg_real) / sec;
+            m.fg_shown_fps = static_cast<float>(m.fg_shown) / sec;
+            SSPC_LOG(GPU, Info, "[FSR-FG] game frames {:.1f}/s, displayed {:.1f}/s (generated {:.1f}/s){}",
+                     m.fg_real_fps, m.fg_shown_fps, m.fg_shown_fps - m.fg_real_fps,
+                     m.fg->Generating() ? "" : " - generation off");
+            m.fg_real = m.fg_shown = 0;
+            m.fg_window_t = now;
+        }
     }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         m.Recreate();
@@ -1043,6 +1252,90 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         fr->fence = s.fence;
         fr->state.store(show ? 3 : 0, std::memory_order_release);
     }
+}
+
+bool Presenter::FrameGenActive() const {
+    return impl_->fg != nullptr;
+}
+
+bool Presenter::RecordFrameGenInputs(VkCommandBuffer cb, s32 frame, const FrameGenSource& src) {
+    Impl& m = *impl_;
+    if (!m.fg || frame < 0 || frame >= static_cast<s32>(kFrames)) {
+        return false;
+    }
+    Impl::FgFrame& g = m.fg_frames[frame];
+    g.valid = false;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    if (!MakeOwn(m.ctx, g.depth, VK_FORMAT_R32_SFLOAT, src.depth_w, src.depth_h, usage) ||
+        !MakeOwn(m.ctx, g.motion, VK_FORMAT_R16G16_SFLOAT, src.motion_w, src.motion_h, usage) ||
+        !MakeOwn(m.ctx, g.hudless, src.hudless_format, src.hudless_w, src.hudless_h,
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        return false;
+    }
+    const auto& f = Fn();
+    const auto src_barrier = [&](VkImage image, VkImageLayout from, VkImageLayout to) {
+        const VkImageMemoryBarrier2 b{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+                                      .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                      .oldLayout = from,
+                                      .newLayout = to,
+                                      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                      .image = image,
+                                      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                   .pImageMemoryBarriers = &b};
+        f.vkCmdPipelineBarrier2(cb, &dep);
+    };
+    src_barrier(src.depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    src_barrier(src.motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    OwnBarrier(cb, g.depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    OwnBarrier(cb, g.motion, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    OwnBarrier(cb, g.hudless, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const auto copy = [&](VkImage from, OwnImage& to) {
+        const VkImageCopy c{.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                            .extent = {to.width, to.height, 1}};
+        f.vkCmdCopyImage(cb, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                         &c);
+    };
+    copy(src.depth, g.depth);
+    copy(src.motion, g.motion);
+    copy(src.hudless, g.hudless);
+    src_barrier(src.depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    src_barrier(src.motion, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    OwnBarrier(cb, g.depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+               VK_ACCESS_2_SHADER_READ_BIT);
+    OwnBarrier(cb, g.motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+               VK_ACCESS_2_SHADER_READ_BIT);
+    OwnBarrier(cb, g.hudless, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_READ_BIT);
+    g.in = {};
+    g.in.depth = g.depth.image;
+    g.in.motion = g.motion.image;
+    g.in.depth_w = g.depth.width;
+    g.in.depth_h = g.depth.height;
+    g.in.motion_w = g.motion.width;
+    g.in.motion_h = g.motion.height;
+    g.in.render_w = src.render_w;
+    g.in.render_h = src.render_h;
+    g.in.jitter_x = src.jitter_x;
+    g.in.jitter_y = src.jitter_y;
+    g.in.mv_scale_x = src.mv_scale_x;
+    g.in.mv_scale_y = src.mv_scale_y;
+    g.in.camera_near = src.camera_near;
+    g.in.camera_far = src.camera_far;
+    g.in.fov_y = src.fov_y;
+    g.in.depth_inverted = src.depth_inverted;
+    g.in.reset = src.reset;
+    g.valid = true;
+    return true;
 }
 
 void Presenter::RequestCapture(u64 flip_id, const std::filesystem::path& png) {

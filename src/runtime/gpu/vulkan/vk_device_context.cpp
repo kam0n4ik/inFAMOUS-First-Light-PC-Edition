@@ -611,15 +611,33 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         .flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
                  VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
                  VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV};
-    const float priority = 1.0f;
-    const VkDeviceQueueCreateInfo qci{.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                      .queueFamilyIndex = ctx->family_,
-                                      .queueCount = 1,
-                                      .pQueuePriorities = &priority};
+    // frame generation (FSR 3.1) presents and acquires on queues of its own, and may use async compute
+    const bool fg_queues = options.presentation && Upscale::GetSettings().frame_gen == Upscale::FrameGen::Fsr;
+    const u32 main_count = fg_queues ? std::min<u32>(3, qf[ctx->family_].queueCount) : 1;
+    u32 compute_family = ~0u;
+    if (fg_queues) {
+        for (u32 i = 0; i < qf.size(); ++i) {
+            if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                compute_family = i;
+                break;
+            }
+        }
+    }
+    const float priorities[3] = {1.0f, 1.0f, 1.0f};
+    const VkDeviceQueueCreateInfo qcis[2] = {
+        {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = ctx->family_,
+         .queueCount = main_count,
+         .pQueuePriorities = priorities},
+        {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = compute_family,
+         .queueCount = 1,
+         .pQueuePriorities = priorities}};
+    const VkDeviceQueueCreateInfo& qci = qcis[0];
     const VkDeviceCreateInfo dci{.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                  .pNext = caps.diagnostics_config ? static_cast<const void*>(&diag_info)
                                                                   : static_cast<const void*>(&f2),
-                                 .queueCreateInfoCount = 1,
+                                 .queueCreateInfoCount = compute_family != ~0u ? 2u : 1u,
                                  .pQueueCreateInfos = &qci,
                                  .enabledExtensionCount = static_cast<u32>(denable.size()),
                                  .ppEnabledExtensionNames = denable.data()};
@@ -764,6 +782,19 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         caps.calibrated_timestamps = false;
     }
     f.vkGetDeviceQueue(ctx->device_, ctx->family_, 0, &ctx->queue_);
+    for (u32 i = 1; i < main_count; ++i) {
+        VkQueue q = VK_NULL_HANDLE;
+        f.vkGetDeviceQueue(ctx->device_, ctx->family_, i, &q);
+        ctx->extra_queues_.push_back(q);
+    }
+    if (compute_family != ~0u) {
+        f.vkGetDeviceQueue(ctx->device_, compute_family, 0, &ctx->compute_queue_);
+        ctx->compute_family_ = compute_family;
+    }
+    if (fg_queues) {
+        SSPC_LOG(GPU, Info, "native backend: frame generation queues: {} more of family {}, async compute family {}",
+                 main_count - 1, ctx->family_, static_cast<s32>(compute_family));
+    }
 
     std::string list;
     for (const char* e : denable) {
