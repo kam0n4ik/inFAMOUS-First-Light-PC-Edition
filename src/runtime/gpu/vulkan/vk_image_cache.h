@@ -155,7 +155,9 @@ public:
                     VkAccessFlags2 access);
 
     /// A sampler for an S# (cached by its bits). VK_NULL_HANDLE: unsupported fields (counted).
-    VkSampler Sampler(const Gpu::Shader::SamplerDesc& sharp, bool is_depth, u64 border_color_base);
+    /// `extra_lod_bias`: added to the S#'s (upscaling: the scene's textures sampled for the output resolution).
+    VkSampler Sampler(const Gpu::Shader::SamplerDesc& sharp, bool is_depth, u64 border_color_base,
+                      float extra_lod_bias = 0.0f);
 
     /// [addr, addr + size) was written by someone other than the GPU's rendering (a DMA/WRITE_DATA, a file read, the
     /// guest's own memory writes reported exactly): textures there are uploaded again at their next use, GPU-written

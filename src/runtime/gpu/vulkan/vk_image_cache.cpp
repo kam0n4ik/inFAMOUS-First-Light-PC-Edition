@@ -989,7 +989,7 @@ bool ImageCache::Transition(VkCommandBuffer cb, CachedImage& img, VkImageLayout 
     return true;
 }
 
-VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, u64 border_color_base) {
+VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, u64 border_color_base, float extra_lod_bias) {
     SamplerCaps caps;
     caps.anisotropy = true;
     caps.max_anisotropy = 16.0f;
@@ -1009,6 +1009,11 @@ VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, 
     u32 bits[4];
     std::memcpy(bits, border.data(), 16);
     key = Mix(Mix(key, bits[0] | (u64{bits[1]} << 32)), bits[2] | (u64{bits[3]} << 32));
+    if (extra_lod_bias != 0.0f) { // (upscaling: the scene's textures at the output's detail)
+        u32 b = 0;
+        std::memcpy(&b, &extra_lod_bias, 4);
+        key = Mix(key, 0xB1A5000000000000ull | b);
+    }
     if (const auto it = samplers_.find(key); it != samplers_.end()) {
         return it->second;
     }
@@ -1023,7 +1028,7 @@ VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, 
                                  .addressModeU = p.address_u,
                                  .addressModeV = p.address_v,
                                  .addressModeW = p.address_w,
-                                 .mipLodBias = p.mip_lod_bias,
+                                 .mipLodBias = std::clamp(p.mip_lod_bias + extra_lod_bias, -15.0f, 15.0f),
                                  .anisotropyEnable = p.anisotropy_enable ? VK_TRUE : VK_FALSE,
                                  .maxAnisotropy = p.max_anisotropy,
                                  .compareEnable = p.compare_enable ? VK_TRUE : VK_FALSE,

@@ -64,6 +64,8 @@ bool NextFlipBuffer(BufferInfo& out, s32& index);
 /// The command processor reached a flip marker; the frame's work (and the copy of its buffer into the presenter's
 /// `frame`) completes at `gpu_value`. false: no EOP flip was requested for it (counted, logged once).
 bool OnFlipMarker(u64 gpu_value, s32 frame);
+/// `address` is a registered display buffer (Upscaling: the draws that write the displayed frame).
+bool IsDisplayBuffer(u64 address);
 /// Flip id the next OnFlipMarker gives (captures name it).
 u64 NextFlipId();
 /// GnmDriver: the guest address of the port's labels (16 × u64).

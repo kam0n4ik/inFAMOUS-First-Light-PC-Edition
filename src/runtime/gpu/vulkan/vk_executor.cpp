@@ -6,6 +6,7 @@
 // stencil, bias, binding conventions) follows shadPS4's renderer_vulkan/vk_rasterizer.cpp (GPL-2.0-or-later): the
 // translated SPIR-V is the bridge's, so its bindings and push constants are filled the same way.
 #include "runtime/gpu/vulkan/vk_executor.h"
+#include "runtime/gpu/vulkan/vk_executor_upscale.h"
 
 #include <algorithm>
 #include <bit>
@@ -126,6 +127,7 @@ VkFormat DisplayFormat(u32 pixel_format, VkFormat image_format) {
 
 // SSPC_DIAG_WATCH=<hex address>: the CPU writes of that guest page, caught by write protection (P4.5 race diagnosis)
 std::atomic<u64> g_watch_page{0};
+std::atomic<u64> g_watch_target{0}; ///< SSPC_UPSCALE_SCAN_JITTER: the watch moved to what the scan found
 // SSPC_DIAG_WATCH_READS=1 (P4.6-G7, SSPC-020): the page no-access - the CPU's reads are caught too (who reads the GPU
 // clock fences)
 DWORD g_watch_prot = PAGE_READONLY;
@@ -160,7 +162,9 @@ LONG CALLBACK WatchFilter(EXCEPTION_POINTERS* e) {
     if (page == 0 || (a & ~0xFFFull) != page) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    const u32 n = g_watch_n.fetch_add(1, std::memory_order_acq_rel);
+    const u64 target = g_watch_target.load(std::memory_order_acquire);
+    const bool counted = target == 0 || (a + 0x40 >= target && a < target + 0x40); // (a retargeted watch: its bytes only)
+    const u32 n = counted ? g_watch_n.fetch_add(1, std::memory_order_acq_rel) : ~0u;
     if (n < g_watch_hits.size()) {
         g_watch_hits[n] = {__rdtsc(), e->ContextRecord->Rip, a, GetCurrentThreadId(),
                            static_cast<u32>(r->ExceptionInformation[0])};
@@ -2147,6 +2151,20 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 writes_memory = true;
                 images_.InvalidateFromBufferWrite(b.address, b.size);
             }
+            if (cb_dump_flip_ != 0 && !compute && !b.written && b.size <= (64u << 10)) {
+                // SSPC_UPSCALE_CB_DUMP (diagnostics): the first scene draw's constant buffers, frame after frame
+                std::vector<u8> bytes(b.size);
+                if (auto* mem = GetGuestMemory(); mem != nullptr) {
+                    mem->CopySparse(b.address, bytes.data(), b.size);
+                    const auto dir = options_.capture_path.parent_path().parent_path() / "upscale" / "cb";
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    std::ofstream(dir / fmt::format("cb_{}_{}_{}_{:x}.bin", cb_dump_flip_, s.module == nullptr ? 0 : 1,
+                                                    b.binding, b.address),
+                                  std::ios::binary)
+                        .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                }
+            }
             break;
         }
         case GS::BufferKind::Flatbuf: {
@@ -2290,6 +2308,14 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 ii.imageLayout = (im.storage || feedback) ? VK_IMAGE_LAYOUT_GENERAL
                                  : m->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                if (up_display_draw_ && !im.storage) { // (upscaling: the display draw's textures)
+                    const ImageViewDesc vd = TSharpView(im.desc, im.depth, im.array, im.storage);
+                    const ImageLayout tl = LayoutFromTSharp(im.desc, im.depth);
+                    const auto comps = ViewComponents(vd.mapping);
+                    up_sampled_.push_back({m, ii.imageView, vd.format,
+                                           comps.Valid() ? comps.value : VkComponentMapping{}, tl.size.width,
+                                           tl.size.height});
+                }
                 image_infos.push_back(ii);
                 info_images_.push_back(m);
                 bound.push_back(m);
@@ -2331,6 +2357,13 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                     vd.levels = 1;
                 }
                 ii.imageView = images_.View(*img, vd, im.storage);
+                if (up_display_draw_ && !im.storage && count == 1) { // (upscaling: the display draw's textures)
+                    const auto comps = ViewComponents(vd.mapping);
+                    const ImageLayout tl = LayoutFromTSharp(im.desc, im.depth);
+                    up_sampled_.push_back({img, ii.imageView, vd.format,
+                                           comps.Valid() ? comps.value : VkComponentMapping{}, tl.size.width,
+                                           tl.size.height});
+                }
                 if (memo != nullptr && ii.imageView != VK_NULL_HANDLE) {
                     *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView};
                 }
@@ -2366,7 +2399,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         if (sm.status != GS::ResourceStatus::Ok) {
             desc = {};
         }
-        VkSampler vs = images_.Sampler(desc, depth, border_base);
+        VkSampler vs = images_.Sampler(desc, depth, border_base, !compute && jitter_draw_ ? lod_bias_ : 0.0f);
         if (vs == VK_NULL_HANDLE) {
             vs = images_.Sampler(GS::SamplerDesc{}, depth, 0); // the bridge's fallback: the default S#
         }
@@ -2438,6 +2471,10 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
             v.y = yoffset - yscale;
             v.width = xscale * 2.0f;
             v.height = yscale * 2.0f;
+            if (jitter_draw_) { // upscaling: the scene's sub-pixel jitter (render pixels)
+                v.x += jitter_x_;
+                v.y += jitter_y_;
+            }
         }
         s32 ax = tlx, ay = tly, bx = brx, by = bry;
         if (vport_scissor) {
@@ -2882,6 +2919,20 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     target_cache_.depth_img = depth_img;
     }
     stage(stats_.t_targets);
+    UpscaleOnTargets(d, color_img, depth_img, dc); // (upscaling: the velocity pass, the display draw, jitter)
+    cb_dump_flip_ = 0;
+    if (up_ && jitter_draw_) {
+        static const u64 cb_from = [] {
+            char v[24] = {};
+            return GetEnvironmentVariableA("SSPC_UPSCALE_CB_DUMP", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) : 0ull;
+        }();
+        static u64 dumped_flip = 0;
+        const u64 flip = VideoOut::NextFlipId();
+        if (cb_from != 0 && flip >= cb_from && flip < cb_from + 4 && dumped_flip != flip) {
+            dumped_flip = flip; // (the frame's first jittered draw)
+            cb_dump_flip_ = flip;
+        }
+    }
     Inspector::Class insp_cls{};
     if (insp_catalog_ != nullptr) {
         Inspector::DrawShape sh;
@@ -2948,6 +2999,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         return;
     }
     stats_.t_bind += GS::FineTicks() - tb0;
+    UpscaleDisplayDraw(color_img, img_infos); // (upscaling: the scene sampled by the display draw replaced)
     if (!clock_labels_.empty()) {
         NoteClockLabelReads(&vs.plan, vs.address);
         if (has_ps) {
@@ -4211,8 +4263,14 @@ void Executor::RaceCheck() {
             }
             SSPC_LOG(GPU, Info, "{}", out);
         }
-        const u64 page = watch & ~0xFFFull;
+        const u64 target = g_watch_target.load(std::memory_order_acquire);
+        const u64 page = (target != 0 ? target : watch) & ~0xFFFull;
         DWORD old = 0;
+        if (target != 0 && page != g_watch_page.load(std::memory_order_acquire)) {
+            if (const u64 prev = g_watch_page.load(std::memory_order_acquire); prev != 0) {
+                VirtualProtect(reinterpret_cast<void*>(prev), 4096, PAGE_READWRITE, &old); // (the old page released)
+            }
+        }
         if (VirtualProtect(reinterpret_cast<void*>(page), 4096, g_watch_prot, &old)) {
             g_watch_page.store(page, std::memory_order_release);
         }
@@ -5006,6 +5064,7 @@ void Executor::Flip(const Cp::FlipMarker&) {
     DrawHistogram();
     RaceCheck();
     CmdTraceFlip();
+    UpscaleOnFlip(); // (upscaling: the next frame's jitter, its inputs to find again)
     ++stats_.flips;
     if (prof_ && ++prof_frames_ >= 300) {
         ProfReport();
@@ -5081,6 +5140,10 @@ void Executor::Flip(const Cp::FlipMarker&) {
         ++insp_frame_; // (FrameLog's flip marker index: the hook's calls)
     }
     frontend_.NewFrame();
+}
+
+void RetargetWriteWatch(u64 address) {
+    g_watch_target.store(address, std::memory_order_release);
 }
 
 } // namespace SecondSon::Gpu::Vk

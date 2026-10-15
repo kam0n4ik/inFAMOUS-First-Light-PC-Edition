@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "runtime/gpu/vulkan/vk_device_context.h"
+#include "runtime/gpu/upscale/upscalers.h"
 
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "base/log.h"
 #include "runtime/gpu/shader/shader_types.h"
@@ -134,6 +136,25 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
                 return nullptr;
             }
             ienable.push_back(e);
+        }
+    }
+    // Upscaling: NVIDIA NGX's instance extensions for DLSS (when sspc_dlss.dll is present; docs/UPSCALING_FRAME_GENERATION.md)
+    std::vector<std::string> ngx_instance, ngx_device;
+    std::vector<const char*> ngx_added; ///< device extensions enabled only because NGX asked for them
+    std::string dlss_why;
+    if (options.presentation) {
+        Upscale::Dlss::AppendInstanceExtensions(ngx_instance, dlss_why);
+        for (const std::string& e : ngx_instance) {
+            if (!Has(iexts, e.c_str())) {
+                dlss_why = fmt::format("the instance extension {} NGX needs is missing", e);
+                ngx_instance.clear();
+                break;
+            }
+        }
+        for (const std::string& e : ngx_instance) {
+            if (std::ranges::none_of(ienable, [&](const char* x) { return e == x; })) {
+                ienable.push_back(e.c_str());
+            }
         }
     }
     std::vector<const char*> layers;
@@ -356,6 +377,37 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     if (Has(dexts, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
         denable.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     }
+    // Upscaling: the device extensions NGX needs for DLSS on this GPU
+    if (options.presentation && !ngx_instance.empty()) {
+        Upscale::Dlss::AppendDeviceExtensions(ctx->instance_, pd, ctx->vendor_id_, ngx_device, dlss_why);
+        for (const std::string& e : ngx_device) {
+            if (!Has(dexts, e.c_str())) {
+                dlss_why = fmt::format("the device extension {} NGX needs is missing", e);
+                ngx_device.clear();
+                break;
+            }
+        }
+        // (the EXT form of buffer device address is not enabled with the core one the device gets: the two together
+        // fail device creation; NGX works with the core feature)
+        std::erase(ngx_device, std::string("VK_EXT_buffer_device_address"));
+        for (const std::string& e : ngx_device) {
+            if (std::ranges::none_of(denable, [&](const char* x) { return e == x; })) {
+                denable.push_back(e.c_str());
+                ngx_added.push_back(e.c_str()); // (only these are taken out again if the device fails with them)
+            }
+        }
+        SSPC_LOG(GPU, Info, "native backend: DLSS (NGX) {}", dlss_why.empty()
+                                                                 ? fmt::format("prepared: instance [{}], device [{}]",
+                                                                               fmt::join(ngx_instance, " "),
+                                                                               fmt::join(ngx_device, " "))
+                                                                 : "unavailable: " + dlss_why);
+    } else if (options.presentation) {
+        SSPC_LOG(GPU, Info, "native backend: DLSS (NGX) unavailable: {}", dlss_why);
+    }
+    Upscale::UpdateStatus([&](Upscale::Status& st) {
+        st.dlss_available = dlss_why.empty() && !ngx_device.empty();
+        st.dlss_why = dlss_why;
+    });
     // P4.12: the stall trace's deep mode converts the batches' GPU timestamps to the CPU's clock (only then: the device
     // is otherwise created as before)
     if (char st[256] = {}; GetEnvironmentVariableA("SSPC_P412_STALL_TRACE", st, sizeof(st)) >= 4 &&
@@ -571,7 +623,117 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
                                  .pQueueCreateInfos = &qci,
                                  .enabledExtensionCount = static_cast<u32>(denable.size()),
                                  .ppEnabledExtensionNames = denable.data()};
-    if (const VkResult r = f.vkCreateDevice(pd, &dci, nullptr, &ctx->device_); r != VK_SUCCESS) {
+    VkResult created = f.vkCreateDevice(pd, &dci, nullptr, &ctx->device_);
+    if (created != VK_SUCCESS && !ngx_added.empty()) {
+        // which of NGX's extensions the device fails with: without each one in turn (logged), else without all of them
+        // (the game runs, DLSS does not)
+        const VkResult first = created;
+        std::vector<const char*> base;
+        for (const char* x : denable) {
+            if (std::ranges::find(ngx_added, x) == ngx_added.end()) {
+                base.push_back(x);
+            }
+        }
+        const auto attempt = [&](const std::vector<const char*>& list) {
+            VkDeviceCreateInfo again = dci;
+            again.enabledExtensionCount = static_cast<u32>(list.size());
+            again.ppEnabledExtensionNames = list.data();
+            ctx->device_ = VK_NULL_HANDLE;
+            return f.vkCreateDevice(pd, &again, nullptr, &ctx->device_);
+        };
+        std::string culprit;
+        // SSPC_DIAG_NGX_BISECT=1 (diagnostics): with all of NGX's extensions, without each of the others in turn -
+        // which one the device fails with together with them
+        if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_NGX_BISECT", v, sizeof(v)) == 1 && v[0] == '1') {
+            for (const char* drop : base) {
+                std::vector<const char*> list;
+                for (const char* x : base) {
+                    if (x != drop) {
+                        list.push_back(x);
+                    }
+                }
+                list.insert(list.end(), ngx_added.begin(), ngx_added.end());
+                const VkResult r = attempt(list);
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC SSPC_DIAG_NGX_BISECT: NGX's extensions without {}: {}", drop,
+                         static_cast<int>(r));
+                if (r == VK_SUCCESS) {
+                    reinterpret_cast<PFN_vkDestroyDevice>(f.vkGetDeviceProcAddr(ctx->device_, "vkDestroyDevice"))(
+                        ctx->device_, nullptr); // (the device table is loaded later)
+                    ctx->device_ = VK_NULL_HANDLE;
+                }
+            }
+        }
+        if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_NGX_BISECT", v, sizeof(v)) == 1 && v[0] == '1') {
+            // the feature chain: none at all, then without each structure in turn (sType logged)
+            std::vector<const char*> all = base;
+            all.insert(all.end(), ngx_added.begin(), ngx_added.end());
+            const auto try_chain = [&](const void* next) {
+                VkDeviceCreateInfo again = dci;
+                again.pNext = next;
+                again.enabledExtensionCount = static_cast<u32>(all.size());
+                again.ppEnabledExtensionNames = all.data();
+                VkDevice dev = VK_NULL_HANDLE;
+                const VkResult r = f.vkCreateDevice(pd, &again, nullptr, &dev);
+                if (r == VK_SUCCESS) {
+                    reinterpret_cast<PFN_vkDestroyDevice>(f.vkGetDeviceProcAddr(dev, "vkDestroyDevice"))(dev, nullptr);
+                }
+                return r;
+            };
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC SSPC_DIAG_NGX_BISECT: no feature chain: {}",
+                     static_cast<int>(try_chain(nullptr)));
+            std::vector<VkBaseOutStructure*> nodes;
+            for (auto* n = static_cast<VkBaseOutStructure*>(const_cast<void*>(dci.pNext)); n != nullptr; n = n->pNext) {
+                nodes.push_back(n);
+            }
+            for (size_t k = 0; k < nodes.size(); ++k) {
+                VkBaseOutStructure* saved = nullptr;
+                const void* head = dci.pNext;
+                if (k == 0) {
+                    head = nodes[0]->pNext;
+                } else {
+                    saved = nodes[k - 1]->pNext;
+                    nodes[k - 1]->pNext = nodes[k]->pNext;
+                }
+                const VkResult r = try_chain(head);
+                if (k != 0) {
+                    nodes[k - 1]->pNext = saved;
+                }
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC SSPC_DIAG_NGX_BISECT: chain without sType {}: {}",
+                         static_cast<int>(nodes[k]->sType), static_cast<int>(r));
+            }
+        }
+        for (const char* skip : ngx_added) {
+            std::vector<const char*> list = base;
+            for (const char* x : ngx_added) {
+                if (x != skip) {
+                    list.push_back(x);
+                }
+            }
+            created = attempt(list);
+            SSPC_LOG(GPU, Warning, "native backend: vkCreateDevice without {}: {}", skip, static_cast<int>(created));
+            if (created == VK_SUCCESS) {
+                culprit = skip;
+                denable = list;
+                break;
+            }
+        }
+        if (created != VK_SUCCESS) {
+            created = attempt(base);
+            denable = base;
+            culprit = "all of them";
+        }
+        if (created == VK_SUCCESS) {
+            const std::string why = fmt::format("the device could not be created with NGX's extension {} ({})",
+                                                culprit, static_cast<int>(first));
+            SSPC_LOG(GPU, Warning, "native backend: {} - DLSS unavailable", why);
+            ngx_device.clear();
+            Upscale::UpdateStatus([&](Upscale::Status& st) {
+                st.dlss_available = false;
+                st.dlss_why = why;
+            });
+        }
+    }
+    if (const VkResult r = created; r != VK_SUCCESS) {
         ctx->device_ = VK_NULL_HANDLE;
         error = fmt::format("vkCreateDevice on {} failed ({})", ctx->name_, static_cast<int>(r));
         return nullptr;

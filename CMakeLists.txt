@@ -34,6 +34,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/native_render_ops.cpp
     src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
+    src/engine/render/render_resolution.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
     src/input/settings.cpp
@@ -91,6 +92,8 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/vulkan/vk_presenter.cpp
     src/runtime/gpu/vulkan/vk_stability_tests.cpp
     src/runtime/gpu/vulkan/vk_resources.cpp
+    src/runtime/gpu/upscale/upscalers.cpp
+    src/runtime/gpu/vulkan/vk_executor_upscale.cpp
     src/runtime/gpu/host_shaders.cpp
     src/runtime/gpu/image_layout.cpp
     src/runtime/gpu/native_backend.cpp
@@ -255,3 +258,39 @@ target_compile_definitions(sspc_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEA
 target_compile_options(sspc_engine_tests PRIVATE /utf-8 /W4)
 target_link_libraries(sspc_engine_tests PRIVATE fmt::fmt)
 set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Upscaling and frame generation (docs/UPSCALING_FRAME_GENERATION.md). The vendors' SDKs are not part of the sources:
+# tools/upscalers/stage_sdks.ps1 puts them into third_party/upscalers (NVIDIA DLSS SDK headers + nvsdk_ngx_s.lib,
+# AMD FidelityFX API headers, NVIDIA Streamline headers, and the runtime DLLs copied next to SecondSonPC.exe).
+set(SSPC_UPSCALERS_DIR "${CMAKE_SOURCE_DIR}/third_party/upscalers" CACHE PATH "Staged upscaler SDKs")
+if(EXISTS "${SSPC_UPSCALERS_DIR}/ngx/include/nvsdk_ngx_vk.h" AND EXISTS "${SSPC_UPSCALERS_DIR}/ngx/lib/nvsdk_ngx_s.lib")
+    # sspc_dlss.dll: the only binary that links NVIDIA's NGX SDK (static CRT, as nvsdk_ngx_s.lib). SecondSonPC.exe
+    # loads it at run time; without it DLSS is unavailable and everything else runs.
+    add_library(sspc_dlss SHARED src/dlss_bridge/sspc_dlss_bridge.cpp src/dlss_bridge/sspc_dlss_bridge.h)
+    set_target_properties(sspc_dlss PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded"
+                          RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(sspc_dlss PRIVATE "${SSPC_UPSCALERS_DIR}/ngx/include" "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(sspc_dlss PRIVATE Vulkan::Headers "${SSPC_UPSCALERS_DIR}/ngx/lib/nvsdk_ngx_s.lib")
+    target_compile_definitions(sspc_dlss PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_dependencies(shadps4 sspc_dlss)
+    message(STATUS "SecondSonPC: DLSS bridge (sspc_dlss.dll) from ${SSPC_UPSCALERS_DIR}/ngx")
+else()
+    message(STATUS "SecondSonPC: no NGX SDK in ${SSPC_UPSCALERS_DIR}/ngx - sspc_dlss.dll is not built (DLSS unavailable)")
+endif()
+if(EXISTS "${SSPC_UPSCALERS_DIR}/ffx-api/include/ffx_api/ffx_api.h")
+    target_include_directories(sspc_runtime PRIVATE "${SSPC_UPSCALERS_DIR}/ffx-api/include")
+    target_compile_definitions(sspc_runtime PRIVATE SSPC_HAVE_FFX_API=1)
+endif()
+if(EXISTS "${SSPC_UPSCALERS_DIR}/streamline/include/sl.h")
+    target_include_directories(sspc_runtime PRIVATE "${SSPC_UPSCALERS_DIR}/streamline/include")
+    target_compile_definitions(sspc_runtime PRIVATE SSPC_HAVE_STREAMLINE=1)
+endif()
+# The vendors' runtime DLLs next to the executable (each is loaded only when its feature is used).
+file(GLOB _sspc_upscaler_dlls "${SSPC_UPSCALERS_DIR}/bin/*.dll")
+if(_sspc_upscaler_dlls)
+    add_custom_target(sspc_upscaler_dlls ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_sspc_upscaler_dlls} ${CMAKE_BINARY_DIR}/bin
+        COMMENT "SecondSonPC: upscaler runtime DLLs")
+    add_dependencies(shadps4 sspc_upscaler_dlls)
+endif()

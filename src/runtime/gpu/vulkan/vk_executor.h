@@ -445,6 +445,34 @@ private:
     bool dyn_vertex_valid_ = false;
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
 
+    // Upscaling (docs/UPSCALING_FRAME_GENERATION.md, vk_executor_upscale.cpp): the game's scene at its render size goes
+    // through DLSS / FSR 3.1 in place of the game's own scaling to the display buffer.
+    struct UpscaleState;
+    std::unique_ptr<UpscaleState> up_;
+    bool up_display_draw_ = false; ///< the draw being bound writes a display buffer (BindStage notes its textures)
+    struct UpscaleSampled {
+        CachedImage* img = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkComponentMapping components{}; ///< the view's swizzle (the output is viewed the same way)
+        u32 width = 0, height = 0; ///< the T#'s size
+    };
+    std::vector<UpscaleSampled> up_sampled_;
+    bool jitter_draw_ = false;            ///< SetDynamicState offsets this draw's viewports by the jitter
+    float jitter_x_ = 0.0f, jitter_y_ = 0.0f; ///< render pixels (x right, y down)
+    u64 cb_dump_flip_ = 0; ///< SSPC_UPSCALE_CB_DUMP: this draw's constant buffers written (diagnostics)
+    float lod_bias_ = 0.0f; ///< the scene draws' texture LOD bias: log2(render / output width)
+    /// After the draw's targets are known: the velocity pass (snapshots of depth and motion when it ends) and whether
+    /// this draw is scene geometry to jitter.
+    void UpscaleOnTargets(const Cp::DrawDescriptor& d, const std::array<CachedImage*, 8>& color, CachedImage* depth,
+                          u32 depth_control);
+    /// After the draw's descriptors are built: a draw into a display buffer that samples the render-size scene gets
+    /// the upscaled scene in its place (recorded before the draw). The view in `images` is replaced.
+    void UpscaleDisplayDraw(const std::array<CachedImage*, 8>& color, std::vector<VkDescriptorImageInfo>& images);
+    void UpscaleOnFlip();
+    /// After commands an SDK recorded itself: nothing this command buffer bound or set is known any more.
+    void InvalidateBoundState();
+
     bool Begin();
     void RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0);
     void RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs, const PreparedCommand& pc,

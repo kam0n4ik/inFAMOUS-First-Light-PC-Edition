@@ -661,6 +661,16 @@ bool NextFlipBuffer(BufferInfo& out, s32& index) {
     return true;
 }
 
+bool IsDisplayBuffer(u64 address) {
+    std::scoped_lock lock{g_port.mutex};
+    for (const Slot& slot : g_port.slots) {
+        if (slot.group >= 0 && slot.address == address) {
+            return true;
+        }
+    }
+    return false;
+}
+
 u64 NextFlipId() {
     std::scoped_lock lock{g_port.mutex};
     return g_port.next_flip_id;
