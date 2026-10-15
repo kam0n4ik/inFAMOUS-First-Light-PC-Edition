@@ -92,6 +92,18 @@ bool ParseBackend(std::string_view s, Backend& out) {
     return true;
 }
 
+void ApplyConfig(std::string_view upscaler, std::string_view quality, u32 sharpness_percent,
+                 std::string_view frame_generation, u32 fg_multiplier, bool reflex) {
+    Settings s = GetSettings();
+    ParseBackend(upscaler, s.backend);
+    ParseQuality(quality, s.quality);
+    s.sharpness = static_cast<float>(std::min(sharpness_percent, 100u)) / 100.0f;
+    s.frame_gen = frame_generation == "fsr" ? FrameGen::Fsr : frame_generation == "dlss" ? FrameGen::Dlss : FrameGen::Off;
+    s.fg_multiplier = std::clamp<u32>(fg_multiplier, 2, 4);
+    s.reflex = reflex;
+    SetSettings(s);
+}
+
 bool ParseQuality(std::string_view s, Quality& out) {
     if (s == "native" || s == "dlaa" || s == "nativeaa") {
         out = Quality::Native;
@@ -181,6 +193,14 @@ void ApplyEnvironmentOverrides() {
     }
     if (const std::string v = env("SSPC_UPSCALE_SHARPNESS"); !v.empty()) {
         s.sharpness = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.0f, 1.0f);
+        any = true;
+    }
+    if (const std::string v = env("SSPC_FRAME_GEN"); !v.empty()) {
+        s.frame_gen = v == "fsr" ? FrameGen::Fsr : v == "dlss" ? FrameGen::Dlss : FrameGen::Off;
+        any = true;
+    }
+    if (const std::string v = env("SSPC_FRAME_GEN_MULTIPLIER"); !v.empty()) {
+        s.fg_multiplier = std::clamp<u32>(static_cast<u32>(std::atoi(v.c_str())), 2, 4);
         any = true;
     }
     if (env("SSPC_UPSCALE_JITTER") == "0") {

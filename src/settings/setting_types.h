@@ -18,7 +18,9 @@ struct Config;
 
 namespace SecondSon::Settings {
 
-enum class Category : u8 { Display, Graphics, Audio, Controls, Keyboard, Gamepad, Interface, Game, Shaders, Count };
+enum class Category : u8 {
+    Display, Graphics, Audio, Controls, Keyboard, Gamepad, Interface, Game, Shaders, Upscaling, Count
+};
 constexpr size_t kCategoryCount = static_cast<size_t>(Category::Count);
 
 enum class Type : u8 {
@@ -48,6 +50,10 @@ constexpr u32 RealController = 1u << 3; // libScePad is SecondSonPC's (stick tun
 constexpr u32 RenderScale = 1u << 8;
 constexpr u32 FrameLimiter = 1u << 9;
 constexpr u32 NativeFpsOverlay = 1u << 10;
+// Upscaling (docs/UPSCALING_FRAME_GENERATION.md): what this GPU and its driver can do, found when the backend started
+constexpr u32 Dlss = 1u << 11;         // DLSS Super Resolution (GeForce RTX, NGX)
+constexpr u32 FsrFrameGen = 1u << 12;  // FSR 3.1 frame generation (amd_fidelityfx_vk.dll)
+constexpr u32 DlssFrameGen = 1u << 13; // DLSS Frame Generation (Streamline, GeForce RTX 40/50)
 } // namespace Capability
 
 struct Choice {

@@ -164,6 +164,9 @@ int Shots(const fs::path& out) {
     shot("ru_1080_interface_xbox.png", 1920, 1080, true, C::Interface, kAllCaps, P::Xbox, nullptr, 0);
     shot("ru_1080_game.png", 1920, 1080, true, C::Game, kAllCaps, P::Keyboard, nullptr, 0);
     shot("ru_1080_shaders.png", 1920, 1080, true, C::Shaders, kAllCaps, P::Keyboard, "cmd.clear_shaders", 0);
+    shot("ru_1080_upscaling.png", 1920, 1080, true, C::Upscaling, kAllCaps | Settings::Capability::RenderScale | Settings::Capability::Dlss |
+             Settings::Capability::FsrFrameGen, P::Keyboard,
+         "upscaling.upscaler", 0);
     shot("ru_1080_confirm_display.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, "display.fullscreen", 1);
     shot("en_1080_display.png", 1920, 1080, false, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
     shot("ru_720_display.png", 1280, 720, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);

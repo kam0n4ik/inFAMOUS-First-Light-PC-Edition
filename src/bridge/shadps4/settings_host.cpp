@@ -10,6 +10,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "engine/particles/smoke_quality.h"
+#include "runtime/gpu/upscale/upscale_settings.h"
 #include "settings/settings_service.h"
 #include "ui/menu_controller.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -57,6 +58,15 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
             } else if (d->id == "graphics.particleResolution") {
                 Engine::Particles::SetParticleResolution(c.pc.particle_resolution);
+            } else if (d->id == "upscaling.sharpness" || d->id == "upscaling.frameGenMultiplier" ||
+                       d->id == "upscaling.reflex") {
+                // read by the GPU's recording / present threads every frame (the technology, quality and frame
+                // generation need a restart: the render size and the swapchain are set at start)
+                Gpu::Upscale::Settings s = Gpu::Upscale::GetSettings();
+                s.sharpness = static_cast<float>(std::min(c.pc.upscale_sharpness, 100u)) / 100.0f;
+                s.fg_multiplier = std::clamp<u32>(c.pc.frame_gen_multiplier, 2, 4);
+                s.reflex = c.pc.reflex;
+                Gpu::Upscale::SetSettings(s);
             } else if (d->category == Settings::Category::Graphics) {
                 fsr = true;
             }

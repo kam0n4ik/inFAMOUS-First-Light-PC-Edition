@@ -514,7 +514,9 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
     menu.OnNav(Ui::Nav::NextTab);
     menu.OnNav(Ui::Nav::NextTab);
     menu.OnNav(Ui::Nav::NextTab);
-    check(g, "tabs: Display -> Graphics -> Audio -> Mouse", menu.CurrentCategory() == Category::Controls, "");
+    menu.OnNav(Ui::Nav::NextTab);
+    check(g, "tabs: Display -> Graphics -> Upscaling -> Audio -> Mouse", menu.CurrentCategory() == Category::Controls,
+          "");
     menu.Focus("input.invertY");
     menu.OnNav(Ui::Nav::Accept);
     const bool toggled = std::get<bool>(s.Get(*Find("input.invertY")));

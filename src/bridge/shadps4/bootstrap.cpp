@@ -63,6 +63,7 @@
 #include "engine/render/native_draw.h"
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
+#include "settings/settings_service.h"
 #include "loader/bindings.h"
 #include "loader/image_file.h"
 #include "loader/linker.h"
@@ -776,6 +777,21 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
             Fatal("--gpu-backend sspc: SecondSonPC's GPU backend did not start: " + gpu_error);
         }
         Lifecycle::AddExitStep(Lifecycle::Stage::Devices, "native GPU backend", [] { Gpu::Native::Stop(); });
+        {
+            // the settings menu: what the upscaling rows can do with this GPU (known now the device exists)
+            namespace Cap = Settings::Capability;
+            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale;
+            if (Gpu::Upscale::GetStatus().dlss_available) {
+                caps |= Cap::Dlss;
+            }
+            if (Gpu::Upscale::GetStatus().fsr_fg_available) {
+                caps |= Cap::FsrFrameGen;
+            }
+            if (Gpu::Upscale::GetStatus().dlss_fg_available) {
+                caps |= Cap::DlssFrameGen;
+            }
+            Settings::Instance().SetCapabilities(caps);
+        }
     }
     bindings.LogSummary(); // also for --selftest: the NATIVE/BRIDGE split without running the game
     if (!cfg.gpu_shader_verify.empty()) {
@@ -1308,6 +1324,8 @@ void RunGame(const App::Config& cfg) {
     // Upscaling: DLSS needs the driver's CUDA part, which needs address space under 1 TiB - given to it before the guest
     // memory takes all of it (docs/UPSCALING_FRAME_GENERATION.md)
     if (cfg.gpu_backend == App::Config::GpuBackend::Sspc) {
+        Gpu::Upscale::ApplyConfig(cfg.pc.upscaler, cfg.pc.upscale_quality, cfg.pc.upscale_sharpness,
+                                  cfg.pc.frame_generation, cfg.pc.frame_gen_multiplier, cfg.pc.reflex);
         Gpu::Upscale::ApplyEnvironmentOverrides();
         if (Gpu::Upscale::GetSettings().backend == Gpu::Upscale::Backend::Dlss) {
             Gpu::Upscale::ReserveCudaWindow();

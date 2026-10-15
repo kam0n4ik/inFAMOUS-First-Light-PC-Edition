@@ -23,6 +23,13 @@ struct PcSettings {
     // [Graphics] the engine's own reduced-resolution path for its translucent particles (fire, smoke, dust): "auto"
     // (the game's own adaptation) | "full" | "half" | "quarter"
     std::string particle_resolution = "auto";
+    // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
+    std::string upscaler = "off";            // "off" | "dlss" | "fsr"
+    std::string upscale_quality = "quality"; // "native" | "quality" | "balanced" | "performance" | "ultra"
+    u32 upscale_sharpness = 50;              // 0..100 %: RCAS after DLSS, FSR's own RCAS
+    std::string frame_generation = "off";    // "off" | "fsr" | "dlss"
+    u32 frame_gen_multiplier = 2;            // 2 | 3 | 4 (3 and 4: DLSS Multi Frame Generation, RTX 50)
+    bool reflex = true;                      // NVIDIA Reflex low latency with DLSS Frame Generation
 
     // [Gamepad]: a real controller (DualShock 4 and others through SDL)
     u32 vibration = 100;             // % of the motor strength the game asks for; 0 = off

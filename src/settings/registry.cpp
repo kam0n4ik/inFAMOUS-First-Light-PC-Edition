@@ -70,6 +70,28 @@ constexpr Choice kParticleResolutions[] = {
     {"half", "Half", "Половина"},
     {"quarter", "Quarter", "Четверть"},
 };
+constexpr Choice kUpscalers[] = {
+    {"off", "Off (native 1920x1080)", "Выключено (нативные 1920×1080)"},
+    {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
+    {"fsr", "AMD FSR 3.1", "AMD FSR 3.1"},
+};
+constexpr Choice kUpscaleQualities[] = {
+    {"native", "Native AA (DLAA / FSR native)", "Нативное сглаживание (DLAA / FSR native)"},
+    {"quality", "Quality (1280x720)", "Качество (1280×720)"},
+    {"balanced", "Balanced (1120x632)", "Баланс (1120×632)"},
+    {"performance", "Performance (960x540)", "Производительность (960×540)"},
+    {"ultra", "Ultra Performance (640x360)", "Ультрапроизводительность (640×360)"},
+};
+constexpr Choice kFrameGenerations[] = {
+    {"off", "Off", "Выключено"},
+    {"fsr", "AMD FSR Frame Generation", "AMD FSR Frame Generation"},
+    {"dlss", "NVIDIA DLSS Frame Generation", "NVIDIA DLSS Frame Generation"},
+};
+constexpr Choice kFrameGenMultipliers[] = {
+    {"2", "x2", "×2"},
+    {"3", "x3 (DLSS, RTX 50)", "×3 (DLSS, RTX 50)"},
+    {"4", "x4 (DLSS, RTX 50)", "×4 (DLSS, RTX 50)"},
+};
 
 // ---- labels of the keyboard/mouse actions (index = Input::Action)
 
@@ -310,17 +332,125 @@ void Build(Registry& r) {
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.particle_resolution; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.particle_resolution = std::get<std::string>(x); },
     });
+    // ------------------------------------------------------------------ Upscaling & frame generation
+    v.push_back(Desc{
+        .id = "upscaling.upscaler", .table = "Graphics", .key = "upscaler", .category = Category::Upscaling,
+        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::RenderScale, .choices = kUpscalers,
+        .en = "Upscaling technology", .ru = "Технология масштабирования",
+        .help_en = "The game renders its 3D scene at the quality's lower resolution and the upscaler rebuilds the "
+                   "1920x1080 picture from it (motion vectors, depth and a sub-pixel jitter of the scene); the HUD is "
+                   "drawn by the game at full resolution on top. DLSS needs a GeForce RTX card; FSR 3.1 runs on any "
+                   "GPU. Off: the game renders at 1920x1080 with its own anti-aliasing.",
+        .help_ru = "Игра рендерит 3D-сцену в пониженном разрешении выбранного качества, а апскейлер восстанавливает "
+                   "из неё картинку 1920×1080 (векторы движения, глубина и субпиксельный сдвиг сцены); интерфейс игра "
+                   "рисует поверх в полном разрешении. DLSS нужна видеокарта GeForce RTX; FSR 3.1 работает на любой. "
+                   "«Выключено» — игра рендерит 1920×1080 со своим сглаживанием.",
+        .why_en = "Only SecondSonPC's own GPU backend (--gpu-backend sspc) has the upscalers.",
+        .why_ru = "Апскейлеры есть только в собственном графическом бэкенде SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.upscaler; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.upscaler = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "upscaling.quality", .table = "Graphics", .key = "upscaleQuality", .category = Category::Upscaling,
+        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::RenderScale, .choices = kUpscaleQualities,
+        .en = "Quality", .ru = "Качество",
+        .help_en = "The render resolution of the scene (output 1920x1080): Quality 1.5x, Balanced 1.7x, Performance 2x, "
+                   "Ultra Performance 3x fewer pixels per side. Lower: faster where the GPU limits the frame rate, "
+                   "softer picture. Native: anti-aliasing only, at full resolution.",
+        .help_ru = "Разрешение рендеринга сцены (вывод 1920×1080): «Качество» в 1,5 раза, «Баланс» в 1,7, "
+                   "«Производительность» в 2, «Ультрапроизводительность» в 3 раза меньше пикселей по стороне. Ниже — "
+                   "быстрее там, где кадр упирается в GPU, и мягче картинка. «Нативное» — только сглаживание в полном "
+                   "разрешении.",
+        .why_en = "Only SecondSonPC's own GPU backend (--gpu-backend sspc) has the upscalers.",
+        .why_ru = "Апскейлеры есть только в собственном графическом бэкенде SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.upscale_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.upscale_quality = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "upscaling.sharpness", .table = "Graphics", .key = "upscaleSharpness", .category = Category::Upscaling,
+        .type = Type::Int, .apply = Apply::Live, .needs = Capability::RenderScale, .min = 0, .max = 100, .ui_min = 0,
+        .ui_max = 100, .step = 5, .unit = "%", .en = "Image sharpness", .ru = "Резкость изображения",
+        .help_en = "Contrast-adaptive sharpening (AMD RCAS) of the upscaled picture: SecondSonPC's after DLSS, FSR's own "
+                   "with FSR. 0: none.",
+        .help_ru = "Контрастно-адаптивное повышение резкости (AMD RCAS) масштабированной картинки: собственное "
+                   "SecondSonPC после DLSS, встроенное в FSR — с FSR. 0 — без него.",
+        .why_en = "Only SecondSonPC's own GPU backend (--gpu-backend sspc) has the upscalers.",
+        .why_ru = "Апскейлеры есть только в собственном графическом бэкенде SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.upscale_sharpness); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.upscale_sharpness = static_cast<u32>(std::get<s64>(x));
+        },
+    });
+    v.push_back(Desc{
+        .id = "upscaling.frameGeneration", .table = "Graphics", .key = "frameGeneration",
+        .category = Category::Upscaling, .type = Type::Choice, .apply = Apply::Restart,
+        .needs = Capability::RenderScale, .choices = kFrameGenerations, .en = "Frame generation",
+        .ru = "Генерация кадров",
+        .help_en = "Generated frames shown between the frames the game renders: the picture moves more smoothly, the "
+                   "game itself runs at the same rate (its physics and timing do not change) and input reacts about "
+                   "one frame later. Needs an upscaler (its depth and motion). FSR: any GPU; DLSS: GeForce RTX 40/50. "
+                   "Paused in menus, loading screens and camera cuts.",
+        .help_ru = "Между кадрами, которые рендерит игра, показываются сгенерированные: картинка движется плавнее, "
+                   "сама игра работает с прежней частотой (физика и тайминги не меняются), ввод реагирует примерно на "
+                   "кадр позже. Нужен апскейлер (его глубина и движение). FSR — любая видеокарта; DLSS — GeForce "
+                   "RTX 40/50. В меню, на загрузках и при сменах камеры приостанавливается.",
+        .why_en = "Only SecondSonPC's own GPU backend (--gpu-backend sspc) has frame generation.",
+        .why_ru = "Генерация кадров есть только в собственном графическом бэкенде SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.frame_generation; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.frame_generation = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "upscaling.frameGenMultiplier", .table = "Graphics", .key = "frameGenMultiplier",
+        .category = Category::Upscaling, .type = Type::Choice, .apply = Apply::Live, .needs = Capability::DlssFrameGen,
+        .choices = kFrameGenMultipliers, .en = "Frame generation multiplier", .ru = "Множитель генерации",
+        .help_en = "Frames shown per rendered frame. x3 and x4 are DLSS Multi Frame Generation (GeForce RTX 50); FSR "
+                   "generates one frame (x2).",
+        .help_ru = "Сколько кадров показывается на каждый отрендеренный. ×3 и ×4 — DLSS Multi Frame Generation "
+                   "(GeForce RTX 50); FSR генерирует один кадр (×2).",
+        .why_en = "x3 / x4 need DLSS Frame Generation, which this GPU or driver does not support (GeForce RTX 40/50, "
+                  "Hardware-accelerated GPU scheduling); FSR Frame Generation is always x2.",
+        .why_ru = "×3/×4 требуют DLSS Frame Generation, которую эта видеокарта или драйвер не поддерживает (GeForce "
+                  "RTX 40/50, аппаратное планирование GPU); FSR Frame Generation всегда ×2.",
+        .get = [](const Config& c, const Desc&) -> Value { return std::to_string(c.pc.frame_gen_multiplier); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.frame_gen_multiplier = static_cast<u32>(std::stoul(std::get<std::string>(x)));
+        },
+    });
+    v.push_back(Desc{
+        .id = "upscaling.reflex", .table = "Graphics", .key = "reflex", .category = Category::Upscaling,
+        .type = Type::Bool, .apply = Apply::Live, .needs = Capability::DlssFrameGen, .en = "NVIDIA Reflex",
+        .ru = "NVIDIA Reflex",
+        .help_en = "NVIDIA Reflex low latency with DLSS Frame Generation: less input delay, possibly a lower frame rate "
+                   "when the GPU is saturated.",
+        .help_ru = "Режим низкой задержки NVIDIA Reflex с DLSS Frame Generation: меньше задержка ввода, возможно, "
+                   "меньше FPS, когда GPU загружен полностью.",
+        .why_en = "Reflex comes with DLSS Frame Generation (Streamline), which this GPU or driver does not support.",
+        .why_ru = "Reflex работает вместе с DLSS Frame Generation (Streamline), которую эта видеокарта или драйвер не "
+                  "поддерживает.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.reflex; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.reflex = std::get<bool>(x); },
+    });
+    v.push_back(Desc{
+        .id = "upscaling.output", .category = Category::Upscaling, .type = Type::Bool, .apply = Apply::Unavailable,
+        .en = "Output resolution: 1920x1080", .ru = "Выходное разрешение: 1920×1080",
+        .why_en = "The upscaler writes the game's own 1920x1080 display buffer, under the game's UI; the window then "
+                  "scales that picture. A larger output needs the game's display size and UI layout changed (not "
+                  "researched).",
+        .why_ru = "Апскейлер пишет в собственный буфер дисплея игры 1920×1080, под её интерфейс; окно затем "
+                  "масштабирует эту картинку. Больший вывод требует изменить размер дисплея и раскладку интерфейса "
+                  "игры (не исследовано).",
+    });
     struct Missing {
         std::string_view id, en, ru, why_en, why_ru;
         u32 cap;
     };
     constexpr Missing kMissing[] = {
         {"graphics.renderScale", "Render resolution", "Разрешение рендеринга",
-         "The game's render targets are fixed at 1920x1080; another size means recreating the targets and scaling "
-         "the viewports in SecondSonPC's backend (P4.6+). The window only scales the finished frame now.",
-         "Цели рендеринга игры фиксированы на 1920×1080; другой размер требует пересоздания целей и масштабирования "
-         "вьюпортов в собственном бэкенде (P4.6+). Сейчас окно только масштабирует готовый кадр.",
-         Capability::RenderScale},
+         "Set by the upscaler's quality (Upscaling & frame generation): the scene is rendered smaller only when an "
+         "upscaler rebuilds the picture.",
+         "Задаётся качеством апскейлера (раздел «Масштабирование и генерация кадров»): сцена рендерится меньше "
+         "только тогда, когда апскейлер восстанавливает картинку.",
+         0},
         {"graphics.textures", "Texture quality", "Качество текстур",
          "The game loads one set of textures; another quality needs replaced resources or filtering in the backend "
          "(not researched).",
@@ -344,11 +474,6 @@ void Build(Registry& r) {
         {"graphics.depthOfField", "Depth of field", "Глубина резкости",
          "The game has no such option; turning it off means changing the game's shaders (not researched).",
          "В игре нет такого параметра; отключение — правка шейдеров игры (не исследовано).", 0},
-        {"graphics.upscaler", "DLSS / FSR 2+ / XeSS", "DLSS / FSR 2+ / XeSS",
-         "Temporal upscalers need motion vectors and depth from the game and SecondSonPC's own backend: a phase of its "
-         "own.",
-         "Временным масштабировщикам нужны векторы движения и глубина от игры и собственный бэкенд — отдельная фаза.",
-         0},
     };
     for (const auto& m : kMissing) {
         v.push_back(Desc{.id = m.id, .category = Category::Graphics, .type = Type::Bool, .apply = Apply::Unavailable,
@@ -676,17 +801,17 @@ const Desc* FindByKey(std::string_view table, std::string_view key) {
 std::string_view CategoryId(Category category) {
     constexpr std::array<std::string_view, kCategoryCount> kIds{"display",  "graphics", "audio",     "controls",
                                                                 "keyboard", "gamepad",  "interface", "game",
-                                                                "shaders"};
+                                                                "shaders",  "upscaling"};
     return kIds[static_cast<size_t>(category)];
 }
 
 std::string_view CategoryLabel(Category category, bool ru) {
     constexpr std::array<std::string_view, kCategoryCount> kEn{"Display", "Graphics", "Audio",     "Mouse",
                                                                "Keys",    "Controller", "Interface", "Game",
-                                                               "Shaders & cache"};
+                                                               "Shaders & cache", "Upscaling & frame generation"};
     constexpr std::array<std::string_view, kCategoryCount> kRu{"Экран",   "Графика",   "Звук",      "Мышь",
                                                                "Клавиши", "Геймпад",   "Интерфейс", "Игра",
-                                                               "Шейдеры и кэш"};
+                                                               "Шейдеры и кэш", "Масштабирование и генерация кадров"};
     return (ru ? kRu : kEn)[static_cast<size_t>(category)];
 }
 

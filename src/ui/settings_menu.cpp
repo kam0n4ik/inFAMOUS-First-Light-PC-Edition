@@ -37,7 +37,7 @@ constexpr Color kKeycapLine{86, 95, 115, 255};
 constexpr Color kGlyphBg{38, 42, 54, 255};
 constexpr Color kShade{0, 0, 0, 150};
 
-constexpr Category kOrder[] = {Category::Display,  Category::Graphics, Category::Audio,     Category::Controls,
+constexpr Category kOrder[] = {Category::Display,  Category::Graphics, Category::Upscaling, Category::Audio,     Category::Controls,
                                Category::Keyboard, Category::Gamepad,  Category::Interface, Category::Shaders,
                                Category::Game};
 constexpr u64 kConfirmCommandNs = 5'000'000'000;

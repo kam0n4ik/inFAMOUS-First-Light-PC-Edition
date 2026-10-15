@@ -14,6 +14,7 @@ enum class Backend : u8 { Off, Dlss, Fsr };
 /// The usual per-side scale factors: Native (DLAA / FSR Native AA) 1.0, Quality 1.5, Balanced 1.72, Performance 2.0,
 /// Ultra Performance 3.0.
 enum class Quality : u8 { Native, Quality, Balanced, Performance, UltraPerformance };
+enum class FrameGen : u8 { Off, Fsr, Dlss };
 
 float ScaleOf(Quality q);
 const char* BackendName(Backend b);
@@ -26,7 +27,14 @@ struct Settings {
     Quality quality = Quality::Quality;
     float sharpness = 0.5f; ///< 0..1
     bool jitter = true;     ///< sub-pixel jitter of the scene's geometry (off: diagnostics only)
+    FrameGen frame_gen = FrameGen::Off;
+    u32 fg_multiplier = 2; ///< frames shown per rendered frame (2..4)
+    bool reflex = true;
 };
+/// The settings menu's / SecondSonPC.toml's values ([Graphics] upscaler, upscaleQuality, upscaleSharpness,
+/// frameGeneration, frameGenMultiplier, reflex) as the runtime's settings.
+void ApplyConfig(std::string_view upscaler, std::string_view quality, u32 sharpness_percent,
+                 std::string_view frame_generation, u32 fg_multiplier, bool reflex);
 void SetSettings(const Settings& s);
 Settings GetSettings();
 /// SSPC_UPSCALER=off|dlss|fsr, SSPC_UPSCALE_QUALITY=native|quality|balanced|performance|ultra, SSPC_UPSCALE_SHARPNESS=
@@ -48,6 +56,8 @@ void GetRenderSize(u32& width, u32& height);
 /// What runs, for the settings menu and the logs (any thread).
 struct Status {
     bool dlss_available = false, fsr_available = false;
+    bool fsr_fg_available = false, dlss_fg_available = false; ///< frame generation (found when the backend started)
+    std::string fsr_fg_why, dlss_fg_why;
     std::string dlss_why, fsr_why; ///< why one is not available
     Backend active = Backend::Off; ///< the upscaler of the last frame (Off: none ran)
     std::string reason;            ///< why none ran, if one was chosen
