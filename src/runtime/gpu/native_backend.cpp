@@ -343,6 +343,15 @@ private:
     std::chrono::steady_clock::time_point pc_saved_at_{};
     std::unique_ptr<Vk::PipelineFactory> pipelines_;
     std::unique_ptr<Vk::Presenter> presenter_;
+
+public:
+    void SetFrameGen(bool on) {
+        if (presenter_) {
+            presenter_->SetFrameGen(on);
+        }
+    }
+
+private:
     std::unique_ptr<GS::ShaderFrontend> frontend_;
     std::unique_ptr<Vk::Executor> executor_;
     std::unique_ptr<Cp::CommandProcessor> cp_;
@@ -1951,6 +1960,12 @@ ShaderCacheInfo CacheInfo() {
 
 bool Running() {
     return g_backend != nullptr;
+}
+
+void SetFrameGen(bool on) {
+    if (g_backend != nullptr) {
+        g_backend->SetFrameGen(on);
+    }
 }
 
 std::string Report() {

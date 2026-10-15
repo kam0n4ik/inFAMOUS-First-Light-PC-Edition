@@ -368,6 +368,11 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
             return nullptr;
         }
         denable.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+        // NVIDIA Reflex: the driver's low latency mode on the swapchain, frames tied together by their present ids
+        if (Has(dexts, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && Has(dexts, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+            denable.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+            denable.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+        }
     }
     for (const char* e : kWantedExtensions) {
         if (Has(dexts, e)) {
@@ -448,6 +453,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
 
     // --- features: every one the device has among those the translated code and the backend use (queried, then
     // passed back; the chain only holds structures of enabled extensions)
+    VkPhysicalDevicePresentIdFeaturesKHR present_id{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swap_maintenance{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT rob{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -493,6 +499,9 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     };
     if (options.presentation) {
         link(swap_maintenance);
+    }
+    if (enabled(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
+        link(present_id);
     }
     link(rob);
     link(div);
@@ -546,6 +555,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     }
     f.vkGetPhysicalDeviceFeatures2(pd, &f2);
     caps.swapchain_maintenance1 = options.presentation && swap_maintenance.swapchainMaintenance1 == VK_TRUE;
+    caps.low_latency = enabled(VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && present_id.presentId == VK_TRUE;
     if (options.presentation && !caps.swapchain_maintenance1) {
         error = "native presentation requires the swapchainMaintenance1 feature";
         return nullptr;
@@ -612,7 +622,8 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
                  VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
                  VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV};
     // frame generation (FSR 3.1) presents and acquires on queues of its own, and may use async compute
-    const bool fg_queues = options.presentation && Upscale::GetSettings().frame_gen == Upscale::FrameGen::Fsr;
+    // (always when presenting: frame generation can be turned on while the game runs)
+    const bool fg_queues = options.presentation;
     const u32 main_count = fg_queues ? std::min<u32>(3, qf[ctx->family_].queueCount) : 1;
     u32 compute_family = ~0u;
     if (fg_queues) {

@@ -54,6 +54,7 @@
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "bridge/shadps4/settings_host.h"
+#include "runtime/gpu/upscale/reflex.h"
 #include "ui/menu_controller.h"
 #include "bridge/shadps4/track_diag.h"
 #include "engine/guest_hooks.h"
@@ -790,6 +791,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
             if (Gpu::Upscale::GetStatus().dlss_fg_available) {
                 caps |= Cap::DlssFrameGen;
             }
+            if (Gpu::Reflex::Available()) {
+                caps |= Cap::Reflex;
+            }
             Settings::Instance().SetCapabilities(caps);
         }
     }
@@ -845,46 +849,21 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // size (the engine's own render size, written before it starts); the display and the UI stay 1920x1080.
     {
         Gpu::Upscale::ApplyEnvironmentOverrides();
-        Gpu::Upscale::Settings us = Gpu::Upscale::GetSettings();
-        Engine::Render::RenderSize rs = Engine::Render::kDisplaySize;
-        // the upscaler must be able to run, else the scene would only be stretched: DLSS needs NGX on the device (known
-        // since the backend started), FSR its DLL
-        std::string unavailable;
-        if (native_gpu && us.backend == Gpu::Upscale::Backend::Dlss && !Gpu::Upscale::GetStatus().dlss_available) {
-            unavailable = "DLSS unavailable: " + Gpu::Upscale::GetStatus().dlss_why;
-        } else if (native_gpu && us.backend == Gpu::Upscale::Backend::Fsr) {
-            wchar_t exe[MAX_PATH] = {};
-            GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            if (!std::filesystem::is_regular_file(std::filesystem::path(exe).parent_path() / L"amd_fidelityfx_vk.dll")) {
-                unavailable = "FSR unavailable: amd_fidelityfx_vk.dll is not next to SecondSonPC.exe";
-            }
-        }
-        if (!unavailable.empty()) {
-            SSPC_LOG(Loader, Warning, "Upscaling: {} - the scene renders at the native size", unavailable);
-            Gpu::Upscale::UpdateStatus([&](Gpu::Upscale::Status& st) { st.reason = unavailable; });
-        } else if (native_gpu && us.backend != Gpu::Upscale::Backend::Off) {
-            rs = Engine::Render::RenderSizeForScale(Gpu::Upscale::ScaleOf(us.quality));
-        } else if (!native_gpu && us.backend != Gpu::Upscale::Backend::Off) {
+        // the game starts at the native size (its targets' memory is allocated for it at start; a smaller size is
+        // switched to at its first frame and back whenever the menu changes - SSPC_RENDER_RES=WxH: a fixed start size,
+        // diagnostics)
+        Engine::Render::InstallRenderResolution(linker.GetModule(eboot_index)->Base(), Engine::Render::kDisplaySize);
+        if (native_gpu) {
+            Engine::Render::InstallTemporalAaControl(linker.GetModule(eboot_index)->Base());
+            Engine::Render::InstallRenderSwitch(linker.GetModule(eboot_index)->Base());
+            Bridge::ApplyUpscaling(true);
+        } else if (Gpu::Upscale::GetSettings().backend != Gpu::Upscale::Backend::Off) {
             SSPC_LOG(Loader, Warning, "Upscaling ({}) needs SecondSonPC's GPU backend (--gpu-backend sspc): off",
-                     Gpu::Upscale::BackendName(us.backend));
+                     Gpu::Upscale::BackendName(Gpu::Upscale::GetSettings().backend));
+            Gpu::Upscale::Settings us = Gpu::Upscale::GetSettings();
             us.backend = Gpu::Upscale::Backend::Off;
             Gpu::Upscale::SetSettings(us);
         }
-        Engine::Render::InstallRenderResolution(linker.GetModule(eboot_index)->Base(), rs);
-        // the game's SMAA T2x (its own camera jitter, a two-frame blend) off while an upscaler jitters the scene;
-        // SSPC_UPSCALE_GAME_TAA=1 keeps it (diagnostics)
-        const bool upscaling = native_gpu && unavailable.empty() && us.backend != Gpu::Upscale::Backend::Off;
-        char gt[4] = {};
-        const bool keep_taa = GetEnvironmentVariableA("SSPC_UPSCALE_GAME_TAA", gt, sizeof(gt)) == 1 && gt[0] == '1';
-        Engine::Render::SetTemporalAaOff(upscaling && !keep_taa);
-        if (native_gpu) {
-            Engine::Render::InstallTemporalAaControl(linker.GetModule(eboot_index)->Base());
-        }
-        const Engine::Render::RenderSize applied = Engine::Render::CurrentRenderSize();
-        Gpu::Upscale::SetRenderSize(applied.width, applied.height);
-        SSPC_LOG(Loader, Info, "Upscaling: {} {}, scene {}x{} -> display {}x{}", Gpu::Upscale::BackendName(us.backend),
-                 Gpu::Upscale::QualityName(us.quality), applied.width, applied.height,
-                 Engine::Render::kDisplaySize.width, Engine::Render::kDisplaySize.height);
     }
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
@@ -1327,9 +1306,7 @@ void RunGame(const App::Config& cfg) {
         Gpu::Upscale::ApplyConfig(cfg.pc.upscaler, cfg.pc.upscale_quality, cfg.pc.upscale_sharpness,
                                   cfg.pc.frame_generation, cfg.pc.frame_gen_multiplier, cfg.pc.reflex);
         Gpu::Upscale::ApplyEnvironmentOverrides();
-        if (Gpu::Upscale::GetSettings().backend == Gpu::Upscale::Backend::Dlss) {
-            Gpu::Upscale::ReserveCudaWindow();
-        }
+        Gpu::Upscale::ReserveCudaWindow(); // (DLSS may be chosen in the menu while the game runs)
     }
     // The guest memory's manager, chosen before anything reaches it (patch 0012): the bridge's by default,
     // SecondSonPC's own with --native memory (P2.3.4), which takes the address space right here.

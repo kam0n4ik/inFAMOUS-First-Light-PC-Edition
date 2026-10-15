@@ -65,6 +65,8 @@ bool Start(const Options& options, std::string& error);
 /// Stops the threads, waits for the device, releases the resources (the process's exit step). Idempotent.
 void Stop();
 bool Running();
+/// FSR frame generation on / off while the game runs (the settings menu; the presenter switches its swapchain).
+void SetFrameGen(bool on);
 /// A summary of what the backend did (also written to <logs>\gpu_native.txt at Stop).
 std::string Report();
 

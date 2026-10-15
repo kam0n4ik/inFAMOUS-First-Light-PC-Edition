@@ -38,6 +38,7 @@ struct Executor::UpscaleState {
     UpscaleImage sharpened; ///< the output after RCAS (DLSS with sharpness > 0)
     UpscaleImage hudless;   ///< frame generation: the display buffer after the scene, before the UI
     bool hudless_taken = false;
+    u32 frame_rw = 0, frame_rh = 0; ///< this frame's render size (its velocity pass; the size changes live)
     bool flip_done = false, flip_jitter = false, flip_reset = false; ///< the frame Flip hands over
     float flip_jx = 0.0f, flip_jy = 0.0f;
     VkDescriptorSetLayout rcas_set = VK_NULL_HANDLE;

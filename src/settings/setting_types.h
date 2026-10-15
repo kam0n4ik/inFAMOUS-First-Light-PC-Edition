@@ -54,6 +54,7 @@ constexpr u32 NativeFpsOverlay = 1u << 10;
 constexpr u32 Dlss = 1u << 11;         // DLSS Super Resolution (GeForce RTX, NGX)
 constexpr u32 FsrFrameGen = 1u << 12;  // FSR 3.1 frame generation (amd_fidelityfx_vk.dll)
 constexpr u32 DlssFrameGen = 1u << 13; // DLSS Frame Generation (Streamline, GeForce RTX 40/50)
+constexpr u32 Reflex = 1u << 14;       // NVIDIA Reflex (VK_NV_low_latency2: GeForce, a recent driver)
 } // namespace Capability
 
 struct Choice {

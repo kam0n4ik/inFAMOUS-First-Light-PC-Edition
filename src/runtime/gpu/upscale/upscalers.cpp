@@ -207,6 +207,10 @@ void ApplyEnvironmentOverrides() {
         s.jitter = false;
         any = true;
     }
+    if (const std::string v = env("SSPC_REFLEX"); v == "0" || v == "1") { // NVIDIA Reflex off / on
+        s.reflex = v == "1";
+        any = true;
+    }
     if (any) {
         SetSettings(s);
         SSPC_LOG(GPU, Warning, "Upscaling from the environment: {} {}, sharpness {:.2f}, jitter {}", BackendName(s.backend),

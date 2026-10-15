@@ -169,7 +169,11 @@ namespace SecondSon::Gpu::Vk {
     X(vkGetQueueCheckpointDataNV)                                                                                      \
     X(vkCmdWriteBufferMarkerAMD)                                                                                       \
     X(vkGetDeviceFaultInfoEXT)                                                                                         \
-    X(vkGetCalibratedTimestampsEXT)
+    X(vkGetCalibratedTimestampsEXT)                                                                                   \
+    X(vkSetLatencySleepModeNV)                                                                                        \
+    X(vkLatencySleepNV)                                                                                               \
+    X(vkSetLatencyMarkerNV)                                                                                           \
+    X(vkGetLatencyTimingsNV)
 
 #define SSPC_VKA_MEMBER(name) PFN_##name name = nullptr;
 

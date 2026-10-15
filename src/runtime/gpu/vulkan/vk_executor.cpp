@@ -25,6 +25,7 @@
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/vulkan/vk_reflex.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_capture.h"
@@ -764,7 +765,9 @@ void Executor::Flush() {
                                          .semaphore = bind_sem,
                                          .value = bind_value,
                                          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        VkLatencySubmissionPresentIdNV latency{}; // (NVIDIA Reflex: the GPU work of the frame being recorded)
         const VkSubmitInfo2 si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                               .pNext = Reflex::SubmitChain(VideoOut::NextFlipId(), latency),
                                .waitSemaphoreInfoCount = bind_sem != VK_NULL_HANDLE ? 1u : 0u,
                                .pWaitSemaphoreInfos = &wait,
                                .commandBufferInfoCount = n_cb,
@@ -5133,7 +5136,11 @@ void Executor::Flip(const Cp::FlipMarker&) {
     const u64 value = open_ ? cur_.value : timeline_.LastSubmitted();
     ++stats_.flushes_flip;
     Flush();
-    if (VideoOut::OnFlipMarker(value, frame) && flip_hook_ != nullptr) {
+    const bool flipped = VideoOut::OnFlipMarker(value, frame);
+    if (flipped) {
+        Reflex::RenderSubmitEnd(VideoOut::NextFlipId() - 1); // (NVIDIA Reflex: the frame's commands are submitted)
+    }
+    if (flipped && flip_hook_ != nullptr) {
         flip_hook_(flip_ctx_, value);
         if (insp_catalog_ != nullptr) {
             insp_frame_ends_.push_back({insp_frame_, value}); // (Poll hands its GPU time on once it completed)

@@ -615,6 +615,8 @@ bool Started() {
     return g_started.load(std::memory_order_acquire);
 }
 
+std::atomic<u64> g_requested_flips{0}; ///< SubmitEopFlip's requests (RequestedFlips)
+
 s32 SubmitEopFlip(s32 handle, u32 index, u32 flip_mode, s64 flip_arg) {
     Port* port = GetPort(handle);
     if (port == nullptr) {
@@ -641,6 +643,7 @@ s32 SubmitEopFlip(s32 handle, u32 index, u32 flip_mode, s64 flip_arg) {
     ++port->flip.flip_pending_num;
     port->flip.submit_tsc = Tsc();
     port->pending_eop.push_back({index, flip_arg});
+    g_requested_flips.fetch_add(1, std::memory_order_release);
     std::scoped_lock s{g_stats_mutex};
     ++g_stats.flips_requested;
     return 0;
@@ -669,6 +672,10 @@ bool IsDisplayBuffer(u64 address) {
         }
     }
     return false;
+}
+
+u64 RequestedFlips() {
+    return g_requested_flips.load(std::memory_order_acquire);
 }
 
 u64 NextFlipId() {

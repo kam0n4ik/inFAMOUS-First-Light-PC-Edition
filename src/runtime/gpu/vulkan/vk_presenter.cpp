@@ -4,6 +4,7 @@
 #include "runtime/gpu/vulkan/vk_presenter.h"
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -18,6 +19,7 @@
 #include "runtime/gpu/png_writer.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/upscale/fsr_framegen.h"
+#include "runtime/gpu/vulkan/vk_reflex.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
@@ -253,6 +255,8 @@ struct Presenter::Impl {
 
     // FSR 3.1 frame generation (null: off): per frame its inputs, the HUD-less frame at the backbuffer's size
     std::unique_ptr<Upscale::FsrFrameGen> fg;
+    std::atomic<bool> fg_active{false}; ///< fg != null (read by the recording thread)
+    std::atomic<int> fg_wanted{-1};     ///< SetFrameGen: 0 off, 1 on, -1 nothing asked (the present thread switches)
     struct FgFrame {
         OwnImage depth, motion, hudless;
         bool valid = false;
@@ -362,7 +366,12 @@ struct Presenter::Impl {
             fg->DestroySwapchain(swapchain);
             swapchain = VK_NULL_HANDLE;
         }
+        // NVIDIA Reflex works on this swapchain (not on frame generation's: its own presents)
+        const VkSwapchainLatencyCreateInfoNV latency{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV,
+                                                     .latencyModeEnable = VK_TRUE};
+        const bool reflex = !fg && ctx.Caps().low_latency;
         const VkSwapchainCreateInfoKHR sci{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+                                           .pNext = reflex ? &latency : nullptr,
                                            .surface = surface,
                                            .minImageCount = count,
                                            .imageFormat = fmt.format,
@@ -387,6 +396,11 @@ struct Presenter::Impl {
             return false;
         }
         DestroySwapchainObjects();
+        if (reflex) {
+            Reflex::Attach(created); // (the old one is no longer used by it)
+        } else {
+            Reflex::Detach(old);
+        }
         if (old != VK_NULL_HANDLE) {
             f.vkDestroySwapchainKHR(ctx.Device(), old, nullptr);
         }
@@ -448,6 +462,68 @@ struct Presenter::Impl {
         std::scoped_lock lock{stats_mutex};
         ++stats.swapchain_recreated;
         return true;
+    }
+
+    /// FSR 3.1 frame generation's context (it owns the swapchain): its own present and acquire queues.
+    bool CreateFrameGen(std::string& why) {
+        Upscale::FsrFrameGen::Queues q;
+        q.game = {ctx.Queue(), ctx.QueueFamily()};
+        q.present = {ctx.ExtraQueue(0), ctx.QueueFamily()};
+        q.acquire = {ctx.ExtraQueue(1), ctx.QueueFamily()};
+        q.compute = {ctx.ComputeQueue(), ctx.ComputeFamily()};
+        if (q.present.queue == VK_NULL_HANDLE || q.acquire.queue == VK_NULL_HANDLE) {
+            why = "the graphics queue family has no spare queues for its presents";
+            return false;
+        }
+        fg = Upscale::FsrFrameGen::Create(ctx.Physical(), ctx.Device(), q, Fn().vkGetDeviceProcAddr, why);
+        return fg != nullptr;
+    }
+
+    /// The settings menu turned frame generation on or off: the swapchain is replaced by one of the other kind (the
+    /// present thread, between two presents; every present slot retired first).
+    void SwitchFrameGen(bool on) {
+        if (on == (fg != nullptr) || ctx.Failed()) {
+            return;
+        }
+        for (auto& s : slots) {
+            if (!WaitSlot(s)) {
+                return;
+            }
+        }
+        Fn().vkDeviceWaitIdle(ctx.Device());
+        DestroySwapchainObjects();
+        Reflex::Detach(swapchain);
+        if (swapchain != VK_NULL_HANDLE) {
+            if (fg) {
+                fg->DestroySwapchain(swapchain);
+            } else {
+                Fn().vkDestroySwapchainKHR(ctx.Device(), swapchain, nullptr);
+            }
+            swapchain = VK_NULL_HANDLE;
+        }
+        std::string why;
+        if (on) {
+            if (!CreateFrameGen(why)) {
+                SSPC_LOG(GPU, Warning, "native presenter: FSR frame generation unavailable: {}", why);
+            }
+        } else {
+            fg_active.store(false, std::memory_order_release);
+            fg.reset();
+        }
+        for (auto& g : fg_frames) {
+            g.valid = false;
+        }
+        std::string error;
+        if (!CreateSwapchain(error)) {
+            SSPC_LOG(GPU, Error, "native presenter: swapchain after switching frame generation: {}", error);
+        }
+        fg_active.store(fg != nullptr, std::memory_order_release);
+        Upscale::UpdateStatus([&](Upscale::Status& st) {
+            st.fsr_fg_available = !on || fg != nullptr;
+            st.fsr_fg_why = why;
+        });
+        SSPC_LOG(GPU, Info, "native presenter: FSR frame generation {} (swapchain {}x{})",
+                 fg ? "on" : (on ? "unavailable: " + why : std::string("off")), extent.width, extent.height);
     }
 
     void DestroyFrame(Frame& fr) {
@@ -718,13 +794,7 @@ std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timel
     // FSR 3.1 frame generation (chosen at start; it owns the swapchain): its own present and acquire queues
     if (Upscale::GetSettings().frame_gen == Upscale::FrameGen::Fsr) {
         std::string why;
-        Upscale::FsrFrameGen::Queues q;
-        q.game = {ctx.Queue(), ctx.QueueFamily()};
-        q.present = {ctx.ExtraQueue(0), ctx.QueueFamily()};
-        q.acquire = {ctx.ExtraQueue(1), ctx.QueueFamily()};
-        q.compute = {ctx.ComputeQueue(), ctx.ComputeFamily()};
-        impl->fg = Upscale::FsrFrameGen::Create(ctx.Physical(), ctx.Device(), q, Fn().vkGetDeviceProcAddr, why);
-        if (!impl->fg) {
+        if (!impl->CreateFrameGen(why)) {
             SSPC_LOG(GPU, Warning, "native presenter: FSR frame generation unavailable: {}", why);
         }
         Upscale::UpdateStatus([&](Upscale::Status& st) {
@@ -735,10 +805,12 @@ std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timel
         // (not chosen: it would be available where the DLL and a second queue are)
         Upscale::UpdateStatus([&](Upscale::Status& st) { st.fsr_fg_available = true; });
     }
+    Reflex::Init(ctx.Device(), ctx.Caps().low_latency);
     if (!impl->CreateSwapchain(error)) {
         Presenter tmp(std::move(impl)); // destroys what was made
         return nullptr;
     }
+    impl->fg_active.store(impl->fg != nullptr, std::memory_order_release);
     SSPC_LOG(GPU, Info, "native presenter: swapchain {}x{} on the game window, format {}, present mode {}",
              impl->extent.width, impl->extent.height, static_cast<int>(impl->swap_format), static_cast<int>(impl->mode));
     return std::unique_ptr<Presenter>(new Presenter(std::move(impl)));
@@ -783,6 +855,7 @@ Presenter::~Presenter() {
         DestroyOwn(m.ctx, g.hudless);
     }
     DestroyOwn(m.ctx, m.fg_hudless_bb);
+    Reflex::Detach(m.swapchain);
     if (m.swapchain != VK_NULL_HANDLE) {
         if (m.fg) {
             f.vkDeviceWaitIdle(m.ctx.Device());
@@ -921,6 +994,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     };
     if (m.ctx.Failed()) {
         return;
+    }
+    if (const int want = m.fg_wanted.exchange(-1, std::memory_order_acq_rel); want >= 0) {
+        m.SwitchFrameGen(want == 1);
     }
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(m.window, &w, &h);
@@ -1171,8 +1247,14 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         r = m.ctx.Failed() ? m.ctx.Failure() : f.vkQueueSubmit2(m.ctx.Queue(), 1, &si, s.fence);
         if (r == VK_SUCCESS) {
             s.submitted = true;
+            // NVIDIA Reflex: the present carries the frame's id (its flip id), as its markers do
+            const bool reflex = !m.fg && Reflex::Attached();
+            const VkPresentIdKHR present_id{.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+                                            .swapchainCount = 1,
+                                            .pPresentIds = &flip_id};
             const VkSwapchainPresentFenceInfoEXT pf{
                 .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT,
+                .pNext = reflex ? &present_id : nullptr,
                 .swapchainCount = 1, .pFences = &s.present_fence};
             const VkPresentInfoKHR pi{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                                       .pNext = &pf,
@@ -1186,7 +1268,13 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                 fpi.pNext = nullptr;
                 pr = m.fg->Present(m.ctx.Queue(), fpi);
             } else {
+                if (reflex) {
+                    Reflex::PresentMarker(true, flip_id);
+                }
                 pr = f.vkQueuePresentKHR(m.ctx.Queue(), &pi);
+                if (reflex) {
+                    Reflex::PresentMarker(false, flip_id);
+                }
             }
             // WSI errors below still enqueue semaphore waits and the present fence.
             s.present_pending = !m.fg && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
@@ -1255,12 +1343,16 @@ void Presenter::Present(s32 frame, u64 flip_id) {
 }
 
 bool Presenter::FrameGenActive() const {
-    return impl_->fg != nullptr;
+    return impl_->fg_active.load(std::memory_order_acquire);
+}
+
+void Presenter::SetFrameGen(bool on) {
+    impl_->fg_wanted.store(on ? 1 : 0, std::memory_order_release);
 }
 
 bool Presenter::RecordFrameGenInputs(VkCommandBuffer cb, s32 frame, const FrameGenSource& src) {
     Impl& m = *impl_;
-    if (!m.fg || frame < 0 || frame >= static_cast<s32>(kFrames)) {
+    if (!m.fg_active.load(std::memory_order_acquire) || frame < 0 || frame >= static_cast<s32>(kFrames)) {
         return false;
     }
     Impl::FgFrame& g = m.fg_frames[frame];

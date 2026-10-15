@@ -53,6 +53,7 @@ struct DeviceCaps {
     bool image_view_min_lod = false;
     bool maintenance5 = false;
     bool swapchain_maintenance1 = false; ///< present fences: required for safe native presentation teardown
+    bool low_latency = false; ///< VK_NV_low_latency2 + the presentId feature (NVIDIA Reflex)
     bool debug_utils = false;
     /// SSPC_GPU_MARKERS=1 (P4.6-G6, diagnostic): debug labels around the recorded commands and object names, for a
     /// GPU profiler's capture (NVIDIA Nsight Graphics GPU Trace) to be read by pass/pipeline; needs VK_EXT_debug_utils

@@ -61,6 +61,9 @@ public:
     bool RecordFrameGenInputs(VkCommandBuffer cb, s32 frame, const FrameGenSource& src);
     /// Frame generation runs (the FSR swapchain exists): the executor gathers its inputs.
     bool FrameGenActive() const;
+    /// FSR frame generation on or off while the game runs (the settings menu): the present thread replaces the
+    /// swapchain before its next present.
+    void SetFrameGen(bool on);
 
     /// Present thread: shows `frame` (or black for -1). The frame is free again once the presentation's commands
     /// completed.

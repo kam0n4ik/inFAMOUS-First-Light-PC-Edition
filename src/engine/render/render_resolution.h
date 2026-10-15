@@ -30,8 +30,16 @@ RenderSize RenderSizeForScale(float scale);
 /// 1920x1080 leaves the code untouched. Returns false and logs why when the code is not the analysed one.
 bool InstallRenderResolution(u64 eboot_base, RenderSize size);
 
-/// The render size the game was started with (1920x1080 when not patched).
+/// The scene's render size now (the size the game started with, then the last switch).
 RenderSize CurrentRenderSize();
+
+/// The render size changed while the game runs (the PS4 Pro's mode switch path): an entry probe on FrameBegin
+/// 0x1f0be0 writes a requested size into the device and its size-class table and re-describes the display and scene
+/// targets (0x300b00, 0x18e210) before the frame starts. Their memory is the one allocated at start: sizes up to the
+/// started one. Install in the loader's window (before the guest runs), after InstallRenderResolution.
+bool InstallRenderSwitch(u64 eboot_base);
+/// Asks for `size` (clamped to the started size) at the game's next frame. false: the switch is not installed.
+bool RequestRenderSize(RenderSize size);
 
 /// The game's temporal anti-aliasing (SMAA T2x) off while `off` is set: its camera jitter and two-frame blend would
 /// take the place of the upscaler's own jitter and smear its input. CameraJitter 0x472810 runs every frame: while the

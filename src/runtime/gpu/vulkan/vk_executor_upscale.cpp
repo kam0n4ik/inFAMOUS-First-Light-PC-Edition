@@ -326,6 +326,8 @@ void Executor::UpscaleOnTargets(const Cp::DrawDescriptor& d, const std::array<Ca
         u.scene_depth_addr = u.vel_depth->layout.guest_address;
         std::string err;
         const u32 w = u.vel_depth->layout.size.width, h = u.vel_depth->layout.size.height;
+        u.frame_rw = w;
+        u.frame_rh = h;
         const bool ok =
             EnsureImage(ctx_, u.depth, VK_FORMAT_R32_SFLOAT, w, h,
                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -414,8 +416,7 @@ void Executor::UpscaleOnTargets(const Cp::DrawDescriptor& d, const std::array<Ca
         jitter_draw_ = true;
         jitter_x_ = u.frame_jx;
         jitter_y_ = u.frame_jy;
-        u32 rw = 0, rh = 0;
-        Upscale::GetRenderSize(rw, rh);
+        const u32 rw = depth->layout.size.width; // (the scene depth: this frame's render size)
         // textures of the scene at the output's detail: the upscaler rebuilds it from the jittered samples
         lod_bias_ = u.last_out_w > rw && rw != 0 ? std::log2(static_cast<float>(rw) / static_cast<float>(u.last_out_w))
                                                  : 0.0f;
@@ -431,8 +432,11 @@ void Executor::UpscaleDisplayDraw(const std::array<CachedImage*, 8>& color,
     up_display_draw_ = false;
     UpscaleState& u = *up_;
     const Upscale::Settings s = Upscale::GetSettings();
-    u32 rw = 0, rh = 0;
-    Upscale::GetRenderSize(rw, rh);
+    // this frame's render size: its velocity pass's (frames recorded before a size change keep theirs)
+    u32 rw = u.frame_rw, rh = u.frame_rh;
+    if (rw == 0) {
+        Upscale::GetRenderSize(rw, rh);
+    }
     // the scene this draw samples: a GPU-written RGBA8 texture of the render size
     const UpscaleSampled* scene = nullptr;
     for (const UpscaleSampled& t : up_sampled_) {
@@ -820,8 +824,7 @@ void Executor::UpscaleFrameGenInputs(s32 frame, CachedImage* display) {
     if (!taken) {
         return;
     }
-    u32 rw = 0, rh = 0;
-    Upscale::GetRenderSize(rw, rh);
+    const u32 rw = u.depth.width, rh = u.depth.height; // (this frame's render size)
     Presenter::FrameGenSource src;
     src.depth = u.depth.image;
     src.motion = u.motion.image;
@@ -879,8 +882,10 @@ void Executor::UpscaleOnFlip() {
         u.frame_jx = u.frame_jy = 0.0f;
         return;
     }
-    u32 rw = 0, rh = 0;
-    Upscale::GetRenderSize(rw, rh);
+    u32 rw = u.frame_rw, rh = u.frame_rh; // (the last frame's size: a change shows one frame later)
+    if (rw == 0) {
+        Upscale::GetRenderSize(rw, rh);
+    }
     ++u.jitter_index;
     Upscale::Jitter(u.jitter_index, rw, std::max<u32>(u.last_out_w, rw), u.frame_jx, u.frame_jy);
 }

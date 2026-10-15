@@ -68,6 +68,8 @@ bool OnFlipMarker(u64 gpu_value, s32 frame);
 bool IsDisplayBuffer(u64 address);
 /// Flip id the next OnFlipMarker gives (captures name it).
 u64 NextFlipId();
+/// GPU flips the game asked for so far (SubmitEopFlip): the flip id the last one gets (NVIDIA Reflex's frame id).
+u64 RequestedFlips();
 /// GnmDriver: the guest address of the port's labels (16 × u64).
 bool BufferLabelAddress(s32 handle, u64& address);
 

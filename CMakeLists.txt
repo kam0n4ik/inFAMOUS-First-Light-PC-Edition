@@ -90,6 +90,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/vulkan/vk_pipelines.cpp
     src/runtime/gpu/vulkan/vk_precompile.cpp
     src/runtime/gpu/vulkan/vk_presenter.cpp
+    src/runtime/gpu/vulkan/vk_reflex.cpp
     src/runtime/gpu/vulkan/vk_stability_tests.cpp
     src/runtime/gpu/vulkan/vk_resources.cpp
     src/runtime/gpu/upscale/upscalers.cpp

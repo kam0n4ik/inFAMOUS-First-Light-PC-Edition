@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 #include <windows.h>
@@ -144,6 +145,137 @@ void SetTemporalAaOff(bool off) {
 
 RenderSize CurrentRenderSize() {
     return {g_width.load(std::memory_order_acquire), g_height.load(std::memory_order_acquire)};
+}
+
+namespace {
+
+// The render size changed while the game runs - the PS4 Pro's own path. FrameBegin 0x1f0be0 (every frame, the game's
+// render thread) switches the Pro's modes: it writes the device's render size (+0xC/+0x10), the per-size-class table
+// (device +0xdf0f14: w, h pairs; the scene targets' current sizes) from it, re-describes the display targets
+// (RenderTarget::Configure 0x300b00) and every scene target (ConfigureSceneTargets 0x18e210 on 0xe682b0). Their memory
+// was allocated at start from the table of maxima (+0xdf0f7c, AllocateTarget 0x300a90 -> 0x2ffeb0): a size up to the
+// one the game started with fits without new memory.
+constexpr ProbeSite kFrameBeginSite{{0x1f0be0, 0x5aa, 0x6273d28a515609b7ull}, 20};
+constexpr GuestFunction kConfigureTarget{0x300b00, 0x2bb, 0x4489645ef331292aull};
+constexpr GuestFunction kConfigureSceneTargets{0x18e210, 0x2f9, 0x804f07e3bc802864ull};
+constexpr u64 kSceneTargets = 0xe682b0; // ConfigureSceneTargets' object
+constexpr u64 kQuarterHeightFlag = 0x1d0cbd5;
+constexpr u64 kSizeTable = 0xdf0f14; // device offset: the size classes' current w, h (u32 pairs)
+
+using FrameBeginFn = SSPC_SYSV_ABI void (*)(u64 device, u32 arg);
+using ConfigureFn = SSPC_SYSV_ABI void (*)(u64 object);
+FrameBeginFn g_frame_begin = nullptr;
+ConfigureFn g_configure_target = nullptr;
+ConfigureFn g_configure_scene = nullptr;
+u64 g_switch_base = 0;
+std::atomic<u64> g_requested{0}; // w << 32 | h (0: none)
+std::atomic<u64> g_frames{0};
+RenderSize g_started{1920, 1080}; // the size the targets' memory was allocated for
+struct DiagSwitch {
+    u64 frame;
+    RenderSize size;
+};
+std::vector<DiagSwitch> g_diag;
+
+void WriteSizes(u64 device, u32 w, u32 h) {
+    auto* d = reinterpret_cast<u8*>(device);
+    const auto put = [&](u64 off, u32 a, u32 b) {
+        std::memcpy(d + off, &a, 4);
+        std::memcpy(d + off + 4, &b, 4);
+    };
+    const bool quarter_h = *reinterpret_cast<const u8*>(g_switch_base + kQuarterHeightFlag) != 0;
+    // (as VideoOut init 0x1eff00 derives them from the render size, PS4 - not checkerboard)
+    std::memcpy(d + 0xC, &w, 4);
+    std::memcpy(d + 0x10, &h, 4);
+    put(0xdf0f1c, w, h);
+    put(0xdf0f64, w, h);
+    put(0xdf0f6c, w, h);
+    put(0xdf0f24, w, h);
+    const u32 hw = w >> 1, hh = h >> 1;
+    put(0xdf0f74, hw, hh);
+    const u32 qh = quarter_h ? h >> 2 : hh;
+    put(0xdf0f2c, hw, qh);
+    put(0xdf0f5c, (hw + 0x13) / 0x14, (qh + 0x13) / 0x14);
+    const u32 sw = std::max<u32>(0x1e0, w >> 2), sh = std::max<u32>(0x10e, qh >> 1);
+    put(0xdf0f34, sw, sh);
+    put(0xdf0f3c, sw >> 1, sh >> 1);
+    put(0xdf0f44, sw >> 2, sh >> 2);
+    put(0xdf0f4c, sw >> 3, sh >> 3);
+    put(0xdf0f54, sw >> 4, sh >> 4);
+}
+
+SSPC_SYSV_ABI void FrameBeginProbe(u64 device, u32 arg) {
+    const u64 frame = g_frames.fetch_add(1, std::memory_order_relaxed);
+    for (const DiagSwitch& s : g_diag) {
+        if (s.frame == frame) {
+            g_requested.store(u64{s.size.width} << 32 | s.size.height, std::memory_order_release);
+        }
+    }
+    if (const u64 req = g_requested.exchange(0, std::memory_order_acq_rel); req != 0) {
+        const u32 w = static_cast<u32>(req >> 32), h = static_cast<u32>(req);
+        const RenderSize cur = CurrentRenderSize();
+        if (w != cur.width || h != cur.height) {
+            WriteSizes(device, w, h);
+            g_configure_target(device + 0x8c4);
+            g_configure_target(device + 0x20a * 8);
+            g_configure_target(device + 0x2fc * 8);
+            g_configure_scene(g_switch_base + kSceneTargets);
+            g_width.store(w, std::memory_order_release);
+            g_height.store(h, std::memory_order_release);
+            SSPC_LOG(Engine, Warning, "Render resolution: the scene now renders at {}x{} (was {}x{}; frame {})", w, h,
+                     cur.width, cur.height, frame);
+        }
+    }
+    g_frame_begin(device, arg);
+}
+
+} // namespace
+
+bool InstallRenderSwitch(u64 eboot_base) {
+    std::string error;
+    if (!VerifyGuestFunction(eboot_base, kConfigureTarget, error) ||
+        !VerifyGuestFunction(eboot_base, kConfigureSceneTargets, error)) {
+        SSPC_LOG(Engine, Error, "Render resolution switch not installed (the size stays as started): {}", error);
+        return false;
+    }
+    void* original =
+        InstallEntryProbe(eboot_base, kFrameBeginSite, reinterpret_cast<const void*>(&FrameBeginProbe), error);
+    if (original == nullptr) {
+        SSPC_LOG(Engine, Error, "Render resolution switch not installed (the size stays as started): {}", error);
+        return false;
+    }
+    g_switch_base = eboot_base;
+    g_configure_target = reinterpret_cast<ConfigureFn>(eboot_base + kConfigureTarget.rva);
+    g_configure_scene = reinterpret_cast<ConfigureFn>(eboot_base + kConfigureSceneTargets.rva);
+    g_frame_begin = reinterpret_cast<FrameBeginFn>(original);
+    g_started = CurrentRenderSize();
+    // SSPC_DIAG_RES_SWITCH=frame:WxH[,frame:WxH...]: switches at those game frames (diagnostics)
+    if (const std::string env = Env("SSPC_DIAG_RES_SWITCH"); !env.empty()) {
+        size_t at = 0;
+        while (at < env.size()) {
+            const size_t end = std::min(env.find(',', at), env.size());
+            unsigned long long f = 0;
+            unsigned w = 0, h = 0;
+            if (std::sscanf(env.substr(at, end - at).c_str(), "%llu:%ux%u", &f, &w, &h) == 3) {
+                g_diag.push_back({f, {w, h}});
+            }
+            at = end + 1;
+        }
+        SSPC_LOG(Engine, Warning, "DIAGNOSTIC: SSPC_DIAG_RES_SWITCH='{}' ({} switches)", env, g_diag.size());
+    }
+    SSPC_LOG(Engine, Info, "Render resolution switch: entry probe on FrameBegin 0x1f0be0 (up to {}x{})",
+             g_started.width, g_started.height);
+    return true;
+}
+
+bool RequestRenderSize(RenderSize size) {
+    size.width = std::clamp<u32>(size.width & ~1u, 320, g_started.width);
+    size.height = std::clamp<u32>(size.height & ~1u, 180, g_started.height);
+    if (g_frame_begin == nullptr) {
+        return false;
+    }
+    g_requested.store(u64{size.width} << 32 | size.height, std::memory_order_release);
+    return true;
 }
 
 } // namespace SecondSon::Engine::Render

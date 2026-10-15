@@ -335,7 +335,7 @@ void Build(Registry& r) {
     // ------------------------------------------------------------------ Upscaling & frame generation
     v.push_back(Desc{
         .id = "upscaling.upscaler", .table = "Graphics", .key = "upscaler", .category = Category::Upscaling,
-        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::RenderScale, .choices = kUpscalers,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kUpscalers,
         .en = "Upscaling technology", .ru = "Технология масштабирования",
         .help_en = "The game renders its 3D scene at the quality's lower resolution and the upscaler rebuilds the "
                    "1920x1080 picture from it (motion vectors, depth and a sub-pixel jitter of the scene); the HUD is "
@@ -352,7 +352,7 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "upscaling.quality", .table = "Graphics", .key = "upscaleQuality", .category = Category::Upscaling,
-        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::RenderScale, .choices = kUpscaleQualities,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kUpscaleQualities,
         .en = "Quality", .ru = "Качество",
         .help_en = "The render resolution of the scene (output 1920x1080): Quality 1.5x, Balanced 1.7x, Performance 2x, "
                    "Ultra Performance 3x fewer pixels per side. Lower: faster where the GPU limits the frame rate, "
@@ -383,7 +383,7 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "upscaling.frameGeneration", .table = "Graphics", .key = "frameGeneration",
-        .category = Category::Upscaling, .type = Type::Choice, .apply = Apply::Restart,
+        .category = Category::Upscaling, .type = Type::Choice, .apply = Apply::Live,
         .needs = Capability::RenderScale, .choices = kFrameGenerations, .en = "Frame generation",
         .ru = "Генерация кадров",
         .help_en = "Generated frames shown between the frames the game renders: the picture moves more smoothly, the "
@@ -418,15 +418,18 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "upscaling.reflex", .table = "Graphics", .key = "reflex", .category = Category::Upscaling,
-        .type = Type::Bool, .apply = Apply::Live, .needs = Capability::DlssFrameGen, .en = "NVIDIA Reflex",
+        .type = Type::Bool, .apply = Apply::Live, .needs = Capability::Reflex, .en = "NVIDIA Reflex",
         .ru = "NVIDIA Reflex",
-        .help_en = "NVIDIA Reflex low latency with DLSS Frame Generation: less input delay, possibly a lower frame rate "
-                   "when the GPU is saturated.",
-        .help_ru = "Режим низкой задержки NVIDIA Reflex с DLSS Frame Generation: меньше задержка ввода, возможно, "
-                   "меньше FPS, когда GPU загружен полностью.",
-        .why_en = "Reflex comes with DLSS Frame Generation (Streamline), which this GPU or driver does not support.",
-        .why_ru = "Reflex работает вместе с DLSS Frame Generation (Streamline), которую эта видеокарта или драйвер не "
-                  "поддерживает.",
+        .help_en = "NVIDIA Reflex low latency: the game starts each frame just in time for the GPU instead of queuing "
+                   "frames ahead, so the input reaches the screen sooner. Any GeForce (GTX 900 and newer); not with "
+                   "FSR frame generation (its own swapchain).",
+        .help_ru = "Режим низкой задержки NVIDIA Reflex: игра начинает каждый кадр ровно к моменту, когда GPU "
+                   "освобождается, а не копит кадры в очереди, — ввод быстрее доходит до экрана. Любая GeForce "
+                   "(GTX 900 и новее); не вместе с генерацией кадров FSR (у неё свой swapchain).",
+        .why_en = "Reflex needs an NVIDIA GPU with VK_NV_low_latency2 (a recent GeForce driver) and SecondSonPC's own GPU "
+                  "backend.",
+        .why_ru = "Reflex требует видеокарту NVIDIA с VK_NV_low_latency2 (свежий драйвер GeForce) и собственный "
+                  "графический бэкенд SecondSonPC.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.reflex; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.reflex = std::get<bool>(x); },
     });

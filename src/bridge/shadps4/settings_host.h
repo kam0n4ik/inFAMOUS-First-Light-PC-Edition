@@ -16,4 +16,9 @@ void ApplyPcBridgeSettings(const App::Config& cfg);
 /// (the bridge's presenter is not started: FSR/RCAS and its FPS counter are unavailable).
 void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_mode, bool native_gpu);
 
+/// SecondSonPC's GPU backend: the upscaling settings applied - the upscaler checked (DLSS on the device, FSR's DLL),
+/// the game's render size asked for (switched at its next frame), its own TAA off while an upscaler jitters, frame
+/// generation switched (`at_start`: the presenter was created with it). At start and on every menu change.
+void ApplyUpscaling(bool at_start);
+
 } // namespace SecondSon::Bridge

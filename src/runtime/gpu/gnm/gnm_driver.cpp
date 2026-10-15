@@ -60,6 +60,8 @@
 #include "base/log.h"
 #include "runtime/exports.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/upscale/reflex.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/gnm/gnm_init_sequences.h"
@@ -721,6 +723,7 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
                 TakeEarlyFrame(count, dcbs, dcb_sizes, vo_handle, buffer_index, flip_mode, flip_arg)) {
             StallTrace::RegisterThread(StallTrace::Role::Game);
             StallTrace::Span(StallTrace::Ev::GameSubmitFlip, t0, StallTrace::Now());
+            Gpu::Reflex::GameFrameSubmitted(VideoOut::RequestedFlips()); // (NVIDIA Reflex: may sleep here)
             return *early;
         }
     }
@@ -789,6 +792,10 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
         for (u32 i = 0; i < 300 && !(sync_submit == 1 ? host->IsQuiet() : host->IsRecorded()); ++i) {
             Sleep(1);
         }
+    }
+    if (submitted == kOk) {
+        // NVIDIA Reflex: this frame's simulation ended; the game's next frame starts when the driver says so
+        Gpu::Reflex::GameFrameSubmitted(VideoOut::RequestedFlips());
     }
     return submitted;
 }
