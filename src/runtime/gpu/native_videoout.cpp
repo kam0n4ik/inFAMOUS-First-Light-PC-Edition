@@ -282,7 +282,7 @@ void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, doub
             return;
         }
         const Pacing p = UnpackPacing(g_pacing.load(std::memory_order_acquire));
-        if (p.vblank) {
+        if (p.vblank || (g_sink != nullptr && g_sink->NeedsVblank())) {
             return;
         }
         QueryPerformanceCounter(&now);
@@ -375,10 +375,18 @@ void PresentThread() {
     const double period_ticks = static_cast<double>(freq.QuadPart) * 1001.0 / 60000.0;
     double next = static_cast<double>(now.QuadPart) + period_ticks;
     const auto present = [](const FlipRequest& r) { Present(r); };
+    bool fg_logged = false;
     while (!g_stop.load(std::memory_order_acquire)) {
         if (!UnpackPacing(g_pacing.load(std::memory_order_acquire)).vblank) {
-            FreeLoop(timer, freq, period_ticks, next);
-            continue;
+            if (g_sink == nullptr || !g_sink->NeedsVblank()) {
+                FreeLoop(timer, freq, period_ticks, next);
+                continue;
+            }
+            if (!fg_logged) {
+                fg_logged = true;
+                SSPC_LOG(GPU, Info, "VideoOut: frame generation on - flips at the vblank (the frame rate limit applies "
+                                    "without it)");
+            }
         }
         QueryPerformanceCounter(&now);
         const double wait = next - static_cast<double>(now.QuadPart);

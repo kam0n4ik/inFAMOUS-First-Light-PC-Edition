@@ -265,6 +265,9 @@ public:
     bool WaitReady(u64 value, u64 timeout_ns) override {
         return value == 0 || (timeline_ && timeline_->Wait(value, timeout_ns));
     }
+    bool NeedsVblank() override {
+        return presenter_ && presenter_->FrameGenActive();
+    }
     void Present(const VideoOut::FlipRequest& r) override {
         if (presenter_) {
             presenter_->Present(r.frame, r.flip_id);
