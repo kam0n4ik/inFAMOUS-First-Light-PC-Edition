@@ -30,6 +30,17 @@ constexpr Choice kPresentModes[] = {
     {"mailbox", "Fast (Mailbox)", "Быстрая (Mailbox)"},
     {"immediate", "Off (Immediate)", "Выкл. (Immediate)"},
 };
+constexpr Choice kFrameRateLimits[] = {
+    {"console", "60 (PS4 vblank)", "60 (кадр по vblank PS4)"},
+    {"30", "30", "30"},
+    {"60", "60", "60"},
+    {"90", "90", "90"},
+    {"120", "120", "120"},
+    {"144", "144", "144"},
+    {"165", "165", "165"},
+    {"240", "240", "240"},
+    {"unlimited", "Unlimited", "Без ограничения"},
+};
 constexpr Choice kSideways[] = {
     {"right-up", "Right side up", "Правой стороной вверх"},
     {"left-up", "Left side up", "Левой стороной вверх"},
@@ -226,7 +237,7 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "display.presentMode", .table = "Display", .key = "presentMode", .category = Category::Display,
-        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::BridgePresenter,
+        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::Window,
         .choices = kPresentModes, .en = "Vertical sync", .ru = "Вертикальная синхронизация",
         .help_en = "How frames are shown (Vulkan present mode). FIFO: classic sync, no tearing. Mailbox: no tearing, "
                    "lower latency. Immediate: no sync, tearing possible. Takes effect after a restart: changing it "
@@ -235,10 +246,6 @@ void Build(Registry& r) {
                    "Mailbox — без разрывов и с меньшей задержкой; Immediate — без синхронизации, возможны разрывы. "
                    "Вступает в силу после перезапуска: смена на лету требует пересоздания swapchain в графическом "
                    "бэкенде.",
-        .why_en = "SecondSonPC's own presenter (--gpu-backend sspc) always picks Mailbox for now; passing the setting "
-                  "to it is P4.6 integration.",
-        .why_ru = "Собственный презентер (--gpu-backend sspc) пока всегда выбирает Mailbox; передача настройки — "
-                  "интеграция P4.6.",
         .get = [](const Config& c, const Desc&) -> Value {
             return std::string(c.present_mode == "Fifo" ? "fifo" : c.present_mode == "Immediate" ? "immediate"
                                                                                                     : "mailbox");
@@ -260,13 +267,21 @@ void Build(Registry& r) {
         .legacy_parse = true,
     });
     v.push_back(Desc{
-        .id = "display.frameLimit", .category = Category::Display, .type = Type::Bool,
-        .apply = Apply::Unavailable, .needs = Capability::FrameLimiter, .en = "Frame rate limit",
-        .ru = "Ограничение FPS",
-        .why_en = "Needs a limiter in the frame presentation path (VideoOut/presenter) - the graphics backend, P4.6. "
-                  "The game itself offers a 30 fps limit (Options - Game - Frame Rate).",
-        .why_ru = "Нужен ограничитель в пути показа кадров (VideoOut/презентер) — это графический бэкенд, этап P4.6. "
-                  "В самой игре есть ограничение 30 к/с (Параметры → Игра → Частота кадров).",
+        .id = "display.frameRateLimit", .table = "Display", .key = "frameRateLimit", .category = Category::Display,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::FrameLimiter, .choices = kFrameRateLimits,
+        .en = "Frame rate limit", .ru = "Ограничение FPS",
+        .help_en = "60 (PS4 vblank): as the console - a frame is shown only at a 60 Hz vblank, so a frame that takes "
+                   "17 ms waits until 33 ms. A number or Unlimited: a frame is shown as soon as it is ready (the game's "
+                   "clock is real time: the world does not run faster). Above the display's refresh rate only with "
+                   "Vertical sync Mailbox or Off. The game's own 30 fps lock (Options - Game) still applies.",
+        .help_ru = "60 (кадр по vblank PS4) — как на консоли: кадр показывается только на vblank 60 Гц, поэтому кадр "
+                   "за 17 мс ждёт до 33 мс. Число или «Без ограничения» — кадр показывается сразу, как готов (часы "
+                   "игры — реальное время: мир не ускоряется). Выше частоты монитора — только с вертикальной "
+                   "синхронизацией Mailbox или «Выкл.». Ограничение 30 к/с самой игры (Параметры → Игра) действует.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.frame_rate_limit; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.frame_rate_limit = std::get<std::string>(x); },
     });
 
     // ------------------------------------------------------------------ Graphics

@@ -93,7 +93,7 @@ void TestPresenter(const std::filesystem::path& logs, Results& r, VkResult injec
     if (!window) return;
     {
         Timeline timeline(*ctx); std::string error;
-        auto p = Presenter::Create(*ctx, timeline, window, error);
+        auto p = Presenter::Create(*ctx, timeline, window, "Mailbox", error);
         r.Check(p != nullptr, "create presenter: " + error);
         if (p) {
             {

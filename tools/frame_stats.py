@@ -5,6 +5,11 @@
 # them); frames whose flip marker is inside the window give the GPU thread's and the GPU's per-frame figures.
 # Definitions: average FPS = (frames - 1) / span; median FPS = 1000 / median frame time; 1% low FPS = 1000 / mean of the
 # slowest 1% frame times (at least one frame); p95/p99 = frame time percentiles (nearest rank).
+# FrameBreak (docs/FRAMEBREAK.md): every stream is reported under both 1% low definitions - "low1_fps" (mean of the
+# worst 1 %) and "low1_p99_fps" (1000 / p99) - and 0.1 % low, p99.9 and the shares of frames under / over fixed budgets.
+# Streams: "present" = intervals between presents (what the display was given; vblank-quantized in the console
+# pacing), "engine" = intervals between the game's flip requests (its frame loop), "render" = intervals between the
+# command processor's flip markers (a frame's commands processed).
 import csv
 import json
 import math
@@ -20,6 +25,28 @@ def pct(v, q):
 
 def mean(v):
     return sum(v) / len(v) if v else float("nan")
+
+
+def stream(ft, prefix):
+    """Frame time statistics of one stream of intervals (ms) under `prefix`_ keys."""
+    if len(ft) < 2:
+        return {}
+    s = sorted(ft, reverse=True)
+    w1 = s[: max(1, len(ft) // 100)]
+    w01 = s[: max(1, len(ft) // 1000)]
+    n = len(ft)
+    return {
+        prefix + "avg_fps": 1000.0 / mean(ft),
+        prefix + "low1_fps": 1000.0 / mean(w1),
+        prefix + "low1_p99_fps": 1000.0 / pct(ft, 0.99),
+        prefix + "low01_fps": 1000.0 / mean(w01) if n >= 1000 else float("nan"),
+        prefix + "p50_ms": pct(ft, 0.5), prefix + "p95_ms": pct(ft, 0.95), prefix + "p99_ms": pct(ft, 0.99),
+        prefix + "p999_ms": pct(ft, 0.999) if n >= 1000 else float("nan"), prefix + "max_ms": max(ft),
+        prefix + "share": {  # % of frames: faster than 120/90/60 FPS, slower than 40/30/20 FPS
+            "<8.33": 100.0 * sum(1 for d in ft if d < 8.33) / n, "<11.11": 100.0 * sum(1 for d in ft if d < 11.11) / n,
+            "<16.67": 100.0 * sum(1 for d in ft if d < 16.67) / n, ">25": 100.0 * sum(1 for d in ft if d > 25.0) / n,
+            ">33.33": 100.0 * sum(1 for d in ft if d > 33.33) / n, ">50": 100.0 * sum(1 for d in ft if d > 50.0) / n},
+    }
 
 
 def main(argv):
@@ -91,10 +118,17 @@ def main(argv):
     gft = [b - a for a, b in zip(gf, gf[1:])]
     res["game_ft_mean_ms"] = mean(gft)
     res["game_ft_p95_ms"] = pct(gft, 0.95)
+    # FrameBreak: the three streams under both 1 % low definitions
+    cf = [r["cp_flip_ms"] for r in rows if r["cp_flip_ms"] and lo <= r["cp_flip_ms"] <= hi]
+    res.update(stream(ft, "present_"))
+    res.update(stream(gft, "engine_"))
+    res.update(stream([b - a for a, b in zip(cf, cf[1:])], "render_"))
 
     for k, v in res.items():
         if isinstance(v, float):
             res[k] = round(v, 3)
+        elif isinstance(v, dict):
+            res[k] = {a: round(x, 2) if isinstance(x, float) else x for a, x in v.items()}
     if out_json:
         with open(out_json, "w") as f:
             json.dump(res, f, indent=1)

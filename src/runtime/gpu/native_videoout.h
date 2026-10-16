@@ -12,6 +12,7 @@
 #pragma once
 
 #include <span>
+#include <string>
 
 #include "base/abi.h"
 
@@ -47,9 +48,27 @@ public:
     virtual ~Sink() = default;
     /// Has the GPU work up to `gpu_value` completed? (the present thread polls it at each vblank)
     virtual bool Ready(u64 gpu_value) = 0;
+    /// Waits up to `timeout_ns` for it (the free pacing: a frame shown as soon as its work completed). true: done.
+    virtual bool WaitReady(u64 gpu_value, u64 /*timeout_ns*/) { return Ready(gpu_value); }
     /// Shows `request` (its buffer, or blank). Called on the present thread.
     virtual void Present(const FlipRequest& request) = 0;
 };
+
+/// How flips reach the display (FrameBreak FB-2, docs/FRAMEBREAK.md). The game's clock is the TSC (eboot 0x12a160:
+/// the frame's delta = TSC ticks / sceKernelGetTscFrequency, at most 1/30 s), not the vblank count, so its world runs
+/// at the same speed whatever the flip cadence.
+struct Pacing {
+    /// true ("console"): a flip only at an emulated 59.94 Hz vblank (every flip_rate + 1-th), as the PS4's output: a
+    /// frame that misses one waits for the next (16.7 / 33.4 / 50 ms). false: a flip as soon as its GPU work completed.
+    bool vblank = true;
+    u32 cap_fps = 0; ///< free pacing: at most this many flips a second (0: none); the game's own flip rate still holds
+    u32 spin_us = 0; ///< free pacing with a cap: the last microseconds before a flip are spun, not slept (precision)
+};
+/// Any thread, while the game runs too (the settings menu).
+void SetPacing(const Pacing& pacing);
+Pacing GetPacing();
+/// "console" | "unlimited" | "30" ... "360" -> the pacing; false: not one of them.
+bool ParsePacing(const std::string& text, Pacing& out);
 
 /// Starts the port's present thread with `sink` (the backend's); Stop joins it. Idempotent.
 void Start(Sink* sink);
@@ -85,6 +104,8 @@ void SetLabelCallback(void (*fn)(void* ctx), void* ctx);
 struct Stats {
     u64 flips_requested = 0, flips_presented = 0, blank = 0, vblanks = 0, markers_without_flip = 0;
     u64 waited_vblanks = 0; ///< vblanks a request waited for its GPU work
+    u64 free_flips = 0;     ///< flips shown by the free pacing (not at a vblank)
+    u64 capped_waits = 0;   ///< ... of them held back by the cap or the game's flip rate
 };
 Stats GetStats();
 

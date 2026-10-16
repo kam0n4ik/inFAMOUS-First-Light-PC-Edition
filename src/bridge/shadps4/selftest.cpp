@@ -4857,8 +4857,13 @@ int RunSelfTest(const App::Config& cfg) {
     char only[16] = {};
     const bool shader_only = GetEnvironmentVariableA("SSPC_SELFTEST_ONLY", only, sizeof(only)) == 6 &&
                              std::string_view(only) == "shader";
+    // FrameBreak: SSPC_SELFTEST_ONLY=settings - the PC settings' groups alone (same reason)
+    const bool settings_only = std::string_view(only) == "settings";
     decltype(TestShaderFrontend(cfg)) native_groups;
-    if (!shader_only) {
+    if (settings_only) {
+        TestPcSettings(t, cfg);
+    }
+    if (!shader_only && !settings_only) {
     TestParamSfo(t, cfg);
     TestFileSystem(t, cfg);
     TestPlayGo(t);
@@ -4923,6 +4928,7 @@ int RunSelfTest(const App::Config& cfg) {
         native_groups.push_back(std::move(g));
     }
     } // (!shader_only)
+    if (!settings_only) {
     // P5.3: the native operations' direct path through the processor (light: also in the shader-only run).
     for (auto& g : TestGpuNativeDirect()) {
         native_groups.push_back(std::move(g));
@@ -4931,6 +4937,7 @@ int RunSelfTest(const App::Config& cfg) {
     for (auto& g : TestShaderFrontend(cfg)) {
         native_groups.push_back(std::move(g));
     }
+    } // (!settings_only)
     for (const auto& g : native_groups) {
         t.checks += g.checks;
         t.failures += g.failures;

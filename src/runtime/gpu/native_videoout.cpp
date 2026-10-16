@@ -8,8 +8,13 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <string>
+#include <immintrin.h>
+
+#include <fmt/format.h>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -196,6 +201,168 @@ void CompleteFlip(const FlipRequest& r) {
     }
 }
 
+// FrameBreak FB-2: the pacing, packed (bit 0 vblank, bits 8..31 the cap, bits 32..47 the spin); g_wake (auto-reset)
+// wakes the present thread for a new request or a pacing change
+std::atomic<u64> g_pacing{1};
+HANDLE g_wake = nullptr;
+
+u64 PackPacing(const Pacing& p) {
+    return (p.vblank ? 1ull : 0ull) | (u64{std::min<u32>(p.cap_fps, 0xFFFFFF)} << 8) |
+           (u64{std::min<u32>(p.spin_us, 0xFFFF)} << 32);
+}
+Pacing UnpackPacing(u64 v) {
+    return {(v & 1) != 0, static_cast<u32>((v >> 8) & 0xFFFFFF), static_cast<u32>((v >> 32) & 0xFFFF)};
+}
+
+void Wake() {
+    if (g_wake != nullptr) {
+        SetEvent(g_wake);
+    }
+}
+
+void Present(const FlipRequest& r) {
+    if (g_sink != nullptr) {
+        g_sink->Present(r);
+    }
+    if (r.eop) {
+        FrameLog::Presented();
+    }
+    CompleteFlip(r);
+    std::scoped_lock s{g_stats_mutex};
+    ++g_stats.flips_presented;
+    g_stats.blank += r.index < 0 ? 1 : 0;
+}
+
+/// One emulated vblank: its events and status (both pacings keep the PS4's 59.94 Hz count).
+void Vblank(u64 vcount) {
+    std::vector<Kernel::EventQueues::QueueId> vblank_events;
+    {
+        std::scoped_lock lock{g_port.mutex};
+        vblank_events = g_port.vblank_events;
+    }
+    TriggerEvents(vblank_events, kVblankEvent, kVblankEvent | (vcount << 16));
+    {
+        std::scoped_lock lock{g_port.vblank_mutex};
+        ++g_port.vblank.count;
+        g_port.vblank.process_time = ProcessTime();
+        g_port.vblank.tsc = Tsc();
+    }
+    std::scoped_lock s{g_stats_mutex};
+    ++g_stats.vblanks;
+}
+
+/// Sleeps until the QPC value `until` or a wake (a request, a pacing change), whichever first.
+void SleepUntil(HANDLE timer, double until, const LARGE_INTEGER& freq) {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double wait = until - static_cast<double>(now.QuadPart);
+    if (wait <= 0) {
+        return;
+    }
+    const LONGLONG hundred_ns = static_cast<LONGLONG>(wait * 1e7 / static_cast<double>(freq.QuadPart));
+    if (timer != nullptr && hundred_ns > 0) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -hundred_ns;
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        const HANDLE h[2] = {timer, g_wake};
+        WaitForMultipleObjects(g_wake != nullptr ? 2 : 1, h, FALSE, 100);
+    } else if (hundred_ns >= 10000) {
+        Sleep(static_cast<DWORD>(hundred_ns / 10000));
+    }
+}
+
+/// The free pacing (FrameBreak FB-2): the oldest request is shown as soon as its GPU work completed and the cap (and
+/// the game's own flip rate, its "lock to 30" option) allow; the vblank count still advances at 59.94 Hz. Returns when
+/// the pacing changes back to the vblank one or the thread stops.
+void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, double& next_tick) {
+    LARGE_INTEGER now{};
+    double last_flip = 0.0; // QPC of the last flip taken
+    for (;;) {
+        if (g_stop.load(std::memory_order_acquire)) {
+            return;
+        }
+        const Pacing p = UnpackPacing(g_pacing.load(std::memory_order_acquire));
+        if (p.vblank) {
+            return;
+        }
+        QueryPerformanceCounter(&now);
+        double t = static_cast<double>(now.QuadPart);
+        if (t >= next_tick) {
+            u64 vcount = 0;
+            {
+                std::scoped_lock lock{g_port.vblank_mutex};
+                vcount = g_port.vblank.count;
+            }
+            Vblank(vcount);
+            next_tick += period_ticks;
+            if (t > next_tick + 4 * period_ticks) {
+                next_tick = t + period_ticks; // far behind (a debugger, a stall): resync
+            }
+        }
+        FlipRequest front;
+        bool have = false;
+        s32 rate = 0;
+        {
+            std::scoped_lock lock{g_port.mutex};
+            if (g_port.open && !g_port.requests.empty()) {
+                front = g_port.requests.front();
+                rate = g_port.flip_rate;
+                have = true;
+            }
+        }
+        double wake_at = next_tick;
+        if (have) {
+            // the cap, and the game's flip rate (1: 30 Hz, 2: 20 Hz - its own frame rate lock) as a minimum interval
+            double interval = p.cap_fps != 0 ? static_cast<double>(freq.QuadPart) / p.cap_fps : 0.0;
+            interval = std::max(interval, static_cast<double>(rate + 1) * period_ticks * (rate > 0 ? 1.0 : 0.0));
+            const double earliest = last_flip + interval;
+            if (g_sink != nullptr && !g_sink->Ready(front.gpu_value)) {
+                // the frame's GPU work: waited for here (bounded by the next vblank tick)
+                const double left = next_tick - t;
+                const u64 ns = left > 0 ? static_cast<u64>(left * 1e9 / static_cast<double>(freq.QuadPart)) : 0;
+                if (!g_sink->WaitReady(front.gpu_value, std::max<u64>(ns, 100'000))) {
+                    QueryPerformanceCounter(&now);
+                    if (static_cast<double>(now.QuadPart) + period_ticks / 8 < next_tick) {
+                        SleepUntil(timer, next_tick, freq); // a failure, not a timeout: no busy loop
+                    }
+                }
+                continue;
+            }
+            const double spin = static_cast<double>(p.spin_us) * static_cast<double>(freq.QuadPart) / 1e6;
+            if (t + spin >= earliest) {
+                if (t < earliest) {
+                    const StallTrace::Scope trace_cap(StallTrace::Ev::VblankWait);
+                    do {
+                        _mm_pause();
+                        QueryPerformanceCounter(&now);
+                    } while (static_cast<double>(now.QuadPart) < earliest);
+                    t = static_cast<double>(now.QuadPart);
+                }
+                {
+                    std::scoped_lock lock{g_port.mutex};
+                    if (g_port.requests.empty()) {
+                        continue; // (closed meanwhile)
+                    }
+                    front = g_port.requests.front(); // only this thread takes requests: the same one
+                    g_port.requests.pop_front();
+                }
+                last_flip = t;
+                Present(front);
+                std::scoped_lock s{g_stats_mutex};
+                ++g_stats.free_flips;
+                continue;
+            }
+            {
+                std::scoped_lock s{g_stats_mutex};
+                ++g_stats.capped_waits;
+            }
+            wake_at = std::min(wake_at, earliest - spin);
+        }
+        const StallTrace::Scope trace_idle(StallTrace::Ev::VblankWait); // (P4.12)
+        SleepUntil(timer, wake_at, freq);
+    }
+}
+
 void PresentThread() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:VideoOutPresent");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -207,19 +374,12 @@ void PresentThread() {
     // 59.94 Hz, as the PS4's output (and the bridge's vblank)
     const double period_ticks = static_cast<double>(freq.QuadPart) * 1001.0 / 60000.0;
     double next = static_cast<double>(now.QuadPart) + period_ticks;
-    const auto present = [](const FlipRequest& r) {
-        if (g_sink != nullptr) {
-            g_sink->Present(r);
-        }
-        if (r.eop) {
-            FrameLog::Presented();
-        }
-        CompleteFlip(r);
-        std::scoped_lock s{g_stats_mutex};
-        ++g_stats.flips_presented;
-        g_stats.blank += r.index < 0 ? 1 : 0;
-    };
+    const auto present = [](const FlipRequest& r) { Present(r); };
     while (!g_stop.load(std::memory_order_acquire)) {
+        if (!UnpackPacing(g_pacing.load(std::memory_order_acquire)).vblank) {
+            FreeLoop(timer, freq, period_ticks, next);
+            continue;
+        }
         QueryPerformanceCounter(&now);
         const double wait = next - static_cast<double>(now.QuadPart);
         if (wait > 0) {
@@ -280,20 +440,7 @@ void PresentThread() {
         if (take) {
             present(req);
         }
-        std::vector<Kernel::EventQueues::QueueId> vblank_events;
-        {
-            std::scoped_lock lock{g_port.mutex};
-            vblank_events = g_port.vblank_events;
-        }
-        TriggerEvents(vblank_events, kVblankEvent, kVblankEvent | (vcount << 16));
-        {
-            std::scoped_lock lock{g_port.vblank_mutex};
-            ++g_port.vblank.count;
-            g_port.vblank.process_time = ProcessTime();
-            g_port.vblank.tsc = Tsc();
-        }
-        std::scoped_lock s{g_stats_mutex};
-        ++g_stats.vblanks;
+        Vblank(vcount);
     }
     if (timer != nullptr) {
         CloseHandle(timer);
@@ -591,11 +738,47 @@ const Runtime::Export kExports[] = {
 
 } // namespace
 
+void SetPacing(const Pacing& pacing) {
+    const u64 v = PackPacing(pacing);
+    if (g_pacing.exchange(v, std::memory_order_acq_rel) != v) {
+        SSPC_LOG(GPU, Info, "VideoOut: pacing {}{}", pacing.vblank ? "console (a flip at a 59.94 Hz vblank)" : "free",
+                 pacing.vblank       ? std::string()
+                 : pacing.cap_fps    ? fmt::format(", at most {} FPS (spin {} us)", pacing.cap_fps, pacing.spin_us)
+                                     : std::string(", unlimited"));
+    }
+    Wake();
+}
+
+Pacing GetPacing() {
+    return UnpackPacing(g_pacing.load(std::memory_order_acquire));
+}
+
+bool ParsePacing(const std::string& text, Pacing& out) {
+    if (text == "console") {
+        out = Pacing{.vblank = true};
+        return true;
+    }
+    if (text == "unlimited") {
+        out = Pacing{.vblank = false, .cap_fps = 0};
+        return true;
+    }
+    char* end = nullptr;
+    const unsigned long n = std::strtoul(text.c_str(), &end, 10);
+    if (text.empty() || end == nullptr || *end != '\0' || n < 20 || n > 1000) {
+        return false;
+    }
+    out = Pacing{.vblank = false, .cap_fps = static_cast<u32>(n)};
+    return true;
+}
+
 void Start(Sink* sink) {
     if (g_started.exchange(true)) {
         return;
     }
     g_sink = sink;
+    if (g_wake == nullptr) {
+        g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
     g_stop.store(false, std::memory_order_release);
     g_thread = std::thread(&PresentThread);
 }
@@ -605,6 +788,7 @@ void Stop() {
         return;
     }
     g_stop.store(true, std::memory_order_release);
+    Wake();
     if (g_thread.joinable()) {
         g_thread.join();
     }
@@ -708,6 +892,7 @@ bool OnFlipMarker(u64 gpu_value, s32 frame) {
                     a.pitch_in_pixel};
     }
     g_port.requests.push_back(r);
+    Wake(); // (the free pacing shows it as soon as its work completes)
     return true;
 }
 

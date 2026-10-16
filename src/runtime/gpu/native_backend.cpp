@@ -262,6 +262,9 @@ public:
     bool Ready(u64 value) override {
         return value == 0 || (timeline_ && timeline_->Completed() >= value);
     }
+    bool WaitReady(u64 value, u64 timeout_ns) override {
+        return value == 0 || (timeline_ && timeline_->Wait(value, timeout_ns));
+    }
     void Present(const VideoOut::FlipRequest& r) override {
         if (presenter_) {
             presenter_->Present(r.frame, r.flip_id);
@@ -495,7 +498,7 @@ bool Backend::Start(const Options& o, std::string& error) {
         images_->SetBudget(budget);
     }
     pipelines_ = std::make_unique<Vk::PipelineFactory>(*ctx_, profile_);
-    presenter_ = Vk::Presenter::Create(*ctx_, *timeline_, o.sdl_window, error);
+    presenter_ = Vk::Presenter::Create(*ctx_, *timeline_, o.sdl_window, o.present_mode, error);
     if (!presenter_) {
         return false;
     }
@@ -815,6 +818,24 @@ bool Backend::Start(const Options& o, std::string& error) {
     executor_->SetFlipHook([](void* self, u64 value) { static_cast<Backend*>(self)->OnFlip(value); }, this);
     Gnm::SetHost(this);
     VideoOut::SetLabelCallback([](void* ctx) { static_cast<Backend*>(ctx)->cv_.notify_one(); }, this);
+    // FrameBreak FB-2: how flips reach the display ([Display] frameRateLimit; SSPC_FB_FRAME_LIMIT for test runs,
+    // SSPC_FB_SPIN_US the capped pacing's spin before a flip)
+    {
+        std::string limit = o.frame_limit;
+        if (char v[16] = {}; GetEnvironmentVariableA("SSPC_FB_FRAME_LIMIT", v, sizeof(v)) > 0) {
+            limit = v;
+        }
+        VideoOut::Pacing pacing;
+        if (!VideoOut::ParsePacing(limit, pacing)) {
+            SSPC_LOG(GPU, Error, "frame rate limit '{}' unknown: the console pacing", limit);
+            pacing = VideoOut::Pacing{};
+        }
+        pacing.spin_us = o.pacing_spin_us;
+        if (char v[16] = {}; GetEnvironmentVariableA("SSPC_FB_SPIN_US", v, sizeof(v)) > 0) {
+            pacing.spin_us = static_cast<u32>(std::strtoul(v, nullptr, 10));
+        }
+        VideoOut::SetPacing(pacing);
+    }
     VideoOut::Start(this);
     stop_.store(false);
     if (parallel_) {
@@ -2038,6 +2059,16 @@ void SetFrameGen(bool on) {
     if (g_backend != nullptr) {
         g_backend->SetFrameGen(on);
     }
+}
+
+bool SetFrameLimit(const std::string& limit) {
+    VideoOut::Pacing p;
+    if (!VideoOut::ParsePacing(limit, p)) {
+        return false;
+    }
+    p.spin_us = VideoOut::GetPacing().spin_us;
+    VideoOut::SetPacing(p);
+    return true;
 }
 
 std::string Report() {

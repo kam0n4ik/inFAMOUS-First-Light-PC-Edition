@@ -760,6 +760,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         no.sdl_window = g_window->GetSDLWindow();
         no.device_index = cfg.gpu_device;
         no.validation = cfg.gpu_native_validate;
+        no.present_mode = cfg.present_mode;
+        no.frame_limit = cfg.pc.frame_rate_limit;
         no.diagnostics = cfg.gpu_native_diag;
         no.sdk_version = Core::ReadCompiledSdkVersion(guest_eboot_path);
         no.capture_flip = cfg.gpu_capture_flip;
@@ -788,7 +790,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         {
             // the settings menu: what the upscaling rows can do with this GPU (known now the device exists)
             namespace Cap = Settings::Capability;
-            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale;
+            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter;
             if (Gpu::Upscale::GetStatus().dlss_available) {
                 caps |= Cap::Dlss;
             }

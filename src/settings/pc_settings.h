@@ -12,6 +12,9 @@ namespace SecondSon::Settings {
 struct PcSettings {
     // [Display]
     std::string monitor; // display name the window opens on; "" = the primary display
+    // FrameBreak FB-2 (native backend): "console" (a flip at the PS4's 59.94 Hz vblank) | "30" | "60" | "90" | "120" |
+    // "144" | "165" | "240" | "unlimited" (a flip as soon as its frame is done)
+    std::string frame_rate_limit = "console";
 
     // [Graphics]: the bridge's presenter (FSR 1.0 + RCAS of the final frame); the native backend: P4.6
     bool fsr = false;       // upscales the game's 1920x1080 frame to a larger window

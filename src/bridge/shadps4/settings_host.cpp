@@ -134,6 +134,8 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
             } else if (d->id == "display.showFps" && bridge_presenter) {
                 EmulatorSettings.SetShowFpsCounter(c.show_fps);
                 Overlay::SetSimpleFps(c.show_fps);
+            } else if (d->id == "display.frameRateLimit" && !bridge_presenter) {
+                Gpu::Native::SetFrameLimit(c.pc.frame_rate_limit); // the present thread's pacing, at once
             } else if (d->id == "graphics.smokeQuality") {
                 Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
             } else if (d->id == "graphics.particleResolution") {

@@ -26,9 +26,10 @@ class Timeline;
 
 class Presenter {
 public:
-    /// `sdl_window`: the game's SDL_Window. nullptr and `error` on failure.
+    /// `sdl_window`: the game's SDL_Window; `present_mode` the wanted one ("Mailbox" | "Fifo" | "Immediate", [Display]
+    /// presentMode: the next supported one if the surface lacks it). nullptr and `error` on failure.
     static std::unique_ptr<Presenter> Create(DeviceContext& ctx, Timeline& timeline, void* sdl_window,
-                                             std::string& error);
+                                             const std::string& present_mode, std::string& error);
     ~Presenter(); ///< waits for its submissions, destroys frames and the swapchain
 
     Presenter(const Presenter&) = delete;

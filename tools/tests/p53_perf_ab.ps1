@@ -46,6 +46,15 @@ $defs = @{
     # GPU optimization stage: P5.4 early frame submission on top of Native (frame_trace.cpp, SSPC_P54_EARLY_SUBMIT)
     native_early = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1"
     early_cfirst = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1;SSPC_DIAG_QUEUE_ORDER=compute-first"
+    # FrameBreak FB-2 (docs/FRAMEBREAK.md): the present pacing - console (a flip at the 59.94 Hz vblank, as before),
+    # free with a cap, unlimited
+    fb_console   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console"
+    fb_unl       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited"
+    fb_60        = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=60"
+    fb_90        = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=90"
+    fb_120       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=120"
+    fb_144       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=144"
+    fb_30        = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30"
     # GPU-6: written bindings in video memory shadowed again as before (vk_executor.cpp PrepareShadows)
     native_shkeep = "SSPC_CP_MODE=native;SSPC_GPU_SHADOW_VRAM=keep"
     # the frame lifecycle trace (tools\p54\p54_lifecycle.py, compute scheduling): not for FPS

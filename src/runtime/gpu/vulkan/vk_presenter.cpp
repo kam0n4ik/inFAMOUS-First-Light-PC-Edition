@@ -44,6 +44,21 @@ VkFormat Unorm(VkFormat f) {
     }
 }
 
+const char* PresentModeName(VkPresentModeKHR m) {
+    switch (m) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+        return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+        return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_KHR:
+        return "FIFO";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+        return "FIFO_RELAXED";
+    default:
+        return "other";
+    }
+}
+
 float HalfToFloat(u16 h) {
     const u32 s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
     float v;
@@ -219,6 +234,8 @@ struct Presenter::Impl {
     VkFormat swap_format = VK_FORMAT_B8G8R8A8_UNORM;
     VkExtent2D extent{};
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR wanted_mode = VK_PRESENT_MODE_MAILBOX_KHR; ///< [Display] presentMode
+    bool modes_logged = false;
     std::vector<VkImage> images;
     std::vector<VkSemaphore> done; ///< per swapchain image: its commands finished (the present waits on it)
 
@@ -347,12 +364,25 @@ struct Presenter::Impl {
         f.vkGetPhysicalDeviceSurfacePresentModesKHR(ctx.Physical(), surface, &nm, nullptr);
         std::vector<VkPresentModeKHR> modes(nm);
         f.vkGetPhysicalDeviceSurfacePresentModesKHR(ctx.Physical(), surface, &nm, modes.data());
-        // the VideoOut thread paces at the vblank: a present must not block it (mailbox, else immediate, else FIFO)
+        // [Display] presentMode (FrameBreak FB-2): the wanted mode if the surface has it, else mailbox, immediate,
+        // FIFO (FIFO always exists). FIFO blocks the VideoOut thread at the display's refresh (vertical sync).
+        const auto has = [&](VkPresentModeKHR m) { return std::ranges::find(modes, m) != modes.end(); };
         mode = VK_PRESENT_MODE_FIFO_KHR;
-        if (std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) != modes.end()) {
+        if (has(wanted_mode)) {
+            mode = wanted_mode;
+        } else if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
             mode = VK_PRESENT_MODE_MAILBOX_KHR;
-        } else if (std::ranges::find(modes, VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end()) {
+        } else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
             mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        if (!modes_logged) {
+            modes_logged = true;
+            std::string list;
+            for (const VkPresentModeKHR m : modes) {
+                list += fmt::format("{}{}", list.empty() ? "" : ", ", PresentModeName(m));
+            }
+            SSPC_LOG(GPU, Info, "native presenter: present modes {}; wanted {}, using {}; {} images min, {} max", list,
+                     PresentModeName(wanted_mode), PresentModeName(mode), caps.minImageCount, caps.maxImageCount);
         }
         u32 count = std::max(caps.minImageCount + 1, 3u);
         if (caps.maxImageCount != 0) {
@@ -712,8 +742,11 @@ struct Presenter::Impl {
 Presenter::Presenter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timeline, void* sdl_window,
-                                             std::string& error) {
+                                             const std::string& present_mode, std::string& error) {
     auto impl = std::make_unique<Impl>(ctx, timeline);
+    impl->wanted_mode = present_mode == "Fifo"        ? VK_PRESENT_MODE_FIFO_KHR
+                        : present_mode == "Immediate" ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                      : VK_PRESENT_MODE_MAILBOX_KHR;
     if (!ctx.Caps().swapchain_maintenance1) {
         error = "present fences are required (swapchainMaintenance1)";
         return nullptr;

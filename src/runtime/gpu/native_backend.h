@@ -18,6 +18,9 @@ struct Options {
     void* sdl_window = nullptr;          ///< the game window (SDL_Window*)
     s32 device_index = -1;
     bool validation = false;             ///< --gpu-native-validate
+    std::string present_mode = "Mailbox"; ///< [Display] presentMode: "Mailbox" | "Fifo" | "Immediate"
+    std::string frame_limit = "console"; ///< [Display] frameRateLimit (VideoOut::ParsePacing)
+    u32 pacing_spin_us = 200;            ///< a capped pacing's spin before a flip
     bool diagnostics = false;            ///< --gpu-native-diag (command journal, checkpoints, markers, names)
     s32 sdk_version = 0;                 ///< the game's compiled SDK version (GnmDriver's init sequence)
     u64 capture_flip = 0;                ///< --gpu-capture-native-frame N
@@ -67,6 +70,8 @@ void Stop();
 bool Running();
 /// FSR frame generation on / off while the game runs (the settings menu; the presenter switches its swapchain).
 void SetFrameGen(bool on);
+/// FrameBreak FB-2: [Display] frameRateLimit while the game runs (VideoOut::ParsePacing; the spin kept). false: unknown.
+bool SetFrameLimit(const std::string& limit);
 /// A summary of what the backend did (also written to <logs>\gpu_native.txt at Stop).
 std::string Report();
 
