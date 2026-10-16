@@ -149,6 +149,9 @@ public:
         /// as flags of the next record (stream order); a read of memory a GPU write may still be pending for waits
         /// until thread 2 executed every earlier record (not a drain of thread 1). async_acquire is off with it.
         bool frontend_thread = false;
+        /// Native CP (SSPC_CP_JOURNAL_CHANGES=1): register writes that change nothing are not journaled (the replicas
+        /// already hold those values; RegisterFile::SetSinkChangesOnly).
+        bool journal_changes_only = false;
     };
     /// `buffers`: the executor's buffer cache (the processor's writes invalidate it on thread 2).
     ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options);
@@ -343,6 +346,7 @@ private:
     const u64 spin_ticks_;
     const bool async_, async_copies_, verify_;
     bool async_acquire_ = false;
+    bool journal_changes_only_ = false;
     std::atomic<u64> verified_{0}, verify_mismatches_{0}; ///< thread 2 (Options::verify)
     GS::ShaderFrontend* frontend_ = nullptr;
     const std::atomic<u64>* map_gen_ = nullptr;

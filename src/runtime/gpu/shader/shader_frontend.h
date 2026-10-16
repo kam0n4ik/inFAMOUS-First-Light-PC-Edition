@@ -176,7 +176,8 @@ struct FrontendStats {
     u64 queued = 0, queue_full = 0, gated = 0, layout_retries = 0;
     u64 translations = 0, translation_failures = 0;
     u64 translate_us = 0, emit_us = 0, spirv_bytes = 0;
-    u64 srt_compile_failures = 0, srt_walk_failures = 0, srt_faults = 0, srt_reads = 0;
+    u64 srt_compile_failures = 0, srt_walk_failures = 0, srt_faults = 0, srt_reads = 0, srt_line_reads = 0,
+        srt_line_mismatches = 0;
     u64 pipeline_reuse = 0;     ///< the draw kept the previous pipeline (modules and its register groups unchanged)
     /// P4.7 stage memo: the stage's last preparation taken again (same program address, runtime, binding start, user
     /// data; no guest memory change since); misses: guest memory changed since / user data differ / anything else

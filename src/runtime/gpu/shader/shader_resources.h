@@ -111,7 +111,9 @@ public:
     size_t Size() const { return ops_.size(); }
 
     struct RunStats {
-        u32 reads = 0;  ///< guest memory reads
+        u32 reads = 0;  ///< guest memory reads (the walk's loads)
+        u32 line_reads = 0; ///< Native CP: of the guest memory, 64-byte lines read for them (SetLineCache)
+        u32 line_mismatches = 0; ///< SetLineCache verify: a load from a line that differed from the exact read
         u32 faults = 0; ///< reads the memory refused (each yields 0, as the bridge's patched load does)
         u32 user_data_read = 0; ///< bit i: the walk read user data register i (P5.3 Native Render Frontend)
         bool user_data_written = false; ///< the walk stored into the flattened data's first 16 dwords (the registers)
@@ -121,6 +123,10 @@ public:
     /// `flat`).
     bool Run(std::span<const u32, 16> user_data, std::span<u32> flat, GuestReader& memory, RunStats& stats,
              std::string& error) const;
+    /// Native CP (CP-2, SSPC_CP_SRT_LINES=1): a walk reads guest memory by aligned 64-byte lines, each read once per
+    /// walk (a table's descriptors are loaded 4-8 bytes at a time, ~18 loads per walk); a line that cannot be read
+    /// whole falls back to the exact load. Off: every load reads the memory itself. Set once, before the first walk.
+    static void SetLineCache(bool on, bool verify = false);
 
     struct Op {
         u8 code = 0;

@@ -678,6 +678,20 @@ void TestSrt(TestGroup& g) {
     const bool ran2 = srt.Run(bad, z, low, st2, err);
     g.Check("an unreadable table: the copies read 0 and the refusals are counted (the next walk reads again)",
             ran2 && z[16] == 0 && z[17] == 0 && st2.faults > 0, fmt::format("faults {}", st2.faults));
+    // Native CP: the same walks reading guest memory by 64-byte lines
+    GS::SrtProgram::SetLineCache(true);
+    std::vector<u32> lined(24, 0), zl(24, 0xFFFFFFFF);
+    std::copy(ud.begin(), ud.end(), lined.begin());
+    std::copy(bad.begin(), bad.end(), zl.begin());
+    GS::SrtProgram::RunStats st3, st4;
+    const bool ran3 = compiled && srt.Run(ud, lined, low, st3, err);
+    const bool ran4 = srt.Run(bad, zl, low, st4, err);
+    GS::SrtProgram::SetLineCache(false);
+    g.Check("SRT walks by 64-byte lines (Native CP): the same flattened data, fewer memory reads; an unreadable table "
+            "still reads 0 with its refusals counted",
+            ran3 && lined == ours && st3.line_reads != 0 && st3.line_reads < st3.reads && ran4 && zl[16] == 0 &&
+                zl[17] == 0 && st4.faults > 0,
+            fmt::format("loads {}, lines read {}; unreadable: faults {}", st3.reads, st3.line_reads, st4.faults));
     // refusals
     GS::SrtProgram s2;
     const u8 foreign[] = {0x48, 0x89, 0xC8, 0xC3}; // mov rax, rcx; ret

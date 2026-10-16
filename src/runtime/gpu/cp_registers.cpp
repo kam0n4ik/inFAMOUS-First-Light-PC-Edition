@@ -217,7 +217,7 @@ bool RegisterFile::Write(Space space, u32 offset, const u32* values, u32 count) 
     if (mirror_ != nullptr) {
         std::memcpy(mirror_ + first, values, size_t{count} * sizeof(u32));
     }
-    if (sink_ != nullptr) {
+    if (sink_ != nullptr && (changed != 0 || !sink_changes_only_)) {
         sink_->OnWrite(space, offset, values, count);
     }
     writes_ += count;

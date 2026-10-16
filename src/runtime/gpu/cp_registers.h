@@ -218,6 +218,11 @@ public:
     void SetSink(RegisterSink* sink) {
         sink_ = sink;
     }
+    /// Native CP (CP-2): a Write that changes no register is not reported to the sink (a replica kept by the sink's
+    /// reports already holds those values; ~2/3 of the game's register writes repeat the value).
+    void SetSinkChangesOnly(bool on) {
+        sink_changes_only_ = on;
+    }
 
     /// 64-bit content hash of a group's registers, kept up to date at every change (the XOR of a 64-bit mix of each
     /// register's index and value): O(1), no pass over the group's registers when a pipeline key is built.
@@ -246,6 +251,7 @@ private:
     u64 changes_ = 0;
     u32* mirror_ = nullptr;
     RegisterSink* sink_ = nullptr;
+    bool sink_changes_only_ = false;
 };
 
 /// One queue's compute registers [0x2E00, 0x2E50).

@@ -35,6 +35,12 @@ $defs = @{
     round64k_acq = "SSPC_CP_ROUND_PACKETS=65536;SSPC_P411_ASYNC_ACQUIRE=1"
     # CP-2: shader code trusted by write tracking, read again once in 8 frames
     trust_s      = "SSPC_P52_CODE_TRUST=sampled"
+    # Native CP modes (--cp-mode / SSPC_CP_MODE; runtime/gpu/cp_mode.h) and their candidate changes
+    cp_legacy    = "SSPC_CP_MODE=legacy"
+    cp_parallel  = "SSPC_CP_MODE=parallel"
+    cp_native    = "SSPC_CP_MODE=native"
+    native_j     = "SSPC_CP_MODE=native;SSPC_CP_JOURNAL_CHANGES=1"
+    native_srt   = "SSPC_CP_MODE=native;SSPC_CP_SRT_LINES=1"
     # P5.3.1-3 render modes (the parallel processor, the default): LEGACY / the first native pass (G-buffer, pass 1:
     # commit, draw, state, and the Native Render Frontend's cache) / that pass without the cache / HYBRID / NATIVE_EXP.
     legacy       = ""

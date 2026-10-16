@@ -925,6 +925,8 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     }
     stats_.srt_reads += s.plan.srt.reads;
     stats_.srt_faults += s.plan.srt.faults;
+    stats_.srt_line_reads += s.plan.srt.line_reads;
+    stats_.srt_line_mismatches += s.plan.srt.line_mismatches;
     for (size_t i = 0; i < s.plan.status_counts.size(); ++i) {
         stats_.resources[i] += s.plan.status_counts[i];
     }
@@ -1354,8 +1356,10 @@ std::string ShaderFrontend::Report() const {
     t += fmt::format("disk cache (P4.14): modules found for programs met {}, read instead of translated {} (saving {} ms "
                      "of translation as recorded), unusable records {}\n",
                      st.disk_stubs, st.disk_loads, st.disk_saved_us / 1000, st.disk_load_failures);
-    t += fmt::format("SRT walks: guest reads {}, refused reads (0) {}, walkers not interpreted {}, walks failed {}\n",
-                     st.srt_reads, st.srt_faults, st.srt_compile_failures, st.srt_walk_failures);
+    t += fmt::format("SRT walks: guest reads {} (64-byte lines read for them {}, verified loads that differed {}), "
+                     "refused reads (0) {}, walkers not interpreted {}, walks failed {}\n",
+                     st.srt_reads, st.srt_line_reads, st.srt_line_mismatches, st.srt_faults, st.srt_compile_failures,
+                     st.srt_walk_failures);
     t += "resources:";
     for (size_t i = 0; i < st.resources.size(); ++i) {
         t += fmt::format(" {}={}", ResourceStatusName(static_cast<ResourceStatus>(i)), st.resources[i]);

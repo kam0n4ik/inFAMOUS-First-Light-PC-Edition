@@ -43,7 +43,10 @@ std::string ApplyCpMode(std::string mode, bool native_backend) {
     } else if (mode == "parallel") {
         preset = {{"SSPC_P410_PARALLEL_CP", "1"}};
     } else {
-        preset = {{"SSPC_P410_PARALLEL_CP", "1"}, {"SSPC_P52_CODE_TRUST", "sampled"}};
+        preset = {{"SSPC_P410_PARALLEL_CP", "1"},
+                  {"SSPC_P52_CODE_TRUST", "sampled"},
+                  {"SSPC_CP_JOURNAL_CHANGES", "1"},
+                  {"SSPC_CP_SRT_LINES", "1"}};
     }
     std::string set, kept;
     for (const auto& [name, value] : preset) {

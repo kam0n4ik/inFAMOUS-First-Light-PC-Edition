@@ -394,9 +394,27 @@ bool SrtProgram::Compile(std::span<const u8> code, std::string& error) {
     return true;
 }
 
+namespace {
+bool g_srt_lines = false, g_srt_lines_verify = false; // SrtProgram::SetLineCache
+} // namespace
+
+void SrtProgram::SetLineCache(bool on, bool verify) {
+    g_srt_lines = on;
+    g_srt_lines_verify = on && verify; // (every load from a line read exactly too, compared; the exact bytes taken)
+}
+
 bool SrtProgram::Run(std::span<const u32, 16> user_data, std::span<u32> flat, GuestReader& memory, RunStats& stats,
                      std::string& error) const {
     using enum SrtOp;
+    // Native CP: the walk's guest memory by 64-byte lines (one walk: the memory does not change while it runs - it
+    // runs on the processor's thread between packets; a line never crosses a page)
+    struct Line {
+        u64 tag = ~0ull;
+        bool ok = false;
+        alignas(8) u8 bytes[64];
+    };
+    std::array<Line, 4> lines;
+    u32 next_line = 0;
     // rdi is a pointer: into the user data registers (where the walk starts) or a guest address.
     struct Ptr {
         bool guest = false;
@@ -439,6 +457,34 @@ bool SrtProgram::Run(std::span<const u32, 16> user_data, std::span<u32> flat, Gu
         }
         ++stats.reads;
         const u64 addr = base.value + static_cast<u64>(offset);
+        if (g_srt_lines && (addr & 63) + bytes <= 64 && InGpuSpace(addr & ~63ull, 64)) {
+            const u64 tag = addr & ~63ull;
+            Line* line = nullptr;
+            for (Line& l : lines) {
+                if (l.tag == tag) {
+                    line = &l;
+                    break;
+                }
+            }
+            if (line == nullptr) {
+                line = &lines[next_line++ % lines.size()];
+                line->tag = tag;
+                line->ok = memory.Read(tag, line->bytes, 64);
+                ++stats.line_reads;
+            }
+            if (line->ok && !g_srt_lines_verify) {
+                std::memcpy(dst, line->bytes + (addr - tag), bytes);
+                return true;
+            }
+            if (line->ok) {
+                u8 exact[8] = {};
+                const bool read = memory.Read(addr, exact, bytes);
+                stats.line_mismatches += !read || std::memcmp(exact, line->bytes + (addr - tag), bytes) != 0 ? 1 : 0;
+                std::memcpy(dst, read ? exact : line->bytes + (addr - tag), bytes);
+                return true;
+            }
+            // (not readable whole: the exact load below decides)
+        }
         if (!InGpuSpace(addr, bytes) || !memory.Read(addr, dst, bytes)) {
             ++stats.faults;
             std::memset(dst, 0, bytes); // the bridge's patched load: the register becomes 0

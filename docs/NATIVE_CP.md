@@ -128,6 +128,43 @@ A/B (`logs/p53/cp2_trust`, n = 2, interleaved; FG off):
 
 The village is limited by the GPU as much as by the processor: no change there. Device lost 0, `[Error]` 0.
 
+## CP-2: register writes that change nothing are not journaled (taken into Native)
+
+The recording thread keeps a replica of the register file from a journal of every register write. 66-68 % of the
+game's register writes repeat the value already there (new counter: `register writes ..., of them changing a value
+... (32-34 %)`); a packet that changes no register now writes nothing to the journal
+(`RegisterFile::SetSinkChangesOnly`, `SSPC_CP_JOURNAL_CHANGES=1`): the replica already holds those values.
+
+Check: `SSPC_P410_VERIFY=1` (the replica's registers compared with the processor's at every draw and dispatch):
+33.3 million compared, **0 different** (beach and village, `logs/cp/journal_verify`).
+
+A/B Native vs Native + this (`logs/p53/cp2_journal`, n = 2, interleaved):
+
+| Scene | Native FPS | + journal changes only | CP thread ms | recording thread ms |
+|---|---|---|---|---|
+| beach | 44.3 [42.4..46.1] | 47.6 [47.5..47.7] | 19.9 -> 18.2 | 16.6 -> 15.5 |
+| early | 40.9 [40.8..41.1] | **42.3 [42.2..42.4]** (+3.4 %) | 20.5 -> 19.7 | 16.8 -> 16.3 |
+| user1022 | 36.7 [36.4..37.1] | **37.3 [37.2..37.4]** (+1.6 %) | 21.9 -> 21.3 | 18.1 -> 17.9 |
+
+1% low unchanged (29.2-29.3). Device lost 0, `[Error]` 0.
+
+## CP-2: SRT walks read guest memory by 64-byte lines (taken into Native)
+
+An SRT walk (the game's resource table walker, interpreted) loads 4-8 bytes per guest memory read: ~88 000 reads
+per frame, each through the frontend's reader with its check for a pending GPU write. Now a walk reads aligned 64-byte
+lines, each once per walk (a line never crosses a page; one that cannot be read whole falls back to the exact load;
+`SrtProgram::SetLineCache`, `SSPC_CP_SRT_LINES=1`; `verify`: every load from a line also read exactly and compared).
+Memory reads per run 238 M loads -> 19 M lines (12.4×). Check (`logs/cp/srt_verify`, beach + village): 518 million
+loads verified, **0 differed**. Self-test `Shader(srt)`: the same walks give the same flattened data with fewer reads.
+
+A/B Native (with the journal change) vs + lines (`logs/p53/cp2_srt`, n = 2, interleaved):
+
+| Scene | Native FPS | + SRT lines | CP thread ms |
+|---|---|---|---|
+| beach | 47.2 [47.0..47.3] | **48.5 [48.4..48.5]** (+2.7 %) | 18.5 -> 17.9 |
+| early | 41.6 [41.5..41.8] | **42.8 [42.5..43.0]** (+2.7 %) | 20.0 -> 19.4 |
+| user1022 | 37.4 [36.7..38.2] | 37.9 [37.4..38.5] (within the spread) | 21.0 -> 20.5 |
+
 ## Modes (CP-3.14)
 
 `--cp-mode legacy|parallel|native` (or `SSPC_CP_MODE`; `runtime/gpu/cp_mode.*`), chosen once before the backend
@@ -138,7 +175,7 @@ keeps its value; the log says what the mode set (`command processor mode: native
 |---|---|---|
 | legacy | one thread (`SSPC_P410_PARALLEL_CP=0`) | |
 | parallel | the processor + frontend, and the Vulkan recording thread (P4.10) | **yes** (until Native passes long play) |
-| native | parallel + code trust `sampled` | |
+| native | parallel + code trust `sampled` + journal of changes only + SRT lines | |
 
 ### Checks of Native (2026-10-16)
 

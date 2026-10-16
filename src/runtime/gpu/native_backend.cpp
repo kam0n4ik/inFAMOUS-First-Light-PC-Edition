@@ -522,6 +522,14 @@ bool Backend::Start(const Options& o, std::string& error) {
                                    "pages stay unwritten", s);
         }
     }
+    // Native CP: SSPC_CP_SRT_LINES=1 - SRT walks read guest memory by 64-byte lines (SrtProgram::SetLineCache)
+    // (verify: every load from a line read exactly too and compared - "verified loads that differed" in the report)
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_CP_SRT_LINES", v, sizeof(v)) > 0 &&
+                        (std::string_view(v) == "1" || std::string_view(v) == "verify")) {
+        const bool verify = std::string_view(v) == "verify";
+        GS::SrtProgram::SetLineCache(true, verify);
+        SSPC_LOG(GPU, Info, "Native CP: SRT walks read guest memory by 64-byte lines (SSPC_CP_SRT_LINES={})", v);
+    }
     // P5.3 Native Render Frontend: SSPC_P53_NATIVE_FRONTEND=[verify:]<passes> - the stages of draws the engine
     // described (draw markers; SSPC_P53_NATIVE_DRAW) in these passes take a cached preparation with exactly their
     // inputs. <passes>: "apply" (or 1/on: the passes of SSPC_P53_NATIVE_DRAW=apply:..), "all", or a list 0..40.
@@ -616,6 +624,15 @@ bool Backend::Start(const Options& o, std::string& error) {
             char e[8] = {};
             return GetEnvironmentVariableA("SSPC_P411_ASYNC_ACQUIRE", e, sizeof(e)) == 1 && e[0] == '1';
         }();
+        // Native CP: SSPC_CP_JOURNAL_CHANGES=1 - register writes that change nothing are not journaled
+        po.journal_changes_only = [] {
+            char e[8] = {};
+            return GetEnvironmentVariableA("SSPC_CP_JOURNAL_CHANGES", e, sizeof(e)) == 1 && e[0] == '1';
+        }();
+        if (po.journal_changes_only) {
+            SSPC_LOG(GPU, Info, "Native CP: register writes that change nothing are not journaled "
+                                "(SSPC_CP_JOURNAL_CHANGES=1)");
+        }
         if (frontend_ahead) {
             po.frontend = frontend_.get();
             po.map_gen = &memory_.map_gen;

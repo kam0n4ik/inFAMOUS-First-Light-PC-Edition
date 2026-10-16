@@ -109,6 +109,7 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
     }
     fthread_mode_ = options.frontend_thread && frontend_ != nullptr;
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
+    journal_changes_only_ = options.journal_changes_only;
 }
 
 ParallelCp::~ParallelCp() {
@@ -126,6 +127,7 @@ void ParallelCp::Attach(Cp::CommandProcessor& cp) {
         freplica_.SetMirror(nullptr);
     }
     cp.MutableRegisters().SetSink(this);
+    cp.MutableRegisters().SetSinkChangesOnly(journal_changes_only_);
     exec_.SetRegisters(&replica_);
 }
 
@@ -160,6 +162,7 @@ void ParallelCp::Stop() {
     exec_.SetMemoBumps(true);
     if (cp_ != nullptr) {
         cp_->MutableRegisters().SetSink(nullptr);
+        cp_->MutableRegisters().SetSinkChangesOnly(false);
         exec_.SetRegisters(&cp_->Registers());
     }
 }
