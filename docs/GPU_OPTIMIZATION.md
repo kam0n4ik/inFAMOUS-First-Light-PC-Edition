@@ -67,6 +67,60 @@ BackBuffer` layout at a draw - VUID-vkCmdDraw-None-09600 20; `AMD FSR PresentQue
 00067 4) and two seen once at one submission (a clear after a transition - SYNC-HAZARD-WRITE-AFTER-WRITE; an image
 view of a transfer-only image - 04441).
 
+## Where the time goes after GPU-1 (Native + early, 2026-10-16)
+
+GPU time per effect category, Performance Inspector (`SSPC_INSPECTOR=light`: timestamps at category changes, window
+62-88 s; `logs/performance_inspector/2026-10-16_09-21-29`, `_09-25-51`, `_09-30-13`), ms per frame; "rec" = the
+recording thread's CPU time of those commands:
+
+| Category | beach GPU (rec) | harbour GPU (rec) | village GPU (rec) | draws / dispatches (beach / village) |
+|---|---|---|---|---|
+| all | 13.89 | 15.90 | 21.64 | |
+| compute, other | 1.14 (0.28) | 1.73 (0.67) | **4.07** (4.56) | 46 / 1110 dispatches |
+| geometry / G-buffer | 2.70 (3.56) | 3.52 (5.09) | 3.28 (3.56) | 854 / 855 draws |
+| post-processing | 2.85 (0.45) | 2.94 (0.44) | 3.12 (0.44) | 63 / 67 |
+| write-backs and copies (GPU -> host) | 1.44 | 1.43 | **3.45** | |
+| smoke | 0.26 (0.03) | 0.56 | **2.03** (0.03) | 2 / 2 draws |
+| lighting | 1.17 | 1.15 | 1.43 | 1 dispatch |
+| shadows | 1.35 (**4.73**) | 1.33 (4.01) | 0.84 (3.43) | **3487** / 2271 draws |
+| particle simulation | 1.19 (2.37) | 1.06 | 0.96 | 518 / 413 dispatches |
+| foliage (classified) | 0.06 (1.69) | 0.02 | 0.02 | 836 / 219 draws |
+
+Foliage costs the GPU almost nothing; its cost is per draw on the CPU (the shadow cascades draw the foliage again:
+3487 shadow draws a frame on the beach, 4.7 ms of recording). The village's GPU is compute (1110 small dispatches),
+the write-backs and one smoke draw (2 ms: 5-6 thousand particle quads blended into a 1920×1080 RGBA16F target).
+
+The processor's thread (CPU samples, `logs/p53/opt4_prof`): the frontend's PrepareStage 27-32 %, CopyStage 8-11 %,
+**ShaderFrontend::GpuWrote 5.2 % (beach) / 8.4 % (village)**, RegisterFile::Write 4-6 %, waits 10-15 %.
+
+## GPU-3: tracked shader code blocks by a bitmap (taken)
+
+`ShaderFrontend::GpuWrote` (P5.2 code trust) runs for every written binding of every draw and dispatch and looked up
+an `unordered_set` once per 64 KiB block of the binding (a 16 MiB pool = 256 lookups; MSVC's `std::hash<u64>` is
+FNV-1a). Now a bitmap of the blocks below 1 TiB, checked a 64-bit word at a time, and the blocks' bounds; the set
+stays for anything above. The same answer by construction (a randomized check of the word masks against the set:
+200 000 ranges, 0 different); self-tests (shader) 126 / 0.
+
+A/B (`logs/p53/opt5_codebits`, n = 3, two exes interleaved: `p53_perf_ab.ps1 -ExeB`):
+
+| Scene | before | after | processor thread ms |
+|---|---|---|---|
+| beach | 53.97 [53.94..54.01] | **55.19 [55.13..55.24]** (+2.3 %) | 18.05 -> 17.63 |
+| early | 50.07 [50.00..50.20] | **50.68 [50.59..50.82]** (+1.2 %) | 19.30 -> 18.94 |
+| user1022 | 37.36 [36.67..37.79] | 37.24 [35.50..38.22] | 21.55 -> 21.58 |
+
+The village's low run (35.50, 1 % low 20.1) is the new exe's first run: its shaders were translated again while it
+ran (829 translations, 1.2 s of pipeline creation in the measured window); its other two runs 38.22 / 38.00.
+
+## GPU-4: unchanged draw stages handed on as one shared copy (measured, rejected)
+
+Thread 1 copies each draw's two prepared stages into the record (CopyStage). A stage the frontend's memo kept
+unchanged was handed on as one shared immutable copy instead (a generation counter per stage). Verify mode
+(`logs/opt/share_verify`): 9.57 M stages shared on the beach, 7.90 M in the village, **0 different**; register
+replica 35.9 M draws/dispatches, 0 different. But A/B (`logs/p53/opt6_share`, n = 3): beach 54.55 -> 53.93 FPS,
+processor +0.18 ms; harbour and village within the spread - one allocation per 5 shares and the shared pointers'
+atomic counts between the two threads cost what the copies saved. Removed.
+
 ## Tools
 
 - `p53_perf_ab.ps1` configurations: `native_early`, `early_cfirst`, `native_prof` (CPU samples of both GPU threads),
