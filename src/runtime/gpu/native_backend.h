@@ -19,7 +19,7 @@ struct Options {
     s32 device_index = -1;
     bool validation = false;             ///< --gpu-native-validate
     std::string present_mode = "Mailbox"; ///< [Display] presentMode: "Mailbox" | "Fifo" | "Immediate"
-    std::string frame_limit = "console"; ///< [Display] frameRateLimit (VideoOut::ParsePacing)
+    std::string frame_limit = "60";       ///< [Display] frameRateLimit (VideoOut::ParsePacing)
     u32 pacing_spin_us = 200;            ///< a capped pacing's spin before a flip
     bool diagnostics = false;            ///< --gpu-native-diag (command journal, checkpoints, markers, names)
     s32 sdk_version = 0;                 ///< the game's compiled SDK version (GnmDriver's init sequence)

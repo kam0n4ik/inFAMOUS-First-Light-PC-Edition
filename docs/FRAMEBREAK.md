@@ -1,0 +1,84 @@
+# SecondSonPC: Project FrameBreak - frame pacing, 1 % low, FPS unlock
+
+Measured figures only. RTX 2060 6 GB, Ryzen 5 5500, 32 GB, display 1920×1080 **165 Hz**; runs 1296×759 window,
+MAILBOX, no upscaler, no frame generation, `--cp-mode native`, window 62-88 s (`tools/tests/p53_perf_ab.ps1`).
+
+## FB-1: what limited the frame rate
+
+| Limiter | Where | Effect |
+|---|---|---|
+| **Emulated vblank** | `native_videoout.cpp` `PresentThread`: a flip taken only at a 59.94 Hz tick (every flip_rate + 1-th) | the cap of 60 and the 16.7 / 33.4 / 50 ms steps: a frame that misses a tick waits for the next one |
+| The game's flip rate | `sceVideoOutSetFlipRate` (eboot `0x1f2eb0`, its Options - Frame Rate lock): 0 = 60 Hz, 1 = 30 Hz | honoured in every pacing |
+| The game's double buffering | `sceGnmInsertWaitFlipDone` (`0x628640`): the next frame waits for the buffer shown before | at most one frame ahead of the display: no queue builds up |
+| SubmitFrame's EOP wait | engine `0x1f1e30` (P5.4) | one frame in flight on the GPU |
+| Present mode | the native presenter always took MAILBOX | fixed: `[Display] presentMode` honoured |
+| `0x1f0be0` `usleep` loop | waits for pending flips only while re-registering the display buffers (HDR / size change) | not a limiter |
+| `0x3052b0` streaming budget | spins up to 10 % (90 % while loading) of 1/30 s per frame on its queue | a time budget per frame, not a cap |
+
+The surface offers FIFO, FIFO_RELAXED, MAILBOX, IMMEDIATE; 2..8 images.
+
+**Why the 1 % low sat at ~29.3 FPS:** the benchmark's 1 % low is 1000 / mean of the worst 1 % *present intervals*. With
+the vblank pacing a frame computed in 18 ms was shown 33.4 ms after the previous one; once more than 1 % of frames
+missed 16.7 ms the 1 % low was 1000 / 34 ms whatever the frames cost. It measured the vblank, not the renderer.
+
+## FB-2: present pacing without the vblank (`4237c99`)
+
+`VideoOut::Pacing`: `console` (as before) or free - a flip as soon as its GPU work completes (`Sink::WaitReady` on the
+timeline), with an optional cap (waitable timer + 200 µs spin) and the game's flip rate honoured; the 59.94 Hz vblank
+count still advances. `[Display] frameRateLimit` = `console | 30 | 60 | 90 | 120 | 144 | 165 | 240 | unlimited`
+(settings menu, live); `SSPC_FB_FRAME_LIMIT`, `SSPC_FB_SPIN_US` for test runs.
+
+`tools/frame_stats.py` now reports three streams - `present_` (display intervals), `engine_` (the game's flip
+requests), `render_` (the processor's flip markers) - each with both 1 % low definitions (`low1_fps` = worst 1 % mean,
+`low1_p99_fps` = 1000 / p99), 0.1 % low, p99.9 and the shares of frames under 8.33 / 11.11 / 16.67 ms and over
+25 / 33.33 / 50 ms. The older keys (`avg_fps`, `low1_fps`, `ft_p95_ms`, ...) are unchanged.
+
+A/B `logs/p53/fb2_ab` (n = 3 per mode, interleaved; medians [min..max]):
+
+| Scene | mode | avg FPS | 1 % low | p99 ms | CP / GPU ms |
+|---|---|---|---|---|---|
+| beach | console | 53.4 [50.6..54.8] | 29.4 [29.3..29.4] | 34.0 | 18.2 / 13.3 |
+| beach | unlimited | 56.4 [50.5..56.6] | **48.8** [28.9..51.4] | **19.6** [19.1..33.1] | 17.7 / 13.4 |
+| harbour | console | 51.4 [50.8..51.4] | 29.4 | 34.0 | 18.8 / 15.3 |
+| harbour | unlimited | 51.9 [51.3..52.2] | **46.8** [45.2..47.1] | **21.1** | 18.9 / 15.3 |
+| village | console | 39.0 [38.4..39.0] | 29.3 | 34.1 | 20.5 / 20.7 |
+| village | unlimited | 40.0 [35.8..40.0] | **35.3** [28.9..35.4] | **27.4** | 20.3 / 20.7 |
+
+The frame's own cost is unchanged (CP and GPU per frame the same): the gain is the vblank wait removed, not a faster
+renderer. 18 runs: `[Error]` 0, device lost 0. The low ends of the ranges are runs whose whole window ran 1.8-2.2 ms
+slower on the CP (village unlimited r3: on the GPU too) - the machine's known slow mode (P4.11/P4.12), seen in both
+modes (beach console 50.6 FPS), not the pacing.
+
+## FB-3: the game's time at different frame rates
+
+**Code:** the game's clock `0x12a160` (main loop `0x29c8d0`, object `eboot+0xe16290`): `dt = (rdtsc - last) /
+sceKernelGetTscFrequency`, clamped to 1/30 s (1/15 with a flag), negative -> 0; four clocks accumulate `dt * scale` in
+ticks of 1/1440 s. The world's time is real time, not a vblank or frame count.
+
+**Measured** (`SSPC_FB_CLOCK_PROBE=1`: `src/engine/game_clock_probe.*` reads the clock every 100 ms, read-only;
+`tools/framebreak/clock_rate.py`; `logs/p53/fb3_clock2`, beach, game seconds per wall second, window 62-88 s):
+
+| Pacing | mean frame (dt) | game s / wall s (all four clocks) |
+|---|---|---|
+| cap 30 | 33.7 ms (65 % of frames at the 1/30 clamp) | 0.99994 |
+| console | 17.9 ms | 0.99998 |
+| unlimited | 19.8 ms | 0.99999 |
+
+The game's time does not depend on the pacing. Above 60 FPS it is not measured: no gameplay scene here reaches it
+(the CP takes ~18 ms a frame). Not checked either: per-system timings (physics substeps, animation, particles, scripted
+events, cutscenes, mouse sensitivity) beyond the global clock.
+
+The screenshot comparison (camera after a scripted stick turn, `logs/p53/fb3_time2`, `fb3_turn`) was inconclusive: by
+the 90 s capture the game's own camera recentring decides the view (a 2 s turn ends where three 0.25 s turns do); at
+30 FPS the view stays ~40-75 px apart from ~55 FPS in both series - cause not found.
+
+**Default:** `frameRateLimit = "60"` - the free pacing capped at 60: no vblank wait, the measured rates, no frame rate
+above the one the game was made for (menus and loading screens ran at ~200 FPS unlimited: ~18 000 flips a run against
+~5 000). `console` and `unlimited` stay in the menu.
+
+## Tools
+
+- `p53_perf_ab.ps1` configs `fb_console`, `fb_unl`, `fb_30` ... `fb_144`, `fbc_*` (with the clock probe); `-Press`
+  for a scripted route of one's own (p46_runs.ps1 `-Press`).
+- `SSPC_SELFTEST_ONLY=settings`: the PC settings' self-test groups alone (the full self-test needs more commit than
+  this PC has without a page file - it crashed the same way on the pre-FrameBreak exe).

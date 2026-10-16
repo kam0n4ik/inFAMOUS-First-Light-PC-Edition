@@ -20,7 +20,8 @@ param(
     [string]$Env = "",
     [string]$Exe = "",
     [string]$OutRoot = "",
-    [string]$ExtraArgs = ""
+    [string]$ExtraArgs = "",
+    [string]$Press = "" # FrameBreak: scripted input instead of the default route (--press syntax)
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -47,10 +48,11 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
         Copy-Item $sources[$scene] "$profileDir\home" -Recurse
         foreach ($f in "gpu_device_lost.txt", "vk_validation.log", "gpu_native.txt", "gpu_frames.csv",
                     "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt",
-                    "gpu_cpu_profile.txt", "gpu_cpu_profile_game.txt", "cpu_samples_raw.txt") {
+                    "gpu_cpu_profile.txt", "gpu_cpu_profile_game.txt", "cpu_samples_raw.txt", "game_clock.csv") {
             Remove-Item "$root\logs\$f" -ErrorAction SilentlyContinue
         }
         $press = "space@12,space@22,move:-3000:0@56:0.25,move:-3000:0@58:0.25,move:-3000:0@60:0.25"
+        if ($Press) { $press = $Press }
         $gameArgs = "--loader sspc --user-data $profileDir --vram-log 5 --press $press"
         if ($Backend -eq "sspc") { $gameArgs += " --gpu-backend sspc" }
         if ($Validate) { $gameArgs += " --gpu-native-validate" }
@@ -76,7 +78,7 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
         New-Item -ItemType Directory -Force $out | Out-Null
         foreach ($f in "gpu_device_lost.txt", "gpu_native.txt", "gpu_frames.csv", "SecondSonPC.log", "vk_validation.log",
                     "shader_stall_events.csv", "shader_stall_frames.csv", "shader_stall_frames.txt", "shader_stall_summary.txt",
-                    "gpu_cpu_profile.txt", "gpu_cpu_profile_game.txt", "cpu_samples_raw.txt") { # (P5.2: the samplers' output)
+                    "gpu_cpu_profile.txt", "gpu_cpu_profile_game.txt", "cpu_samples_raw.txt", "game_clock.csv") { # (P5.2: the samplers' output)
             if (Test-Path "$root\logs\$f") { Copy-Item "$root\logs\$f" $out }
         }
         foreach ($f in "screen.png", "run.json") {

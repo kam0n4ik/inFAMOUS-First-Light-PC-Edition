@@ -59,6 +59,7 @@
 #include "runtime/gpu/upscale/reflex.h"
 #include "ui/menu_controller.h"
 #include "bridge/shadps4/track_diag.h"
+#include "engine/game_clock_probe.h"
 #include "engine/guest_hooks.h"
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
@@ -845,6 +846,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // PC Edition: the game's own settings screen (Esc) leads to the PC settings (docs/PC_EDITION_UI.md)
     Engine::GameMenu::Install(linker.GetModule(eboot_index)->Base());
     Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+    Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (FrameBreak FB-3)
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
     if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)

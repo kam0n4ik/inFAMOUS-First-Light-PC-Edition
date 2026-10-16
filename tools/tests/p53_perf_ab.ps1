@@ -13,7 +13,8 @@ param(
     [int]$Seconds = 90,
     [string]$Configs = "base,apply9,apply19,apply19s,par_base,par_apply19s",
     [string]$Exe = "", # a copy of SecondSonPC.exe for the whole series (the build may change while it runs)
-    [string]$ExeB = "" # a second exe: a configuration named <config>_B runs <config> with it (an A/B of two builds)
+    [string]$ExeB = "", # a second exe: a configuration named <config>_B runs <config> with it (an A/B of two builds)
+    [string]$Press = "" # FrameBreak: scripted input for p46_runs.ps1 (its default route if empty)
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -55,6 +56,11 @@ $defs = @{
     fb_120       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=120"
     fb_144       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=144"
     fb_30        = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30"
+    # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
+    fbc_console  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console;SSPC_FB_CLOCK_PROBE=1"
+    fbc_30       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30;SSPC_FB_CLOCK_PROBE=1"
+    fbc_60       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=60;SSPC_FB_CLOCK_PROBE=1"
+    fbc_unl      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_CLOCK_PROBE=1"
     # GPU-6: written bindings in video memory shadowed again as before (vk_executor.cpp PrepareShadows)
     native_shkeep = "SSPC_CP_MODE=native;SSPC_GPU_SHADOW_VRAM=keep"
     # the frame lifecycle trace (tools\p54\p54_lifecycle.py, compute scheduling): not for FPS
@@ -112,6 +118,7 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
                 "-Scenes", $scene, "-Repeats", "1", "-Seconds", "$Seconds", "-OutRoot", $out)
             if ($defs[$cfgEnv]) { $runArgs += @("-Env", $defs[$cfgEnv]) } # (base: no variable at all)
             if ($cfgExe) { $runArgs += @("-Exe", $cfgExe) }
+            if ($Press) { $runArgs += @("-Press", $Press) }
             powershell @runArgs | Out-Null
             if (-not (Test-Path "$out\$runTag\${scene}_1\stats.json")) {
                 "$(Get-Date -Format s) $runTag $scene FAILED: no stats.json" | Out-File "$out\series.txt" -Encoding utf8 -Append

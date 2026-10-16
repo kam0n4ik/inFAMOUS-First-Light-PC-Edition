@@ -24,6 +24,7 @@ add_library(sspc_runtime STATIC
     src/base/lifecycle.cpp
     src/base/log.cpp
     src/base/vram_monitor.cpp
+    src/engine/game_clock_probe.cpp
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp
