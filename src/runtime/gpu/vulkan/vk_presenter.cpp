@@ -1179,8 +1179,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         if (show && frame >= 0 && m.fg_frames[frame].valid) {
             Impl::FgFrame& g = m.fg_frames[frame];
             in = &g.in;
+            // (TRANSFER_SRC: AMD's frame generation copies out of it - VUID-vkCmdCopyImage-aspect-06662)
             if (MakeOwn(m.ctx, m.fg_hudless_bb, m.swap_format, m.extent.width, m.extent.height,
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
                 OwnBarrier(s.cb, m.fg_hudless_bb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                            VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 const VkClearColorValue clear{.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
