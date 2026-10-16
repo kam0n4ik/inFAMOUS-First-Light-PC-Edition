@@ -42,6 +42,16 @@ $defs = @{
     native_j     = "SSPC_CP_MODE=native;SSPC_CP_JOURNAL_CHANGES=1"
     native_srt   = "SSPC_CP_MODE=native;SSPC_CP_SRT_LINES=1"
     native_flip  = "SSPC_CP_MODE=native;SSPC_CP_ASYNC_FLIP=1"
+    # GPU optimization stage: P5.4 early frame submission on top of Native (frame_trace.cpp, SSPC_P54_EARLY_SUBMIT)
+    native_early = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1"
+    early_cfirst = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1;SSPC_DIAG_QUEUE_ORDER=compute-first"
+    # the frame lifecycle trace (tools\p54\p54_lifecycle.py, compute scheduling): not for FPS
+    early_trace  = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1;SSPC_P54_FRAME_TRACE=1;SSPC_P412_STALL_TRACE=deep"
+    # profiles (not for FPS): CPU samples of both GPU threads after 60 s; the Performance Inspector (GPU time per
+    # effect category from timestamps at category changes, logs\performance_inspector\<time>)
+    native_prof  = "SSPC_CP_MODE=native;SSPC_DIAG_SAMPLE=1;SSPC_DIAG_SAMPLE_GAME=GpuRecord;SSPC_DIAG_SAMPLE_AFTER=60"
+    native_insp  = "SSPC_CP_MODE=native;SSPC_INSPECTOR=light,sample=0"
+    early_insp   = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1;SSPC_INSPECTOR=light,sample=0"
     # P5.3.1-3 render modes (the parallel processor, the default): LEGACY / the first native pass (G-buffer, pass 1:
     # commit, draw, state, and the Native Render Frontend's cache) / that pass without the cache / HYBRID / NATIVE_EXP.
     legacy       = ""

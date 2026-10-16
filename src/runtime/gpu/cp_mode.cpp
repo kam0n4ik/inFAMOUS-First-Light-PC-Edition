@@ -46,7 +46,9 @@ std::string ApplyCpMode(std::string mode, bool native_backend) {
         preset = {{"SSPC_P410_PARALLEL_CP", "1"},
                   {"SSPC_P52_CODE_TRUST", "sampled"},
                   {"SSPC_CP_JOURNAL_CHANGES", "1"},
-                  {"SSPC_CP_SRT_LINES", "1"}};
+                  {"SSPC_CP_SRT_LINES", "1"},
+                  // the frame handed to the processor at the game's sceGnmSubmitDone (P5.4; docs/NATIVE_CP.md, GPU-1)
+                  {"SSPC_P54_EARLY_SUBMIT", "1"}};
     }
     std::string set, kept;
     for (const auto& [name, value] : preset) {
