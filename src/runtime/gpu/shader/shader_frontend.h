@@ -266,6 +266,10 @@ public:
     const std::shared_ptr<const StageView>& SharedStage(HwStage stage) const {
         return shared_[static_cast<size_t>(stage)];
     }
+    /// FrameBreak FB-6: changes whenever the stage's own view (Stage() without a shared preparation) may have changed
+    /// since the last draw/dispatch - every preparation but one the stage memo took again unchanged. The parallel
+    /// processor copies a view into its record only when this moved.
+    u64 StageGeneration(HwStage stage) const { return stage_gen_[static_cast<size_t>(stage)]; }
     /// Translations run so far and their time (any thread: the frame log samples it at each flip).
     struct TranslationTotals {
         u64 count = 0, ns = 0, max_ns = 0;
@@ -347,6 +351,8 @@ private:
         std::array<u32, 16> user_data{};
     };
     std::array<StageMemo, static_cast<size_t>(HwStage::Count)> memo_{};
+    std::array<u64, static_cast<size_t>(HwStage::Count)> stage_gen_{}; ///< FB-6 (StageGeneration)
+    std::array<bool, static_cast<size_t>(HwStage::Count)> memo_hit_{}; ///< the last PrepareStage was a memo hit
     std::array<u64, static_cast<size_t>(HwStage::Count)> runtime_ver_{}; ///< bumped at every runtime rebuild
     std::atomic<u64> memory_gen_{1}; ///< (atomic: a change may be reported from another thread)
     bool memo_on_ = false;

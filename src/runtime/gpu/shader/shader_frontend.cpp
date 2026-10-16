@@ -775,6 +775,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
                                          GuestReader& memory, bool may_queue, const Cp::EngineTable* engine) {
     const size_t si = static_cast<size_t>(hw);
     shared_[si].reset();
+    memo_hit_[si] = false;
     // P4.7: the stage's last ready preparation again (its StageView holds it) when nothing it was built from changed
     StageMemo& memo = memo_[si];
     u64 verify = 0; // SSPC_DIAG_STAGE_MEMO=verify: a hit prepared in full anyway - the fingerprint of what it would give
@@ -787,6 +788,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
             s.module->state.load(std::memory_order_acquire) == ModuleState::Ready) {
             if (!memo_verify_) {
                 ++stats_.memo_hits;
+                memo_hit_[si] = true; // (the view is untouched: FB-6's generation stays)
                 ++s.module->uses;
                 NoteGpuWrites(s); // (P5.2: its writes happen again with this draw)
                 return StageStatus::Ready;
@@ -1257,9 +1259,13 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         const auto cpst = static_cast<size_t>(hw); // Cp::Stage has the graphics stages in HwStage's order
         const std::span<const u32, 16> ud(d.user_data[cpst]);
         const Cp::EngineTable* engine = !native ? nullptr : hw == HwStage::Ps ? &d.engine_ps : &d.engine_vs;
+        memo_hit_[si] = false;
         s.status = runtime_valid_[si]
                        ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready, engine)
                        : StageStatus::Unsupported;
+        if (!memo_hit_[si]) {
+            ++stage_gen_[si]; // (FB-6: anything but an unchanged memo hit may have changed the view)
+        }
         ++stats_.stage_status[static_cast<size_t>(s.status)];
         ready &= s.status == StageStatus::Ready;
         start = Stage(hw).end; // (the shared preparation's, when the native cache gave one)
@@ -1305,6 +1311,7 @@ const DrawPreparation& ShaderFrontend::PrepareDispatch(const Cp::DispatchDescrip
     ++stats_.dispatches;
     prep_ = {};
     StageView& s = stages_[static_cast<size_t>(HwStage::Cs)];
+    ++stage_gen_[static_cast<size_t>(HwStage::Cs)]; // (FB-6: the runtime is rebuilt every dispatch)
     BuildComputeRuntime(cs, s.runtime);
     ++runtime_ver_[static_cast<size_t>(HwStage::Cs)];
     ++stats_.runtime_builds;

@@ -82,3 +82,32 @@ above the one the game was made for (menus and loading screens ran at ~200 FPS u
   for a scripted route of one's own (p46_runs.ps1 `-Press`).
 - `SSPC_SELFTEST_ONLY=settings`: the PC settings' self-test groups alone (the full self-test needs more commit than
   this PC has without a page file - it crashed the same way on the pre-FrameBreak exe).
+
+## FB-6: the command processor (in progress)
+
+Profile without the vblank (`logs/p53/fb6_prof`, beach, `native_prof`): thread 1 (CP + shader frontend) 18.2 ms a
+frame, of it 3.3 ms waiting for thread 2 (drains at round ends ~1.6 ms, met memory waits ~0.8 ms); thread 2
+(recording) busy 15.8, idle 2.4. Thread 1: PrepareDraw 42 % incl. (PrepareStage 29 %), CopyStage 11 %, SetRegs /
+RegisterFile::Write ~7 %, memmove 8.6 % excl.; thread 2: the driver's vkCmd* ~18 % (shown as vkGetInstanceProcAddr),
+RecordDraw 13 %, BindStage 7 %, GuestRangeImpl 9 %.
+
+**CP-5 "both" again without the vblank (rejected again).** A round of 65536 packets + met memory waits without a drain
+(`SSPC_CP_ROUND_PACKETS=65536;SSPC_P411_ASYNC_ACQUIRE=1`; `logs/p53/fb6_both`, n = 3, unlimited pacing): thread 1
+-0.7..-0.9 ms, but the frames come later to the GPU - beach 52.8 [49.5..55.4] -> 48.2 [46.7..49.4] FPS, harbour 51.4
+[47.9..51.8] -> 44.3 [43.7..44.8], village 36.9 -> 36.5 / r3 35.5 -> 32.4 (1 % low 26.3 -> 19.7). Several base runs
+fell into the machine's slow mode (49.5 / 47.9 / 34.3).
+
+**Stage reuse (rejected, off).** `SSPC_FB_STAGE_REUSE=1` (`verify` compares every reused stage byte for byte): a draw
+stage the frontend did not prepare again (a memo hit) is not copied into the record again - thread 2 takes the last
+copy (`parallel_cp.cpp` ReuseView). Correct: 9.2 M (beach) and 8.2 M (village) reused stages verified, 0 mismatches.
+A/B `logs/p53/fb6_reuse_ab2` (n = 3, interleaved, unlimited pacing; avg FPS per run):
+
+| Scene | base | reuse |
+|---|---|---|
+| beach | 48.1 / 53.2 / 53.8 | 49.5 / 49.1 / 54.3 |
+| harbour | 48.7 / 49.3 / 50.7 | 49.2 / 45.8 / 47.7 |
+| village | 36.5 / 34.4 / 39.6 | 39.4 / 39.2 / 39.3 |
+
+No gain beyond the run-to-run spread (the machine's slow mode again in several runs: CP 20-24 ms against ~18.5);
+harbour lower in two of three. The copy it saves (CopyStage, ~11 % of thread 1) is not what limits the frame. Kept
+off.

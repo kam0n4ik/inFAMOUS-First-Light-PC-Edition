@@ -258,6 +258,8 @@ private:
         bool hook_done = false, applied = false; ///< MemoryAcquired with P4.11's async_acquire (applied: writes found)
         bool prepared = false; ///< stage 2: the frontend's preparation below (a filtered draw has none)
         bool front_memo = false; ///< frontend thread: a guest memory change (memo) before this record
+        /// FrameBreak FB-6: the draw's VS / PS view was not copied - the same as the last copied one (thread 2 keeps it)
+        bool vs_same = false, ps_same = false;
         u64 journal_end = 0;   ///< the journal applied up to here before it executes
         u64 reg_hash = 0;      ///< Options::verify: the processor's registers at the packet
         Cp::DrawDescriptor draw;
@@ -370,6 +372,17 @@ private:
     void* flip_snapshot_ctx_ = nullptr;
     const FrameLog::GpuThreadTotals* flip_totals_ = nullptr; ///< thread 2: the queued flip being executed
     std::atomic<u64> verified_{0}, verify_mismatches_{0}; ///< thread 2 (Options::verify)
+    // FrameBreak FB-6 (SSPC_FB_STAGE_REUSE=1|verify): a draw's VS/PS view copied into its record only when the
+    // frontend's StageGeneration moved; thread 2 swaps each copied view into last_vs_/last_ps_ and uses those (records
+    // execute in order, so a record marked "same" finds the view of the last copied one there). verify: copied anyway,
+    // a "same" record's copy compared with last_*.
+    u8 stage_reuse_ = 0; ///< 0 off, 1 on, 2 verify
+    /// Thread 2: the view a prepared draw's stage executes with (`rec` itself when off or shared).
+    const GS::StageView& ReuseView(GS::StageView& rec, bool shared, bool same, GS::StageView& last);
+    static constexpr u64 kNoGen = ~0ull;
+    u64 copied_gen_vs_ = kNoGen, copied_gen_ps_ = kNoGen; ///< thread 1: the generations last copied
+    GS::StageView last_vs_, last_ps_;                     ///< thread 2
+    std::atomic<u64> reuse_same_{0}, reuse_copied_{0}, reuse_mismatches_{0};
     GS::ShaderFrontend* frontend_ = nullptr;
     const std::atomic<u64>* map_gen_ = nullptr;
     const Vk::Timeline* timeline_ = nullptr;

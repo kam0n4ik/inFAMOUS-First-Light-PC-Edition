@@ -70,7 +70,39 @@ void CopyStage(GS::StageView& d, const GS::StageView& s) {
     }
 }
 
+/// FB-6 verify: the copies of one view (vectors of trivially copyable bindings: their bytes).
+template <typename T>
+bool SameBytes(const std::vector<T>& a, const std::vector<T>& b) {
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+}
+bool SameView(const GS::StageView& a, const GS::StageView& b) {
+    return a.status == b.status && a.address == b.address && a.program == b.program &&
+           a.footer_hash == b.footer_hash && a.module == b.module &&
+           std::memcmp(&a.runtime, &b.runtime, sizeof(a.runtime)) == 0 && a.start == b.start && a.end == b.end &&
+           a.program_error == b.program_error && a.plan.stage == b.plan.stage && SameBytes(a.plan.flat, b.plan.flat) &&
+           SameBytes(a.plan.buffers, b.plan.buffers) && SameBytes(a.plan.images, b.plan.images) &&
+           SameBytes(a.plan.samplers, b.plan.samplers) && SameBytes(a.plan.vertices, b.plan.vertices) &&
+           a.plan.status_counts == b.plan.status_counts && a.plan.error == b.plan.error;
+}
+
 } // namespace
+
+const GS::StageView& ParallelCp::ReuseView(GS::StageView& rec, bool shared, bool same, GS::StageView& last) {
+    if (shared || stage_reuse_ == 0) {
+        return rec;
+    }
+    const auto bump = [](std::atomic<u64>& c) { c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); };
+    if (same) {
+        bump(reuse_same_);
+        if (stage_reuse_ == 2 && !SameView(rec, last)) {
+            bump(reuse_mismatches_);
+        }
+        return last;
+    }
+    bump(reuse_copied_);
+    std::swap(rec, last); // (the record keeps the old buffers: thread 1 copies into their capacity later)
+    return last;
+}
 
 std::string_view DrainReasonName(DrainReason r) {
     static constexpr std::string_view kNames[] = {
@@ -112,6 +144,13 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
     journal_changes_only_ = options.journal_changes_only;
     async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
+    if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
+                         GetEnvironmentVariableA("SSPC_FB_STAGE_REUSE", v, sizeof(v)) > 0) {
+        stage_reuse_ = std::string_view(v) == "verify" ? 2 : v[0] == '1' ? 1 : 0;
+        if (stage_reuse_ != 0) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_STAGE_REUSE={} - unchanged draw stages not copied", v);
+        }
+    }
 }
 
 ParallelCp::~ParallelCp() {
@@ -520,6 +559,7 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
 
 void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs) {
     r.prepared = false;
+    r.vs_same = r.ps_same = false;
     r.stage_shared.reset();
     r.ps_shared.reset();
     r.state = nullptr;
@@ -534,18 +574,29 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
         r.stage_shared = frontend_->SharedStage(GS::HwStage::Vs);
         r.ps_shared = frontend_->SharedStage(GS::HwStage::Ps);
-        if (r.stage_shared == nullptr) {
-            CopyStage(r.stage, frontend_->Stage(GS::HwStage::Vs));
-        }
-        if (r.ps_shared == nullptr) {
-            CopyStage(r.ps, frontend_->Stage(GS::HwStage::Ps));
-        }
+        // FB-6: a view the frontend did not change since the last copy is not copied again (stage_reuse_)
+        const auto copy = [&](GS::HwStage hw, GS::StageView& dst, bool shared, u64& copied, bool& same) {
+            same = false;
+            if (shared) {
+                copied = kNoGen; // (thread 2 does not see this one: the next own view is copied)
+                return;
+            }
+            const u64 gen = frontend_->StageGeneration(hw);
+            same = stage_reuse_ != 0 && gen == copied;
+            if (!same || stage_reuse_ == 2) {
+                CopyStage(dst, frontend_->Stage(hw));
+            }
+            copied = gen;
+        };
+        copy(GS::HwStage::Vs, r.stage, r.stage_shared != nullptr, copied_gen_vs_, r.vs_same);
+        copy(GS::HwStage::Ps, r.ps, r.ps_shared != nullptr, copied_gen_ps_, r.ps_same);
         r.state = prep.ready ? frontend_->Pipelines().Graphics(prep.pipeline) : nullptr;
     }
     r.prepared = true;
     bool writes = false;
-    NoteStageWrites(r.Vs(), index, writes);
-    NoteStageWrites(r.Ps(), index, writes);
+    // (a view not copied is the frontend's current one)
+    NoteStageWrites(r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs(), index, writes);
+    NoteStageWrites(r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps(), index, writes);
     if (writes) {
         frontend_->GuestMemoryChanged(); // (Executor::MarkWrites after the draw: no memoized preparation past it)
     }
@@ -961,7 +1012,14 @@ void ParallelCp::Execute(Record& r, u64 index) {
             if (frontend_ != nullptr) {
                 Vk::PreparedCommand pc;
                 if (r.prepared) {
-                    pc = {&r.prep, &r.Vs(), &r.Ps(), r.state};
+                    pc = {&r.prep, &ReuseView(r.stage, r.stage_shared != nullptr, r.vs_same, last_vs_),
+                          &ReuseView(r.ps, r.ps_shared != nullptr, r.ps_same, last_ps_), r.state};
+                    if (r.stage_shared != nullptr) {
+                        pc.stage = &r.Vs();
+                    }
+                    if (r.ps_shared != nullptr) {
+                        pc.ps = &r.Ps();
+                    }
                 }
                 exec_.DrawPrepared(r.draw, pc);
             } else {
@@ -1319,6 +1377,13 @@ std::string ParallelCp::Report() const {
         out += fmt::format("  frontend thread (P5.3D): preparing {:.0f} ms, waiting for records {:.0f} ms, waiting for "
                            "thread 2 {:.0f} ms ({} times)\n",
                            ms(t.tf_busy_ticks), ms(t.tf_idle_ticks), ms(t.tf_wait_ticks), t.tf_waits);
+    }
+    if (stage_reuse_ != 0) {
+        out += fmt::format("  FB-6 unchanged draw stages not copied (SSPC_FB_STAGE_REUSE={}): taken from the last copy "
+                           "{}, copied {}; verify mismatches {}\n",
+                           stage_reuse_ == 2 ? "verify" : "1", reuse_same_.load(std::memory_order_relaxed),
+                           reuse_copied_.load(std::memory_order_relaxed),
+                           reuse_mismatches_.load(std::memory_order_relaxed));
     }
     if (verify_) {
         out += fmt::format("  register replica verification (SSPC_P410_VERIFY=1): draws/dispatches compared {}, "
