@@ -27,6 +27,7 @@
 #include "runtime/gpu/shader/gcn_program.h"
 #include "runtime/gpu/shader/shader_resources.h"
 #include "runtime/gpu/shader/shader_translator.h"
+#include "runtime/gpu/u64_hash.h"
 
 namespace SecondSon::Gpu::Shader {
 
@@ -153,7 +154,7 @@ private:
     CodeTrust trust_ = CodeTrust::Off;
     TrackCodeFn track_ = nullptr;
     void* track_ctx_ = nullptr;
-    std::unordered_map<u64, AddressEntry> addresses_; ///< key: address << 3 | stage
+    std::unordered_map<u64, AddressEntry, U64Hash> addresses_; ///< key: address << 3 | stage
     /// P4.9: the entries looked up last (direct-mapped by key) - the map's hashing and bucket walk on every stage of every
     /// draw were ~1.4% of the GPU thread (village); its entries are never erased, so the pointers stay valid
     std::array<std::pair<u64, AddressEntry*>, 256> addr_memo_{};
@@ -201,7 +202,7 @@ private:
     void* track_ctx_ = nullptr;
     u64 lo_ = ~0ull, hi_ = 0; ///< the bytes any entry covers
     const Entry& GetEntry(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation, Entry& e);
-    std::unordered_map<u64, Entry> entries_;
+    std::unordered_map<u64, Entry, U64Hash> entries_;
     std::array<std::pair<u64, Entry*>, 256> memo_{}; ///< P4.9: entries looked up last (never erased: stable pointers)
     std::vector<u32> scratch_;
 };

@@ -121,6 +121,22 @@ replica 35.9 M draws/dispatches, 0 different. But A/B (`logs/p53/opt6_share`, n 
 processor +0.18 ms; harbour and village within the spread - one allocation per 5 shares and the shared pointers'
 atomic counts between the two threads cost what the copies saved. Removed.
 
+## GPU-5: a two-multiplication hash for the per-draw maps keyed by u64 (taken)
+
+MSVC's `std::hash<u64>` is FNV-1a over 8 bytes (`std::_Fnv1a_append_value` 1.5-2.4 % of the processor's thread).
+`runtime/gpu/u64_hash.h` (MurmurHash3's finalizer) for the maps looked up per draw / per binding: programs by address
+and fetch shaders (`shader_cache.h`), pipelines and layouts (`vk_pipelines.h`), the texture memo and the pending fast
+clears (`vk_executor.h`), image views and samplers (`vk_image_cache.h`). No code depends on these maps' order
+(lookups, or walks that mark every match).
+
+A/B (`logs/p53/opt7_hash`, n = 3, the new build's shader cache warmed first: `logs/opt/warm_opt6`): beach 54.58
+[54.40..54.78] -> **55.15 [54.86..55.40]** (+1.0 %, processor 17.83 -> 17.66 ms); harbour 50.53 -> 50.60 and village
+38.12 -> 38.05, within the spread.
+
+Note for every A/B of a build: the persistent shader cache's generation is a hash of `src/runtime/gpu/shader/*`
+(CMakeLists.txt): a change there makes the new build translate its shaders again in its first run (GPU-3's village
+run). Warm the new build's cache before a series.
+
 ## Tools
 
 - `p53_perf_ab.ps1` configurations: `native_early`, `early_cfirst`, `native_prof` (CPU samples of both GPU threads),

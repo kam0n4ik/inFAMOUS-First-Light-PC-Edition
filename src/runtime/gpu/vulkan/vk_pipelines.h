@@ -27,6 +27,7 @@
 #include "runtime/gpu/shader/shader_resources.h"
 #include "runtime/gpu/vulkan/vk_api.h"
 #include "runtime/gpu/vulkan/vk_precompile.h"
+#include "runtime/gpu/u64_hash.h"
 
 namespace SecondSon::Gpu::Vk {
 
@@ -132,12 +133,12 @@ private:
         u32 bindings = 0;
         std::vector<u64> desc; ///< (binding, type, count) of each binding: compared, the hash only finds it
     };
-    std::unordered_map<u64, SharedLayout> layouts_;
+    std::unordered_map<u64, SharedLayout, U64Hash> layouts_;
     bool share_layouts_ = false;
     std::unordered_map<u32, VkShaderModule> modules_;
     std::mutex aux_mutex_; ///< (P4.14: the precompiler's workers build auxiliary stages too)
     std::unordered_map<u64, VkShaderModule> aux_;
-    std::unordered_map<u64, const PipelineObjects*> pipelines_; ///< (pipeline id or module, layout signature) -> pipeline
+    std::unordered_map<u64, const PipelineObjects*, U64Hash> pipelines_; ///< (pipeline id or module, layout signature) -> pipeline
     std::deque<std::unique_ptr<PipelineObjects>> owned_;       ///< created on demand (the precompiler owns its own)
     std::unordered_multimap<u64, std::pair<GS::PipelineDesc, const PipelineObjects*>> by_desc_; ///< hash -> made
     VkPipelineCache cache_ = VK_NULL_HANDLE;

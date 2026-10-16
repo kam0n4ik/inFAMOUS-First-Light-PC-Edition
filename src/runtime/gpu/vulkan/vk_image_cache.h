@@ -23,6 +23,7 @@
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/vulkan/vk_api.h"
 #include "runtime/gpu/vulkan/vk_formats.h"
+#include "runtime/gpu/u64_hash.h"
 
 namespace SecondSon::Gpu {
 class PageTracker;
@@ -67,7 +68,7 @@ struct CachedImage {
     bool write_tracked = false;
     u64 last_seq = 0;
     u64 last_frame = 0; ///< ImageCache::NewFrame count at its last use
-    std::unordered_map<u64, VkImageView> views;
+    std::unordered_map<u64, VkImageView, U64Hash> views;
 };
 
 struct ImageCacheStats {
@@ -278,7 +279,7 @@ public:
 
 private:
     u32 next_id_ = 1;
-    std::unordered_map<u64, VkSampler> samplers_;
+    std::unordered_map<u64, VkSampler, U64Hash> samplers_;
     std::deque<Temp> temps_;
     // detiler
     VkDescriptorSetLayout detile_set_layout_ = VK_NULL_HANDLE;

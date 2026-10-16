@@ -25,6 +25,7 @@
 #include "runtime/gpu/vulkan/vk_api.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
+#include "runtime/gpu/u64_hash.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 
 namespace SecondSon::Gpu::Shader {
@@ -406,7 +407,7 @@ private:
         CachedImage* img = nullptr;
         VkImageView view = VK_NULL_HANDLE;
     };
-    std::unordered_map<u64, TexMemo> tex_memo_;
+    std::unordered_map<u64, TexMemo, U64Hash> tex_memo_;
     /// P4.9: tex_memo_'s entries looked up last, direct-mapped by key (never erased: the pointers stay valid) - the map's
     /// hashing on every texture of every draw was ~1.1% of the GPU thread (village); SSPC_P49_LOOKUP_MEMO=0: off
     std::array<std::pair<u64, TexMemo*>, 256> tex_slot_{};
@@ -777,7 +778,7 @@ private:
     bool flush_full_ = false;  ///< the flush in progress ends a full batch (max_draws_per_batch)
     bool batch_fence_ = false; ///< the open batch holds a fence, a flip or a timeline write
     // CMASK/HTILE addresses a compute clear marked: the target clears at its next rendering
-    std::unordered_map<u64, bool> pending_meta_clear_;
+    std::unordered_map<u64, bool, U64Hash> pending_meta_clear_;
     ExecutorStats stats_;
     std::vector<TimelineWrite> timeline_writes_; ///< not completed yet (pruned in Poll)
     u64 tw_lo_ = ~0ull, tw_hi_ = 0;              ///< their bounds
