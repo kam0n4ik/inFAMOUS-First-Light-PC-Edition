@@ -98,6 +98,7 @@ struct ExecutorStats {
     u64 timeline_copies = 0, timeline_copy_bytes = 0, tc_refused = 0;
     u64 timeline_gds = 0, gds_refused = 0; ///< DMA_DATA to/from GDS on the timeline (P4.6)
     u64 shadows = 0, shadow_bytes = 0, shadow_overlaps = 0, shadow_no_room = 0, shadow_too_large = 0;
+    u64 shadow_vram = 0; ///< written bindings in the buffer cache's video memory (GPU-6: not shadowed with =skip)
     u64 target_cache_hits = 0, target_cache_misses = 0;
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed

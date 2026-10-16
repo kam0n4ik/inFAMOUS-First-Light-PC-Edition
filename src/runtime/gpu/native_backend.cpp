@@ -1898,9 +1898,11 @@ std::string Backend::Report() {
                                s.stream_kinds[3], s.stream_kind_bytes[3] >> 20, s.stream_kinds[4],
                                s.stream_kind_bytes[4] >> 20);
         }
-        out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}); written "
+        out += fmt::format("write shadows {} ({} MiB; left in place: overlapping {}, no room {}, too large {}; in video "
+                           "memory {}); written "
                            "dispatch bindings <=64 KiB {}, <=256 KiB {}, <=1 MiB {}, <=4 MiB {}, <=16 MiB {}, larger {}\n",
                            s.shadows, s.shadow_bytes >> 20, s.shadow_overlaps, s.shadow_no_room, s.shadow_too_large,
+                           s.shadow_vram,
                            s.shadow_sizes[0], s.shadow_sizes[1], s.shadow_sizes[2], s.shadow_sizes[3],
                            s.shadow_sizes[4], s.shadow_sizes[5]);
         out += fmt::format("timeline copies {} ({} MiB, refused {})\n", s.timeline_copies, s.timeline_copy_bytes >> 20,

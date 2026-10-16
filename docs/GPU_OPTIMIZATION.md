@@ -137,6 +137,29 @@ Note for every A/B of a build: the persistent shader cache's generation is a has
 (CMakeLists.txt): a change there makes the new build translate its shaders again in its first run (GPU-3's village
 run). Warm the new build's cache before a series.
 
+## GPU-6: written bindings in video memory are not shadowed (taken)
+
+`Executor::PrepareShadows` copies a dispatch's written bindings (<= 256 KiB, >= 8 workgroups) into dense shadows and
+back with two global barriers, because a shader's stores into the host memory mirror are ~150x slower (P4.4). A
+binding the buffer cache placed in video memory is written as fast as a shadow: copying it in and out was work for
+nothing. Such bindings are now left in place (`SSPC_GPU_SHADOW_VRAM=keep`: as before). Counted: in the village 12 872
+of 56 699 shadow candidates were in video memory (`logs/opt/shvram_validate`); Vulkan Validation + Sync, village and
+beach: **0 messages**.
+
+A/B (`logs/p53/opt8_shvram`, n = 3, interleaved):
+
+| Scene | GPU busy ms | FPS |
+|---|---|---|
+| beach | 13.81 [13.78..13.83] -> **13.44 [13.41..13.48]** | 55.28 -> 55.24 (processor-bound) |
+| early | 15.74 [15.73..15.76] -> **15.39 [15.37..15.44]** | 50.78 -> 50.80 (processor-bound) |
+| user1022 | 21.26 [21.20..21.36] -> **20.93 [20.81..21.02]** | 38.09 [37.66..38.34] -> **38.66 [38.31..38.89]** (+1.5 %) |
+
+What stays: most written compute bindings (the 12 MiB particle pool, the sort lists) live in the host mirror, not
+in video memory: the buffer cache takes only write-tracked ranges, and the windows imported straight from the guest's
+memory (no separate backing) are never armed (`GuestBuffers`, `PageTracker::NeverArm`: protecting imported memory
+lost the device on NVIDIA, P4.4). The village's ~1100 small dispatches store into host memory over PCIe - the largest
+GPU item left there (see "Next").
+
 ## Tools
 
 - `p53_perf_ab.ps1` configurations: `native_early`, `early_cfirst`, `native_prof` (CPU samples of both GPU threads),

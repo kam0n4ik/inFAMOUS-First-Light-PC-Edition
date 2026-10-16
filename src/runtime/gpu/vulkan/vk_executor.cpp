@@ -1158,6 +1158,26 @@ void Executor::PrepareShadows(const void* plan_ptr, std::vector<VkDescriptorBuff
             ++stats_.shadow_too_large;
             continue;
         }
+        // GPU-6 (docs/GPU_OPTIMIZATION.md): the shadows are for the host memory mirror (its stores ~150x slower); a
+        // binding in the buffer cache's video memory is written as fast as a shadow - copying it in and out (and the
+        // two global barriers) is work for nothing: left in place (A/B: GPU -0.33..-0.37 ms a frame in all three
+        // scenes). SSPC_GPU_SHADOW_VRAM=keep shadows them as before.
+        if (info.buffer == buffers_.Buffer()) {
+            ++stats_.shadow_vram;
+            static const bool skip_vram = [] {
+                char v[8] = {};
+                const bool keep = GetEnvironmentVariableA("SSPC_GPU_SHADOW_VRAM", v, sizeof(v)) == 4 &&
+                                  std::string_view(v) == "keep";
+                if (keep) {
+                    SSPC_LOG(GPU, Warning, "SSPC_GPU_SHADOW_VRAM=keep - written bindings in video memory are shadowed "
+                                           "too (before GPU-6)");
+                }
+                return !keep;
+            }();
+            if (skip_vram) {
+                continue;
+            }
+        }
         // another binding of the same memory would see the other copy: those stay in place
         bool overlap = false;
         for (size_t j = 0; j < plan.buffers.size() && !overlap; ++j) {

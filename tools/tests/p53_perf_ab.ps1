@@ -46,6 +46,8 @@ $defs = @{
     # GPU optimization stage: P5.4 early frame submission on top of Native (frame_trace.cpp, SSPC_P54_EARLY_SUBMIT)
     native_early = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1"
     early_cfirst = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1;SSPC_DIAG_QUEUE_ORDER=compute-first"
+    # GPU-6: written bindings in video memory shadowed again as before (vk_executor.cpp PrepareShadows)
+    native_shkeep = "SSPC_CP_MODE=native;SSPC_GPU_SHADOW_VRAM=keep"
     # the frame lifecycle trace (tools\p54\p54_lifecycle.py, compute scheduling): not for FPS
     early_trace  = "SSPC_CP_MODE=native;SSPC_P54_EARLY_SUBMIT=1;SSPC_P54_FRAME_TRACE=1;SSPC_P412_STALL_TRACE=deep"
     # profiles (not for FPS): CPU samples of both GPU threads after 60 s; the Performance Inspector (GPU time per
