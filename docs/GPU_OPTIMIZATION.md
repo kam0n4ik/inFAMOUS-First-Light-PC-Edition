@@ -160,6 +160,64 @@ memory (no separate backing) are never armed (`GuestBuffers`, `PageTracker::Neve
 lost the device on NVIDIA, P4.4). The village's ~1100 small dispatches store into host memory over PCIe - the largest
 GPU item left there (see "Next").
 
+## Result: before / after (2026-10-16, `logs/p53/opt_final`)
+
+Before = the exe of `0743ef0` (the Native CP report's build), after = `7bfcba1`; both `--cp-mode native`, both shader
+caches warmed first (`logs/opt/warm_opt0`, `warm_final`); n = 3 per scene, interleaved; frame generation off, no
+upscaler, 1296×759, mailbox; window 62-88 s. Medians [min..max]:
+
+| Scene | FPS before | FPS after | gain | 1 % low before / after | GPU ms before / after | p95 / p99 ms before -> after | frames of 1 vblank |
+|---|---|---|---|---|---|---|---|
+| beach (+ foliage) | 48.09 [48.04..48.20] | **55.12 [54.82..55.28]** | **+14.6 %** | 29.32 / 29.39 | 13.78 / 13.42 | 33.80 / 34.04 -> 33.00 / 33.94 | 75 % -> 91 % |
+| early (harbour) | 42.63 [42.30..42.81] | **49.94 [49.77..50.05]** | **+17.1 %** | 29.28 / 29.33 | 15.74 / 15.35 | 33.97 / 34.05 -> 33.68 / 34.02 | 59 % -> 80 % |
+| user1022 (village) | 37.29 [37.06..37.54] | **38.55 [38.37..38.79]** | **+3.4 %** | 29.23 / 27.85 [25.17..29.21] | 21.38 / 20.74 | 34.03 / 34.12 -> 34.03 / 34.13 | 39 % -> 45 % |
+
+| | beach | harbour | village |
+|---|---|---|---|
+| processor thread ms (busy) | 17.98 -> 17.73 | 19.53 -> 19.39 | 20.93 -> 20.52 |
+| recording thread ms | 15.48 -> 15.30 | 16.39 -> 16.64 | 17.97 -> 17.76 |
+| frame mean ms | 20.79 -> 18.14 | 23.46 -> 20.02 | 26.82 -> 25.94 |
+| draws a frame | 5596 -> 5589 | 5248 -> 5207 | 4284 -> 4313 |
+| working set / VRAM MiB | 5516 / 1569 -> 5539 / 1572 | 5562 / 1690 -> 5594 / 1699 | 5501 / 1562 -> 5521 / 1565 |
+
+All 18 runs stopped normally, `[Error]` 0, device lost 0. The draw count is the game's own (nothing is drawn less).
+The village's 1 % low after: one run (`cp_native_B_r1`) had one 83 ms frame at 76 s (the processor 69 ms in that
+frame; no pipeline creation, no shader translation, no eviction logged); none in its other two runs, in the three
+GPU-6 runs of the same code or in any other run of the day (every series searched for frames over 60 ms): one hitch,
+cause not found. Without it the village's 1 % low is 29.18-29.21.
+
+What moved the frame: the processor no longer idles in the GPU's tail (GPU-1, most of the gain), less processor time
+per draw (GPU-3, GPU-5), less GPU time (GPU-6). The 1 % low stays at ~29.3 FPS: under the 60 Hz vblank the worst 1 %
+of frames take two vblanks until fewer than 1 % of frames miss 16.7 ms.
+
+Input latency: not measured in this stage. P5.4 measured the early submission's proxy (the game's frame start ->
+present) at -11 ms (village) and -7 ms (beach) on the Parallel base.
+
+## Not done / not measurable here
+
+- A dense forest close to the camera: there is no save or scripted route with the camera inside foliage; the beach
+  route after its camera turns (5 600 draws, 836 foliage draws + 3 487 shadow draws a frame) is the foliage case
+  measured. On this route foliage costs 0.06 ms of GPU; its cost is the processor's and the recording thread's time
+  per draw.
+- Smoke: one draw, 2.0 ms GPU in the village (`logs/p44/shader_2edad2700_*.spv`): 6 texture samples, ~67 FMA, two
+  discards, no loops - the cost is the blending of thousands of overlapping quads into RGBA16F, not wasted shader
+  work. Nothing removable without changing the picture.
+- The deep stall trace's stack sampler crash (see Tools) is not fixed.
+
+## Next (by measured size)
+
+1. Village GPU: the ~1100 small compute dispatches (4.1 ms) store into host memory over PCIe because the windows
+   imported straight from guest memory cannot be write-tracked (`PageTracker::NeverArm`): a separately backed (and
+   so protectable) mapping for the particle pool and the sort lists would let the buffer cache keep them in video
+   memory - the largest GPU item left; it changes the memory model (high risk, needs its own validation).
+2. Village GPU: the end-of-batch write-backs (3.45 ms) - only ranges the CPU reads back need to reach the host.
+3. Village frame: the game waits for its async compute twice a frame (19 ms); 7 ms of it is the processor's work on
+   ~20 800 compute packets - less time per compute packet (PrepareDispatch, CopyStage, register writes).
+4. Beach and harbour (processor-bound, 80-91 % of frames already at one vblank): the per-draw preparation
+   (PrepareStage 27-32 % of the processor's thread; shadow cascades = 3 487 draws a frame).
+5. Every build that changes `src/runtime/gpu/shader/*` makes players translate ~830 shaders again in their first
+   minutes (stutter): the cache generation could hash the translator's output-relevant code only.
+
 ## Tools
 
 - `p53_perf_ab.ps1` configurations: `native_early`, `early_cfirst`, `native_prof` (CPU samples of both GPU threads),
