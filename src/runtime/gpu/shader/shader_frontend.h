@@ -266,6 +266,11 @@ public:
     const std::shared_ptr<const StageView>& SharedStage(HwStage stage) const {
         return shared_[static_cast<size_t>(stage)];
     }
+    /// GPU optimization: a graphics stage's view changes only when this changes (the stage memo's hits leave both
+    /// alone): a caller's copy of Stage() made at the same generation is still the same.
+    u64 StageGeneration(HwStage stage) const {
+        return stage_gen_[static_cast<size_t>(stage)];
+    }
     /// Translations run so far and their time (any thread: the frame log samples it at each flip).
     struct TranslationTotals {
         u64 count = 0, ns = 0, max_ns = 0;
@@ -325,6 +330,12 @@ private:
     TrackCodeFn code_track_ = nullptr;
     void* code_track_ctx_ = nullptr;
     std::unordered_set<u64> code_blocks_;
+    // GPU optimization: the same blocks as a bitmap (below 1 TiB) and their bounds - GpuWrote's check per written
+    // binding was a hash lookup per 64 KiB block (village: ~8 % of the processor's thread)
+    static constexpr u64 kCodeBitBlocks = u64{1} << 24;
+    std::vector<u64> code_bits_;
+    u64 code_lo_ = ~0ull, code_hi_ = 0;
+    bool CodeBlocksHit(u64 first, u64 last) const;
     u64 gpu_writes_checked_ = 0, gpu_code_writes_ = 0;
     PipelineStateCache pipelines_;
     std::array<StageView, static_cast<size_t>(HwStage::Count)> stages_{};
@@ -342,6 +353,8 @@ private:
     };
     std::array<StageMemo, static_cast<size_t>(HwStage::Count)> memo_{};
     std::array<u64, static_cast<size_t>(HwStage::Count)> runtime_ver_{}; ///< bumped at every runtime rebuild
+    std::array<u64, static_cast<size_t>(HwStage::Count)> stage_gen_{};   ///< StageGeneration (graphics stages)
+    std::array<bool, static_cast<size_t>(HwStage::Count)> memo_took_{};  ///< the last PrepareStage was a memo hit
     std::atomic<u64> memory_gen_{1}; ///< (atomic: a change may be reported from another thread)
     bool memo_on_ = false;
     bool memo_diag_ = false;                       ///< SSPC_DIAG_MEMO_STATS=1

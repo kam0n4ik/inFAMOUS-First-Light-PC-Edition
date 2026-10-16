@@ -472,8 +472,39 @@ bool ShaderFrontend::TrackCode(void* self, u64 addr, u64 size) {
     }
     for (u64 b = addr >> 16; b <= (addr + size - 1) >> 16; ++b) {
         f->code_blocks_.insert(b);
+        if (b < kCodeBitBlocks) {
+            if (f->code_bits_.empty()) {
+                f->code_bits_.assign(kCodeBitBlocks / 64, 0);
+            }
+            f->code_bits_[b >> 6] |= u64{1} << (b & 63);
+        }
+        f->code_lo_ = std::min(f->code_lo_, b);
+        f->code_hi_ = std::max(f->code_hi_, b);
     }
     return true;
+}
+
+bool ShaderFrontend::CodeBlocksHit(u64 first, u64 last) const {
+    // (the blocks below 1 TiB by the bitmap a 64-bit word at a time; above it, if any, by the set)
+    if (last < code_lo_ || first > code_hi_) {
+        return false;
+    }
+    first = std::max(first, code_lo_);
+    last = std::min(last, code_hi_);
+    for (u64 b = first; b <= last && b < kCodeBitBlocks;) {
+        const u64 w = b >> 6, lo = b & 63, hi = std::min<u64>(63, last - (w << 6));
+        const u64 mask = (hi == 63 ? ~0ull : ((u64{1} << (hi + 1)) - 1)) & (~0ull << lo);
+        if (!code_bits_.empty() && (code_bits_[w] & mask) != 0) {
+            return true;
+        }
+        b = (w + 1) << 6;
+    }
+    for (u64 b = std::max(first, kCodeBitBlocks); b <= last; ++b) {
+        if (code_blocks_.contains(b)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ShaderFrontend::GpuWrote(u64 addr, u64 size) {
@@ -482,10 +513,8 @@ void ShaderFrontend::GpuWrote(u64 addr, u64 size) {
     }
     ++gpu_writes_checked_;
     const u64 first = addr >> 16, last = (addr + size - 1) >> 16;
-    bool hit = last - first > 4096; // (a huge range: let the caches' own range checks decide)
-    for (u64 b = first; !hit && b <= last; ++b) {
-        hit = code_blocks_.contains(b);
-    }
+    const bool hit = last - first > 4096 || // (a huge range: let the caches' own range checks decide)
+                     CodeBlocksHit(first, last);
     if (!hit) {
         return;
     }
@@ -760,6 +789,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
                 ++stats_.memo_hits;
                 ++s.module->uses;
                 NoteGpuWrites(s); // (P5.2: its writes happen again with this draw)
+                memo_took_[si] = true; // (the view is untouched: StageGeneration stays)
                 return StageStatus::Ready;
             }
             verify = StageFingerprint(s);
@@ -1228,10 +1258,14 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         const auto cpst = static_cast<size_t>(hw); // Cp::Stage has the graphics stages in HwStage's order
         const std::span<const u32, 16> ud(d.user_data[cpst]);
         const Cp::EngineTable* engine = !native ? nullptr : hw == HwStage::Ps ? &d.engine_ps : &d.engine_vs;
+        memo_took_[si] = false;
         s.status = runtime_valid_[si]
                        ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready, engine)
                        : StageStatus::Unsupported;
         ++stats_.stage_status[static_cast<size_t>(s.status)];
+        if (!memo_took_[si]) {
+            ++stage_gen_[si];
+        }
         ready &= s.status == StageStatus::Ready;
         start = Stage(hw).end; // (the shared preparation's, when the native cache gave one)
     }
