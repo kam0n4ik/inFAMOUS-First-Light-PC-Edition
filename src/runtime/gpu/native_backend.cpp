@@ -3,6 +3,7 @@
 
 #include "runtime/gpu/native_backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -512,7 +513,10 @@ bool Backend::Start(const Options& o, std::string& error) {
     // unwritten (not read and compared again every frame); verify - tracked and still read, counting missed writes
     if (char v[8] = {}; GetEnvironmentVariableA("SSPC_P52_CODE_TRUST", v, sizeof(v)) > 0) {
         const std::string_view s(v);
-        fo.code_trust = s == "1" ? GS::CodeTrust::On : s == "verify" ? GS::CodeTrust::Verify : GS::CodeTrust::Off;
+        fo.code_trust = s == "1"         ? GS::CodeTrust::On
+                        : s == "verify"  ? GS::CodeTrust::Verify
+                        : s == "sampled" ? GS::CodeTrust::Sampled
+                                         : GS::CodeTrust::Off;
         if (fo.code_trust != GS::CodeTrust::Off) {
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P52_CODE_TRUST={} - shader code trusted while its write-tracked "
                                    "pages stay unwritten", s);
@@ -959,6 +963,20 @@ void Backend::Loop() {
             }
             return c;
         }();
+        // Native CP (CP-5 experiment): SSPC_CP_ROUND_PACKETS=<n> - a queue's packets per round (4096). Each round of
+        // the parallel processor ends with a drain (the recording thread finishes the round's records: polls, flushes
+        // and idle waits follow), ~12-14 per frame at 4096 (CP-0: 1.3-2 ms of the processor's thread per frame).
+        static const u32 round_limit = [] {
+            char v[16] = {};
+            u32 n = GetEnvironmentVariableA("SSPC_CP_ROUND_PACKETS", v, sizeof(v)) > 0
+                        ? static_cast<u32>(std::strtoul(v, nullptr, 10))
+                        : 4096u;
+            n = std::clamp<u32>(n, 256u, 1u << 20);
+            if (n != 4096) {
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ROUND_PACKETS={} - a queue's packets per round", n);
+            }
+            return n;
+        }();
         for (u32 k = 0; k < Cp::kNumQueues; ++k) {
             const u32 q = compute_first ? (k + 1) % Cp::kNumQueues : k;
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
@@ -967,7 +985,7 @@ void Backend::Loop() {
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
-            for (; i < 4096; ++i) {
+            for (; i < round_limit; ++i) {
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
                     progress = true;
@@ -990,11 +1008,11 @@ void Backend::Loop() {
             }
             if (slice_t0 != 0 && (i != 0 || slice_stop == 1)) {
                 StallTrace::Span(StallTrace::Ev::CpQueueSlice, slice_t0, StallTrace::Now(), q, i,
-                                 i == 4096 ? u16{2} : slice_stop);
+                                 i == round_limit ? u16{2} : slice_stop);
             }
             round_packets += i; // (P4.12: the round's packets; a queue that stopped at the limit)
-            round_capped += i == 4096 ? 1 : 0;
-            graphics_capped |= i == 4096 && q == Cp::kGraphicsQueue;
+            round_capped += i == round_limit ? 1 : 0;
+            graphics_capped |= i == round_limit && q == Cp::kGraphicsQueue;
             pending |= cp_->PendingSubmissions(q) != 0;
         }
         if (parallel_) {
@@ -1193,7 +1211,7 @@ void Backend::Loop() {
         }
         if (executor_->WantsFlush() || (!progress && executor_->HasOpenWork())) {
             const auto flush_t0 = Clock::now();
-            executor_->Flush();
+            executor_->FlushFromLoop();
             const u64 flush_ns = ns_since(flush_t0);
             prof_flush += flush_ns;
             tot_busy_ns_ += flush_ns;
@@ -1795,6 +1813,14 @@ std::string Backend::Report() {
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",
                            s.wb_bytes_by[0] >> 20, s.wb_bytes_by[1] >> 20, s.wb_bytes_by[2] >> 20, s.flushes_full);
+        out += fmt::format("batch submissions by cause: full {}, held fence {}, processor idle {}, synchronize {}, "
+                           "flip {}\n",
+                           s.flushes_full, s.flushes_fence, s.flushes_idle, s.flushes_sync, s.flushes_flip);
+        if (cp_ != nullptr) {
+            const u64 w = cp_->Registers().Writes(), c = cp_->Registers().Changes();
+            out += fmt::format("register writes {}, of them changing a value {} ({:.1f} %)\n", w, c,
+                               w != 0 ? 100.0 * static_cast<double>(c) / static_cast<double>(w) : 0.0);
+        }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
                            "ranges {}, read-after-write {}, write-after-write {}, write-after-read {}\n",
                            s.barrier_why[0], s.barrier_why[1], s.barrier_why[2], s.barrier_why[3], s.barrier_why[4],

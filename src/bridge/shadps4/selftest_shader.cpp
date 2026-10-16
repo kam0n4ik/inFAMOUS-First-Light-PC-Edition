@@ -237,6 +237,29 @@ void TestValidation(TestGroup& g) {
     auto p = pc.Get(mem, 0x10002000, GS::HwStage::Ps);
     g.Check("the same code as VS and PS: two programs (a stage translates differently)",
             v.program != nullptr && p.program != nullptr && v.program != p.program, "");
+    // Native CP (CP-2): code trust "sampled" - trusted while tracked, yet read again once in kTrustSampleFrames frames
+    GS::ProgramCache pt;
+    pt.SetCodeTrust(GS::CodeTrust::Sampled, [](void*, u64, u64) { return true; }, nullptr);
+    mem.Put(0x10004000, a);
+    pt.Get(mem, 0x10004000, GS::HwStage::Ps); // first read (its length known from now)
+    pt.NewEpoch();
+    pt.Get(mem, 0x10004000, GS::HwStage::Ps); // read again, now tracked
+    mem.Put(0x10004000, b);                   // a write tracking did not see
+    const u64 key = (u64{0x10004000} << 3) | static_cast<u64>(GS::HwStage::Ps);
+    u32 trusted = 0, reads_before_due = 0, frames = 0;
+    bool found = false;
+    for (; frames < GS::kTrustSampleFrames && !found; ++frames) {
+        pt.NewEpoch();
+        const bool due = GS::TrustSampleDue(key, pt.Epoch());
+        const auto l = pt.Get(mem, 0x10004000, GS::HwStage::Ps);
+        trusted += !l.read ? 1 : 0;
+        reads_before_due += l.read && !due ? 1 : 0;
+        found = l.read && l.changed;
+    }
+    g.Check("code trust sampled: trusted between its frames, the unseen rewrite found within 8 frames (a missed write)",
+            found && reads_before_due == 0 && trusted == frames - 1 && pt.Stats().trust_mismatches == 1,
+            fmt::format("frames {} trusted {} early reads {} mismatches {}", frames, trusted, reads_before_due,
+                        pt.Stats().trust_mismatches));
 }
 
 // ---- Shader(runtime)

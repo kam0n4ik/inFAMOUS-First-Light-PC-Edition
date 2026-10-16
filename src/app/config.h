@@ -106,6 +106,7 @@ struct Config {
     // presenter only when asked for (comparisons, diagnostics)
     GpuBackend gpu_backend = GpuBackend::Sspc;
     std::string render_mode; // --render-mode legacy|hybrid|native_experimental (P5.3; empty: SSPC_RENDER_MODE, else legacy)
+    std::string cp_mode;     // --cp-mode legacy|parallel|native (Native CP; empty: SSPC_CP_MODE, else parallel)
     bool gpu_native_validate = false;        // --gpu-native-validate: the Vulkan validation layer on the native backend
     bool gpu_native_diag = false;            // --gpu-native-diag: command journal, checkpoints, markers (device loss)
     u64 gpu_capture_flip = 0;                // --gpu-capture-native-frame <flip>: that flip's frame -> logs\p44\native_frame.png

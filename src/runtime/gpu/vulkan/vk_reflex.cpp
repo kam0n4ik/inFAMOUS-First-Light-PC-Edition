@@ -184,8 +184,12 @@ void RenderSubmitEnd(u64 flip_id) {
     }
 }
 
+std::unique_lock<std::mutex> LockSwapchain() {
+    return std::unique_lock<std::mutex>{g_mutex};
+}
+
 void PresentMarker(bool start, u64 flip_id) {
-    std::scoped_lock lock{g_mutex};
+    // (LockSwapchain's lock held by the caller)
     if (g_swapchain != VK_NULL_HANDLE && flip_id != 0) {
         Mark(start ? VK_LATENCY_MARKER_PRESENT_START_NV : VK_LATENCY_MARKER_PRESENT_END_NV, flip_id);
     }

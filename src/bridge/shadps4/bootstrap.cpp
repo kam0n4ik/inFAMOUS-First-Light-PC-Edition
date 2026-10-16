@@ -78,6 +78,7 @@
 #include "runtime/exports.h"
 #include "bridge/shadps4/gpu_memory_host.h"
 #include "runtime/gpu/backend.h"
+#include "runtime/gpu/cp_mode.h"
 #include "runtime/gpu/cp_shadow.h"
 #include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/native_backend.h"
@@ -723,6 +724,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     if (!cfg.selftest) {
         // P5.3: the render mode's switches before the GPU backend reads them (legacy: none)
         Engine::Render::NativeDraw::ApplyRenderMode(cfg.render_mode, native_gpu);
+        // Native CP: the command processor's mode, also before the backend reads its switches (cp_mode.h)
+        Gpu::ApplyCpMode(cfg.cp_mode, native_gpu);
     }
     if (!cfg.selftest) {
         // one owner of the guest GPU, chosen once: the bridge's renderer, or SecondSonPC's backend (it claims every

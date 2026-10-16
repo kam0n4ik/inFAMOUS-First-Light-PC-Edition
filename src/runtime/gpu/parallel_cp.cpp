@@ -231,6 +231,9 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
         ++t1_.t1_full_waits;
     } else {
         t1_.t1_drain_ticks += ticks;
+        if (why < t1_.drain_ticks_by.size()) {
+            t1_.drain_ticks_by[why] += ticks;
+        }
     }
     // P4.12: what thread 1 waited for - thread 2 executing records up to `target` (a: the target; b: records then
     // queued; c: the drain's reason)
@@ -1307,7 +1310,8 @@ std::string ParallelCp::Report() const {
     out += "  drains that waited, by reason:";
     for (size_t i = 0; i < t.drains_by.size(); ++i) {
         if (t.drains_by[i] != 0) {
-            out += fmt::format(" {} {};", DrainReasonName(static_cast<DrainReason>(i)), t.drains_by[i]);
+            out += fmt::format(" {} {} ({:.0f} ms);", DrainReasonName(static_cast<DrainReason>(i)), t.drains_by[i],
+                               ms(t.drain_ticks_by[i]));
         }
     }
     out += "\n";

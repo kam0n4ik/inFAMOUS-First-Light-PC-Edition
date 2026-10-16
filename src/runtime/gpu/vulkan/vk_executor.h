@@ -268,6 +268,11 @@ public:
     void Poll();
     /// A fence was held since the last Flush (the processor waits for the GPU): the loop flushes.
     bool WantsFlush() const { return want_flush_; }
+    /// The loop's flush (Native CP, CP-0: counted by its cause - a held fence, or the processor idle with work open).
+    void FlushFromLoop() {
+        ++(want_flush_ ? stats_.flushes_fence : stats_.flushes_idle);
+        Flush();
+    }
     bool HasOpenWork() const { return open_ && commands_ > 0; }
     bool Busy() const { return !in_flight_.empty(); }
     /// Waits up to `timeout_ns` for the oldest batch in flight; true when one completed.

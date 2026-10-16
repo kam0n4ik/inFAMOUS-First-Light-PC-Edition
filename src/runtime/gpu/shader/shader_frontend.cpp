@@ -1336,9 +1336,10 @@ std::string ShaderFrontend::Report() const {
     t += fmt::format("code trust (P5.2, SSPC_P52_CODE_TRUST={}): programs trusted by write tracking {}, missed writes "
                      "{}; fetch shaders trusted {}, invalidated {}, missed writes {}; GPU/processor writes checked {}, "
                      "over tracked code {} (code blocks {})\n",
-                     options_.code_trust == CodeTrust::On       ? "1"
-                     : options_.code_trust == CodeTrust::Verify ? "verify"
-                                                                : "0",
+                     options_.code_trust == CodeTrust::On        ? "1"
+                     : options_.code_trust == CodeTrust::Verify  ? "verify"
+                     : options_.code_trust == CodeTrust::Sampled ? "sampled"
+                                                                 : "0",
                      pc.trusted_tracked, pc.trust_mismatches, fetches_.trusted_tracked, fetches_.invalidations,
                      fetches_.trust_mismatches, gpu_writes_checked_, gpu_code_writes_, code_blocks_.size());
     t += fmt::format("runtime parameters: built {}, kept {}\n", st.runtime_builds, st.runtime_reuse);

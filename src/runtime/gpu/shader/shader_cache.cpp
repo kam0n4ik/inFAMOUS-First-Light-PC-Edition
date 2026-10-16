@@ -74,7 +74,8 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
     }
     // P5.2: its code pages write-tracked before the read that validated it, and not written since
     const bool tracked_clean = entry != nullptr && entry->tracked && !entry->dirty;
-    if (tracked_clean && trust_ == CodeTrust::On) {
+    if (tracked_clean && (trust_ == CodeTrust::On ||
+                          (trust_ == CodeTrust::Sampled && (entry->epoch == epoch_ || !TrustSampleDue(key, epoch_))))) {
         ++stats_.trusted_tracked;
         out.program = entry->program;
         out.footer_hash = entry->footer_hash;
@@ -203,7 +204,8 @@ const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32
                                               Validation validation, Entry& e) {
     // P5.2: tracked before the read that validated it, not written since (see ProgramCache::Get)
     const bool tracked_clean = e.epoch != 0 && e.tracked && !e.dirty;
-    if (tracked_clean && trust_ == CodeTrust::On) {
+    if (tracked_clean && (trust_ == CodeTrust::On ||
+                          (trust_ == CodeTrust::Sampled && (e.epoch == epoch || !TrustSampleDue(addr, epoch))))) {
         ++trusted_tracked;
         return e;
     }

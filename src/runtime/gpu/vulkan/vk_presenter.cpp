@@ -1031,9 +1031,13 @@ void Presenter::Present(s32 frame, u64 flip_id) {
             m.ctx.Fail("reset acquire fence", r);
             return;
         }
-        r = m.fg ? m.fg->Acquire(m.swapchain, 100'000'000ull, s.acquired, VK_NULL_HANDLE, &index)
-                 : f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, s.acquire_fence,
-                                           &index);
+        if (m.fg) {
+            r = m.fg->Acquire(m.swapchain, 100'000'000ull, s.acquired, VK_NULL_HANDLE, &index);
+        } else {
+            const auto reflex_lock = Reflex::LockSwapchain(); // (the game's thread uses the swapchain too)
+            r = f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, s.acquire_fence,
+                                        &index);
+        }
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         m.Recreate();
@@ -1268,6 +1272,7 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                 fpi.pNext = nullptr;
                 pr = m.fg->Present(m.ctx.Queue(), fpi);
             } else {
+                const auto reflex_lock = Reflex::LockSwapchain(); // (after the queue's mutex, as the executor)
                 if (reflex) {
                     Reflex::PresentMarker(true, flip_id);
                 }

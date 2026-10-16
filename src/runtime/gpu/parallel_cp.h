@@ -81,6 +81,7 @@ struct ParallelTotals {
     u64 drains = 0;          ///< drains that had to wait (the queue was not empty)
     u64 drains_empty = 0;    ///< drains of an empty queue (nothing to wait for)
     std::array<u64, static_cast<size_t>(DrainReason::Count)> drains_by{}; ///< waiting ones, by reason
+    std::array<u64, static_cast<size_t>(DrainReason::Count)> drain_ticks_by{}; ///< Native CP (CP-0): their wait, TSC
     u64 t1_drain_ticks = 0;  ///< thread 1 waiting for drains
     u64 t1_full_ticks = 0, t1_full_waits = 0; ///< thread 1 waiting for a free slot / journal room (backpressure)
     u64 t1_sleeps = 0;       ///< thread 1's blocking waits (after the spin)

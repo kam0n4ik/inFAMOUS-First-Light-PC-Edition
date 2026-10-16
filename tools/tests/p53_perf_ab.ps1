@@ -27,6 +27,14 @@ $defs = @{
     par_apply19s = "SSPC_P410_PARALLEL_CP=1;SSPC_P53_NATIVE_DRAW=apply:1,9;SSPC_P53_NATIVE_STATE=apply;$quiet"
     # P5.3D: the shader frontend on its own thread (parallel_cp.h, Options::frontend_thread)
     par_ft       = "SSPC_P410_PARALLEL_CP=1;SSPC_P53_FRONTEND_THREAD=1"
+    # SecondSon Native CP, CP-0: the existing options of the parallel processor measured again
+    par_acq      = "SSPC_P411_ASYNC_ACQUIRE=1"
+    # CP-5 experiment: a queue's packets per round of the processor (4096 by default)
+    round16k     = "SSPC_CP_ROUND_PACKETS=16384"
+    round64k     = "SSPC_CP_ROUND_PACKETS=65536"
+    round64k_acq = "SSPC_CP_ROUND_PACKETS=65536;SSPC_P411_ASYNC_ACQUIRE=1"
+    # CP-2: shader code trusted by write tracking, read again once in 8 frames
+    trust_s      = "SSPC_P52_CODE_TRUST=sampled"
     # P5.3.1-3 render modes (the parallel processor, the default): LEGACY / the first native pass (G-buffer, pass 1:
     # commit, draw, state, and the Native Render Frontend's cache) / that pass without the cache / HYBRID / NATIVE_EXP.
     legacy       = ""

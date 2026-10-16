@@ -2,6 +2,7 @@
 // its present markers and present ids, the executor's submissions tagged with their frame.
 #pragma once
 
+#include <mutex>
 #include <vulkan/vulkan_core.h>
 
 #include "runtime/gpu/upscale/reflex.h"
@@ -15,8 +16,13 @@ void Init(VkDevice device, bool available);
 void Attach(VkSwapchainKHR swapchain);
 void Detach(VkSwapchainKHR swapchain);
 bool Attached();
-/// The presenter, around vkQueuePresentKHR of frame `flip_id` (its present carries VkPresentIdKHR = flip_id).
+/// The presenter, around vkQueuePresentKHR of frame `flip_id` (its present carries VkPresentIdKHR = flip_id), with
+/// LockSwapchain's lock held.
 void PresentMarker(bool start, u64 flip_id);
+/// The presenter's own uses of its swapchain (vkAcquireNextImageKHR, vkQueuePresentKHR) are made under this lock: the
+/// game's thread marks and sleeps on the same swapchain, an externally synchronized object (Vulkan validation:
+/// UNASSIGNED-Threading-MultipleThreads). Order: the queue's mutex first, then this one (the executor's SubmitChain).
+std::unique_lock<std::mutex> LockSwapchain();
 /// The executor: a submission of frame `flip_id`'s work tagged with it (`storage` chained into VkSubmitInfo2's pNext;
 /// nullptr when Reflex is not attached).
 const void* SubmitChain(u64 flip_id, VkLatencySubmissionPresentIdNV& storage);

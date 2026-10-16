@@ -43,6 +43,8 @@
 //                              P4.1: it executes no GPU command of the game yet)
 //     --render-mode legacy|hybrid|native_experimental   P5.3: the native render path of --gpu-backend sspc
 //                              (engine/render/native_draw.h ApplyRenderMode; SSPC_RENDER_MODE the same)
+//     --cp-mode legacy|parallel|native   the command processor of --gpu-backend sspc: one thread / two threads (the
+//                              default) / the SecondSon Native CP (runtime/gpu/cp_mode.h; SSPC_CP_MODE the same)
 //     --perf-opt <name>        P2.5 bridge performance change on / --no-perf-opt <name> off
 //                              (barrier-memo: on by default; docs\PHASE2_P25_PERFORMANCE.md)
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
@@ -245,6 +247,12 @@ int main(int argc, char* argv[]) {
                 return Fail("--render-mode must be legacy|hybrid|native_experimental");
             }
             config->render_mode = std::string(mode); // (P5.3; needs --gpu-backend sspc, else legacy runs)
+        } else if (arg == "--cp-mode" && has_value) {
+            const std::string_view mode = argv[++i];
+            if (mode != "legacy" && mode != "parallel" && mode != "native") {
+                return Fail("--cp-mode must be legacy|parallel|native");
+            }
+            config->cp_mode = std::string(mode); // (needs --gpu-backend sspc; chosen once, before the backend starts)
         } else if (arg == "--gpu-native-validate") {
             config->gpu_native_validate = true;
         } else if (arg == "--gpu-native-diag") {

@@ -35,7 +35,16 @@ enum class Validation : u8 { PerFrame, PerBind };
 /// P5.2 (SSPC_P52_CODE_TRUST): a program's or fetch shader's code read once and its pages write-tracked stays trusted
 /// - no read and comparison every frame - until a write to those pages (or their unmapping) invalidates it. Off: the
 /// per-frame validation alone; Verify: tracked but read every frame as before, counting what a trusted entry missed.
-enum class CodeTrust : u8 { Off, On, Verify };
+/// Sampled (Native CP, CP-2): trusted as On, but each entry is still read and compared once every kTrustSampleFrames
+/// frames (entries spread over the frames): a write tracking cannot see (a shader's store of unknown extent) is found
+/// within that many frames instead of the next one, at 1/kTrustSampleFrames of the per-frame reads.
+enum class CodeTrust : u8 { Off, On, Verify, Sampled };
+inline constexpr u64 kTrustSampleFrames = 8;
+/// Sampled: whether the entry `key` is read again in frame `epoch` (one frame in kTrustSampleFrames, by its key).
+inline bool TrustSampleDue(u64 key, u64 epoch) {
+    return ((key * 0x9E3779B97F4A7C15ull) >> 61) == (epoch & (kTrustSampleFrames - 1));
+}
+static_assert(kTrustSampleFrames == 8, "TrustSampleDue takes the hash's top 3 bits");
 /// Write-tracks [addr, addr + size) (before the code there is read); false: it cannot be tracked (the entry is then
 /// validated every frame as before).
 using TrackCodeFn = bool (*)(void* ctx, u64 addr, u64 size);
