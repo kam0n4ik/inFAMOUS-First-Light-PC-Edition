@@ -789,7 +789,6 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
                 ++stats_.memo_hits;
                 ++s.module->uses;
                 NoteGpuWrites(s); // (P5.2: its writes happen again with this draw)
-                memo_took_[si] = true; // (the view is untouched: StageGeneration stays)
                 return StageStatus::Ready;
             }
             verify = StageFingerprint(s);
@@ -1258,14 +1257,10 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         const auto cpst = static_cast<size_t>(hw); // Cp::Stage has the graphics stages in HwStage's order
         const std::span<const u32, 16> ud(d.user_data[cpst]);
         const Cp::EngineTable* engine = !native ? nullptr : hw == HwStage::Ps ? &d.engine_ps : &d.engine_vs;
-        memo_took_[si] = false;
         s.status = runtime_valid_[si]
                        ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready, engine)
                        : StageStatus::Unsupported;
         ++stats_.stage_status[static_cast<size_t>(s.status)];
-        if (!memo_took_[si]) {
-            ++stage_gen_[si];
-        }
         ready &= s.status == StageStatus::Ready;
         start = Stage(hw).end; // (the shared preparation's, when the native cache gave one)
     }

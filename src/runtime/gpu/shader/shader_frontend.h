@@ -266,11 +266,6 @@ public:
     const std::shared_ptr<const StageView>& SharedStage(HwStage stage) const {
         return shared_[static_cast<size_t>(stage)];
     }
-    /// GPU optimization: a graphics stage's view changes only when this changes (the stage memo's hits leave both
-    /// alone): a caller's copy of Stage() made at the same generation is still the same.
-    u64 StageGeneration(HwStage stage) const {
-        return stage_gen_[static_cast<size_t>(stage)];
-    }
     /// Translations run so far and their time (any thread: the frame log samples it at each flip).
     struct TranslationTotals {
         u64 count = 0, ns = 0, max_ns = 0;
@@ -353,8 +348,6 @@ private:
     };
     std::array<StageMemo, static_cast<size_t>(HwStage::Count)> memo_{};
     std::array<u64, static_cast<size_t>(HwStage::Count)> runtime_ver_{}; ///< bumped at every runtime rebuild
-    std::array<u64, static_cast<size_t>(HwStage::Count)> stage_gen_{};   ///< StageGeneration (graphics stages)
-    std::array<bool, static_cast<size_t>(HwStage::Count)> memo_took_{};  ///< the last PrepareStage was a memo hit
     std::atomic<u64> memory_gen_{1}; ///< (atomic: a change may be reported from another thread)
     bool memo_on_ = false;
     bool memo_diag_ = false;                       ///< SSPC_DIAG_MEMO_STATS=1

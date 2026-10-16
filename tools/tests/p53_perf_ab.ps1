@@ -12,7 +12,8 @@ param(
     [int]$Repeats = 3,
     [int]$Seconds = 90,
     [string]$Configs = "base,apply9,apply19,apply19s,par_base,par_apply19s",
-    [string]$Exe = "" # a copy of SecondSonPC.exe for the whole series (the build may change while it runs)
+    [string]$Exe = "", # a copy of SecondSonPC.exe for the whole series (the build may change while it runs)
+    [string]$ExeB = "" # a second exe: a configuration named <config>_B runs <config> with it (an A/B of two builds)
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -70,7 +71,9 @@ New-Item -ItemType Directory -Force $out | Out-Null
 for ($rep = 1; $rep -le $Repeats; $rep++) {
     foreach ($scene in ($Scenes -split ',' | Where-Object { $_ })) {
         foreach ($cfg in ($Configs -split ',' | Where-Object { $_ })) {
-            if (-not $defs.ContainsKey($cfg)) { throw "unknown config '$cfg'" }
+            $cfgEnv = if ($cfg.EndsWith("_B")) { $cfg.Substring(0, $cfg.Length - 2) } else { $cfg }
+            $cfgExe = if ($cfg.EndsWith("_B")) { $ExeB } else { $Exe }
+            if (-not $defs.ContainsKey($cfgEnv)) { throw "unknown config '$cfg'" }
             $runTag = "${cfg}_r$rep"
             if (Test-Path "$out\$runTag\${scene}_1\stats.json") {
                 continue # done in an earlier (interrupted) invocation of the same series: resumed, not repeated
@@ -96,8 +99,8 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
             }
             $runArgs = @("-ExecutionPolicy", "Bypass", "-File", "$root\tools\tests\p46_runs.ps1", "-Tag", $runTag,
                 "-Scenes", $scene, "-Repeats", "1", "-Seconds", "$Seconds", "-OutRoot", $out)
-            if ($defs[$cfg]) { $runArgs += @("-Env", $defs[$cfg]) } # (base: no variable at all)
-            if ($Exe) { $runArgs += @("-Exe", $Exe) }
+            if ($defs[$cfgEnv]) { $runArgs += @("-Env", $defs[$cfgEnv]) } # (base: no variable at all)
+            if ($cfgExe) { $runArgs += @("-Exe", $cfgExe) }
             powershell @runArgs | Out-Null
             if (-not (Test-Path "$out\$runTag\${scene}_1\stats.json")) {
                 "$(Get-Date -Format s) $runTag $scene FAILED: no stats.json" | Out-File "$out\series.txt" -Encoding utf8 -Append
