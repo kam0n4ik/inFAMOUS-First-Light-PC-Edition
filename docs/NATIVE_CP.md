@@ -165,6 +165,16 @@ A/B Native (with the journal change) vs + lines (`logs/p53/cp2_srt`, n = 2, inte
 | early | 41.6 [41.5..41.8] | **42.8 [42.5..43.0]** (+2.7 %) | 20.0 -> 19.4 |
 | user1022 | 37.4 [36.7..38.2] | 37.9 [37.4..38.5] (within the spread) | 21.0 -> 20.5 |
 
+## CP-5: the flip on the recording thread (measured, not taken)
+
+`SSPC_CP_ASYNC_FLIP=1` (off by default): the processor queues the flip marker to the recording thread instead of
+presenting itself (the executor skips the image eviction and the frontend's new frame there; the recording thread
+does them in order). Checks: Vulkan Validation + Sync 0 messages (beach, village), register replica verification
+1.42 million draws / 0 different, 1217 flips queued (`logs/cp/flip_val`). A/B against Native (`logs/p53/cp_flip_ab`,
+n = 2): beach 48.00 -> 48.02 FPS, harbour 42.80 -> 42.71, village 37.12 -> 37.39 - within the spread. The ~1.2 ms of
+presentation leaves the processor's thread, but the frame waits for it on the recording thread just the same. Kept
+as an option, not in the Native preset.
+
 ## Modes (CP-3.14)
 
 `--cp-mode legacy|parallel|native` (or `SSPC_CP_MODE`; `runtime/gpu/cp_mode.*`), chosen once before the backend
@@ -186,6 +196,48 @@ keeps its value; the log says what the mode set (`command processor mode: native
 | FSR 3.1 Quality + Reflex, beach, validation | works; 41 warnings, all inside AMD FSR 3.1's own shader (`rw_luma_history`: Rgba8 operand on an RGBA16F view) - not SecondSonPC's code |
 | FSR Native AA + FSR frame generation, beach | real 39.9 FPS, displayed 79.7/s |
 | The picture, Parallel vs Native, beach (`logs/cp/img_native1`, `tools/tests/cp_image_ab.ps1`) | by eye the same (geometry, textures, light, smoke, HUD); the numeric comparison is weak here: the game's pause did not freeze the scene, two Parallel runs differ by MAE 8.1/255, Native by 9.3 |
+
+## CP-7: the three modes (2026-10-16, `logs/p53/cp7_modes`, n = 3, interleaved, frame generation off)
+
+Window 1296×759, mailbox, 90 s per run (the first 60 s warm-up excluded); medians of 3 runs (the ranges are in the
+summary).
+
+| Scene | Metric | Legacy | Parallel | Native |
+|---|---|---|---|---|
+| beach (+ foliage) | avg FPS | 33.95 | 44.04 | **47.85** (+8.7 % vs Parallel) |
+| | 1 % low FPS | 23.67 | 28.86 | 29.32 |
+| | frame p95 / p99 ms | 34.04 / 39.38 | 33.87 / 34.06 | 33.82 / 34.03 |
+| | processor busy ms (excl. recording) | 27.25 (5.54) | 20.16 (5.62) | 18.12 (3.89) |
+| | recording thread ms | - | 16.26 | 15.63 |
+| | GPU busy ms | 13.74 | 13.75 | 13.73 |
+| | draws / frame | 5642 | 5590 | 5587 |
+| | process CPU % of a core | 240 | 330 | 328 |
+| | working set / VRAM MiB | 5481 / 1565 | 5511 / 1568 | 5511 / 1568 |
+| early (harbour) | avg FPS | 30.96 | 39.94 | **42.66** (+6.8 %) |
+| | 1 % low FPS | 26.74 | 29.28 | 29.30 |
+| | frame p95 / p99 ms | 34.05 / 34.21 | 34.00 / 34.07 | 33.95 / 34.05 |
+| | processor busy ms (excl. recording) | 29.55 (5.94) | 21.31 (6.56) | 19.56 (4.32) |
+| | recording thread ms | - | 16.49 | 16.69 |
+| | GPU busy ms | 15.57 | 15.73 | 15.74 |
+| | process CPU % of a core | 236 | 319 | 328 |
+| | working set / VRAM MiB | 5528 / 1695 | 5563 / 1695 | 5562 / 1689 |
+| user1022 (village, fire and smoke) | avg FPS | 30.27 | 36.64 | **37.37** (+2.0 %) |
+| | 1 % low FPS | 22.42 | 29.26 | 29.24 |
+| | frame p95 / p99 ms | 39.39 / 44.87 | 34.02 / 34.10 | 34.03 / 34.11 |
+| | processor busy ms (excl. recording) | 28.81 (5.62) | 22.00 (5.79) | 20.85 (4.21) |
+| | recording thread ms | - | 17.68 | 17.95 |
+| | GPU busy ms | 19.86 | 21.30 | 21.44 |
+| | process CPU % of a core | 219 | 295 | 288 |
+| | working set / VRAM MiB | 5467 / 1560 | 5502 / 1560 | 5504 / 1562 |
+
+All 27 runs ended normally (device lost 0, `[Error]` 0, faults not handled by the bridge/game 0). The p95 ~34 ms is
+the vblank pacing (2 vblanks of 60 Hz), not stalls: the share of frames presented after 1 vblank grows Legacy 24 % ->
+Parallel 64 % -> Native 75 % on the beach. In the village the recording thread (17.9 ms) and the GPU (21.4 ms) are
+the limit, so the processor's savings show less there.
+
+Long runs, Native, 240 s per scene (`logs/cp/native_soak`): beach 48.04 FPS (1 % low 29.30), harbour 42.85 (29.26),
+village 36.96 (29.20) - as in the 90 s runs; VRAM 1569 / 1697 / 1563 MiB (as above), device lost 0, `[Error]` 0.
+Not measured here, left to play by hand: the ESC menu and settings changes while playing, input latency.
 
 Found on the way and fixed (not the processor): **a race on the swapchain with Reflex** (commit 4d04823):
 `vkSetLatencyMarkerNV` / `vkLatencySleepNV` on the game's thread used the swapchain while the present thread ran

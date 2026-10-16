@@ -5162,7 +5162,10 @@ void Executor::Flip(const Cp::FlipMarker&) {
     const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     batch_fence_ = true;
     images_.NewFrame();
-    EvictGpuImages();
+    if (!flip_queued_) {
+        EvictGpuImages(); // (a queued flip leaves it to the next drained one: EvictionDue)
+    }
+    eviction_due_.store(images_.OverBudget(), std::memory_order_release);
     CaptureImageAt();
     DrawHistogram();
     RaceCheck();
@@ -5248,7 +5251,15 @@ void Executor::Flip(const Cp::FlipMarker&) {
         }
         ++insp_frame_; // (FrameLog's flip marker index: the hook's calls)
     }
-    frontend_.NewFrame();
+    if (!flip_queued_) {
+        frontend_.NewFrame(); // (queued: the processor's thread began the frontend's frame at the marker)
+    }
+}
+
+void Executor::FlipQueued(const Cp::FlipMarker& marker) {
+    flip_queued_ = true;
+    Flip(marker);
+    flip_queued_ = false;
 }
 
 void RetargetWriteWatch(u64 address) {

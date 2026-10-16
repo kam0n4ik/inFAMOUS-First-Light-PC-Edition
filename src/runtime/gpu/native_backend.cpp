@@ -310,6 +310,9 @@ private:
     }
     /// The executor reached a flip marker (its batch submitted, the flip queued): the frame log's row (P4.6).
     void OnFlip(u64 gpu_value);
+    /// The processor's thread's part of a frame's totals (OnFlip; a flip queued to the recording thread takes it at
+    /// its marker: ParallelCp::SetFlipSnapshot).
+    void FlipTotalsOfProcessor(FrameLog::GpuThreadTotals& t);
     /// P4.10.4: a queued timeline copy the executor refused, done as the processor would (after Synchronize): the CPU
     /// copies guest memory and the caches drop the destination. The recording thread. true: copied.
     bool CpuCopy(u64 src, u64 dst, u64 bytes);
@@ -629,6 +632,13 @@ bool Backend::Start(const Options& o, std::string& error) {
             char e[8] = {};
             return GetEnvironmentVariableA("SSPC_CP_JOURNAL_CHANGES", e, sizeof(e)) == 1 && e[0] == '1';
         }();
+        po.async_flip = [] {
+            char e[8] = {};
+            return GetEnvironmentVariableA("SSPC_CP_ASYNC_FLIP", e, sizeof(e)) == 1 && e[0] == '1';
+        }();
+        if (po.async_flip) {
+            SSPC_LOG(GPU, Info, "Native CP: flip markers are queued to the recording thread (SSPC_CP_ASYNC_FLIP=1)");
+        }
         if (po.journal_changes_only) {
             SSPC_LOG(GPU, Info, "Native CP: register writes that change nothing are not journaled "
                                 "(SSPC_CP_JOURNAL_CHANGES=1)");
@@ -643,6 +653,12 @@ bool Backend::Start(const Options& o, std::string& error) {
             po.frontend_thread = GetEnvironmentVariableA("SSPC_P53_FRONTEND_THREAD", ft, sizeof(ft)) == 1 && ft[0] == '1';
         }
         parallel_ = std::make_unique<ParallelCp>(*executor_, buffers_.get(), po);
+        // Native CP: SSPC_CP_ASYNC_FLIP=1 - the flip marker queued to the recording thread (parallel_cp.h)
+        if (po.async_flip) {
+            parallel_->SetFlipSnapshot([](void* self, FrameLog::GpuThreadTotals& out) {
+                static_cast<Backend*>(self)->FlipTotalsOfProcessor(out);
+            }, this);
+        }
         parallel_->SetCopyFallback(
             [](void* self, u64 src, u64 dst, u64 bytes) { return static_cast<Backend*>(self)->CpuCopy(src, dst, bytes); },
             this);
@@ -1295,32 +1311,20 @@ void Backend::Loop() {
     }
 }
 
-void Backend::OnFlip(u64 gpu_value) {
-    const auto& s = executor_->Stats();
-    FrameLog::GpuThreadTotals t;
+void Backend::FlipTotalsOfProcessor(FrameLog::GpuThreadTotals& t) {
     t.cp_ns = tot_busy_ns_ + static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                   std::chrono::steady_clock::now() - round_t0_)
                                                   .count());
-    t.record_ns = s.record_ns;
-    t.sync_ns = s.sync_wait_us * 1000;
     t.blocked_label_ns = tot_blocked_label_ns_;
     t.blocked_other_ns = tot_blocked_other_ns_;
     t.empty_ns = tot_empty_ns_;
-    t.gpu_busy_ns = s.gpu_busy_ns;
-    t.draws = s.draws;
-    t.dispatches = s.dispatches;
-    t.batches = s.batches;
     t.blocks = cp_->Stats().waits_blocked;
     const auto tr = frontend_->Translations();
     t.shaders = tr.count;
     t.shader_ns = tr.ns;
-    const auto& p = pipelines_->Stats();
-    t.pipelines = p.graphics + p.compute;
-    t.pipeline_ns = p.create_ns;
-    t.module_ns = p.module_ns;
     t.shader_disk = frontend_->DiskLoads();
-    t.callbacks_ns = GS::TicksToNs(s.t_cb);
-    if (parallel_) { // (the flip marker is executed with the queue drained: thread 2's totals are settled)
+    t.last_unblock_tsc = executor_->LastUnblockTsc(); // (written by Poll: the processor's thread)
+    if (parallel_) { // (thread 2's totals: atomics, readable at any time)
         const ParallelTotals pt = parallel_->Totals();
         t.par_wait_ns = GS::TicksToNs(pt.t1_drain_ticks + pt.t1_full_ticks);
         t.par_busy_ns = GS::TicksToNs(pt.t2_busy_ticks);
@@ -1329,7 +1333,30 @@ void Backend::OnFlip(u64 gpu_value) {
         t.par_records = pt.records;
         t.par_depth_sum = pt.depth_sum;
     }
-    FrameLog::CpFlip(gpu_value, t, executor_->LastUnblockTsc());
+}
+
+void Backend::OnFlip(u64 gpu_value) {
+    const auto& s = executor_->Stats();
+    FrameLog::GpuThreadTotals t;
+    // Native CP: a flip queued to the recording thread (this call is on it) carries the processor's totals taken at
+    // its marker; otherwise the flip runs on the processor's thread (the queue drained) and they are taken now
+    if (const FrameLog::GpuThreadTotals* queued = parallel_ ? parallel_->QueuedFlipTotals() : nullptr) {
+        t = *queued;
+    } else {
+        FlipTotalsOfProcessor(t);
+    }
+    t.record_ns = s.record_ns;
+    t.sync_ns = s.sync_wait_us * 1000;
+    t.gpu_busy_ns = s.gpu_busy_ns;
+    t.draws = s.draws;
+    t.dispatches = s.dispatches;
+    t.batches = s.batches;
+    const auto& p = pipelines_->Stats();
+    t.pipelines = p.graphics + p.compute;
+    t.pipeline_ns = p.create_ns;
+    t.module_ns = p.module_ns;
+    t.callbacks_ns = GS::TicksToNs(s.t_cb);
+    FrameLog::CpFlip(gpu_value, t, t.last_unblock_tsc);
     if (StallTrace::On()) { // (P4.12: the trace's events count to the next frame from here)
         const u32 n = FrameLog::GetProgress().cp - 1;
         StallTrace::Instant(StallTrace::Ev::FlipMarker, gpu_value, n);

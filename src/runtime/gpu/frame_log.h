@@ -37,6 +37,7 @@ struct GpuThreadTotals {
     u64 par_drains = 0;       ///< drains that waited
     u64 par_records = 0;      ///< records pushed
     u64 par_depth_sum = 0;    ///< queue depth at each push (mean: / records)
+    u64 last_unblock_tsc = 0; ///< (Native CP: thread 1's last met wait, carried with a flip queued to thread 2)
 };
 
 /// The backend starts: time zero and the rows' storage.

@@ -42,6 +42,7 @@
 
 #include "base/abi.h"
 #include "runtime/gpu/command_processor.h"
+#include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 
 namespace SecondSon::Gpu::Vk {
@@ -109,6 +110,7 @@ struct ParallelTotals {
     u64 gw_max = 0;               ///< most ranges pending at once
     u64 gw_now = 0;               ///< ranges pending now (P4.11 soak telemetry)
     u64 async_acquires = 0;       ///< P4.11: met memory waits queued with their CPU writes applied on thread 1
+    u64 queued_flips = 0;         ///< Native CP: flip markers queued to thread 2 (Options::async_flip)
     u64 copy_failures = 0;        ///< P4.11: queued copies neither recorded nor copied by the CPU (reported, completed)
     // P5.3D (SSPC_P53_FRONTEND_THREAD=1): the frontend on its own thread between thread 1 and thread 2
     u64 tf_busy_ticks = 0;    ///< the frontend thread preparing records (journal replay included)
@@ -152,6 +154,12 @@ public:
         /// Native CP (SSPC_CP_JOURNAL_CHANGES=1): register writes that change nothing are not journaled (the replicas
         /// already hold those values; RegisterFile::SetSinkChangesOnly).
         bool journal_changes_only = false;
+        /// Native CP (SSPC_CP_ASYNC_FLIP=1; with `frontend` on thread 1): a flip marker is queued to thread 2 like a
+        /// draw (Executor::FlipQueued: the frame's copy to the presenter, its submission, the flip) - not executed by
+        /// thread 1 with the queue drained. Thread 1 begins the frontend's frame at the marker and snapshots its own
+        /// per-frame totals for the frame log (SetFlipSnapshot). A flip that must evict GPU-written images
+        /// (Executor::EvictionDue), and every flip while the stall trace or the inspector runs, is drained as before.
+        bool async_flip = false;
     };
     /// `buffers`: the executor's buffer cache (the processor's writes invalidate it on thread 2).
     ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options);
@@ -173,6 +181,14 @@ public:
         copy_fallback_ = copy;
         copy_ctx_ = ctx;
     }
+    /// Options::async_flip: thread 1's part of a frame's totals, taken when the flip marker is queued.
+    void SetFlipSnapshot(void (*snapshot)(void* ctx, FrameLog::GpuThreadTotals& out), void* ctx) {
+        flip_snapshot_ = snapshot;
+        flip_snapshot_ctx_ = ctx;
+    }
+    /// Thread 2, inside a queued flip's execution (the executor's flip hook): thread 1's totals taken at its marker;
+    /// nullptr otherwise (the flip was executed by thread 1 with the queue drained).
+    const FrameLog::GpuThreadTotals* QueuedFlipTotals() const { return flip_totals_; }
     /// Thread 1: waits until thread 2 has executed every record pushed so far; the journal, deferred invalidations and
     /// memory changes not yet handed on are applied here (thread 2 parked).
     void Drain(DrainReason why);
@@ -233,7 +249,7 @@ public:
     void OnLoad(std::span<const u32> values) override;
 
 private:
-    enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy };
+    enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy, Flip };
     struct Record {
         Kind kind = Kind::Journal;
         bool memory_changed = false; ///< a guest memory change reported before it
@@ -250,6 +266,8 @@ private:
         Cp::CacheActionOp cache;
         Cp::FenceOp fence;
         Cp::DmaOp dma;
+        Cp::FlipMarker flip;                 ///< Flip (Options::async_flip)
+        FrameLog::GpuThreadTotals flip_totals; ///< ... thread 1's totals at the marker
         u32 queue = 0;                       ///< WaitMet, MemoryAcquired, Copy
         u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
@@ -347,6 +365,10 @@ private:
     const bool async_, async_copies_, verify_;
     bool async_acquire_ = false;
     bool journal_changes_only_ = false;
+    bool async_flip_ = false;
+    void (*flip_snapshot_)(void*, FrameLog::GpuThreadTotals&) = nullptr;
+    void* flip_snapshot_ctx_ = nullptr;
+    const FrameLog::GpuThreadTotals* flip_totals_ = nullptr; ///< thread 2: the queued flip being executed
     std::atomic<u64> verified_{0}, verify_mismatches_{0}; ///< thread 2 (Options::verify)
     GS::ShaderFrontend* frontend_ = nullptr;
     const std::atomic<u64>* map_gen_ = nullptr;

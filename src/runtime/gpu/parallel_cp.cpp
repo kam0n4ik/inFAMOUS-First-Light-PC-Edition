@@ -13,6 +13,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/inspector.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
@@ -110,6 +111,7 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
     fthread_mode_ = options.frontend_thread && frontend_ != nullptr;
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
     journal_changes_only_ = options.journal_changes_only;
+    async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
 }
 
 ParallelCp::~ParallelCp() {
@@ -999,6 +1001,11 @@ void ParallelCp::Execute(Record& r, u64 index) {
         case Kind::Copy:
             RunCopy(r);
             break;
+        case Kind::Flip:
+            flip_totals_ = &r.flip_totals; // (the flip hook's frame log row: thread 1's totals at the marker)
+            exec_.FlipQueued(r.flip);
+            flip_totals_ = nullptr;
+            break;
         case Kind::Journal:
         case Kind::Stop:
             break;
@@ -1167,6 +1174,19 @@ bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes)
 }
 
 void ParallelCp::Flip(const Cp::FlipMarker& marker) {
+    if (async_flip_ && started_ && !exec_.EvictionDue() && !StallTrace::On() && !Inspector::On()) {
+        // Native CP: executed by thread 2 behind the frame's draws; the frontend's frame begins here (thread 1's order)
+        Record& r = BeginRecord(Kind::Flip);
+        r.flip = marker;
+        r.flip_totals = {};
+        if (flip_snapshot_ != nullptr) {
+            flip_snapshot_(flip_snapshot_ctx_, r.flip_totals);
+        }
+        ++t1_.queued_flips;
+        PushRecord();
+        frontend_->NewFrame();
+        return;
+    }
     Drain(DrainReason::Flip);
     const u64 v0 = exec_.TimelineWritesVersion();
     exec_.Flip(marker); // (the frontend's new frame, evictions: here, on the frontend's thread)
@@ -1309,6 +1329,10 @@ std::string ParallelCp::Report() const {
         out += fmt::format("  P4.11: met memory waits queued with their CPU writes applied on the processor's thread "
                            "(SSPC_P411_ASYNC_ACQUIRE=1) {}; queued copies neither recorded nor copied {}\n",
                            t.async_acquires, t.copy_failures);
+    }
+    if (async_flip_) {
+        out += fmt::format("  Native CP: flip markers queued to the recording thread (SSPC_CP_ASYNC_FLIP=1) {}\n",
+                           t.queued_flips);
     }
     out += "  drains that waited, by reason:";
     for (size_t i = 0; i < t.drains_by.size(); ++i) {

@@ -204,6 +204,12 @@ public:
     u64 RecordedValue() const;
     void CacheAction(const Cp::CacheActionOp& op) override;
     void Flip(const Cp::FlipMarker& marker) override;
+    /// Native CP (SSPC_CP_ASYNC_FLIP=1): the flip marker on the parallel processor's recording thread, queued behind
+    /// the frame's draws - no GPU-written images evicted (EvictionDue: the processor flips with the queue drained the
+    /// next time, as Flip does) and no frontend frame begun (the processor's thread begins it at the marker).
+    void FlipQueued(const Cp::FlipMarker& marker);
+    /// The image cache was over its budget at the last flip: the next flip evicts (Flip, the queue drained). Any thread.
+    bool EvictionDue() const { return eviction_due_.load(std::memory_order_acquire); }
     /// P5.3D A/B: images at those addresses now -> SSPC_DIAG_CAPTURE_DIR (CaptureImageAt's output, pass < 0 there).
     void CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 native_draws, u32 pm4_draws) override;
     void Fence(const Cp::FenceOp& op) override;
@@ -830,6 +836,8 @@ private:
     void (*flip_hook_)(void*, u64) = nullptr;
     void* flip_ctx_ = nullptr;
     u64 last_unblock_tsc_ = 0;
+    std::atomic<bool> eviction_due_{false}; ///< (FlipQueued / EvictionDue)
+    bool flip_queued_ = false;              ///< FlipQueued is running Flip
     u64 batch_first_cmd_ = 0, batch_last_cmd_ = 0;
 
     // P4.8 Performance Inspector (SetInspector)
