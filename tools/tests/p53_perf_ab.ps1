@@ -61,7 +61,9 @@ $defs = @{
     fb_reuse     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_STAGE_REUSE=1"
     fb_reuse_v   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_STAGE_REUSE=verify"
     fb_unl_both  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_PACKETS=65536;SSPC_P411_ASYNC_ACQUIRE=1"
-    # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
+    # FB-7 (village GPU): MEASUREMENT ONLY - the write-back shader's changed words not stored to the host (its PCIe
+    # stores' share of the frame; the host's copy is wrong)
+    fb7_nohost   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_DIAG_MEASURE=wb_nohost"    # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
     fbc_console  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console;SSPC_FB_CLOCK_PROBE=1"
     fbc_30       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30;SSPC_FB_CLOCK_PROBE=1"
     fbc_60       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=60;SSPC_FB_CLOCK_PROBE=1"

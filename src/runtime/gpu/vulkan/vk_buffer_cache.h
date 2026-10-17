@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -117,6 +118,8 @@ public:
     void Collect(u64 completed);
     /// The end of a batch: the copies of its GPU writes back to the host (`cb` outside rendering).
     void RecordWriteBack(VkCommandBuffer cb, u64 seq);
+    /// SSPC_GPU_PROFILE: called in RecordWriteBack after the copies, before the changed-words shader (a timestamp)
+    void SetWriteBackMark(std::function<void()> mark) { wb_mark_ = std::move(mark); }
     /// SSPC_DIAG_MEASURE=skip_wb only: the batch's written ranges forgotten (no write-back).
     void DropWriteBack() {
         written_.clear();
@@ -216,6 +219,7 @@ private:
     u32 prep_next_ = 0;
     u64 valid_gen_ = 1;
     std::vector<std::pair<VkBuffer, VkBufferCopy>> wb_regions_; ///< RecordWriteBack's scratch
+    std::function<void()> wb_mark_;
     std::vector<VkBufferCopy> wb_copies_;
     struct WbSnap {
         u64 seq = 0, addr = 0;
@@ -239,8 +243,7 @@ private:
     u64 shadow_bytes_ = 0;
     VkDescriptorSetLayout diff_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout diff_layout_ = VK_NULL_HANDLE;
-    VkPipeline diff_pipeline_ = VK_NULL_HANDLE;
-    void InitDiff();
+    VkPipeline diff_pipeline_ = VK_NULL_HANDLE;    void InitDiff();
     void CopyIntoShadows(u64 a, u64 size, VkCommandBuffer cb);
     /// The shadow of exactly [b, e) (made, or its host bytes copied in when not in step: `inited`); nullptr: none.
     WbShadow* ShadowFor(u64 b, u64 e, VkCommandBuffer cb, u64 seq, bool& inited);

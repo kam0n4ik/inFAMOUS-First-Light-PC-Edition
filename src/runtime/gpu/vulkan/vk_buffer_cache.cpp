@@ -908,6 +908,9 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
             wb_copies_.clear();
         }
     }
+    if (wb_mark_) {
+        wb_mark_();
+    }
     if (diffs.empty()) {
         return;
     }
@@ -923,6 +926,16 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
     }
     f.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_pipeline_);
     const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
+    // SSPC_DIAG_MEASURE=wb_nohost: MEASUREMENT ONLY - the changed words go to the shadow again instead of the host (the
+    // shader's comparison without its PCIe stores; the host's copy is wrong)
+    static const bool nohost = [] {
+        char v[32] = {};
+        const bool s = GetEnvironmentVariableA("SSPC_DIAG_MEASURE", v, sizeof(v)) > 0 && std::string_view(v) == "wb_nohost";
+        if (s) {
+            SSPC_LOG(GPU, Warning, "MEASUREMENT ONLY: SSPC_DIAG_MEASURE=wb_nohost - changed words not written to the host");
+        }
+        return s;
+    }();
     for (const Diff& d : diffs) {
         bool in_step = true;
         for (u64 a = d.b; a < d.e;) {
@@ -940,9 +953,11 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
             }
             const u64 in_sh = a - d.sh->addr; // (the shadow may hold more than this range)
             const u64 c_off = a & ~(align - 1), s_off = in_sh & ~(align - 1), h_off = v.offset & ~(align - 1);
-            const VkDescriptorBufferInfo bi[3] = {{buffer_, c_off, a + piece - c_off},
-                                                  {d.sh->buffer, s_off, in_sh + piece - s_off},
-                                                  {v.buffer, h_off, v.offset + piece - h_off}};
+            const VkDescriptorBufferInfo bi[3] = {
+                {buffer_, c_off, a + piece - c_off},
+                {d.sh->buffer, s_off, in_sh + piece - s_off},
+                nohost ? VkDescriptorBufferInfo{d.sh->buffer, s_off, in_sh + piece - s_off}
+                       : VkDescriptorBufferInfo{v.buffer, h_off, v.offset + piece - h_off}};
             VkWriteDescriptorSet w[3];
             for (u32 i = 0; i < 3; ++i) {
                 w[i] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -953,7 +968,8 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
             }
             f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_layout_, 0, 3, w);
             const u32 pc[4] = {static_cast<u32>(piece / 4), static_cast<u32>((a - c_off) / 4),
-                               static_cast<u32>((in_sh - s_off) / 4), static_cast<u32>((v.offset - h_off) / 4)};
+                               static_cast<u32>((in_sh - s_off) / 4),
+                               static_cast<u32>(nohost ? (in_sh - s_off) / 4 : (v.offset - h_off) / 4)};
             f.vkCmdPushConstants(cb, diff_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
             f.vkCmdDispatch(cb, static_cast<u32>((piece / 4 + 255) / 256), 1, 1);
             stats_.wb_diff_bytes += piece;

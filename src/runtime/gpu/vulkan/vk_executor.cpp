@@ -228,6 +228,8 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                                    "changes and at a batch's end)");
         } else {
             SSPC_LOG(GPU, Warning, "SSPC_GPU_PROFILE=1: GPU time per command (a timestamp after every command; slower)");
+            // the batch end split: its barrier and copies / the changed-words shader (key 5)
+            buffers_.SetWriteBackMark([this] { ProfMark(6, "batch end: barrier and write-back copies"); });
         }
     }
     markers_ = ctx_.Caps().markers && Fn().vkCmdBeginDebugUtilsLabelEXT != nullptr &&
