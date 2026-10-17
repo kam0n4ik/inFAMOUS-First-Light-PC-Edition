@@ -224,3 +224,64 @@ not move and the frame p95 is ~0.8 ms higher** - more frames reach the next vbla
 command processor's, ~23 ms of CP) stay as slow. The first version cost the harbour 0.5 ms of CP (a dispatch per
 kept-back block); merging adjacent blocks removed it. Left off by default: the goal is the 1% low, which the GPU no
 longer limits in the village - the CP does.
+
+## CP-8: the village's critical path and the processor's waits on it
+
+**What holds the village's frame** (lifecycle trace `logs/cp8/cp8_trace2`, Native + early, unlimited pacing, 470
+frames; `tools/p54/p54_lifecycle.py`): in 98.5 % of frames the game itself is late with the next frame - it waits
+twice a frame for its async compute label (0x1695e0), 19.0 ms of a 25.4 ms period; its own CPU work is ~4 ms. One
+wait (9.5 ms on average): the processor reaching the compute queue's RELEASE_MEM 6.3 ms, the batch submitted 0.25,
+waiting on the GPU behind graphics batches 1.5, executing 1.4, the label 0.2. Frames with the compute waits out of
+the way would be limited by the GPU (20.9 ms busy) and the recording thread (18.8 ms).
+
+Thread 1 per frame (the trace's queue slices): graphics 12.6 ms (~71 500 packets, 177 ns each), compute 5.0 ms (~20 600
+packets, 244 ns each), waiting for the recording thread 4.0 ms (46 drains), idle while the GPU works 4.2 ms. Worst 1 %
+of frames vs the median (`gpu_frames.csv`, 3 base runs): the same structure - the frame is the processor's span plus
+the GPU's tail after the flip (~6 ms), the processor 27 vs 20.6 ms (recording 20.9 vs 16.4), idle waiting for the game
+~5.3 ms in both.
+
+The processor's time by opcode (`SSPC_DIAG_PACKET_TIME=1`, new, diagnostic; whole 90-s run, ms): draws (DRAW_INDEX_2)
+1.8 us each, dispatches 1.7 us each (the frontend's preparation), SET_SH_REG ~35 ns, WAIT_REG_MEM 31-37 us (drains);
+**the compute ring's read pointer, written to guest memory after every packet, 5 352 ms - a third of the compute
+queue's 10 807 ms**: 58 million writes of the same value (the ring's position does not move while the queue executes
+an indirect buffer; the ring is 8 192 dwords, nearly all compute packets are in indirect buffers).
+
+From a game submission to its slice on thread 1 (`logs/cp8/cp8_trace2`): a compute doorbell (53 a frame) waits
+1.26 ms on average - mostly thread 1 in a graphics slice (1.32 ms) or a drain; the early frame handoff 0.51 ms, 0.69
+ms when it fell into thread 1's idle wait for the GPU: that wait (`vkWaitSemaphores` on the oldest batch, up to 1 ms)
+did not see the game's submissions.
+
+**Taken (default; old path by a variable):**
+- the read pointer is written only when its value changes (`CommandProcessor::UpdateReadPointer`; the memory holds the
+  same value as before at every point; `SSPC_CP_RPTR_EVERY_PACKET=1`: after every packet);
+- the idle wait for the GPU ends at the oldest batch's completion **or** a game submission: a second timeline
+  semaphore, both waited on with `VK_SEMAPHORE_WAIT_ANY_BIT`, signalled from `Push` while thread 1 waits
+  (`Timeline::WaitOrWake` / `Wake`; `SSPC_CP_GPU_WAIT_WAKE=0`: the old wait).
+
+A/B (`logs/p53/cp8_screen2` village, `logs/p53/cp8_ab_be` beach and harbour; n = 3, interleaved, one exe):
+
+| Scene | Metric | old | new |
+|---|---|---|---|
+| village | avg FPS | 39.80 [39.60..40.01] | **40.46 [40.32..40.69]** |
+| | 1 % low | 35.06 | 35.82 |
+| | p95 / p99 ms | 26.98 / 27.94 | 26.43 / 27.39 |
+| beach | avg FPS | 55.66 | 55.75 |
+| | 1 % low | 46.54 | 49.50 |
+| | p95 / p99 ms | 18.80 / 19.88 | 18.74 / 19.62 |
+| harbour | avg FPS | 51.38 [50.85..51.90] | 51.02 [50.85..51.28] |
+| | 1 % low | 44.73 | 44.84 |
+| | p95 / p99 ms | 20.63 / 21.32 | 20.82 / 21.58 (within the spread) |
+
+Vulkan Validation + Sync, village and beach (`logs/cp8/cp8_val`): 0 messages, device lost 0, `[Error]` 0.
+
+**Measured, not taken (options, off):**
+
+| Village, n = 2-3 | avg FPS | 1 % low | p95 ms | GPU tail ms |
+|---|---|---|---|---|
+| compute slices of 16 384 packets (`SSPC_CP_COMPUTE_ROUND_PACKETS`) | 36.87 (base 39.28) | 33.74 | 29.0 | 8.05 |
+| compute slices unlimited | 35.21 | 31.57 | 30.5 | 8.87 |
+| compute first in a round (`SSPC_DIAG_QUEUE_ORDER=compute-first`) | 41.14 (new 40.46) | 33.55 | 28.08 | 6.17 |
+| + a compute doorbell ends the graphics slice (`SSPC_CP_COMPUTE_PREEMPT=1`) | 41.41 | 35.17 | 27.11 | 6.32 |
+
+Serving the game's compute earlier raises the average but delays the graphics frame on the processor and on the GPU
+(one Vulkan queue): the tails do not improve. Not taken - the goal is the 1 % low.

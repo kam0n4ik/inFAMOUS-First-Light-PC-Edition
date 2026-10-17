@@ -1925,6 +1925,17 @@ bool Executor::WaitOldest(u64 timeout_ns) {
     return done;
 }
 
+bool Executor::WaitOldestOrWake(u64 wake_value, u64 timeout_ns) {
+    if (in_flight_.empty() || Failed()) {
+        return false;
+    }
+    const bool done = timeline_.WaitOrWake(in_flight_.front().value, wake_value, timeout_ns);
+    if (!done && timeline_.Lost()) {
+        OnDeviceLost("vkWaitSemaphores (oldest batch or a wake-up)", in_flight_.front().value);
+    }
+    return done;
+}
+
 void Executor::Synchronize(u32) {
     const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     FlushKeptBack(0, 1ull << 40, false, 1); // (FB-7: the CPU side may read anything after it)

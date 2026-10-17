@@ -46,11 +46,17 @@ Timeline::Timeline(DeviceContext& ctx) : ctx_(ctx) {
     if (Fn().vkCreateSemaphore(ctx_.Device(), &ci, nullptr, &semaphore_) != VK_SUCCESS) {
         semaphore_ = VK_NULL_HANDLE;
     }
+    if (Fn().vkCreateSemaphore(ctx_.Device(), &ci, nullptr, &wake_) != VK_SUCCESS) {
+        wake_ = VK_NULL_HANDLE; // (WaitOrWake waits for the GPU alone)
+    }
 }
 
 Timeline::~Timeline() {
     if (semaphore_ != VK_NULL_HANDLE) {
         Fn().vkDestroySemaphore(ctx_.Device(), semaphore_, nullptr);
+    }
+    if (wake_ != VK_NULL_HANDLE) {
+        Fn().vkDestroySemaphore(ctx_.Device(), wake_, nullptr);
     }
 }
 
@@ -98,6 +104,43 @@ bool Timeline::Wait(u64 value, u64 timeout_ns) {
         ctx_.Fail("vkWaitSemaphores", r);
     }
     return false;
+}
+
+bool Timeline::WaitOrWake(u64 value, u64 wake_value, u64 timeout_ns) {
+    if (wake_ == VK_NULL_HANDLE) {
+        return Wait(value, timeout_ns);
+    }
+    if (ctx_.Failed()) {
+        return false;
+    }
+    if (completed_.load(std::memory_order_acquire) >= value) {
+        return true;
+    }
+    const VkSemaphore sems[2] = {semaphore_, wake_};
+    const u64 values[2] = {value, wake_value};
+    const VkSemaphoreWaitInfo wi{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                                 .flags = VK_SEMAPHORE_WAIT_ANY_BIT,
+                                 .semaphoreCount = 2,
+                                 .pSemaphores = sems,
+                                 .pValues = values};
+    const VkResult r = Fn().vkWaitSemaphores(ctx_.Device(), &wi, timeout_ns);
+    if (r == VK_SUCCESS) {
+        return Completed() >= value; // (either one: the GPU's value asked)
+    }
+    if (r != VK_TIMEOUT) {
+        last_error_.store(r, std::memory_order_release);
+        ctx_.Fail("vkWaitSemaphores", r);
+    }
+    return false;
+}
+
+void Timeline::Wake(u64 wake_value) {
+    if (wake_ == VK_NULL_HANDLE || ctx_.Failed()) {
+        return;
+    }
+    const VkSemaphoreSignalInfo si{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = wake_,
+                                   .value = wake_value};
+    Fn().vkSignalSemaphore(ctx_.Device(), &si); // (a failure: the waiter's timeout ends its wait as before)
 }
 
 // ------------------------------------------------------------------------------------------------ OwnedBuffer

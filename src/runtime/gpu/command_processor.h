@@ -294,6 +294,10 @@ enum class StepStatus : u8 {
 struct Counters {
     std::array<u64, 256> graphics_packets{}; ///< per opcode
     std::array<u64, 256> compute_packets{};
+    /// Options::packet_ticks: the processor's time per opcode (TSC; the read pointer's update apart)
+    std::array<u64, 256> graphics_ticks{}, compute_ticks{};
+    u64 rptr_ticks = 0;
+    u64 rptr_same = 0; ///< CP-8: read pointer writes left out (the same value as the last one)
     u64 type2 = 0;
     u64 draws = 0, dispatches = 0, dispatches_disabled = 0, flips = 0;
     u64 fences = 0, fences_deferred = 0, fences_written = 0, fences_dropped = 0;
@@ -341,6 +345,8 @@ struct Options {
     bool waits_by_held_fences = false;
     /// Isolated: DMA_DATA to/from GDS offered to GpuWork::GdsOnTimeline (else Synchronize and the CPU copies; P4.6).
     bool gds_on_timeline = false;
+    /// SSPC_DIAG_PACKET_TIME=1 (diagnostic): Counters::graphics_ticks / compute_ticks / rptr_ticks are measured
+    bool packet_ticks = false;
 };
 
 class CommandProcessor {
@@ -503,6 +509,8 @@ private:
     u64 ClockSample(u32 data_sel);
 
     Options options_;
+    /// CP-8 fallback (SSPC_CP_RPTR_EVERY_PACKET=1): a compute ring's read pointer written after every packet, as before
+    bool rptr_every_packet_ = false;
     RegisterFile regs_;
     std::array<std::unique_ptr<Queue>, kNumQueues> queues_;
     std::array<u64, 4> set_base_{}; ///< SET_BASE: 0 display list patch table, 1 draw indirect args, 2 GDS, 3 CE

@@ -48,6 +48,11 @@ public:
     u64 Completed();                           ///< the GPU's value now
     /// Waits until `value` (or `timeout_ns`); true when reached.
     bool Wait(u64 value, u64 timeout_ns);
+    /// CP-8: as Wait, but Wake(v >= wake_value) from another thread ends the wait too (a second timeline semaphore,
+    /// both waited on with VK_SEMAPHORE_WAIT_ANY_BIT); true when `value` was reached.
+    bool WaitOrWake(u64 value, u64 wake_value, u64 timeout_ns);
+    /// CP-8: signals the wake semaphore to `wake_value` (the callers serialize it; the values only grow).
+    void Wake(u64 wake_value);
     bool Ok() const { return semaphore_ != VK_NULL_HANDLE; }
     /// A query or a wait returned VK_ERROR_DEVICE_LOST.
     bool Lost() const { return last_error_.load(std::memory_order_acquire) == VK_ERROR_DEVICE_LOST; }
@@ -58,6 +63,7 @@ public:
 private:
     DeviceContext& ctx_;
     VkSemaphore semaphore_ = VK_NULL_HANDLE;
+    VkSemaphore wake_ = VK_NULL_HANDLE; ///< CP-8: WaitOrWake's second semaphore (host-signalled only)
     /// The completed value raised to `v` (never lowered: two threads may see different values in either order).
     void Advance(u64 v) {
         u64 c = completed_.load(std::memory_order_relaxed);

@@ -66,6 +66,17 @@ $defs = @{
     fb7_nohost   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_DIAG_MEASURE=wb_nohost"
     # FB-7: large GPU-written ranges' blocks kept back from the host until a reader needs them (vk_buffer_cache.h)
     fb7_lazy     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_LAZY_WB=1"
+    # CP-8 (the village's async compute wait): the compute ring's read pointer after every packet (the old path), the
+    # compute queues' packets per round, compute first in a round
+    cp8_base     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_RPTR_EVERY_PACKET=1"
+    cp8_rptr     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited"
+    cp8_c16k     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_COMPUTE_ROUND_PACKETS=16384"
+    cp8_cunl     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_COMPUTE_ROUND_PACKETS=16777216"
+    cp8_cfirst   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_DIAG_QUEUE_ORDER=compute-first"
+    # CP-8: the old path (the read pointer after every packet, the idle GPU wait not woken by submissions); compute first
+    # with a compute doorbell ending the graphics slice early
+    cp8_old      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_RPTR_EVERY_PACKET=1;SSPC_CP_GPU_WAIT_WAKE=0"
+    cp8_cfp      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_DIAG_QUEUE_ORDER=compute-first;SSPC_CP_COMPUTE_PREEMPT=1"
     # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
     fbc_console  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console;SSPC_FB_CLOCK_PROBE=1"
     fbc_30       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30;SSPC_FB_CLOCK_PROBE=1"

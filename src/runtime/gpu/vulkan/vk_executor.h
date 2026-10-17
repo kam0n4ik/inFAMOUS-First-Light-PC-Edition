@@ -310,6 +310,8 @@ public:
     bool Busy() const { return !in_flight_.empty(); }
     /// Waits up to `timeout_ns` for the oldest batch in flight; true when one completed.
     bool WaitOldest(u64 timeout_ns);
+    /// CP-8: as WaitOldest, ended early by Timeline::Wake(>= wake_value) (the game submitted work meanwhile).
+    bool WaitOldestOrWake(u64 wake_value, u64 timeout_ns);
 
     const ExecutorStats& Stats() const { return stats_; }
 

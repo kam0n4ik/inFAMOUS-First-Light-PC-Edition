@@ -107,6 +107,10 @@ struct CommandProcessor::Queue {
     u64 ring_addr = 0;
     u32 ring_dw = 0;
     u64 rptr_addr = 0;
+    /// CP-8: the read pointer last written (a write of the same value again is left out - the ring's position
+    /// stays put while the queue executes an indirect buffer); rptr_known: written since the map
+    u32 rptr_last = 0;
+    bool rptr_known = false;
     u32 cursor_dw = 0; ///< DingDong: the next span's start
     std::array<Pending, kMaxPending> pending{};
     u32 head = 0;
@@ -206,6 +210,9 @@ CommandProcessor::CommandProcessor(const Options& options) : options_(options) {
     }
     queues_[kGraphicsQueue] = std::make_unique<Queue>();
     queues_[kGraphicsQueue]->id = kGraphicsQueue;
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_CP_RPTR_EVERY_PACKET", v, sizeof(v)) == 1 && v[0] == '1') {
+        rptr_every_packet_ = true;
+    }
 }
 
 CommandProcessor::~CommandProcessor() = default;
@@ -305,7 +312,7 @@ bool CommandProcessor::MapComputeQueue(u32 vqid, u64 ring_addr, u32 ring_dwords,
     q.carry.resize(kCarryDwords);
     if (options_.mode == Mode::Isolated && read_ptr_addr != 0) {
         const u32 zero = 0;
-        options_.memory->Write(read_ptr_addr, &zero, sizeof(zero)); // as sceGnmMapComputeQueue: read pointer 0
+        q.rptr_known = options_.memory->Write(read_ptr_addr, &zero, sizeof(zero)); // as sceGnmMapComputeQueue: 0
     }
     return true;
 }
@@ -458,7 +465,12 @@ void CommandProcessor::UpdateReadPointer(Queue& q) {
         return;
     }
     const u32 rptr = (q.frames[0].ring_offset + q.frames[0].pos) % q.ring_dw;
-    options_.memory->Write(q.rptr_addr, &rptr, sizeof(rptr));
+    if (q.rptr_known && rptr == q.rptr_last && !rptr_every_packet_) {
+        ++stats_.rptr_same;
+        return; // (CP-8: the memory holds this value already)
+    }
+    q.rptr_known = options_.memory->Write(q.rptr_addr, &rptr, sizeof(rptr));
+    q.rptr_last = rptr;
 }
 
 bool CommandProcessor::Peek(u32 queue, u64& addr, std::span<const u32>& packet) {
@@ -544,6 +556,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     if (observer_ != nullptr && !q.blocked) { // once per packet, not per retry of a blocked wait
         observer_->BeforePacket(q.id, addr, p);
     }
+    const u64 t0 = options_.packet_ticks ? __rdtsc() : 0;
     const StepStatus s = Execute(q, f, addr, p);
     if (s == StepStatus::Blocked) {
         f.pos = saved;
@@ -556,6 +569,13 @@ StepStatus CommandProcessor::Step(u32 queue) {
     ++(q.compute ? stats_.compute_packets : stats_.graphics_packets)[pk.opcode];
     if (observer_ != nullptr) {
         observer_->AfterPacket(q.id, addr, p); // p stays readable: a chained buffer was read into another vector
+    }
+    if (t0 != 0) {
+        const u64 t1 = __rdtsc();
+        (q.compute ? stats_.compute_ticks : stats_.graphics_ticks)[pk.opcode] += t1 - t0;
+        UpdateReadPointer(q);
+        stats_.rptr_ticks += __rdtsc() - t1;
+        return StepStatus::Packet;
     }
     UpdateReadPointer(q);
     return StepStatus::Packet;

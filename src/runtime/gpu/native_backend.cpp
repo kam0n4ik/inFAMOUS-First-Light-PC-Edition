@@ -323,6 +323,14 @@ private:
             idle_.store(false, std::memory_order_release);
             quiet_.store(false, std::memory_order_release);
             recorded_.store(false, std::memory_order_release);
+            if (s.kind == Submission::Kind::DingDong) {
+                compute_rung_.store(true, std::memory_order_relaxed); // (CP-8: a graphics slice may end early)
+            }
+            if (gpu_waiting_) {
+                gpu_waiting_ = false; // (CP-8: the GPU thread's wait for the oldest batch ends now)
+                ++wakes_;
+                timeline_->Wake(++wake_value_);
+            }
         }
         cv_.notify_one();
     }
@@ -411,6 +419,17 @@ private:
 
     std::mutex mutex_;
     std::condition_variable cv_;
+    /// CP-8: the GPU thread idle with GPU work in flight waits for the oldest batch OR a submission of the game (Push
+    /// signals the timeline's wake semaphore while it waits) - not until the batch completed or 1 ms passed.
+    /// SSPC_CP_GPU_WAIT_WAKE=0: the old wait. (gpu_waiting_ and wake_value_ under mutex_.)
+    bool wake_on_submit_ = true;
+    bool gpu_waiting_ = false;
+    u64 wake_value_ = 0;
+    u64 wakes_ = 0; ///< (under mutex_) waits ended by a submission
+    /// CP-8 (SSPC_CP_COMPUTE_PREEMPT=1): the game rang a compute queue's doorbell since the round began - the graphics
+    /// queue's slice ends at its next 64-packet check (the round ends as usual; the next one takes the submission)
+    std::atomic<bool> compute_rung_{false};
+    u64 preempted_ = 0; ///< graphics slices ended early for it (the GPU thread)
     std::deque<Submission> queue_;
     std::atomic<bool> idle_{true};
     std::atomic<bool> quiet_{true};    ///< IsQuiet (diagnostics)
@@ -733,6 +752,16 @@ bool Backend::Start(const Options& o, std::string& error) {
     }
     cpo.waits_by_held_fences = p46_sync;
     cpo.gds_on_timeline = p46_sync;
+    // CP-8: SSPC_CP_GPU_WAIT_WAKE=0 - the GPU thread's idle wait for the GPU is not ended by the game's submissions
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_CP_GPU_WAIT_WAKE", v, sizeof(v)) == 1 && v[0] == '0') {
+        wake_on_submit_ = false;
+        SSPC_LOG(GPU, Warning, "SSPC_CP_GPU_WAIT_WAKE=0: the idle wait for the GPU ignores the game's submissions (old)");
+    }
+    // SSPC_DIAG_PACKET_TIME=1: the processor's time per opcode and queue kind in gpu_native.txt (diagnostic)
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_PACKET_TIME", v, sizeof(v)) == 1 && v[0] == '1') {
+        cpo.packet_ticks = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_PACKET_TIME=1 - the processor's time per opcode is measured");
+    }
     memory_.unordered_labels = p46_sync;
     // EOP/RELEASE_MEM clocks in the guest's time base (P4.5): data_sel 4 (the GPU counter the game scales with
     // sceGnmGetGpuCoreClockFrequency, 800 MHz) is the TSC the game reads with rdtsc, in GPU core clocks - as the
@@ -1029,6 +1058,7 @@ void Backend::Loop() {
         {
             std::unique_lock lock{mutex_};
             local.swap(queue_);
+            compute_rung_.store(false, std::memory_order_relaxed); // (the doorbells rung so far are taken now)
         }
         for (const auto& s : local) {
             Apply(s);
@@ -1081,6 +1111,28 @@ void Backend::Loop() {
             }
             return n;
         }();
+        // CP-8 experiment: SSPC_CP_COMPUTE_ROUND_PACKETS=<n> - the compute queues' packets per round (the graphics
+        // queue keeps round_limit): the game waits for its async compute while the graphics frame is processed
+        static const u32 compute_limit = [] {
+            char v[16] = {};
+            if (GetEnvironmentVariableA("SSPC_CP_COMPUTE_ROUND_PACKETS", v, sizeof(v)) == 0) {
+                return round_limit;
+            }
+            const u32 n = std::clamp<u32>(static_cast<u32>(std::strtoul(v, nullptr, 10)), 256u, 1u << 24);
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_COMPUTE_ROUND_PACKETS={} - a compute queue's packets per round",
+                     n);
+            return n;
+        }();
+        // CP-8: SSPC_CP_COMPUTE_PREEMPT=1 - a compute doorbell ends the graphics slice early (with compute first)
+        static const bool compute_preempt = [] {
+            char v[8] = {};
+            const bool on = GetEnvironmentVariableA("SSPC_CP_COMPUTE_PREEMPT", v, sizeof(v)) == 1 && v[0] == '1';
+            if (on) {
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_COMPUTE_PREEMPT=1 - a compute doorbell ends the graphics "
+                                       "queue's slice early");
+            }
+            return on;
+        }();
         for (u32 k = 0; k < Cp::kNumQueues; ++k) {
             const u32 q = compute_first ? (k + 1) % Cp::kNumQueues : k;
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
@@ -1089,7 +1141,13 @@ void Backend::Loop() {
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
-            for (; i < round_limit; ++i) {
+            const u32 limit = q == Cp::kGraphicsQueue ? round_limit : compute_limit;
+            const bool preemptible = compute_preempt && q == Cp::kGraphicsQueue;
+            for (; i < limit; ++i) {
+                if (preemptible && (i & 63) == 63 && compute_rung_.load(std::memory_order_relaxed)) {
+                    ++preempted_; // (CP-8: the compute work the game waits for, first in the next round)
+                    break;
+                }
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
                     progress = true;
@@ -1112,11 +1170,11 @@ void Backend::Loop() {
             }
             if (slice_t0 != 0 && (i != 0 || slice_stop == 1)) {
                 StallTrace::Span(StallTrace::Ev::CpQueueSlice, slice_t0, StallTrace::Now(), q, i,
-                                 i == round_limit ? u16{2} : slice_stop);
+                                 i == limit ? u16{2} : slice_stop);
             }
             round_packets += i; // (P4.12: the round's packets; a queue that stopped at the limit)
-            round_capped += i == round_limit ? 1 : 0;
-            graphics_capped |= i == round_limit && q == Cp::kGraphicsQueue;
+            round_capped += i == limit ? 1 : 0;
+            graphics_capped |= i == limit && q == Cp::kGraphicsQueue;
             pending |= cp_->PendingSubmissions(q) != 0;
         }
         if (parallel_) {
@@ -1368,6 +1426,21 @@ void Backend::Loop() {
             const auto until = idle_t0 + std::chrono::nanoseconds(spin_ns);
             while (Clock::now() < until) {
                 YieldProcessor();
+            }
+        } else if (busy && wake_on_submit_) {
+            // CP-8: until the oldest batch completes or the game submits (Push wakes it), at most 1 ms
+            u64 wake = 0;
+            {
+                std::scoped_lock lock{mutex_};
+                if (queue_.empty()) {
+                    gpu_waiting_ = true;
+                    wake = wake_value_ + 1;
+                }
+            }
+            if (wake != 0) {
+                executor_->WaitOldestOrWake(wake, 1'000'000);
+                std::scoped_lock lock{mutex_};
+                gpu_waiting_ = false;
             }
         } else if (busy) {
             executor_->WaitOldest(1'000'000); // 1 ms: completion unblocks labels
@@ -1945,6 +2018,29 @@ std::string Backend::Report() {
             const u64 w = cp_->Registers().Writes(), c = cp_->Registers().Changes();
             out += fmt::format("register writes {}, of them changing a value {} ({:.1f} %)\n", w, c,
                                w != 0 ? 100.0 * static_cast<double>(c) / static_cast<double>(w) : 0.0);
+            // packets by opcode and queue kind (with SSPC_DIAG_PACKET_TIME=1 also their time, ms)
+            const auto& cs = cp_->Stats();
+            const double ms_per_tick = 1000.0 / static_cast<double>(Kernel::Clock::TscFrequency());
+            for (const bool compute : {false, true}) {
+                const auto& n = compute ? cs.compute_packets : cs.graphics_packets;
+                const auto& t = compute ? cs.compute_ticks : cs.graphics_ticks;
+                out += fmt::format("{} packets by opcode:", compute ? "compute" : "graphics");
+                for (u32 op = 0; op < 256; ++op) {
+                    if (n[op] != 0) {
+                        out += fmt::format(" {:#04x} {} ({:.0f} ms)", op, n[op], static_cast<double>(t[op]) * ms_per_tick);
+                    }
+                }
+                out += '\n';
+            }
+            out += fmt::format("compute ring read pointer: writes of the same value left out {} (CP-8; "
+                               "SSPC_CP_RPTR_EVERY_PACKET=1 writes each), updates {:.0f} ms\n",
+                               cs.rptr_same, static_cast<double>(cs.rptr_ticks) * ms_per_tick);
+            {
+                std::scoped_lock lock{mutex_};
+                out += fmt::format("idle waits for the GPU ended by a submission of the game: {} (CP-8; "
+                                   "SSPC_CP_GPU_WAIT_WAKE=0: off); graphics slices ended early by a compute doorbell "
+                                   "{}\n", wakes_, preempted_);
+            }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
                            "ranges {}, read-after-write {}, write-after-write {}, write-after-read {}\n",
