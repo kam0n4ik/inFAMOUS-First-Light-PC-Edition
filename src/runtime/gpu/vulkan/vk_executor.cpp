@@ -1022,9 +1022,7 @@ void Executor::Poll() {
                 } else if (b.aq_unreported.test(q)) {
                     b.aq_unreported.reset(q);
                     stats_.aq_out_of_order += b.value > completed ? 1 : 0;
-                    if (cp_ != nullptr) {
-                        cp_->CompleteWork(q, b.work[q]);
-                    }
+                    Complete(q, b.work[q]);
                 }
             }
         }
@@ -1037,10 +1035,8 @@ void Executor::Poll() {
         Batch b = std::move(in_flight_.front());
         in_flight_.pop_front();
         Retire(b);
-        if (cp_ != nullptr) {
-            for (const u32 q : b.queues) {
-                cp_->CompleteWork(q, b.work[q]);
-            }
+        for (const u32 q : b.queues) {
+            Complete(q, b.work[q]);
         }
         free_.push_back(std::move(b));
     }
@@ -1056,7 +1052,7 @@ void Executor::Poll() {
 
 void Executor::Retire(Batch& b) {
     {
-        if (cp_ != nullptr && !b.clock_fences.empty() && b.query_slot != ~0u) {
+        if (cp_ != nullptr && !defer_completions_ && !b.clock_fences.empty() && b.query_slot != ~0u) {
             // each clock fence's age: from its timestamp to the batch's last one (taken as now - the completion was
             // just seen)
             u64 end_ts[2] = {};
@@ -1136,6 +1132,16 @@ void Executor::Retire(Batch& b) {
         if (b.prof_base != ~0u) {
             ProfCollect(b);
         }
+    }
+}
+
+void Executor::Complete(u32 queue, u64 seq) {
+    if (defer_completions_) {
+        std::scoped_lock lock{completions_mu_};
+        completions_.emplace_back(queue, seq);
+        completions_ready_.store(true, std::memory_order_release);
+    } else if (cp_ != nullptr) {
+        cp_->CompleteWork(queue, seq);
     }
 }
 

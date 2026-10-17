@@ -438,3 +438,31 @@ gain would be small: the lane removes the ~5.5 ms the second compute request wai
 long frames, while the processor (~21 ms) and the GPU (~21 ms) still bound the frame. Rejected; the code stays off
 (its default path is unchanged: base with the AQ exe 40.25 / 40.55 FPS). Base / CC-2 in the same series
 (`aq_ab1`, n = 3): 40.37 [39.71..40.80] / 41.98 [41.84..42.23] FPS, 1 % low 35.48 / 35.35, p95 26.46 / 27.11 ms.
+
+## CP-9: the processor's round end without a drain (experimental, off)
+
+Beach profile (`logs/p53/pr_prof1`): thread 1 waited for the recording thread ~12 s of a run at drains - round ends
+7.6 s (64 k drains), met memory waits 4.3 s. A drain exists at a round end only for the executor's Poll and flush.
+
+- `SSPC_CP_ROUND_NODRAIN=1`: a round that made progress ends with a `RoundEnd` record instead - thread 2 flushes a held
+  fence's batch and polls the GPU in stream order; the executor keeps the guest queues' completions
+  (`Executor::SetDeferCompletions`) and thread 1 applies them (`CompleteWork`) at its next round end / queue slice.
+  `=2`: not while the game is blocked in its async compute wait (its labels come from the drained path).
+- `SSPC_CP_NODRAIN_FENCE=1`: thread 2 submits a held fence's batch right after the fence record and polls.
+- `SSPC_CP_ASYNC_WRITES=1|gds`: WRITE_DATA / fills and GDS DMA on the timeline queued (shape checked on thread 1; a
+  refusal when they run: Synchronize + the CPU does them on thread 2, `Backend::CpuWrite / CpuGds`).
+
+A/B (`logs/p53/cp9_ab1..3`, n = 3-4, unlimited pacing; medians):
+
+| Scene | base | nodrain=1 + async acquire | nodrain=2 + async acquire | =2 + acquire + GDS queued |
+|---|---|---|---|---|
+| beach FPS | 55.2 | **58.1** (57.3-58.7, n = 4) | 56.5 | 55.5 |
+| beach 1 % low | 49.1 | 48.1 | 47.6 | 47.6 |
+| harbour FPS | 50.6-50.9 | **54.2** | **53.5** | **53.8** |
+| harbour 1 % low / p99 ms | 43.9-45.7 / 21.4-21.7 | 45.9 / 21.2 | 45.3 / 21.2 | 45.9 / 21.1 |
+| village FPS | 40.2-40.3 | 38.9 | 40.6 | 40.4 |
+| village 1 % low / p99 ms | 34.8-35.0 / 28.0 | 31.5 / 30.9 | 33.7 / 29.2 | 34.0 / 28.4 |
+
+All writes queued (`=1`) and the flip queued as well: worse tails (beach 1 % low 41-42, harbour 39-40). The village
+loses with `=1`: the game's compute labels reach it a round later. Not on by default: the beach and the village
+lose 1 % low. The series with the fence flush (`cp9_ab4`) was stopped by the user before it completed.

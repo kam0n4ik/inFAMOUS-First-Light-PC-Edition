@@ -133,6 +133,8 @@ u32 ForcedCopyFallbackEvery() {
 ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options)
     : exec_(executor), buffers_(buffers), spin_ticks_(Kernel::Clock::TscFrequency() / 1'000'000 * options.spin_us),
       async_(options.async), async_copies_(options.async && options.async_copies), verify_(options.verify),
+      async_writes_(options.async && options.async_copies && options.async_writes),
+      async_gds_only_(options.async_gds_only),
       frontend_(options.timeline != nullptr ? options.frontend : nullptr), map_gen_(options.map_gen),
       timeline_(options.timeline), slots_(std::make_unique<Record[]>(kSlots)),
       journal_(std::make_unique<u32[]>(kJournalWords)) {
@@ -351,6 +353,18 @@ void ParallelCp::Drain(DrainReason why) {
     if (frontend_ != nullptr) {
         RetireGpuWrites(); // (frontend thread: parked too - the queue is empty, so it prepared everything)
     }
+}
+
+bool ParallelCp::RoundEndQueued() {
+    if (!started_ || !async_ || Idle()) {
+        return false;
+    }
+    BeginRecord(Kind::RoundEnd);
+    PushRecord();
+    if (frontend_ != nullptr) {
+        RetireGpuWrites(); // (only records already executed: safe with thread 2 running)
+    }
+    return true;
 }
 
 bool ParallelCp::TimelinePending(u64 addr, u64 bytes) {
@@ -970,6 +984,38 @@ void ParallelCp::Loop() {
     }
 }
 
+void ParallelCp::RunWrite(const Record& r) {
+    if (exec_.WriteOnTimeline(r.queue, r.seq, r.dst, r.payload.data(), r.bytes)) {
+        return;
+    }
+    // refused when it ran (an import): what the processor does after a refusal, here in stream order
+    exec_.Synchronize(r.queue);
+    if (write_fallback_ == nullptr || !write_fallback_(write_ctx_, r.dst, r.payload.data(), r.bytes)) {
+        SSPC_LOG(GPU, Error, "parallel command processor: a queued timeline write of {} bytes at {:#x} could be neither "
+                             "recorded nor written by the CPU (its work completes)", r.bytes, r.dst);
+    } else {
+        exec_.GuestMemoryChanged();
+    }
+    write_fallbacks_.store(write_fallbacks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    exec_.CompleteRefusedWork(r.queue, r.seq);
+}
+
+void ParallelCp::RunGds(const Record& r) {
+    if (exec_.GdsOnTimeline(r.queue, r.seq, r.gds_kind, r.src, r.gds_offset, static_cast<u32>(r.bytes), r.pattern)) {
+        return;
+    }
+    exec_.Synchronize(r.queue);
+    if (gds_fallback_ == nullptr ||
+        !gds_fallback_(write_ctx_, r.gds_kind, r.src, r.gds_offset, static_cast<u32>(r.bytes), r.pattern)) {
+        SSPC_LOG(GPU, Error, "parallel command processor: a queued GDS DMA ({} bytes, GDS +{:#x}, memory {:#x}) could be "
+                             "neither recorded nor done by the CPU (its work completes)", r.bytes, r.gds_offset, r.src);
+    } else {
+        exec_.GuestMemoryChanged();
+    }
+    write_fallbacks_.store(write_fallbacks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    exec_.CompleteRefusedWork(r.queue, r.seq);
+}
+
 void ParallelCp::RunCopy(const Record& r) {
     const u32 every = ForcedCopyFallbackEvery();
     const bool forced = every != 0 && ++forced_fallback_n_ % every == 0;
@@ -1056,6 +1102,10 @@ void ParallelCp::Execute(Record& r, u64 index) {
             break;
         case Kind::Fence:
             exec_.Fence(r.fence);
+            if (flush_at_fence_ && exec_.WantsFlush()) {
+                exec_.FlushFromLoop(); // (CP-9: a held fence's work to the GPU now, its completion polled)
+                exec_.Poll();
+            }
             break;
         case Kind::Dma:
             exec_.Dma(r.dma);
@@ -1077,6 +1127,20 @@ void ParallelCp::Execute(Record& r, u64 index) {
             flip_totals_ = &r.flip_totals; // (the flip hook's frame log row: thread 1's totals at the marker)
             exec_.FlipQueued(r.flip);
             flip_totals_ = nullptr;
+            break;
+        case Kind::Write:
+            RunWrite(r);
+            break;
+        case Kind::Gds:
+            RunGds(r);
+            break;
+        case Kind::RoundEnd:
+            // CP-9: what the loop does after a drained round end - a held fence's batch submitted, completed batches
+            // collected (their completions kept for thread 1)
+            if (exec_.WantsFlush()) {
+                exec_.FlushFromLoop();
+            }
+            exec_.Poll();
             break;
         case Kind::Journal:
         case Kind::Stop:
@@ -1285,6 +1349,28 @@ void ParallelCp::Synchronize(u32 queue) {
 }
 
 bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) {
+    if (async_writes_ && !async_gds_only_ && started_ && !Idle()) {
+        // CP-9: accepted by its shape, recorded in stream order (RunWrite: the CPU writes there after a refusal)
+        if (!Vk::Executor::TimelineWriteShapeOk(dst, bytes)) {
+            return false; // (the processor writes it, draining first - as the executor's refusal)
+        }
+        Record& r = BeginRecord(Kind::Write);
+        r.queue = queue;
+        r.seq = seq;
+        r.dst = dst;
+        r.bytes = bytes;
+        r.payload.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + bytes);
+        ++writes_queued_;
+        queued_tw_.emplace_back(dst, dst + bytes);
+        qtw_lo_ = std::min(qtw_lo_, dst);
+        qtw_hi_ = std::max(qtw_hi_, dst + bytes);
+        if (frontend_ != nullptr && !fthread_mode_) {
+            AddGpuWrite(dst, dst + bytes, next_, kLookup);
+        }
+        PushRecord();
+        FrontMemoChanged();
+        return true;
+    }
     Drain(DrainReason::TimelineWrite);
     const bool ok = exec_.WriteOnTimeline(queue, seq, dst, data, bytes);
     SnapshotTimeline();
@@ -1296,6 +1382,31 @@ bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, 
 
 bool ParallelCp::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                                u32 pattern) {
+    if (async_writes_ && started_ && !Idle()) {
+        if (!exec_.GdsShapeOk(kind, memory, gds_offset, bytes)) {
+            return false;
+        }
+        Record& r = BeginRecord(Kind::Gds);
+        r.queue = queue;
+        r.seq = seq;
+        r.gds_kind = kind;
+        r.src = memory;
+        r.gds_offset = gds_offset;
+        r.bytes = bytes;
+        r.pattern = pattern;
+        ++writes_queued_;
+        if (kind == Cp::DmaKind::GdsToMemory) {
+            queued_tw_.emplace_back(memory, memory + bytes);
+            qtw_lo_ = std::min(qtw_lo_, memory);
+            qtw_hi_ = std::max(qtw_hi_, memory + bytes);
+            if (frontend_ != nullptr && !fthread_mode_) {
+                AddGpuWrite(memory, memory + bytes, next_, kLookup);
+            }
+        }
+        PushRecord();
+        FrontMemoChanged();
+        return true;
+    }
     Drain(DrainReason::TimelineGds);
     const bool ok = exec_.GdsOnTimeline(queue, seq, kind, memory, gds_offset, bytes, pattern);
     SnapshotTimeline();

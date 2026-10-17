@@ -93,6 +93,16 @@ $defs = @{
     aq_cc        = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1;SSPC_CC_CRITICAL=1"
     aq_always    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1;SSPC_FB_ASYNC_SPLIT=always"
     aq_nosplit   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1;SSPC_FB_ASYNC_SPLIT=off"
+    # FrameBreak CP-9: the processor's round end without a drain (thread 2 polls), met memory waits without a drain,
+    # timeline writes / GDS DMA queued, the flip marker queued
+    cp9_na       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=1;SSPC_P411_ASYNC_ACQUIRE=1"
+    cp9_naw      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=1;SSPC_P411_ASYNC_ACQUIRE=1;SSPC_CP_ASYNC_WRITES=1"
+    cp9_nawf     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=1;SSPC_P411_ASYNC_ACQUIRE=1;SSPC_CP_ASYNC_WRITES=1;SSPC_CP_ASYNC_FLIP=1"
+    cp9_na2      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=2;SSPC_P411_ASYNC_ACQUIRE=1"
+    cp9_na2g     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=2;SSPC_P411_ASYNC_ACQUIRE=1;SSPC_CP_ASYNC_WRITES=gds"
+    cp9_naf      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=1;SSPC_P411_ASYNC_ACQUIRE=1;SSPC_CP_NODRAIN_FENCE=1"
+    cp9_na2f     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_ROUND_NODRAIN=2;SSPC_P411_ASYNC_ACQUIRE=1;SSPC_CP_NODRAIN_FENCE=1;SSPC_CP_ASYNC_WRITES=gds"
+    cp9_acq      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_P411_ASYNC_ACQUIRE=1"
     # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
     fbc_console  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console;SSPC_FB_CLOCK_PROBE=1"
     fbc_30       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30;SSPC_FB_CLOCK_PROBE=1"

@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -312,6 +313,28 @@ public:
     /// Completed batches -> CommandProcessor::CompleteWork (in order), resources released. The GPU thread, outside
     /// CommandProcessor::Run.
     void Poll();
+    /// FrameBreak CP-9 (SSPC_CP_ASYNC_WRITES): what WriteOnTimeline / GdsOnTimeline refuse by their shape alone (any
+    /// thread: nothing but the GDS buffer's size, fixed); the rest of their refusals (an import) only when they run.
+    static bool TimelineWriteShapeOk(u64 dst, u64 bytes) {
+        return bytes != 0 && bytes <= 65536 && (dst & 3) == 0 && (bytes & 3) == 0 && dst < (1ull << 40);
+    }
+    bool GdsShapeOk(Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes) const {
+        return bytes != 0 && (gds_offset & 3) == 0 && (bytes & 3) == 0 && gds_.buffer != VK_NULL_HANDLE &&
+               u64{gds_offset} + bytes <= gds_.size && (kind == Cp::DmaKind::DataToGds || memory < (1ull << 40)) &&
+               (kind == Cp::DmaKind::DataToGds || kind == Cp::DmaKind::MemoryToGds || kind == Cp::DmaKind::GdsToMemory);
+    }
+    /// FrameBreak CP-9 (SSPC_CP_ROUND_NODRAIN): Poll keeps the guest queues' completions for the processor's thread
+    /// (TakeCompletions) instead of calling CommandProcessor::CompleteWork - Poll may run on the recording thread then.
+    void SetDeferCompletions(bool on) { defer_completions_ = on; }
+    /// The processor's thread: the completions Poll kept, in order (queue, work number).
+    bool CompletionsReady() const { return completions_ready_.load(std::memory_order_acquire); }
+    bool TakeCompletions(std::vector<std::pair<u32, u64>>& out) {
+        out.clear();
+        completions_ready_.store(false, std::memory_order_relaxed);
+        std::scoped_lock lock{completions_mu_};
+        out.swap(completions_);
+        return !out.empty();
+    }
     /// A fence was held since the last Flush (the processor waits for the GPU): the loop flushes.
     bool WantsFlush() const { return want_flush_; }
     /// The loop's flush (Native CP, CP-0: counted by its cause - a held fence, or the processor idle with work open).
@@ -929,6 +952,12 @@ private:
     void Retire(Batch& b);
     /// Poll's end: the resources of completed batches released (every batch up to `completed` done).
     void PollCollect(u64 completed);
+    /// CompleteWork now, or kept for TakeCompletions (CP-9).
+    void Complete(u32 queue, u64 seq);
+    bool defer_completions_ = false;
+    std::mutex completions_mu_;
+    std::vector<std::pair<u32, u64>> completions_;
+    std::atomic<bool> completions_ready_{false};
     std::vector<std::pair<u64, OwnedBuffer>> lds_retired_; ///< outgrown, until the batches using them complete
     u64 lds_groups_ = 1;
     u32 lds_group_bytes_ = 0;

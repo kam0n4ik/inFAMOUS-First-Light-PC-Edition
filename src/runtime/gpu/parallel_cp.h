@@ -129,6 +129,10 @@ public:
         u32 spin_us = 20;         ///< how long a waiting side spins before it blocks (0: blocks at once)
         bool async = true;        ///< the calls that need no answer queued (false: each drains - the first prototype)
         bool async_copies = true; ///< timeline copies queued too (their answer from their shape)
+        /// FrameBreak CP-9 (SSPC_CP_ASYNC_WRITES=1): WRITE_DATA / DMA fills and GDS DMA on the timeline queued too (their
+        /// answer from their shape; a refusal when they run: the CPU does them there, after the earlier work)
+        bool async_writes = false;
+        bool async_gds_only = false; ///< (SSPC_CP_ASYNC_WRITES=gds: GDS DMA only)
         /// Stage 2: the shader frontend runs on thread 1 (nullptr: on thread 2, inside the executor); with it the
         /// guest maps' generation (its reads keep backing runs) and the timeline (the GPU writes it completed).
         GS::ShaderFrontend* frontend = nullptr;
@@ -177,6 +181,14 @@ public:
 
     /// What thread 2 does for a queued timeline copy the executor refused (the processor's own fallback: the CPU copies
     /// after the GPU completed the earlier work): the copy and the caches' invalidation. true: copied.
+    /// CP-9: the CPU's write / GDS DMA for a queued one the executor refused (thread 2, the earlier work complete).
+    void SetWriteFallback(bool (*write)(void* ctx, u64 dst, const void* data, u64 bytes),
+                          bool (*gds)(void* ctx, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes, u32 pattern),
+                          void* ctx) {
+        write_fallback_ = write;
+        gds_fallback_ = gds;
+        write_ctx_ = ctx;
+    }
     void SetCopyFallback(bool (*copy)(void* ctx, u64 src, u64 dst, u64 bytes), void* ctx) {
         copy_fallback_ = copy;
         copy_ctx_ = ctx;
@@ -192,6 +204,15 @@ public:
     /// Thread 1: waits until thread 2 has executed every record pushed so far; the journal, deferred invalidations and
     /// memory changes not yet handed on are applied here (thread 2 parked).
     void Drain(DrainReason why);
+    /// FrameBreak CP-9 (SSPC_CP_ROUND_NODRAIN): the backend loop's round end without a drain while records are still
+    /// queued - thread 2 flushes a held fence's batch and polls the GPU in stream order after them (the executor keeps
+    /// the completions for thread 1). false: the queue is idle (the caller drains - nothing to wait for - and polls).
+    bool RoundEndQueued();
+    /// CP-9 (SSPC_CP_NODRAIN_FENCE=1): thread 2 submits a held fence's batch right after the fence's record and polls
+    /// (the label's work reaches the GPU without waiting for the round's end).
+    void SetFlushAtFence(bool on) { flush_at_fence_ = on; }
+    u64 WritesQueued() const { return writes_queued_; }
+    u64 WriteFallbacks() const { return write_fallbacks_.load(std::memory_order_relaxed); }
     /// Thread 1: a write on the GPU's timeline may be pending over [addr, addr + bytes) - one queued and not executed
     /// yet, or one the executor held at the last point the queue was empty (the processor's reads drain then).
     bool TimelinePending(u64 addr, u64 bytes);
@@ -249,7 +270,8 @@ public:
     void OnLoad(std::span<const u32> values) override;
 
 private:
-    enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy, Flip };
+    enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy, Flip,
+                           RoundEnd, Write, Gds };
     struct Record {
         Kind kind = Kind::Journal;
         bool memory_changed = false; ///< a guest memory change reported before it
@@ -271,6 +293,9 @@ private:
         Cp::FlipMarker flip;                 ///< Flip (Options::async_flip)
         FrameLog::GpuThreadTotals flip_totals; ///< ... thread 1's totals at the marker
         u32 queue = 0;                       ///< WaitMet, MemoryAcquired, Copy
+        std::vector<u8> payload;             ///< CP-9 Write: the data (capacity reused)
+        Cp::DmaKind gds_kind{};              ///< CP-9 Gds (memory in src)
+        u32 gds_offset = 0, pattern = 0;
         u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
@@ -365,6 +390,7 @@ private:
     Cp::RegisterFile replica_;
     const u64 spin_ticks_;
     const bool async_, async_copies_, verify_;
+    const bool async_writes_, async_gds_only_;
     bool async_acquire_ = false;
     bool journal_changes_only_ = false;
     bool async_flip_ = false;
@@ -389,6 +415,14 @@ private:
     FrontReader reader_{*this};
     u32 front_fine_counter_ = 0;
     bool (*copy_fallback_)(void*, u64, u64, u64) = nullptr;
+    bool (*write_fallback_)(void*, u64, const void*, u64) = nullptr;
+    bool (*gds_fallback_)(void*, Cp::DmaKind, u64, u32, u32, u32) = nullptr;
+    void* write_ctx_ = nullptr;
+    void RunWrite(const Record& r);
+    void RunGds(const Record& r);
+    u64 writes_queued_ = 0;
+    bool flush_at_fence_ = false;
+    std::atomic<u64> write_fallbacks_{0};
     void* copy_ctx_ = nullptr;
     // thread 1: timeline copies queued since the queue was last idle; the executor's pending timeline writes then
     std::vector<std::pair<u64, u64>> queued_tw_, exec_tw_;

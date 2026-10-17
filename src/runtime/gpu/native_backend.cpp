@@ -368,6 +368,9 @@ private:
     /// P4.10.4: a queued timeline copy the executor refused, done as the processor would (after Synchronize): the CPU
     /// copies guest memory and the caches drop the destination. The recording thread. true: copied.
     bool CpuCopy(u64 src, u64 dst, u64 bytes);
+    /// CP-9: a queued timeline write / GDS DMA the executor refused, by the CPU (the recording thread, after Synchronize)
+    bool CpuWrite(u64 dst, const void* data, u64 bytes);
+    bool CpuGds(Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes, u32 pattern);
     /// P4.14: the persistent shader cache, the driver's pipeline cache and the start-up precompiler (Start).
     void StartShaderCache(const Options& o);
     void RunPrecompile(const Options& o);
@@ -435,6 +438,19 @@ private:
     /// FP-1 (the GPU thread): rounds without a graphics slice, graphics slices ended, holds ended by their limit, flushes
     /// for a GPU about to run dry, time held
     u64 fp_rounds_held_ = 0, fp_slices_ended_ = 0, fp_expired_ = 0, fp_flushes_ = 0, fp_held_ns_ = 0;
+    // FrameBreak CP-9 (SSPC_CP_ROUND_NODRAIN=1): round ends without a drain (ParallelCp::RoundEndQueued)
+    bool nodrain_ = false;
+    bool nodrain_wait_ = false; ///< SSPC_CP_ROUND_NODRAIN=2
+    u64 nodrain_rounds_ = 0;
+    std::vector<std::pair<u32, u64>> completions_;
+    /// Thread 1: the queues' completions the executor kept (CP-9) handed to the processor (labels written).
+    void ApplyCompletions() {
+        if (nodrain_ && executor_->TakeCompletions(completions_)) {
+            for (const auto& [q, seq] : completions_) {
+                cp_->CompleteWork(q, seq);
+            }
+        }
+    }
     std::chrono::steady_clock::time_point fp_hold_t0_{}; ///< FP-1: the GPU's queue full since (none: not full)
     u64 fp_hold_c_ = 0; ///< FP-1: the GPU's completed value at fp_hold_t0_
     /// FP-1: batches submitted that the GPU has not completed
@@ -705,6 +721,12 @@ bool Backend::Start(const Options& o, std::string& error) {
         po.spin_us = spin_us;
         po.async = async;
         po.async_copies = async_copies;
+        {
+            char v[8] = {};
+            const DWORD n = GetEnvironmentVariableA("SSPC_CP_ASYNC_WRITES", v, sizeof(v));
+            po.async_gds_only = n == 3 && std::string_view(v) == "gds";
+            po.async_writes = (n == 1 && v[0] == '1') || po.async_gds_only;
+        }
         // P4.11: SSPC_P411_ASYNC_ACQUIRE=1 - a met WAIT_REG_MEM on memory does not drain the queue (its CPU writes
         // applied on the processor's thread; parallel_cp.h, Options::async_acquire); off by default
         po.async_acquire = [] {
@@ -743,6 +765,29 @@ bool Backend::Start(const Options& o, std::string& error) {
                 static_cast<Backend*>(self)->FlipTotalsOfProcessor(out);
             }, this);
         }
+        // FrameBreak CP-9: SSPC_CP_ROUND_NODRAIN=1 - a round that made progress ends without waiting for the recording
+        // thread (it polls and flushes after the round's records; the completions come to this thread)
+        if (char v[4] = {}; async && GetEnvironmentVariableA("SSPC_CP_ROUND_NODRAIN", v, sizeof(v)) == 1 &&
+                            (v[0] == '1' || v[0] == '2')) {
+            nodrain_ = true;
+            nodrain_wait_ = v[0] == '2';
+            if (char f[4] = {}; GetEnvironmentVariableA("SSPC_CP_NODRAIN_FENCE", f, sizeof(f)) == 1 && f[0] == '1') {
+                parallel_->SetFlushAtFence(true);
+            }
+            executor_->SetDeferCompletions(true);
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ROUND_NODRAIN=1 - the processor's round ends without draining "
+                                   "the recording thread (it polls the GPU in stream order)");
+        }
+        if (po.async_writes) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ASYNC_WRITES=1 - WRITE_DATA / fills and GDS DMA on the timeline "
+                                   "queued to the recording thread (no drain)");
+        }
+        parallel_->SetWriteFallback(
+            [](void* self, u64 dst, const void* data, u64 bytes) { return static_cast<Backend*>(self)->CpuWrite(dst, data, bytes); },
+            [](void* self, Cp::DmaKind kind, u64 memory, u32 off, u32 bytes, u32 pattern) {
+                return static_cast<Backend*>(self)->CpuGds(kind, memory, off, bytes, pattern);
+            },
+            this);
         parallel_->SetCopyFallback(
             [](void* self, u64 src, u64 dst, u64 bytes) { return static_cast<Backend*>(self)->CpuCopy(src, dst, bytes); },
             this);
@@ -1031,6 +1076,50 @@ bool Backend::DrainCpuWrites() {
     return any;
 }
 
+bool Backend::CpuWrite(u64 dst, const void* data, u64 bytes) {
+    GuestMemory* gm = GetGuestMemory();
+    if (gm == nullptr || !GuestMemory::IsValidGpuMapping(dst, bytes)) {
+        return false;
+    }
+    if (!gm->TryWriteBacking(reinterpret_cast<void*>(dst), data, bytes)) {
+        tracker_.Disarm(dst, bytes);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(dst), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0 ||
+            reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize < dst + bytes) {
+            return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(dst), data, bytes);
+    }
+    images_->Invalidate(dst, bytes);
+    buffers_->Invalidate(dst, bytes);
+    return true;
+}
+
+bool Backend::CpuGds(Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes, u32 pattern) {
+    u8* gds = static_cast<u8*>(gds_.mapped);
+    if (gds == nullptr || u64{gds_offset} + bytes > Cp::kGdsBytes) {
+        return false;
+    }
+    switch (kind) {
+    case Cp::DmaKind::DataToGds:
+        for (u32 i = 0; i + 4 <= bytes; i += 4) {
+            std::memcpy(gds + gds_offset + i, &pattern, 4);
+        }
+        return true;
+    case Cp::DmaKind::MemoryToGds:
+        if (GuestMemory* gm = GetGuestMemory(); gm != nullptr && GuestMemory::IsValidGpuMapping(memory, bytes)) {
+            gm->CopySparse(memory, gds + gds_offset, bytes);
+            return true;
+        }
+        return false;
+    case Cp::DmaKind::GdsToMemory:
+        return CpuWrite(memory, gds + gds_offset, bytes);
+    default:
+        return false;
+    }
+}
+
 bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
     GuestMemory* gm = GetGuestMemory();
     if (gm == nullptr || !GuestMemory::IsValidGpuMapping(src, bytes) || !GuestMemory::IsValidGpuMapping(dst, bytes)) {
@@ -1248,6 +1337,9 @@ void Backend::Loop() {
                 pending |= cp_->PendingSubmissions(q) != 0;
                 continue;
             }
+            if (nodrain_ && executor_->CompletionsReady()) {
+                ApplyCompletions(); // (CP-9: completions thread 2 polled - labels written before the next slice)
+            }
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
@@ -1299,6 +1391,23 @@ void Backend::Loop() {
             graphics_capped |= i == limit && q == Cp::kGraphicsQueue;
             pending |= cp_->PendingSubmissions(q) != 0;
         }
+        // FrameBreak CP-9 (SSPC_CP_ROUND_NODRAIN=1): a round that made progress ends without a drain - thread 2 flushes
+        // and polls after the round's records, thread 1 applies the completions it kept and goes on with the next round
+        // (=2: not while the game waits for its async compute - its labels come from the drained round end's poll)
+        if (parallel_ && nodrain_ && progress && fp_ahead == 0 && !(nodrain_wait_ && CriticalCompute::Waiting()) &&
+            parallel_->RoundEndQueued()) {
+            ++nodrain_rounds_;
+            const u64 round_ns = ns_since(cp_t0);
+            prof_cp += round_ns;
+            tot_busy_ns_ += round_ns;
+            tot_round_ns_ += round_ns;
+            ApplyCompletions();
+            if (ctx_->Failed() || parallel_->Failed()) {
+                parallel_->Drain(DrainReason::RoundEnd); // (the drained path below reports and stops)
+            } else {
+                continue;
+            }
+        }
         if (parallel_) {
             // P4.10: everything the round handed to the recording thread executed - polls, flushes and idle waits as
             // with one thread (part of the round's time: the processor's work is done only now)
@@ -1318,6 +1427,7 @@ void Backend::Loop() {
             const StallTrace::Scope poll_span(StallTrace::Ev::Poll, round_packets, round_capped,
                                               graphics_capped ? 1 : 0);
             executor_->Poll(); // completed batches: the processor writes its held labels now
+            ApplyCompletions(); // (CP-9: the ones thread 2's polls kept too)
         }
         StallTrace::MaybeCalibrate();
         const u64 poll_ns = ns_since(poll_t0);
@@ -2177,6 +2287,13 @@ std::string Backend::Report() {
                                    "about to run dry {}, held {:.0f} ms\n",
                                    fp_rounds_held_, fp_slices_ended_, fp_expired_, fp_flushes_,
                                    static_cast<double>(fp_held_ns_) / 1e6);
+            }
+            if (parallel_) {
+                out += fmt::format("timeline writes / GDS DMA queued (CP-9, SSPC_CP_ASYNC_WRITES): {}, done by the CPU "
+                                   "after a refusal {}\n", parallel_->WritesQueued(), parallel_->WriteFallbacks());
+            }
+            if (nodrain_) {
+                out += fmt::format("round ends without a drain (CP-9, SSPC_CP_ROUND_NODRAIN): {}\n", nodrain_rounds_);
             }
             if (executor_ && executor_->AsyncLane()) {
                 const auto& es = executor_->Stats();
