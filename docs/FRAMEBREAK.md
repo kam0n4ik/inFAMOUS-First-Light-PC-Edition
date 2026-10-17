@@ -285,3 +285,27 @@ Vulkan Validation + Sync, village and beach (`logs/cp8/cp8_val`): 0 messages, de
 
 Serving the game's compute earlier raises the average but delays the graphics frame on the processor and on the GPU
 (one Vulkan queue): the tails do not improve. Not taken - the goal is the 1 % low.
+
+**After CP-8 (`logs/p53/cp8_screen3`, village, n = 3):** the frontend on its own thread (`SSPC_P53_FRONTEND_THREAD=1`)
+40.54 FPS / 1 % low 36.28 / p95 26.11 against 40.46 / 36.35 / 26.10 - no change (thread 1 -0.75 ms, the recording thread
+and the GPU limit). Lazy write-back again (`SSPC_FB_LAZY_WB=1`): **42.83 FPS (+5.9 %), GPU 18.40 ms (-2.4), but 1 %
+low 34.35 and p95/p99 27.84 / 28.61 ms (+1.7 / +1.6)** - as before CP-8. Its worst 1 % of frames: the game hands the
+frame on 2.2 ms later, the processor 23.7 ms (base 22.0), the recording thread +1.1 ms - the readers' write-backs land
+in the heaviest frames and on the game's compute waits. Stays off.
+
+## P5.x Native Rebirth: what it could remove from the village's frame
+
+Measured split of the village's frame (CP-8) and who owns each part:
+
+| Part (ms per frame) | Size | Already own code | What a native path could remove |
+|---|---|---|---|
+| PM4 decode, registers, journal, NOPs (thread 1) | ~4 | yes (Native CP) | only by not building PM4 at all - the game's renderer would have to be replaced |
+| per-draw / per-dispatch preparation: program lookup, SRT walk, descriptors, key, CopyStage (thread 1) | ~10 (1.7-1.8 us each, ~4 400 draws + ~1 500 dispatches) | yes (SecondSonPC frontend; P5.3 native cache for 2 passes) | the most: a renderer that knows Second Son's resource tables binds without interpreting them; partly reachable now by the engine-table cache (P5.3) for more passes and for dispatches |
+| Vulkan recording (thread 2) | ~18 | yes | little: ~5 900 draws/dispatches must be recorded by any renderer; fewer only by merging draws (engine knowledge) |
+| GPU work | 18-21 | translated game shaders | write-backs to host memory 2.2-2.5 (the guest's CPU-visible memory model); smoke 2 ms and the rest is the game's own work |
+| the game's async compute waits | 19 of 25.4 (latency) | the game's design | a native port could restructure; inside the emulated frame only by serving the compute queue faster (CP-8) |
+
+Shader translation (shadPS4's recompiler) is not on the per-frame path (disk cache). The parts worth a native
+rewrite are the frontend's preparation (~10 ms of thread 1, of it ~2.5 ms the compute dispatches on the game's wait)
+and the write-back model; the recording thread and the GPU stay whatever the front end. A gain of 10 % or more is not
+guaranteed by any single part: thread 1, the recording thread and the GPU are each 70-85 % busy in a 25 ms frame.
