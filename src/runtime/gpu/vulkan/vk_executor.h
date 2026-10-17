@@ -296,6 +296,8 @@ public:
 
     /// Submits the open batch (nothing when empty).
     void Flush();
+    /// FrameBreak FP-1: the timeline value of the last batch submitted (any thread; the batches' values are dense).
+    u64 SubmittedValue() const { return submitted_value_.load(std::memory_order_acquire); }
     /// Completed batches -> CommandProcessor::CompleteWork (in order), resources released. The GPU thread, outside
     /// CommandProcessor::Run.
     void Poll();
@@ -816,6 +818,7 @@ private:
     std::vector<std::pair<u64, u64>> acc_reads_, acc_writes_; ///< the command's own ranges (capacity reused)
     bool want_flush_ = false;
     bool flush_full_ = false;  ///< the flush in progress ends a full batch (max_draws_per_batch)
+    std::atomic<u64> submitted_value_{0}; ///< FP-1: SubmittedValue
     bool batch_fence_ = false; ///< the open batch holds a fence, a flip or a timeline write
     // CMASK/HTILE addresses a compute clear marked: the target clears at its next rendering
     std::unordered_map<u64, bool, U64Hash> pending_meta_clear_;

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 
 #include "base/abi.h"
 
@@ -19,8 +20,19 @@ inline void Begin() {
     g_waiting.fetch_add(1, std::memory_order_relaxed);
     g_blocked_waits.fetch_add(1, std::memory_order_relaxed);
 }
+/// FP-1: when the last blocked wait ended (steady clock, ns): the game's next request follows within ~1.5 ms.
+inline std::atomic<s64> g_last_end_ns{0};
 inline void End() {
+    g_last_end_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
     g_waiting.fetch_sub(1, std::memory_order_relaxed);
+}
+/// Waiting, or a wait ended less than `tail_ns` ago.
+inline bool WaitingOrJustEnded(s64 tail_ns) {
+    if (g_waiting.load(std::memory_order_relaxed) != 0) {
+        return true;
+    }
+    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return now - g_last_end_ns.load(std::memory_order_relaxed) < tail_ns;
 }
 inline bool Waiting() {
     return g_waiting.load(std::memory_order_relaxed) != 0;

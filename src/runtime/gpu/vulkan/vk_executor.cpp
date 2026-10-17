@@ -814,6 +814,7 @@ void Executor::Flush() {
     if (diag_ != nullptr) {
         diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
     }
+    submitted_value_.store(cur_.value, std::memory_order_release);
     in_flight_.push_back(std::move(cur_));
     cur_ = Batch{};
     open_ = false;

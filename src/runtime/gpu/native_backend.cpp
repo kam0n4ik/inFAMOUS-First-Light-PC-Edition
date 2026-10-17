@@ -432,6 +432,17 @@ private:
     std::atomic<bool> compute_rung_{false};
     u64 preempted_ = 0; ///< graphics slices ended early for it (the GPU thread)
     u64 critical_rounds_ = 0, critical_cut_ = 0, critical_preempted_ = 0; ///< CC-2 (the GPU thread)
+    /// FP-1 (the GPU thread): rounds without a graphics slice, graphics slices ended, holds ended by their limit, flushes
+    /// for a GPU about to run dry, time held
+    u64 fp_rounds_held_ = 0, fp_slices_ended_ = 0, fp_expired_ = 0, fp_flushes_ = 0, fp_held_ns_ = 0;
+    std::chrono::steady_clock::time_point fp_hold_t0_{}; ///< FP-1: the GPU's queue full since (none: not full)
+    u64 fp_hold_c_ = 0; ///< FP-1: the GPU's completed value at fp_hold_t0_
+    /// FP-1: batches submitted that the GPU has not completed
+    u64 GpuBacklog() const {
+        const u64 s = executor_->SubmittedValue();
+        const u64 c = timeline_->QueryCompleted();
+        return s > c ? s - c : 0;
+    }
     /// CC-2: a mapped compute queue has work its processor can step now (not blocked on a wait)
     bool ComputeReady() const {
         for (u32 q = Cp::kGraphicsQueue + 1; q < Cp::kNumQueues; ++q) {
@@ -1159,12 +1170,82 @@ void Backend::Loop() {
                        ? std::clamp<u32>(static_cast<u32>(std::strtoul(v, nullptr, 10)), 64u, 1u << 20)
                        : 512u;
         }();
+        // FrameBreak FP-1: SSPC_FP_GPU_AHEAD=<n> (an experiment, off) - the graphics queue is not stepped while n batches
+        // the GPU has not completed are in its queue (each 64 packets checked); the compute queues are. Vulkan's queue
+        // is in order: the game's async compute request rung near the end of a frame's graphics otherwise waits behind
+        // all of it on the GPU (5.5 ms with CC-2) while the game is blocked on it and the processor has nothing to do;
+        // with the graphics kept to the GPU's pace it goes after n batches. At the round's end the open batch is
+        // submitted when fewer are queued (the GPU about to run dry). A hold ends after SSPC_FP_HOLD_US (4000).
+        static const u32 fp_ahead = [] {
+            char v[16] = {};
+            if (GetEnvironmentVariableA("SSPC_FP_GPU_AHEAD", v, sizeof(v)) == 0) {
+                return 0u;
+            }
+            const u32 n = std::min<u32>(static_cast<u32>(std::strtoul(v, nullptr, 10)), 64u);
+            if (n != 0) {
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FP_GPU_AHEAD={} - the graphics queue waits while {} batches are "
+                                       "queued on the GPU", n, n);
+            }
+            return n;
+        }();
+        static const u64 fp_hold_ns = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_FP_HOLD_US", v, sizeof(v)) > 0
+                       ? std::clamp<u64>(std::strtoull(v, nullptr, 10), 100ull, 100'000ull) * 1000
+                       : 4'000'000ull;
+        }();
+        // SSPC_FP_WHEN=wait: only while the game is blocked in its async compute wait (its next request comes when
+        // that one completes; the processor's lead over the GPU is kept otherwise)
+        static const bool fp_wait_only = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_FP_WHEN", v, sizeof(v)) > 0 && std::string_view(v) == "wait";
+        }();
+        // SSPC_FP_WAIT_TAIL_US (2000): ... and that long after such a wait ended
+        static const s64 fp_tail_ns = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_FP_WAIT_TAIL_US", v, sizeof(v)) > 0
+                       ? static_cast<s64>(std::strtoull(v, nullptr, 10)) * 1000
+                       : s64{2'000'000};
+        }();
+        const bool fp_on = fp_ahead != 0 && (!fp_wait_only || CriticalCompute::WaitingOrJustEnded(fp_tail_ns));
+        bool fp_held = false;
+        // (the hold's limit: the GPU completed nothing for fp_hold_ns - a completion starts it again)
+        const auto fp_hold_ok = [&] {
+            const auto now = Clock::now();
+            const u64 c = timeline_->QueryCompleted();
+            if (fp_hold_t0_ == Clock::time_point{}) {
+                fp_hold_t0_ = now;
+                fp_hold_c_ = c;
+            } else if (c != fp_hold_c_) {
+                fp_held_ns_ += ns_since(fp_hold_t0_);
+                fp_hold_t0_ = now;
+                fp_hold_c_ = c;
+            }
+            return now - fp_hold_t0_ < std::chrono::nanoseconds(fp_hold_ns);
+        };
+        if (fp_on) {
+            if (GpuBacklog() >= fp_ahead) {
+                fp_held = fp_hold_ok();
+                fp_expired_ += fp_held ? 0 : 1;
+            } else if (fp_hold_t0_ != Clock::time_point{}) {
+                fp_held_ns_ += ns_since(fp_hold_t0_);
+                fp_hold_t0_ = {};
+            }
+        } else if (fp_hold_t0_ != Clock::time_point{}) {
+            fp_held_ns_ += ns_since(fp_hold_t0_);
+            fp_hold_t0_ = {};
+        }
         const bool critical = critical_on && CriticalCompute::Waiting();
         critical_rounds_ += critical ? 1 : 0;
         bool compute_left = false; // (CC-2: a compute queue stopped at its limit this round)
         for (u32 k = 0; k < Cp::kNumQueues; ++k) {
             const u32 q = compute_first || critical ? (k + 1) % Cp::kNumQueues : k;
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
+                continue;
+            }
+            if (q == Cp::kGraphicsQueue && fp_held) {
+                ++fp_rounds_held_; // (FP-1: the GPU's queue is full - the compute queues only)
+                pending |= cp_->PendingSubmissions(q) != 0;
                 continue;
             }
             u32 i = 0;
@@ -1175,6 +1256,12 @@ void Backend::Loop() {
             const u32 limit = q != Cp::kGraphicsQueue ? compute_limit : cut ? critical_gfx : round_limit;
             const bool preemptible = (compute_preempt || critical_on) && q == Cp::kGraphicsQueue;
             for (; i < limit; ++i) {
+                if (fp_ahead != 0 && q == Cp::kGraphicsQueue && (i & 63) == 63 &&
+                    (!fp_wait_only || CriticalCompute::WaitingOrJustEnded(fp_tail_ns)) && GpuBacklog() >= fp_ahead && fp_hold_ok()) {
+                    ++fp_slices_ended_; // (FP-1: the next round holds the graphics queue)
+                    slice_stop = 4;
+                    break;
+                }
                 if (preemptible && (i & 63) == 63 &&
                     (compute_preempt ? compute_rung_.load(std::memory_order_relaxed)
                                      : CriticalCompute::Waiting() &&
@@ -1406,7 +1493,11 @@ void Backend::Loop() {
             rate_flips = s.flips;
             rate_draws = s.draws;
         }
-        if (executor_->WantsFlush() || (!progress && executor_->HasOpenWork())) {
+        // (FP-1: the GPU about to run dry takes the open batch now)
+        const bool fp_flush = fp_ahead != 0 && progress && !executor_->WantsFlush() && executor_->HasOpenWork() &&
+                              GpuBacklog() < fp_ahead;
+        fp_flushes_ += fp_flush ? 1 : 0;
+        if (executor_->WantsFlush() || (!progress && executor_->HasOpenWork()) || fp_flush) {
             const auto flush_t0 = Clock::now();
             executor_->FlushFromLoop();
             const u64 flush_ns = ns_since(flush_t0);
@@ -1490,7 +1581,8 @@ void Backend::Loop() {
             StallTrace::Span(blocked   ? (blocked_label ? StallTrace::Ev::IdleLabel : StallTrace::Ev::IdleFlag)
                              : busy    ? StallTrace::Ev::IdleGpu
                                        : StallTrace::Ev::IdleEmpty,
-                             idle_tsc, StallTrace::Now(), timeline_->LastSubmitted(), busy ? 1u : 0u);
+                             idle_tsc, StallTrace::Now(), timeline_->LastSubmitted(),
+                             busy ? (fp_held ? 2u : 1u) : 0u); // (2: FP-1 held the graphics queue)
         }
         prof_idle += idle_ns;
         prof_idle_blocked += blocked ? idle_ns : 0;
@@ -2080,6 +2172,11 @@ std::string Backend::Report() {
                                    "share {}, ended early for the compute queues {}\n",
                                    CriticalCompute::g_blocked_waits.load(), critical_rounds_, critical_cut_,
                                    critical_preempted_);
+                out += fmt::format("graphics at the GPU's pace (FP-1, SSPC_FP_GPU_AHEAD): rounds without the graphics "
+                                   "queue {}, graphics slices ended {}, rounds past the hold's limit {}, flushes for a GPU "
+                                   "about to run dry {}, held {:.0f} ms\n",
+                                   fp_rounds_held_, fp_slices_ended_, fp_expired_, fp_flushes_,
+                                   static_cast<double>(fp_held_ns_) / 1e6);
             }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "

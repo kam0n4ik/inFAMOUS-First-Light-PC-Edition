@@ -365,3 +365,43 @@ the recording thread (17.6 ms) and the GPU (20.8 ms busy, ~4 ms idle a frame wai
 Beach and harbour (`logs/p53/cc_be`, n = 2): CC-2 beach 55.43 -> 56.16 FPS, 1 % low 49.84 -> 50.23, submit -> present
 26.2 -> 26.6 ms; harbour 51.49 -> 51.63, 44.00 -> 44.68, **27.5 -> 29.5 ms**. Met waits without a drain: harbour 51.78 /
 1 % low 46.53, beach one of two runs in the machine's slow mode (48.8). Both stay off.
+
+## FP: the 17 / 31 ms alternation and graphics paced by the GPU (FP-1, `SSPC_FP_GPU_AHEAD`, off)
+
+**Cause** (lifecycle traces `logs/fp/*`, village, window 68-80 s; scratch scripts per frame): one Vulkan queue runs
+the processor's batches strictly in order, and the GPU runs ~6 ms behind the processor (the frame's tail - post
+processing - is cheap to record, heavy to execute). In the "long" frames the game's second compute request (B) is
+rung exactly when the processor finished frame k's graphics (start - `cp_flip(k)` = +0.03 ms): the processor reaches
+its RELEASE_MEM in 0.08 ms, submits in 0.24, then **the batch waits 5.54 ms on the GPU behind 3.8 graphics batches of
+frame k** (5.45 ms), executes 0.93; the wait ends at `gpu_done(k)` (+0.06 ms). The processor idles ~5.7 ms meanwhile
+(nothing to do). The next frame's requests come while the processor has no graphics yet, CC-2 serves them fast, the
+game reaches SubmitFrame early and waits 10-12 ms at step 5 (the EOP of the frame before: a real dependency - its
+buffers are reused). Period 2: W_A (~15) + tail (6) ~= one processor frame (21). The base alternates too (23 / 27 ms);
+CC-2 widens it (CPU 15 + step 5 11 against CPU 22 + step 5 0). Per frame the processor's thread works ~21.5 ms
+(slices 16.7 + drains 4.8), the GPU ~21: neither has slack.
+
+**FP-1** (`native_backend.cpp`; off unless `SSPC_FP_GPU_AHEAD=<n>`): while `n` or more batches are submitted and not
+complete (`Executor::SubmittedValue` - the timeline's completed value), the processor takes no graphics packets
+(the graphics queue skipped in a round, its slice stopped every 64 packets) and the open batch is submitted at the
+round's end once the backlog falls below `n`; compute is served as before. `SSPC_FP_WHEN=wait`: only while the game
+is blocked in its compute wait and `SSPC_FP_WAIT_TAIL_US` (2000) after it (the wait hook installed without CC-2's
+priority too); `SSPC_FP_HOLD_US` (4000): a hold ends if the GPU makes no progress for that long (the timer restarts at
+every completed batch - the first version timed the whole hold and lost it in the ~10 ms wait A).
+
+Single trace runs, village (FPS of trace runs, not an A/B):
+
+| | FPS | 1 % low | period ms (p50 / p90) | alternation | wait B in long frames |
+|---|---|---|---|---|---|
+| base | 39.4 | 32.8 | 23 / 27 | weak | 4.1 ms queued |
+| CC-2 | 42.2 | 34.1 | 21.6 / 27 | strong | 5.5 ms queued |
+| CC-2 + FP-1 always, n = 2 | 33.7 | 29.5 | 29.9 (p95 31.8) | none | - (GPU idle 8.7 ms / frame) |
+| CC-2 + FP-1 always, n = 4 | 36.9 | 29.7 | 26.9 | none | - (GPU idle 5.8 ms) |
+| CC-2 + FP-1 wait, n = 2 (old timer) | 39.6-40.2 | 31.8 | as CC-2 | yes | 5.6-7 ms |
+| **CC-2 + FP-1 wait, n = 2, fixed timer** (`fp2_cwt2`) | 40.0 | 33.3 | 24.7 / 27.7 | **none** (every frame waits at step 5, 7.9 ms) | B 2.6 ms (0.96 queued) |
+| the same + batches of 128 commands (`fp2_cwt2_b128`) | 37.9 | 25.5 | - | - | - |
+| CC-2 + batches of 128 commands, no FP | 40.6 | 33.0 | as CC-2 | yes | 6.6 ms |
+
+Holding graphics back removes the alternation, but with the processor and the GPU equally loaded every hold is a GPU
+bubble: always-on costs 12-20 % FPS. The waiting-only mode with the fixed timer keeps the frames even at the base's
+rate - not the CC-2 gain. The way to keep both: the compute request executing beside the graphics tail, on a queue of
+its own (next section).
