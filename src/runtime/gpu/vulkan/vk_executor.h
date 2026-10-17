@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -139,6 +140,14 @@ struct ExecutorStats {
     /// writes/copies, waits met, flips, Synchronize) - the processor's own time is its rounds minus these and recording
     u64 t_cb = 0, n_cb = 0;
     u64 prepared_mismatches = 0; ///< P4.10: a draw/dispatch without the preparation its registers ask for (never)
+    /// FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE): batches on the async compute lane / the main queue; batches ended where the
+    /// commands turned between graphics and compute; the lane's batches that waited for the main queue (a range
+    /// conflict with a main batch in flight, images, everything before - a wait met by a held fence or unknown
+    /// accesses -, GDS/LDS) or did not; compute-only batches kept on the main queue; queue completions reported before
+    /// an earlier batch's; the lane's GPU time and its overlap with the main queue's batches (timestamps)
+    u64 aq_lane_batches = 0, aq_main_batches = 0, aq_splits = 0, aq_wait_conflict = 0, aq_wait_images = 0,
+        aq_wait_all = 0, aq_wait_shared = 0, aq_free = 0, aq_kept_main = 0, aq_out_of_order = 0;
+    u64 aq_lane_gpu_ns = 0, aq_overlap_ns = 0;
     std::string first_skip[static_cast<size_t>(Skip::Count)];
 };
 
@@ -264,6 +273,8 @@ public:
     void MemoryAcquiredApplied(u32 queue, bool blocked, u64 poll_address, u64 unblock_tsc, bool applied);
     /// TSC of the last met WAIT_REG_MEM on memory that had blocked (the frame log, P4.6).
     u64 LastUnblockTsc() const { return last_unblock_tsc_; }
+    /// FrameBreak AQ: the async compute lane is on (SSPC_FB_ASYNC_COMPUTE=1 and a queue for it).
+    bool AsyncLane() const { return aq_; }
     /// P4.11 soak telemetry: command buffer batches the executor owns (free and in flight).
     u64 BatchObjects() const { return free_.size() + in_flight_.size() + (open_ ? 1 : 0); }
     /// Called at each flip marker queued for presentation (after its batch was submitted), with its timeline value.
@@ -358,6 +369,23 @@ private:
         // P4.12 stall trace: the submission (TSC before the queue's lock, after vkQueueSubmit2), the frame recorded in
         u64 submit_t0 = 0, submit_t1 = 0;
         u32 trace_frame = 0;
+        // FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE): the queue it went to (0 main, 1 the async compute lane) and what its
+        // commands touched, for a later lane batch's decision whether to wait for it
+        u8 lane = 0;
+        u8 pool_lane = 0;          ///< AQ on the compute family: its pool's (the lane decided at Begin)
+        u64 aq_wait_main_min = 0;  ///< on the lane: the main batch holding a fence a wait in it was met by
+        bool aq_main = false;     ///< kept on the main queue (a flip, a kept-back write-back, images evicted)
+        bool aq_wait_all = false; ///< on the lane: after every main batch before it (a wait met by a held fence)
+        bool aq_images = false;   ///< a compute command bound images (their layouts are one state for both queues)
+        bool aq_gds = false;      ///< GDS (one buffer for both queues)
+        u8 aq_lds = 0;            ///< the emulated LDS buffers used: 1 the main one, 2 the lane's
+        bool aq_overflow = false; ///< accesses not known by range (or too many ranges): conflicts with anything
+        /// guest ranges: a main batch's writes and uploads (and its compute commands' accesses), a lane batch's every
+        /// access
+        std::vector<std::pair<u64, u64>> aq_ranges;
+        bool done = false;                          ///< completed on the GPU (AQ: possibly before earlier batches)
+        std::bitset<Cp::kNumQueues> aq_unreported;  ///< done, CompleteWork not called yet (an earlier batch of that
+                                                    ///< queue not complete)
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};
@@ -868,6 +896,39 @@ private:
     // the translator's emulated LDS (shared memory beyond the device's): one workgroup's worth per workgroup of the
     // dispatch (the bridge: SharedMemSize() * NumWorkgroups()), in video memory, zeroed on the GPU
     OwnedBuffer lds_;
+    OwnedBuffer lds_lane_; ///< AQ: the one compute-only batches use (they may run on the lane beside the main queue)
+
+    // FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE=1): a batch whose commands are all of compute queues goes to a second queue
+    // of the main family, beside the main queue's batches in flight; it waits for a main batch only where they
+    // conflict (guest ranges one writes or uploads and the other touches, images, GDS, an emulated LDS buffer, a wait
+    // met by a held fence). Every main batch waits for the lane's last batch: what the main queue records after the
+    // lane's work runs after it, as on one queue. Completion is reported per guest queue in that queue's order.
+    bool aq_ = false;
+    u8 aq_split_ = 1;              ///< a batch ends where commands turn between graphics and compute: 0 never,
+                                   ///< 1 while the game waits for its async compute (CriticalCompute), 2 always
+    bool aq_cmd_compute_ = false;  ///< the command being recorded is a compute queue's
+    bool aq_family_ = false;       ///< the lane is a queue of the compute family: the lane is decided at Begin
+    u64 aq_next_wait_main_ = 0;    ///< a held fence's main batch for the next batch (none open at the wait)
+    struct AqLast {
+        u64 value = 0;
+        u8 lane = 0;
+    };
+    std::array<AqLast, Cp::kNumQueues> aq_q_last_{}; ///< the batch each guest queue's work was recorded in last
+    u64 aq_last_lane_ = 0, aq_last_main_ = 0; ///< the last values submitted on each
+    struct AqInterval {
+        u64 begin = 0, end = 0; ///< GPU timestamps
+    };
+    std::array<std::deque<AqInterval>, 2> aq_iv_; ///< the last completed batches' GPU intervals per queue
+    /// Before a command of `queue` is recorded: the open batch ended when its kind changes (aq_split_).
+    void AqBoundary(u32 queue, bool main_only = false);
+    /// The command being recorded touches guest [addr, addr + size) (see Batch::aq_ranges).
+    void AqNote(u64 addr, u64 size);
+    /// A lane batch `lane` must wait for the main batch `main`.
+    static bool AqConflict(const Batch& main, const Batch& lane);
+    /// A batch's completion bookkeeping (timestamps, clock fences, profiles): once, when it is seen complete.
+    void Retire(Batch& b);
+    /// Poll's end: the resources of completed batches released (every batch up to `completed` done).
+    void PollCollect(u64 completed);
     std::vector<std::pair<u64, OwnedBuffer>> lds_retired_; ///< outgrown, until the batches using them complete
     u64 lds_groups_ = 1;
     u32 lds_group_bytes_ = 0;

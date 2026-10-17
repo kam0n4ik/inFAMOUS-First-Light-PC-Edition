@@ -793,8 +793,9 @@ bool InstallLifecycleFromEnvironment(u64 eboot_base) {
 
 bool InstallCriticalComputeFromEnvironment(u64 eboot_base) {
     // (FrameBreak FP-1's SSPC_FP_WHEN=wait reads the same count: the hook without CC-2's priority)
+    // (FrameBreak AQ's batch split while the game waits - SSPC_FB_ASYNC_COMPUTE=1 - reads it too)
     const bool cc2 = Env("SSPC_CC_CRITICAL") == "1";
-    if (!cc2 && Env("SSPC_FP_WHEN") != "wait") {
+    if (!cc2 && Env("SSPC_FP_WHEN") != "wait" && Env("SSPC_FB_ASYNC_COMPUTE") != "1") {
         return true;
     }
     if (!g_wait_hooked) {
@@ -816,7 +817,7 @@ bool InstallCriticalComputeFromEnvironment(u64 eboot_base) {
     g_critical = true;
     SSPC_LOG(Engine, Warning,
              "EXPERIMENT: {} - the async compute wait 0x1695e0 replaced by the same loop; the game's blocked waits "
-             "counted for the command processor", cc2 ? "SSPC_CC_CRITICAL=1" : "SSPC_FP_WHEN=wait");
+             "counted for the command processor", cc2 ? "SSPC_CC_CRITICAL=1" : Env("SSPC_FP_WHEN") == "wait" ? "SSPC_FP_WHEN=wait" : "SSPC_FB_ASYNC_COMPUTE=1");
     return true;
 }
 

@@ -452,7 +452,7 @@ private:
 
     Queue* Q(u32 queue) const;
     /// Isolated (diagnostics): a fence held for the GPU (any queue) will write `poll` with a value meeting the wait.
-    bool HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref) const;
+    bool HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref, u32* by_queue = nullptr) const;
     /// Isolated: a held fence writes GDS data (RELEASE_MEM data_sel 5, EVENT_WRITE_EOS GDS store) when it completes.
     bool HeldGdsFence() const;
     /// Isolated (diagnostics): the WAIT_REG_MEM addresses the queues blocked on, the time they blocked.

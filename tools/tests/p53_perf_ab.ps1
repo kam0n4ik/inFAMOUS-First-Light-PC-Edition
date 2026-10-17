@@ -85,6 +85,14 @@ $defs = @{
     cc_crit      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CC_CRITICAL=1"
     cc_both      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CC_CRITICAL=1;SSPC_P411_ASYNC_ACQUIRE=1"
     cc_crit2k    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CC_CRITICAL=1;SSPC_CC_CRITICAL_GFX=2048"
+    # FrameBreak FP-1: graphics held while the game waits for its compute (SSPC_FP_GPU_AHEAD, docs/FRAMEBREAK.md FP)
+    fp1_wait     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FP_GPU_AHEAD=2;SSPC_FP_WHEN=wait"
+    # FrameBreak AQ: compute-only batches on a second Vulkan queue (SSPC_FB_ASYNC_COMPUTE); with CC-2; the batches
+    # split between graphics and compute always / never (default: while the game waits)
+    aq           = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1"
+    aq_cc        = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1;SSPC_CC_CRITICAL=1"
+    aq_always    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1;SSPC_FB_ASYNC_SPLIT=always"
+    aq_nosplit   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_ASYNC_COMPUTE=1;SSPC_FB_ASYNC_SPLIT=off"
     # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
     fbc_console  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console;SSPC_FB_CLOCK_PROBE=1"
     fbc_30       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30;SSPC_FB_CLOCK_PROBE=1"

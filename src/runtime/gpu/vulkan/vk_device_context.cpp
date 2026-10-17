@@ -624,9 +624,26 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     // frame generation (FSR 3.1) presents and acquires on queues of its own, and may use async compute
     // (always when presenting: frame generation can be turned on while the game runs)
     const bool fg_queues = options.presentation;
-    const u32 main_count = fg_queues ? std::min<u32>(3, qf[ctx->family_].queueCount) : 1;
+    const u32 fg_count = fg_queues ? std::min<u32>(3, qf[ctx->family_].queueCount) : 1;
+    // FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE=1): one more queue of the main family for the async compute lane (the same
+    // family: no ownership transfer of any buffer or image between the lanes)
+    const bool aq_queue = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_FB_ASYNC_COMPUTE", v, sizeof(v)) == 1 && v[0] == '1';
+    }() && qf[ctx->family_].queueCount > fg_count;
+    // the lane on the dedicated compute family (default: on NVIDIA the main family's queues share one engine - measured
+    // no overlap at all, logs/aq/aq_smoke1) or on the main family (SSPC_FB_ASYNC_COMPUTE_FAMILY=main)
+    const bool aq_main_family = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("SSPC_FB_ASYNC_COMPUTE_FAMILY", v, sizeof(v)) == 4 && std::string_view(v) == "main";
+    }();
+    const bool aq_env = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_FB_ASYNC_COMPUTE", v, sizeof(v)) == 1 && v[0] == '1';
+    }();
+    const u32 main_count = fg_count + (aq_queue && aq_main_family ? 1u : 0u);
     u32 compute_family = ~0u;
-    if (fg_queues) {
+    if (fg_queues || (aq_env && !aq_main_family)) {
         for (u32 i = 0; i < qf.size(); ++i) {
             if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
                 compute_family = i;
@@ -634,7 +651,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
             }
         }
     }
-    const float priorities[3] = {1.0f, 1.0f, 1.0f};
+    const float priorities[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     const VkDeviceQueueCreateInfo qcis[2] = {
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
          .queueFamilyIndex = ctx->family_,
@@ -642,7 +659,9 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
          .pQueuePriorities = priorities},
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
          .queueFamilyIndex = compute_family,
-         .queueCount = 1,
+         .queueCount = aq_env && !aq_main_family && compute_family != ~0u
+                           ? std::min<u32>(fg_queues ? 2u : 1u, qf[compute_family].queueCount)
+                           : 1u,
          .pQueuePriorities = priorities}};
     const VkDeviceQueueCreateInfo& qci = qcis[0];
     const VkDeviceCreateInfo dci{.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -793,10 +812,28 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         caps.calibrated_timestamps = false;
     }
     f.vkGetDeviceQueue(ctx->device_, ctx->family_, 0, &ctx->queue_);
-    for (u32 i = 1; i < main_count; ++i) {
+    for (u32 i = 1; i < fg_count; ++i) {
         VkQueue q = VK_NULL_HANDLE;
         f.vkGetDeviceQueue(ctx->device_, ctx->family_, i, &q);
         ctx->extra_queues_.push_back(q);
+    }
+    if (aq_queue && aq_main_family) {
+        f.vkGetDeviceQueue(ctx->device_, ctx->family_, fg_count, &ctx->lane_queue_);
+        ctx->lane_family_ = ctx->family_;
+        SSPC_LOG(GPU, Info, "native backend: async compute lane queue {} of family {} ({} queues there)", fg_count,
+                 ctx->family_, qf[ctx->family_].queueCount);
+    } else if (aq_env && compute_family != ~0u) {
+        // (frame generation's async compute takes the family's queue 0)
+        const u32 index = fg_queues ? 1u : 0u;
+        if (index < qf[compute_family].queueCount) {
+            f.vkGetDeviceQueue(ctx->device_, compute_family, index, &ctx->lane_queue_);
+            ctx->lane_family_ = compute_family;
+            ctx->lane_families_[0] = ctx->family_;
+            ctx->lane_families_[1] = compute_family;
+            SSPC_LOG(GPU, Info, "native backend: async compute lane queue {} of the compute family {} ({} queues, "
+                                "timestamp bits {}); buffers shared by both families (concurrent)",
+                     index, compute_family, qf[compute_family].queueCount, qf[compute_family].timestampValidBits);
+        }
     }
     if (compute_family != ~0u) {
         f.vkGetDeviceQueue(ctx->device_, compute_family, 0, &ctx->compute_queue_);
@@ -804,7 +841,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     }
     if (fg_queues) {
         SSPC_LOG(GPU, Info, "native backend: frame generation queues: {} more of family {}, async compute family {}",
-                 main_count - 1, ctx->family_, static_cast<s32>(compute_family));
+                 fg_count - 1, ctx->family_, static_cast<s32>(compute_family));
     }
 
     std::string list;

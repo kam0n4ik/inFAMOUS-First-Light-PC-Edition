@@ -79,7 +79,9 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
     VkResult cr = VK_ERROR_UNKNOWN;
     for (u64 size = kAddressSpace; size >= (64ull << 30); size /= 2) {
         bci.size = size;
-        cr = f.vkCreateBuffer(ctx_.Device(), &bci, nullptr, &buffer_);
+        VkBufferCreateInfo shared = bci;
+        ctx_.ShareWithLane(shared); // (FrameBreak AQ)
+        cr = f.vkCreateBuffer(ctx_.Device(), &shared, nullptr, &buffer_);
         if (cr == VK_SUCCESS) {
             space_ = size;
             leaves_.resize(size >> (kBlockBits + kLeafBits));
@@ -432,7 +434,9 @@ BufferCache::WbShadow* BufferCache::ShadowFor(u64 b, u64 e, VkCommandBuffer cb, 
                                      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-        if (f.vkCreateBuffer(ctx_.Device(), &bci, nullptr, &sh.buffer) != VK_SUCCESS) {
+        VkBufferCreateInfo shared = bci;
+        ctx_.ShareWithLane(shared); // (FrameBreak AQ)
+        if (f.vkCreateBuffer(ctx_.Device(), &shared, nullptr, &sh.buffer) != VK_SUCCESS) {
             return nullptr;
         }
         VkMemoryRequirements req{};

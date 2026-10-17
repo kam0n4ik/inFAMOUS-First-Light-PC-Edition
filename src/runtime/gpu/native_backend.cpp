@@ -2178,6 +2178,19 @@ std::string Backend::Report() {
                                    fp_rounds_held_, fp_slices_ended_, fp_expired_, fp_flushes_,
                                    static_cast<double>(fp_held_ns_) / 1e6);
             }
+            if (executor_ && executor_->AsyncLane()) {
+                const auto& es = executor_->Stats();
+                out += fmt::format("async compute lane (AQ, SSPC_FB_ASYNC_COMPUTE): batches on the lane {}, on the main "
+                                   "queue {} (of them compute only, kept there {}); split between graphics and compute "
+                                   "{}; lane batches beside the main queue {}, waiting for it: a range conflict {}, "
+                                   "images {}, a held fence's wait {}, GDS/LDS/unknown {}; queue completions reported "
+                                   "before an earlier batch's {}; the lane's GPU time {:.0f} ms, of it beside the main "
+                                   "queue {:.0f} ms\n",
+                                   es.aq_lane_batches, es.aq_main_batches, es.aq_kept_main, es.aq_splits, es.aq_free,
+                                   es.aq_wait_conflict, es.aq_wait_images, es.aq_wait_all, es.aq_wait_shared,
+                                   es.aq_out_of_order, static_cast<double>(es.aq_lane_gpu_ns) / 1e6,
+                                   static_cast<double>(es.aq_overlap_ns) / 1e6);
+            }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
                            "ranges {}, read-after-write {}, write-after-write {}, write-after-read {}\n",

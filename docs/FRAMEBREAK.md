@@ -405,3 +405,36 @@ Holding graphics back removes the alternation, but with the processor and the GP
 bubble: always-on costs 12-20 % FPS. The waiting-only mode with the fixed timer keeps the frames even at the base's
 rate - not the CC-2 gain. The way to keep both: the compute request executing beside the graphics tail, on a queue of
 its own (next section).
+
+## AQ: an async compute queue (`SSPC_FB_ASYNC_COMPUTE=1`, rejected, off)
+
+**What it does** (`vk_executor.cpp`, `vk_resources.cpp` Timeline, `vk_device_context.cpp`): a batch whose commands are all
+of compute queues goes to a second Vulkan queue. The values stay one dense sequence: the main queue's batches signal the
+main timeline semaphore, the lane's its own; every main batch waits for the lane's last batch (what the main queue
+records later runs after the lane's work), a lane batch waits for a main batch in flight only where they conflict -
+guest ranges one writes or uploads and the other touches, GDS, an emulated LDS buffer (the lane has its own), a
+WAIT_REG_MEM met by a held fence of a main batch (the processor now names the fence's queue), every bind of the sparse
+buffer cache. Dispatches binding images stay on the main queue. Completion is reported per guest queue in that
+queue's order (a lane batch's labels land before earlier graphics batches complete). `Timeline::Completed / Wait`
+keep their meaning (every batch up to the value). Batches are split between graphics and compute while the game waits
+for its compute (`SSPC_FB_ASYNC_SPLIT=wait|always|off`). On the dedicated compute family (default) the buffers are
+created concurrent for both families and the lane is chosen at a batch's Begin (its pool's family);
+`SSPC_FB_ASYNC_COMPUTE_FAMILY=main` takes a second queue of the main family.
+
+**Measured** (village, RTX 2060, `logs/aq/*`, `logs/p53/aq_ab1`, `aq_ab2`):
+
+| | result |
+|---|---|
+| second queue of the main family | **0 ms** of the lane's 13.5 s GPU time beside the main queue (the family's queues share one engine on NVIDIA); 34.4 FPS, 1.5 s stalls |
+| compute family | 5.6-7.3 s of 10-15.6 s beside the main queue - real overlap |
+| compute family, first run before the device was lost (30-54 s) | 42.0 FPS, p95 27.0 ms (base 40.4) |
+| compute family, A/B (6 + 2 runs) | **device lost in 7 of 8 runs** (a shader fault/hang, NVIDIA device fault: instruction pointers); the run that lived: 32.8 FPS, 1 % low 1.1 |
+| the same, every lane batch after every main batch (`SSPC_FB_ASYNC_SERIAL=1`, diagnostic) | no loss (2 runs), no overlap, 36.5 / 40.2 FPS |
+| Vulkan validation + synchronization validation | 0 messages - but at 6 FPS, binds waited on the host, 69 ms overlap: not proof |
+
+One cause found and fixed (a lane batch used cache blocks an earlier main batch's sparse binds made resident without
+waiting for them); the loss stayed (aq_cc_r1 after the fix). The remaining race is not found. Even without it the
+gain would be small: the lane removes the ~5.5 ms the second compute request waits behind the graphics tail in the
+long frames, while the processor (~21 ms) and the GPU (~21 ms) still bound the frame. Rejected; the code stays off
+(its default path is unchanged: base with the AQ exe 40.25 / 40.55 FPS). Base / CC-2 in the same series
+(`aq_ab1`, n = 3): 40.37 [39.71..40.80] / 41.98 [41.84..42.23] FPS, 1 % low 35.48 / 35.35, p95 26.46 / 27.11 ms.

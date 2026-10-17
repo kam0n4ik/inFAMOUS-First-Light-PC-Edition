@@ -55,6 +55,9 @@ Timeline::~Timeline() {
     if (semaphore_ != VK_NULL_HANDLE) {
         Fn().vkDestroySemaphore(ctx_.Device(), semaphore_, nullptr);
     }
+    if (lane_ != VK_NULL_HANDLE) {
+        Fn().vkDestroySemaphore(ctx_.Device(), lane_, nullptr);
+    }
     if (wake_ != VK_NULL_HANDLE) {
         Fn().vkDestroySemaphore(ctx_.Device(), wake_, nullptr);
     }
@@ -66,11 +69,23 @@ u64 Timeline::Completed() {
     }
     u64 v = 0;
     const VkResult r = Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v);
-    if (r == VK_SUCCESS) {
-        Advance(v);
+    u64 lv = 0;
+    const VkResult lr = lane_ != VK_NULL_HANDLE ? Fn().vkGetSemaphoreCounterValue(ctx_.Device(), lane_, &lv) : VK_SUCCESS;
+    if (r == VK_SUCCESS && lr == VK_SUCCESS) {
+        if (lane_ != VK_NULL_HANDLE) {
+            const std::lock_guard lock{lane_mu_};
+            v = DenseLocked(v, lv);
+            Advance(v);
+            while (!lane_pending_.empty() && lane_pending_.front() <= v) {
+                lane_pending_.pop_front(); // (complete)
+            }
+        } else {
+            Advance(v);
+        }
     } else {
-        last_error_.store(r, std::memory_order_release);
-        ctx_.Fail("vkGetSemaphoreCounterValue", r);
+        const VkResult e = r != VK_SUCCESS ? r : lr;
+        last_error_.store(e, std::memory_order_release);
+        ctx_.Fail("vkGetSemaphoreCounterValue", e);
     }
     return completed_.load(std::memory_order_acquire);
 }
@@ -80,7 +95,98 @@ u64 Timeline::QueryCompleted() const {
         return 0;
     }
     u64 v = 0;
+    if (Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v) != VK_SUCCESS) {
+        return 0;
+    }
+    if (lane_ == VK_NULL_HANDLE) {
+        return v;
+    }
+    u64 lv = 0;
+    if (Fn().vkGetSemaphoreCounterValue(ctx_.Device(), lane_, &lv) != VK_SUCCESS) {
+        return 0;
+    }
+    const std::lock_guard lock{lane_mu_};
+    return DenseLocked(v, lv);
+}
+
+bool Timeline::EnableLane() {
+    if (lane_ != VK_NULL_HANDLE) {
+        return true;
+    }
+    const VkSemaphoreTypeCreateInfo type{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+                                         .initialValue = 0};
+    const VkSemaphoreCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+    if (Fn().vkCreateSemaphore(ctx_.Device(), &ci, nullptr, &lane_) != VK_SUCCESS) {
+        lane_ = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+void Timeline::SubmittedOnLane(u64 value) {
+    const std::lock_guard lock{lane_mu_};
+    lane_pending_.push_back(value);
+}
+
+u64 Timeline::QueryMain() const {
+    u64 v = 0;
     return Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v) == VK_SUCCESS ? v : 0;
+}
+
+u64 Timeline::QueryLane() const {
+    u64 v = 0;
+    return lane_ != VK_NULL_HANDLE && Fn().vkGetSemaphoreCounterValue(ctx_.Device(), lane_, &v) == VK_SUCCESS ? v : 0;
+}
+
+u64 Timeline::DenseLocked(u64 main, u64 lane) const {
+    // the main semaphore's value: every batch up to it completed (a main batch waited for the lane's earlier ones);
+    // above it, the run of lane values the lane completed that follow one another
+    u64 v = std::max(main, completed_.load(std::memory_order_acquire));
+    auto it = std::upper_bound(lane_pending_.begin(), lane_pending_.end(), v);
+    while (it != lane_pending_.end() && *it == v + 1 && *it <= lane) {
+        v = *it++;
+    }
+    return v;
+}
+
+bool Timeline::WaitAny(u64 main_value, u64 lane_value, u64 wake_value, u64 timeout_ns) {
+    if (ctx_.Failed()) {
+        return false;
+    }
+    VkSemaphore sems[3];
+    u64 values[3];
+    u32 n = 0;
+    if (main_value != 0) {
+        sems[n] = semaphore_;
+        values[n++] = main_value;
+    }
+    if (lane_value != 0 && lane_ != VK_NULL_HANDLE) {
+        sems[n] = lane_;
+        values[n++] = lane_value;
+    }
+    const u32 gpu = n;
+    if (wake_value != 0 && wake_ != VK_NULL_HANDLE) {
+        sems[n] = wake_;
+        values[n++] = wake_value;
+    }
+    if (gpu == 0) {
+        return false;
+    }
+    const VkSemaphoreWaitInfo wi{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                                 .flags = VK_SEMAPHORE_WAIT_ANY_BIT,
+                                 .semaphoreCount = n,
+                                 .pSemaphores = sems,
+                                 .pValues = values};
+    const VkResult r = Fn().vkWaitSemaphores(ctx_.Device(), &wi, timeout_ns);
+    if (r == VK_SUCCESS) {
+        return (main_value != 0 && QueryMain() >= main_value) || (lane_value != 0 && QueryLane() >= lane_value);
+    }
+    if (r != VK_TIMEOUT) {
+        last_error_.store(r, std::memory_order_release);
+        ctx_.Fail("vkWaitSemaphores", r);
+    }
+    return false;
 }
 
 bool Timeline::Wait(u64 value, u64 timeout_ns) {
@@ -90,10 +196,38 @@ bool Timeline::Wait(u64 value, u64 timeout_ns) {
     if (completed_.load(std::memory_order_acquire) >= value) {
         return true;
     }
+    VkSemaphore sems[2] = {semaphore_, lane_};
+    u64 values[2] = {value, 0};
+    u32 n = 1;
+    if (lane_ != VK_NULL_HANDLE) {
+        // AQ: the main semaphore at the last main value up to `value`, the lane's at its last value up to it (a value
+        // not submitted yet is taken as the main queue's: as before)
+        const std::lock_guard lock{lane_mu_};
+        const u64 done = completed_.load(std::memory_order_acquire);
+        u64 m = value;
+        while (m > done && OnLaneLocked(m)) {
+            --m;
+        }
+        const auto it = std::upper_bound(lane_pending_.begin(), lane_pending_.end(), value);
+        const u64 l = it != lane_pending_.begin() && *std::prev(it) > done ? *std::prev(it) : 0;
+        n = 0;
+        if (m > done) {
+            values[n] = m;
+            sems[n++] = semaphore_;
+        }
+        if (l != 0) {
+            values[n] = l;
+            sems[n++] = lane_;
+        }
+        if (n == 0) {
+            Advance(value);
+            return true;
+        }
+    }
     const VkSemaphoreWaitInfo wi{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-                                 .semaphoreCount = 1,
-                                 .pSemaphores = &semaphore_,
-                                 .pValues = &value};
+                                 .semaphoreCount = n,
+                                 .pSemaphores = sems,
+                                 .pValues = values};
     const VkResult r = Fn().vkWaitSemaphores(ctx_.Device(), &wi, timeout_ns);
     if (r == VK_SUCCESS) {
         Advance(value);
@@ -107,8 +241,8 @@ bool Timeline::Wait(u64 value, u64 timeout_ns) {
 }
 
 bool Timeline::WaitOrWake(u64 value, u64 wake_value, u64 timeout_ns) {
-    if (wake_ == VK_NULL_HANDLE) {
-        return Wait(value, timeout_ns);
+    if (wake_ == VK_NULL_HANDLE || lane_ != VK_NULL_HANDLE) {
+        return Wait(value, timeout_ns); // (AQ: the executor waits with WaitAny)
     }
     if (ctx_.Failed()) {
         return false;
@@ -153,7 +287,9 @@ bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool h
                                  .size = size,
                                  .usage = usage,
                                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if (Fn().vkCreateBuffer(ctx.Device(), &bci, nullptr, &out.buffer) != VK_SUCCESS) {
+    VkBufferCreateInfo shared = bci;
+    ctx.ShareWithLane(shared); // (FrameBreak AQ)
+    if (Fn().vkCreateBuffer(ctx.Device(), &shared, nullptr, &out.buffer) != VK_SUCCESS) {
         error = fmt::format("vkCreateBuffer of {} bytes failed", size);
         out.buffer = VK_NULL_HANDLE;
         return false;
@@ -362,7 +498,9 @@ bool GuestBuffers::Import(u64 base, u64 size, u8* host, Window& out, std::string
                                  .size = size,
                                  .usage = kGuestUsage,
                                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if (f.vkCreateBuffer(ctx_.Device(), &bci, nullptr, &out.buffer) != VK_SUCCESS) {
+    VkBufferCreateInfo shared = bci;
+    ctx_.ShareWithLane(shared); // (FrameBreak AQ)
+    if (f.vkCreateBuffer(ctx_.Device(), &shared, nullptr, &out.buffer) != VK_SUCCESS) {
         error = "vkCreateBuffer (external) failed";
         out.buffer = VK_NULL_HANDLE;
         return false;

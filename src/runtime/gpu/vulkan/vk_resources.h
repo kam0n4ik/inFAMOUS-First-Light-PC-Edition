@@ -14,6 +14,7 @@
 // completed — never vkDeviceWaitIdle per chunk).
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <map>
@@ -60,10 +61,35 @@ public:
     /// P4.10: the GPU's value now without touching the cached one (any thread; 0 on an error).
     u64 QueryCompleted() const;
 
+    // FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE): batches on two queues. The values stay one dense sequence (Next); a batch
+    // on the main queue signals the main semaphore with its value, a batch on the async compute lane the lane's
+    // semaphore. Every main-queue batch waits for the lane's last batch before it, so the main semaphore at `v` means
+    // every batch up to `v` completed; the lane's values above it complete on their own. Completed / QueryCompleted /
+    // Wait keep their meaning: every batch up to the value completed.
+    /// The lane's semaphore (false: it could not be created).
+    bool EnableLane();
+    bool LaneOn() const { return lane_ != VK_NULL_HANDLE; }
+    VkSemaphore LaneHandle() const { return lane_; }
+    /// The recording thread, before the lane's batch `value` is submitted (values in increasing order).
+    void SubmittedOnLane(u64 value);
+    /// The two semaphores' values now (0 on an error / no lane).
+    u64 QueryMain() const;
+    u64 QueryLane() const;
+    /// Waits until the main semaphore reaches `main_value` or the lane's `lane_value` or the wake semaphore
+    /// `wake_value` (0: not that one); true when one of the GPU's was reached.
+    bool WaitAny(u64 main_value, u64 lane_value, u64 wake_value, u64 timeout_ns);
+
 private:
     DeviceContext& ctx_;
     VkSemaphore semaphore_ = VK_NULL_HANDLE;
     VkSemaphore wake_ = VK_NULL_HANDLE; ///< CP-8: WaitOrWake's second semaphore (host-signalled only)
+    VkSemaphore lane_ = VK_NULL_HANDLE; ///< AQ: the async compute lane's batches
+    /// AQ: the lane's values not known complete (ascending; popped by Completed only)
+    mutable std::mutex lane_mu_;
+    std::deque<u64> lane_pending_;
+    /// AQ: every batch up to the value completed, from the two semaphores (lane_mu_ held).
+    u64 DenseLocked(u64 main, u64 lane) const;
+    bool OnLaneLocked(u64 v) const { return std::binary_search(lane_pending_.begin(), lane_pending_.end(), v); }
     /// The completed value raised to `v` (never lowered: two threads may see different values in either order).
     void Advance(u64 v) {
         u64 c = completed_.load(std::memory_order_relaxed);

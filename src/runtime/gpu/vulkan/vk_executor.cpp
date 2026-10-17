@@ -20,6 +20,7 @@
 
 #include "base/log.h"
 #include "engine/render/native_render_ops.h"
+#include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -264,6 +265,29 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         }
     }
     CmdTraceInit();
+    // FrameBreak AQ: the async compute lane (off by default)
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_FB_ASYNC_COMPUTE", v, sizeof(v)) == 1 && v[0] == '1') {
+        if (ctx_.LaneQueue() == VK_NULL_HANDLE || !timeline_.EnableLane()) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_ASYNC_COMPUTE=1 - no queue / semaphore for the lane: off");
+        } else if (prof_ || clock_at_place_) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_ASYNC_COMPUTE=1 - off with SSPC_GPU_PROFILE / SSPC_DIAG_CLOCK=place");
+        } else {
+            aq_ = true;
+            aq_family_ = ctx_.LaneFamily() != ctx_.QueueFamily();
+            buffers_.DisableLazy(); // (FB-7's kept-back write-backs stay on the main queue: not with the lane)
+            char sp[16] = {};
+            if (GetEnvironmentVariableA("SSPC_FB_ASYNC_SPLIT", sp, sizeof(sp)) > 0) {
+                const std::string_view m = sp;
+                aq_split_ = m == "off" ? 0 : m == "always" ? 2 : 1;
+            }
+            SSPC_LOG(GPU, Warning,
+                     "EXPERIMENT: SSPC_FB_ASYNC_COMPUTE=1 - compute-only batches on a second queue beside the main "
+                     "queue's (waiting for a main batch only where they conflict); batches split between graphics and "
+                     "compute: {}; the lane on the {} family",
+                     aq_split_ == 0 ? "never" : aq_split_ == 1 ? "while the game waits" : "always",
+                     aq_family_ ? "compute" : "main");
+        }
+    }
 }
 
 Executor::~Executor() {
@@ -290,6 +314,7 @@ Executor::~Executor() {
         f.vkDestroyQueryPool(dev, clock_pool_, nullptr);
     }
     DestroyBuffer(ctx_, lds_);
+    DestroyBuffer(ctx_, lds_lane_);
     DestroyBuffer(ctx_, diag_scratch_);
     for (auto& [value, b] : lds_retired_) {
         DestroyBuffer(ctx_, b);
@@ -347,18 +372,28 @@ bool Executor::Begin() {
         return true;
     }
     const auto& f = Fn();
-    if (!free_.empty()) {
-        cur_ = std::move(free_.back());
-        free_.pop_back();
+    // (AQ on the compute family: a compute command opens a lane batch - its pool is the compute family's)
+    const u8 want_lane = aq_ && aq_family_ && aq_cmd_compute_ ? 1 : 0;
+    auto reuse = free_.end();
+    for (auto it = free_.rbegin(); it != free_.rend(); ++it) {
+        if (it->pool_lane == want_lane) {
+            reuse = std::prev(it.base());
+            break;
+        }
+    }
+    if (reuse != free_.end()) {
+        cur_ = std::move(*reuse);
+        free_.erase(reuse);
         f.vkResetCommandPool(ctx_.Device(), cur_.pool, 0);
         if (cur_.descriptors != VK_NULL_HANDLE) {
             f.vkResetDescriptorPool(ctx_.Device(), cur_.descriptors, 0);
         }
     } else {
         cur_ = Batch{};
+        cur_.pool_lane = want_lane;
         const VkCommandPoolCreateInfo pci{.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                           .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-                                          .queueFamilyIndex = ctx_.QueueFamily()};
+                                          .queueFamilyIndex = want_lane != 0 ? ctx_.LaneFamily() : ctx_.QueueFamily()};
         if (f.vkCreateCommandPool(ctx_.Device(), &pci, nullptr, &cur_.pool) != VK_SUCCESS) {
             return false;
         }
@@ -382,6 +417,13 @@ bool Executor::Begin() {
     }
     cur_.work.fill(0);
     cur_.queues.clear();
+    cur_.lane = cur_.pool_lane;
+    cur_.aq_wait_main_min = std::exchange(aq_next_wait_main_, 0);
+    cur_.aq_main = cur_.aq_wait_all = cur_.aq_images = cur_.aq_gds = cur_.aq_overflow = false;
+    cur_.aq_lds = 0;
+    cur_.aq_ranges.clear();
+    cur_.done = false;
+    cur_.aq_unreported.reset();
     cur_.value = timeline_.Next();
     cur_.trace_frame = StallTrace::CurrentFrame(); // (P4.12)
     cur_.submit_t0 = cur_.submit_t1 = 0;
@@ -458,9 +500,63 @@ void Executor::Note(u32 queue, u64 seq) {
         cur_.queues.push_back(queue);
     }
     cur_.work[queue] = std::max(cur_.work[queue], seq);
+    aq_q_last_[queue] = {cur_.value, cur_.pool_lane};
     if (prof_queues_ && queue != prof_queue_) {
         ProfQueue(queue); // (before the command's barriers and uploads: they count to its queue)
     }
+}
+
+void Executor::AqBoundary(u32 queue, bool main_only) {
+    aq_cmd_compute_ = queue != Cp::kGraphicsQueue && !main_only;
+    if (!aq_ || !open_) {
+        return;
+    }
+    if (aq_family_ && cur_.pool_lane != 0 && !aq_cmd_compute_) {
+        ++stats_.aq_splits; // (a lane batch's pool cannot record it: the batch ends here, whatever the split mode)
+        Flush();
+        return;
+    }
+    if (aq_split_ == 0 || commands_ == 0) {
+        return;
+    }
+    const bool main_kind = cur_.work[Cp::kGraphicsQueue] != 0 || cur_.aq_main || (aq_family_ && cur_.pool_lane == 0);
+    if (main_kind == !aq_cmd_compute_) {
+        return; // the same kind
+    }
+    if (aq_split_ == 1 && !CriticalCompute::Waiting()) {
+        return;
+    }
+    ++stats_.aq_splits;
+    Flush();
+}
+
+void Executor::AqNote(u64 addr, u64 size) {
+    auto& v = cur_.aq_ranges;
+    const u64 end = addr + size;
+    if (!v.empty() && v.back().first <= end && addr <= v.back().second) {
+        v.back().first = std::min(v.back().first, addr);
+        v.back().second = std::max(v.back().second, end);
+        return;
+    }
+    if (v.size() >= 4096) {
+        cur_.aq_overflow = true;
+        return;
+    }
+    v.emplace_back(addr, end);
+}
+
+bool Executor::AqConflict(const Batch& main, const Batch& lane) {
+    if (main.aq_overflow || (main.aq_gds && lane.aq_gds) || (main.aq_lds & lane.aq_lds) != 0) {
+        return true;
+    }
+    for (const auto& [lb, le] : lane.aq_ranges) {
+        for (const auto& [mb, me] : main.aq_ranges) {
+            if (lb < me && mb < le) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void Executor::EndRendering() {
@@ -751,8 +847,48 @@ void Executor::Flush() {
         }
     }
     cbis[n_cb++] = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cur_.cb};
+    // FrameBreak AQ: the lane for a batch of compute queues only; it waits for the main batches in flight it conflicts
+    // with (or all of them); a main batch waits for the lane's last batch
+    u64 aq_wait_main = 0, aq_wait_lane = 0;
+    if (!aq_family_) {
+        cur_.lane = 0;
+    }
+    if (aq_) {
+        if (aq_family_ ? cur_.lane != 0
+                       : cur_.work[Cp::kGraphicsQueue] == 0 && !cur_.aq_main && !cur_.queues.empty()) {
+            cur_.lane = 1;
+            const u64 main_done = timeline_.QueryMain();
+            aq_wait_main = cur_.aq_wait_main_min > main_done ? cur_.aq_wait_main_min : 0;
+            // SSPC_FB_ASYNC_SERIAL=1 (diagnostic): every lane batch after every main batch before it
+            static const bool serial = [] {
+                char v[4] = {};
+                return GetEnvironmentVariableA("SSPC_FB_ASYNC_SERIAL", v, sizeof(v)) == 1 && v[0] == '1';
+            }();
+            if (serial) {
+                aq_wait_main = aq_last_main_ > main_done ? aq_last_main_ : 0;
+            }
+            if (aq_wait_main != 0) {
+                ++stats_.aq_wait_all; // (a wait met by a held fence of a main batch in flight)
+            } else if (cur_.aq_wait_all || cur_.aq_images || cur_.aq_overflow) {
+                aq_wait_main = aq_last_main_ > main_done ? aq_last_main_ : 0;
+                ++(cur_.aq_wait_all ? stats_.aq_wait_all : cur_.aq_images ? stats_.aq_wait_images : stats_.aq_wait_conflict);
+            } else {
+                bool shared = false;
+                for (const Batch& b : in_flight_) {
+                    if (b.lane == 0 && !b.done && b.value > main_done && AqConflict(b, cur_)) {
+                        aq_wait_main = std::max(aq_wait_main, b.value);
+                        shared = shared || b.aq_overflow || (b.aq_gds && cur_.aq_gds) || (b.aq_lds & cur_.aq_lds) != 0;
+                    }
+                }
+                ++(aq_wait_main == 0 ? stats_.aq_free : shared ? stats_.aq_wait_shared : stats_.aq_wait_conflict);
+            }
+        } else {
+            stats_.aq_kept_main += cur_.work[Cp::kGraphicsQueue] == 0 && !cur_.queues.empty() ? 1 : 0;
+            aq_wait_lane = aq_last_lane_ > timeline_.QueryLane() ? aq_last_lane_ : 0;
+        }
+    }
     const VkSemaphoreSubmitInfo signal{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                       .semaphore = timeline_.Handle(),
+                                       .semaphore = cur_.lane != 0 ? timeline_.LaneHandle() : timeline_.Handle(),
                                        .value = cur_.value,
                                        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     g_diag_submission.store(cur_.value, std::memory_order_relaxed);
@@ -771,20 +907,46 @@ void Executor::Flush() {
         VkSemaphore bind_sem = VK_NULL_HANDLE;
         u64 bind_value = 0;
         buffers_.SubmitBinds(bind_sem, bind_value);
-        const VkSemaphoreSubmitInfo wait{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                         .semaphore = bind_sem,
-                                         .value = bind_value,
-                                         .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        if (aq_ && bind_sem == VK_NULL_HANDLE && buffers_.LastBindValue() != 0) {
+            // AQ: blocks an earlier batch's binds made resident (on the main queue) may be used here - the lane is not
+            // ordered behind them by the queue (measured: device lost with an MMU fault in a shader otherwise)
+            bind_sem = buffers_.BindTimeline();
+            bind_value = buffers_.LastBindValue();
+        }
+        VkSemaphoreSubmitInfo waits[3];
+        u32 n_wait = 0;
+        if (bind_sem != VK_NULL_HANDLE) {
+            waits[n_wait++] = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                               .semaphore = bind_sem,
+                               .value = bind_value,
+                               .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        }
+        if (aq_wait_main != 0) {
+            waits[n_wait++] = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                               .semaphore = timeline_.Handle(),
+                               .value = aq_wait_main,
+                               .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        }
+        if (aq_wait_lane != 0) {
+            waits[n_wait++] = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                               .semaphore = timeline_.LaneHandle(),
+                               .value = aq_wait_lane,
+                               .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        }
         VkLatencySubmissionPresentIdNV latency{}; // (NVIDIA Reflex: the GPU work of the frame being recorded)
         const VkSubmitInfo2 si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-                               .pNext = Reflex::SubmitChain(VideoOut::NextFlipId(), latency),
-                               .waitSemaphoreInfoCount = bind_sem != VK_NULL_HANDLE ? 1u : 0u,
-                               .pWaitSemaphoreInfos = &wait,
+                               .pNext = cur_.lane != 0 ? nullptr : Reflex::SubmitChain(VideoOut::NextFlipId(), latency),
+                               .waitSemaphoreInfoCount = n_wait,
+                               .pWaitSemaphoreInfos = waits,
                                .commandBufferInfoCount = n_cb,
                                .pCommandBufferInfos = cbis,
                                .signalSemaphoreInfoCount = 1,
                                .pSignalSemaphoreInfos = &signal};
-        r = ctx_.Failed() ? ctx_.Failure() : f.vkQueueSubmit2(ctx_.Queue(), 1, &si, VK_NULL_HANDLE);
+        if (cur_.lane != 0) {
+            timeline_.SubmittedOnLane(cur_.value); // (before its submission: a waiter finds it on the lane)
+        }
+        r = ctx_.Failed() ? ctx_.Failure()
+                          : f.vkQueueSubmit2(cur_.lane != 0 ? ctx_.LaneQueue() : ctx_.Queue(), 1, &si, VK_NULL_HANDLE);
     }
     const u64 submit_t1 = GS::Ticks();
     stats_.submit_ns += GS::TicksToNs(submit_t1 - submit_t0);
@@ -815,6 +977,10 @@ void Executor::Flush() {
         diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
     }
     submitted_value_.store(cur_.value, std::memory_order_release);
+    if (aq_) {
+        (cur_.lane != 0 ? aq_last_lane_ : aq_last_main_) = cur_.value;
+        ++(cur_.lane != 0 ? stats_.aq_lane_batches : stats_.aq_main_batches);
+    }
     in_flight_.push_back(std::move(cur_));
     cur_ = Batch{};
     open_ = false;
@@ -837,9 +1003,59 @@ void Executor::Poll() {
     if (StallTrace::On() && !in_flight_.empty() && in_flight_.front().value <= completed) {
         StallTrace::Instant(StallTrace::Ev::GpuCompleted, completed); // (P4.12: the labels of these batches land now)
     }
-    while (!in_flight_.empty() && in_flight_.front().value <= completed) {
+    if (aq_) {
+        // AQ: a batch completes when its queue's semaphore reached it (a lane batch possibly before main batches before
+        // it); a guest queue's completion is reported only once every earlier batch with its work completed
+        const u64 main_v = timeline_.QueryMain(), lane_v = timeline_.QueryLane();
+        std::bitset<Cp::kNumQueues> blocked;
+        for (Batch& b : in_flight_) {
+            if (!b.done && (b.value <= completed || (b.lane != 0 ? lane_v : main_v) >= b.value)) {
+                Retire(b);
+                b.done = true;
+                for (const u32 q : b.queues) {
+                    b.aq_unreported.set(q);
+                }
+            }
+            for (const u32 q : b.queues) {
+                if (!b.done || (b.aq_unreported.test(q) && blocked.test(q))) {
+                    blocked.set(q);
+                } else if (b.aq_unreported.test(q)) {
+                    b.aq_unreported.reset(q);
+                    stats_.aq_out_of_order += b.value > completed ? 1 : 0;
+                    if (cp_ != nullptr) {
+                        cp_->CompleteWork(q, b.work[q]);
+                    }
+                }
+            }
+        }
+        while (!in_flight_.empty() && in_flight_.front().done && in_flight_.front().aq_unreported.none()) {
+            free_.push_back(std::move(in_flight_.front()));
+            in_flight_.pop_front();
+        }
+    }
+    while (!aq_ && !in_flight_.empty() && in_flight_.front().value <= completed) {
         Batch b = std::move(in_flight_.front());
         in_flight_.pop_front();
+        Retire(b);
+        if (cp_ != nullptr) {
+            for (const u32 q : b.queues) {
+                cp_->CompleteWork(q, b.work[q]);
+            }
+        }
+        free_.push_back(std::move(b));
+    }
+    while (!insp_frame_ends_.empty() && insp_frame_ends_.front().value <= completed) {
+        const u32 n = insp_frame_ends_.front().n;
+        insp_frame_ends_.pop_front();
+        Inspector::GpuFrameTimes& acc = insp_acc_[n % insp_acc_.size()];
+        Inspector::GpuFrame(n, acc);
+        acc = {};
+    }
+    PollCollect(completed);
+}
+
+void Executor::Retire(Batch& b) {
+    {
         if (cp_ != nullptr && !b.clock_fences.empty() && b.query_slot != ~0u) {
             // each clock fence's age: from its timestamp to the batch's last one (taken as now - the completion was
             // just seen)
@@ -858,11 +1074,6 @@ void Executor::Poll() {
                 }
             }
         }
-        if (cp_ != nullptr) {
-            for (const u32 q : b.queues) {
-                cp_->CompleteWork(q, b.work[q]);
-            }
-        }
         ++stats_.completed_batches;
         if (b.query_slot != ~0u) {
             u64 ts[2] = {};
@@ -871,6 +1082,25 @@ void Executor::Poll() {
                 ts[1] >= ts[0]) {
                 stats_.gpu_busy_ns += static_cast<u64>(static_cast<double>(ts[1] - ts[0]) * ctx_.Caps().timestamp_period);
                 ++stats_.gpu_batches_timed;
+                if (aq_) {
+                    // AQ: the lane's GPU time, and how much of it ran beside the main queue's batches (each pair counted
+                    // once: when the later of the two completes)
+                    const double period = ctx_.Caps().timestamp_period;
+                    if (b.lane != 0) {
+                        stats_.aq_lane_gpu_ns += static_cast<u64>(static_cast<double>(ts[1] - ts[0]) * period);
+                    }
+                    for (const AqInterval& o : aq_iv_[b.lane != 0 ? 0 : 1]) {
+                        const u64 from = std::max(o.begin, ts[0]), to = std::min(o.end, ts[1]);
+                        if (to > from) {
+                            stats_.aq_overlap_ns += static_cast<u64>(static_cast<double>(to - from) * period);
+                        }
+                    }
+                    auto& mine = aq_iv_[b.lane != 0 ? 1 : 0];
+                    mine.push_back({ts[0], ts[1]});
+                    if (mine.size() > 32) {
+                        mine.pop_front();
+                    }
+                }
                 StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame); // (P4.12)
                 if (insp_catalog_ != nullptr) {
                     // the frame's GPU time: the union of its batches' intervals (one queue; a batch's start may come
@@ -906,15 +1136,10 @@ void Executor::Poll() {
         if (b.prof_base != ~0u) {
             ProfCollect(b);
         }
-        free_.push_back(std::move(b));
     }
-    while (!insp_frame_ends_.empty() && insp_frame_ends_.front().value <= completed) {
-        const u32 n = insp_frame_ends_.front().n;
-        insp_frame_ends_.pop_front();
-        Inspector::GpuFrameTimes& acc = insp_acc_[n % insp_acc_.size()];
-        Inspector::GpuFrame(n, acc);
-        acc = {};
-    }
+}
+
+void Executor::PollCollect(u64 completed) {
     ring_.Collect(completed);
     if (shadow_ring_ != nullptr) {
         shadow_ring_->Collect(completed);
@@ -1446,6 +1671,9 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
             buffer = r.buffer;
             offset = r.offset;
             avail = r.size;
+            if (aq_ && aq_cmd_compute_) {
+                AqNote(addr, size);
+            }
             return true;
         }
         // nothing of it in video memory (the CPU wrote it, or it is new): the host's copy is current; a small read
@@ -1578,11 +1806,15 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
     }
     BufferCache::Range r;
     const u64 tp = GS::FineTicks();
+    const u64 up0 = buffers_.Stats().uploads;
     const bool prepared = buffers_.Prepare(addr, size, write, cur_.cb, cur_.value, r);
     stats_.t_prepare += GS::FineTicks() - tp;
     ++stats_.n_prepare;
     if (!prepared) {
         return false;
+    }
+    if (aq_ && (write || aq_cmd_compute_ || buffers_.Stats().uploads != up0)) {
+        AqNote(addr, size); // (AQ: a write, an upload, or a compute command's access)
     }
     buffer = r.buffer;
     offset = r.offset;
@@ -1598,6 +1830,7 @@ void Executor::TimelineWriteRanges(std::vector<std::pair<u64, u64>>& out) const 
 }
 
 void Executor::CompleteRefusedWork(u32 queue, u64 seq) {
+    AqBoundary(queue);
     if (!Begin()) {
         return;
     }
@@ -1673,6 +1906,7 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
         ++stats_.tw_fail_shape;
         return false;
     }
+    AqBoundary(queue);
     if (!Begin()) {
         return false;
     }
@@ -1684,6 +1918,9 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     }
     Note(queue, seq);
     ++commands_;
+    if (aq_) {
+        AqNote(dst, bytes);
+    }
     if (LabelChanges(kLabelOther | 1)) {
         Label(kLabelOther | 1, "T WRITE_DATA on the timeline");
     }
@@ -1726,6 +1963,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     if (memo_bumps_) {
         frontend_.GpuWrote(dst, bytes); // (P5.2: the frontend runs on this thread; trusted shader code there is re-read)
     }
+    AqBoundary(queue);
     if (!Begin()) {
         return false;
     }
@@ -1792,9 +2030,11 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
         ++stats_.gds_refused;
         return false;
     }
+    AqBoundary(queue);
     if (!Begin()) {
         return false;
     }
+    cur_.aq_gds = true;
     write_run_ = false;
     if (LabelChanges(kLabelOther | 3)) {
         Label(kLabelOther | 3, "T GDS DMA on the timeline");
@@ -1895,13 +2135,38 @@ void Executor::MemoryAcquiredApplied(u32 queue, bool blocked, u64 poll_address, 
     stats_.acquires_applied += applied ? 1 : 0;
 }
 
-void Executor::WaitMetByHeldFence(u32 queue) {
+void Executor::WaitMetByHeldFence(u32 queue_and_fence) {
     const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
+    // (FrameBreak AQ: the fence's queue + 1 in the upper half, 0 unknown)
+    const u32 queue = queue_and_fence & 0xFFFF;
+    const u32 fence_q = (queue_and_fence >> 16) - 1;
     GuestSync(queue);
     // the guest's GPU waits for its earlier work here (EVENT_WRITE_EOS + WAIT_REG_MEM): everything recorded after it
     // waits for everything before it - the next command's global barrier (the batch-end barrier covers later batches)
     ++stats_.waits_by_held;
     MarkWrites(2);
+    if (aq_) {
+        // AQ: the work after the wait goes after the batch the fence's queue recorded in last - nothing to wait for on
+        // the same queue or in the open batch; a main batch when the work after it may go to the lane
+        if (fence_q >= Cp::kNumQueues || !aq_family_) {
+            if (open_) {
+                cur_.aq_wait_all = true;
+            } else {
+                aq_next_wait_main_ = std::max(aq_next_wait_main_, aq_last_main_);
+            }
+        } else if (const AqLast& l = aq_q_last_[fence_q]; l.lane == 0 && l.value != 0) {
+            if (open_ && l.value == cur_.value) {
+                // the fence is in the open main batch: ordered while the work stays in it, but a split right after it
+                // moves that work to the lane - the next batch waits for this one
+                aq_next_wait_main_ = std::max(aq_next_wait_main_, l.value);
+            } else if (open_) {
+                cur_.aq_wait_main_min = std::max(cur_.aq_wait_main_min, l.value);
+                aq_next_wait_main_ = std::max(aq_next_wait_main_, l.value); // (and after a split)
+            } else {
+                aq_next_wait_main_ = std::max(aq_next_wait_main_, l.value);
+            }
+        }
+    }
 }
 
 void Executor::BeforeUpload() {
@@ -1919,6 +2184,9 @@ bool Executor::WaitOldest(u64 timeout_ns) {
     if (in_flight_.empty() || Failed()) {
         return false;
     }
+    if (aq_) {
+        return WaitOldestOrWake(0, timeout_ns);
+    }
     const bool done = timeline_.Wait(in_flight_.front().value, timeout_ns);
     if (!done && timeline_.Lost()) {
         OnDeviceLost("vkWaitSemaphores (oldest batch)", in_flight_.front().value);
@@ -1929,6 +2197,27 @@ bool Executor::WaitOldest(u64 timeout_ns) {
 bool Executor::WaitOldestOrWake(u64 wake_value, u64 timeout_ns) {
     if (in_flight_.empty() || Failed()) {
         return false;
+    }
+    if (aq_) {
+        // AQ: the oldest batch not complete on either queue
+        u64 m = 0, l = 0;
+        for (const Batch& b : in_flight_) {
+            if (!b.done) {
+                u64& v = b.lane != 0 ? l : m;
+                v = v == 0 ? b.value : v;
+                if (m != 0 && l != 0) {
+                    break;
+                }
+            }
+        }
+        if (m == 0 && l == 0) {
+            return true;
+        }
+        const bool done = timeline_.WaitAny(m, l, wake_value, timeout_ns);
+        if (!done && timeline_.Lost()) {
+            OnDeviceLost("vkWaitSemaphores (oldest batch of either queue)", m != 0 ? m : l);
+        }
+        return done;
     }
     const bool done = timeline_.WaitOrWake(in_flight_.front().value, wake_value, timeout_ns);
     if (!done && timeline_.Lost()) {
@@ -1950,6 +2239,7 @@ bool Executor::FlushKeptBack(u64 addr, u64 size, bool eager, u32 why) {
     if (!buffers_.FlushDeferred(addr, size, cur_.cb, cur_.value, eager, why)) {
         return false;
     }
+    cur_.aq_main = true;
     ++commands_; // (the batch is submitted by the sync that follows)
     return true;
 }
@@ -2348,6 +2638,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             break;
         }
         case GS::BufferKind::GdsBuffer:
+            cur_.aq_gds = true;
             info = {gds_.buffer, 0, gds_.size};
             writes_memory |= b.written;
             break;
@@ -2357,10 +2648,15 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             const u64 per_group = std::max<u64>(refl.shared_memory_size, lds_group_bytes_);
             const u64 bytes = (std::max<u64>(per_group * (compute ? lds_groups_ : 1), 16) + 255) & ~255ull;
             const auto& f = Fn();
-            if (lds_.size < bytes) {
-                if (lds_.buffer != VK_NULL_HANDLE) {
-                    lds_retired_.push_back({cur_.value, lds_});
-                    lds_ = {};
+            // (AQ: a batch of compute queues only so far - possibly the lane's - takes the lane's buffer)
+            const bool lane_lds = aq_ && (aq_family_ ? cur_.pool_lane != 0
+                                                     : aq_cmd_compute_ && cur_.work[Cp::kGraphicsQueue] == 0 && !cur_.aq_main);
+            OwnedBuffer& lds_buf = lane_lds ? lds_lane_ : lds_;
+            cur_.aq_lds |= lane_lds ? 2 : 1;
+            if (lds_buf.size < bytes) {
+                if (lds_buf.buffer != VK_NULL_HANDLE) {
+                    lds_retired_.push_back({cur_.value, lds_buf});
+                    lds_buf = {};
                 }
                 u64 grown = 64ull << 20;
                 while (grown < bytes) {
@@ -2368,7 +2664,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 }
                 std::string err;
                 if (!CreateBuffer(ctx_, grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                  false, lds_, err)) {
+                                  false, lds_buf, err)) {
                     Skipped(Skip::Ring, fmt::format("emulated LDS buffer of {} bytes: {}", bytes, err));
                     return false;
                 }
@@ -2383,13 +2679,13 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
                                        .pMemoryBarriers = &mb};
             f.vkCmdPipelineBarrier2(cur_.cb, &dep);
-            f.vkCmdFillBuffer(cur_.cb, lds_.buffer, 0, bytes, 0);
+            f.vkCmdFillBuffer(cur_.cb, lds_buf.buffer, 0, bytes, 0);
             mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
             mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
             mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
             f.vkCmdPipelineBarrier2(cur_.cb, &dep);
-            info = {lds_.buffer, 0, bytes};
+            info = {lds_buf.buffer, 0, bytes};
             writes_memory = true;
             ++stats_.lds_dispatches;
             stats_.lds_max_bytes = std::max(stats_.lds_max_bytes, bytes);
@@ -2859,6 +3155,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     const u32 mode = (regs.Get(kCbColorControl) >> 4) & 7;
     const bool filtered = DrawFiltered(regs, d);
     const GS::DrawPreparation* prepared = filtered ? nullptr : pc.prep;
+    AqBoundary(d.queue);
     if (!Begin()) {
         return;
     }
@@ -3803,6 +4100,8 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     ++trace_.ordinal;
     const auto& f = Fn();
     const GS::DrawPreparation* prepared = cs == nullptr ? nullptr : pc.prep;
+    // (AQ: a dispatch binding images stays on the main queue - their layouts are one state, the transitions graphics')
+    AqBoundary(d.queue, pc.stage != nullptr && !pc.stage->plan.images.empty());
     if (!Begin()) {
         return;
     }
@@ -3915,6 +4214,9 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         return;
     }
     stats_.t_bind += GS::FineTicks() - tb0;
+    if (aq_ && !bound.empty()) {
+        cur_.aq_images = true;
+    }
     VkBuffer argbuf = VK_NULL_HANDLE;
     u64 argoff = 0;
     if (d.indirect) {
@@ -3940,6 +4242,9 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
             (b.written ? acc_writes_ : acc_reads_).emplace_back(kGdsRangeBase, kGdsRangeBase + gds_.size);
         } else if (b.kind != GS::BufferKind::Flatbuf && b.kind != GS::BufferKind::ClipPlanes) {
             acc_unknown = true; // the emulated LDS (shared by every dispatch), BDA, ...
+            if (b.kind != GS::BufferKind::SharedMemory && aq_) {
+                cur_.aq_overflow = true; // (AQ: an access of unknown extent)
+            }
         }
     }
     // storage images need nothing here: ImageCache::Transition orders each image's accesses with its own barrier (a
@@ -4667,7 +4972,11 @@ void Executor::CaptureImageAt() {
         }
         return v;
     }();
-    if (wants.empty() || !Begin()) {
+    if (wants.empty()) {
+        return;
+    }
+    AqBoundary(Cp::kGraphicsQueue);
+    if (!Begin()) {
         return;
     }
     const u64 id = VideoOut::NextFlipId();
@@ -4685,6 +4994,7 @@ void Executor::CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 nat
         return n > 0 && n < sizeof(s) ? std::filesystem::path(s)
                                        : options_.capture_path.parent_path().parent_path() / "p45";
     }();
+    AqBoundary(Cp::kGraphicsQueue);
     if (!Begin()) {
         return;
     }
@@ -5265,9 +5575,14 @@ void Executor::EvictGpuImages() {
         return;
     }
     const std::vector<CachedImage*> back = images_.EvictGpuWritten(timeline_.Completed(), 16);
-    if (back.empty() || !Begin()) {
+    if (back.empty()) {
         return;
     }
+    AqBoundary(Cp::kGraphicsQueue);
+    if (!Begin()) {
+        return;
+    }
+    cur_.aq_main = true;
     EndRendering();
     if (pending_writes_) {
         GlobalBarrier();
@@ -5318,7 +5633,11 @@ void Executor::Flip(const Cp::FlipMarker&) {
     s32 index = -1;
     s32 frame = -1;
     const bool has = VideoOut::NextFlipBuffer(buf, index);
+    if (has && presenter_ != nullptr) {
+        AqBoundary(Cp::kGraphicsQueue);
+    }
     if (has && presenter_ != nullptr && Begin()) {
+        cur_.aq_main = true;
         EndRendering();
         if (LabelChanges(kLabelOther | 4)) {
             Label(kLabelOther | 4, "F flip: frame copy to the presenter");

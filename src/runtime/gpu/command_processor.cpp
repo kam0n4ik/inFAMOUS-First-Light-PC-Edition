@@ -2064,7 +2064,7 @@ bool WaitHolds(u32 function, u32 v, u32 ref) {
 }
 } // namespace
 
-bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref) const {
+bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref, u32* by_queue) const {
     for (u32 id = 0; id < kNumQueues; ++id) {
         const Queue* qp = Q(id);
         if (qp == nullptr || qp->fence_count == 0) {
@@ -2096,6 +2096,9 @@ bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 
                 continue;
             }
             if (WaitHolds(function, v & mask, ref)) {
+                if (by_queue != nullptr) {
+                    *by_queue = id;
+                }
                 return true;
             }
             break; // the queue's last write there does not meet it
@@ -2187,12 +2190,14 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count());
     };
+    u32 by_queue = ~0u;
     if (!ok && memory && options_.waits_by_held_fences && options_.work != nullptr &&
-        HeldFenceSatisfies(key, function, b[4], ref)) {
-        // met in the GPU's order: the work before the fence is already handed on (P4.6)
+        HeldFenceSatisfies(key, function, b[4], ref, &by_queue)) {
+        // met in the GPU's order: the work before the fence is already handed on (P4.6); (FrameBreak AQ: the fence's
+        // queue + 1 in the upper half - the executor orders the work after it behind that queue's batch)
         ok = true;
         ++stats_.waits_met_held;
-        options_.work->WaitMetByHeldFence(q.id);
+        options_.work->WaitMetByHeldFence(q.id | ((by_queue + 1) << 16));
     }
     if (!ok) {
         if (!q.blocked) {

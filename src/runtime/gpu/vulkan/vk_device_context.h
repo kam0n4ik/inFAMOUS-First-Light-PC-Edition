@@ -92,6 +92,19 @@ public:
     /// acquire) and an async compute queue, created only when frame generation was chosen; VK_NULL_HANDLE without.
     VkQueue ExtraQueue(u32 index) const { return index < extra_queues_.size() ? extra_queues_[index] : VK_NULL_HANDLE; }
     VkQueue ComputeQueue() const { return compute_queue_; }
+    /// FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE=1): a queue of the main family for the executor's async compute lane;
+    /// VK_NULL_HANDLE without (the switch off, or the family has no queue left).
+    VkQueue LaneQueue() const { return lane_queue_; }
+    u32 LaneFamily() const { return lane_family_; }
+    /// AQ on the compute family: a buffer the lane's batches may use is created shared by both families (concurrent
+    /// sharing: no ownership transfers). Nothing changes otherwise.
+    void ShareWithLane(VkBufferCreateInfo& bci) const {
+        if (lane_queue_ != VK_NULL_HANDLE && lane_family_ != family_) {
+            bci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            bci.queueFamilyIndexCount = 2;
+            bci.pQueueFamilyIndices = lane_families_;
+        }
+    }
     u32 ComputeFamily() const { return compute_family_; }
     /// First fatal runtime error, shared by recording, presentation and timeline waiters.
     void Fail(const char* where, VkResult result);
@@ -142,6 +155,9 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     std::vector<VkQueue> extra_queues_;
     VkQueue compute_queue_ = VK_NULL_HANDLE;
+    VkQueue lane_queue_ = VK_NULL_HANDLE;
+    u32 lane_family_ = ~0u;
+    u32 lane_families_[2] = {};
     u32 compute_family_ = ~0u;
     u32 family_ = ~0u;
     DeviceCaps caps_;
