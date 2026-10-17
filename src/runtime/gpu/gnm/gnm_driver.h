@@ -58,6 +58,14 @@ using EarlyFrameSource = bool (*)(const u64* return_slot, EarlyFrame& out);
 /// engine itself waits for the previous frame's label before it reuses that frame's buffers.
 void SetEarlyFrameSource(EarlyFrameSource source);
 
+/// REA-3 (SSPC_REA_DEFER_WAIT_B=1, docs/REA_ENGINE_REVERSE.md): the engine's second async compute wait of a frame
+/// (0x3ee470 -> 0x1695e0) orders the particles' light DMA before the frame's graphics. Instead of the game thread
+/// blocking, the next graphics submission starts with WAIT_REG_MEM(label >= target): the same order, kept by the command
+/// processor. Any thread; the gate is consumed by the next PerformSubmit.
+void SetGraphicsGate(u64 label_address, u32 target);
+/// Gates set / put in front of a graphics submission (for the report).
+void GraphicsGateCounts(u64& set, u64& submitted);
+
 namespace Test {
 /// The driver as at start-up: no submission lock, the initialisation sequence pending, no compute queue mapped, no
 /// event registration, SDK version 0. Self-tests only: no host installed and no guest thread inside the driver.

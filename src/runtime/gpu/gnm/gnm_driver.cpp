@@ -383,9 +383,48 @@ s32 CheckSupported(const char* function, u32 count, const u32* const* dcbs, cons
     return kOk;
 }
 
+// REA-3 graphics gate (SetGraphicsGate): label address and target, set by the game thread instead of its wait;
+// g_gate_label != 0 while one is pending. Each gate's packet lives in a ring slot the processor reads by pointer (a
+// slot is reused 64 submissions later: long after the processor read it - frames in flight are at most 2-3).
+std::mutex g_gate_mutex;
+u64 g_gate_label = 0;
+u32 g_gate_target = 0;
+std::atomic<u64> g_gates_set{0}, g_gates_submitted{0};
+alignas(64) u32 g_gate_ring[64][8] = {};
+u32 g_gate_next = 0;
+
+/// The pending gate's WAIT_REG_MEM (memory, >=, from the ME) in front of the submission. Under g_submit_mutex.
+bool SubmitPendingGate(Host& host) {
+    u64 label = 0;
+    u32 target = 0;
+    {
+        std::scoped_lock lk{g_gate_mutex};
+        label = g_gate_label;
+        target = g_gate_target;
+        g_gate_label = 0;
+    }
+    if (label == 0) {
+        return true;
+    }
+    u32* const p = g_gate_ring[g_gate_next++ % 64];
+    p[0] = Type3(Op::WaitRegMem, 5);
+    p[1] = 0x15u; // function 5 (>=), memory
+    p[2] = static_cast<u32>(label & ~3ull);
+    p[3] = static_cast<u32>(label >> 32);
+    p[4] = target;
+    p[5] = 0xFFFFFFFFu;
+    p[6] = 10;
+    g_gates_submitted.fetch_add(1, std::memory_order_relaxed);
+    return host.SubmitGraphics(reinterpret_cast<u64>(p), 7, p);
+}
+
 /// The bridge's PerformSubmit: the initialisation sequence once after each SubmitDone, then the DCBs in order. Under
 /// g_submit_mutex, past WaitGpuIdle.
 s32 PerformSubmit(Host& host, u32 count, const u32* const* dcbs, const u32* dcb_sizes) {
+    if (!SubmitPendingGate(host)) {
+        SSPC_LOG(GPU, Error, "GnmDriver: the backend refused the graphics gate (REA-3): submission dropped");
+        return kErrSubmitInternal;
+    }
     if (g_send_init_packet) {
         const std::span<const u32> sequence = InitSequenceFor(g_sdk_version.load(std::memory_order_relaxed));
         if (!host.SubmitGraphics(reinterpret_cast<u64>(sequence.data()), static_cast<u32>(sequence.size()),
@@ -1953,6 +1992,19 @@ void RaiseInterrupt(Interrupt irq) {
 
 void SetSdkVersion(s32 version) {
     g_sdk_version.store(version, std::memory_order_relaxed);
+}
+
+void SetGraphicsGate(u64 label_address, u32 target) {
+    std::scoped_lock lk{g_gate_mutex};
+    // (a gate still pending - no graphics submission since - is replaced by the newer: the same label, a later value)
+    g_gate_label = label_address;
+    g_gate_target = target;
+    g_gates_set.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GraphicsGateCounts(u64& set, u64& submitted) {
+    set = g_gates_set.load(std::memory_order_relaxed);
+    submitted = g_gates_submitted.load(std::memory_order_relaxed);
 }
 
 void SetEarlyFrameSource(EarlyFrameSource source) {

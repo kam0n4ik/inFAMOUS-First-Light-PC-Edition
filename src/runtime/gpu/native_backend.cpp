@@ -2199,6 +2199,7 @@ std::string Backend::Report() {
     }
     if (guest_) {
         const auto g = guest_->GetStats();
+        out += fmt::format("REA-4 backing runs merged (host-contiguous): {}\n", g.merged_runs);
         out += fmt::format("guest buffer windows {} ({} MiB; through the backing {}, the guest's pages {}), imports {}, failures {} {}\n", g.windows, g.bytes >> 20, g.backing_windows, g.guest_windows,
                            g.imports, g.import_failures, g.first_failure);
     }
@@ -2383,6 +2384,12 @@ std::string Backend::Report() {
         out += fmt::format("write-backs of changed words only (large ranges): {} MiB compared in {} dispatches, shadows "
                            "made from the host {}; prepares answered by the batch's memo {}\n",
                            b.wb_diff_bytes >> 20, b.wb_diff_dispatches, b.wb_shadow_inits, b.prep_memo_hits);
+        out += buffers_->LargeBindReport();
+        if (buffers_->HeapReads()) {
+            out += fmt::format("REA-2 heap reads: {} host-import readings of a vertex-data heap without a write-back; "
+                               "poisoned blocks (correctness test) {}\n",
+                               buffers_->HeapReadsUnflushed(), buffers_->PoisonedBlocks());
+        }
         if (buffers_->Lazy() != 0) {
             const auto& es = executor_->Stats();
             out += fmt::format("FB-7 lazy write-back ({}): blocks kept back {}, would have been {}; written back by a "

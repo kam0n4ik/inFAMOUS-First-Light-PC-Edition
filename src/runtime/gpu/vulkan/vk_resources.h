@@ -214,6 +214,7 @@ public:
         u64 windows = 0, bytes = 0, imports = 0, import_failures = 0, drops = 0, destroyed = 0, lookups = 0;
         u64 exact_windows = 0;
         u64 backing_windows = 0, guest_windows = 0; ///< imported through the backing's view / the guest's pages
+        u64 merged_runs = 0; ///< REA-4: backing runs joined to the one before (host-contiguous)
         std::string first_failure;
     };
     Stats GetStats();

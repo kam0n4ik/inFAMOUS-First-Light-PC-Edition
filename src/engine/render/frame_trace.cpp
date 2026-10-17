@@ -600,9 +600,29 @@ T Volatile(u64 address) {
     return *reinterpret_cast<const volatile T*>(address);
 }
 
+// REA-3 (SSPC_REA_DEFER_WAIT_B=1): the main loop's call 0x29cd56 of 0x3ee470, whose tail call is this wait
+constexpr u64 kWaitBReturn = 0x29cd5b;
+bool g_defer_b = false;
+std::atomic<u64> g_defer_b_count{0}, g_defer_b_met{0};
+
 SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
     const u64 q = reinterpret_cast<u64>(queue);
     const u32 target = Volatile<u32>(q + L::kQueueSubmitted);
+    if (g_defer_b && reinterpret_cast<u64>(__builtin_return_address(0)) == g_base + kWaitBReturn) {
+        const s32 index = Volatile<s32>(q + L::kQueueLabelIndex);
+        const u64 label = Volatile<u64>(g_base + L::kLabelArray) + static_cast<u64>(static_cast<s64>(index)) * 8;
+        if (Volatile<u32>(label) >= target) {
+            g_defer_b_met.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Gpu::Gnm::SetGraphicsGate(label, target);
+        const u64 n = g_defer_b_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n == 100 || n == 1000 || n == 10000) {
+            SSPC_LOG(Engine, Info, "REA-3: {} second compute waits handed to the processor as a graphics gate ({} already "
+                     "met); label {:#x} >= {}", n, g_defer_b_met.load(std::memory_order_relaxed), label, target);
+        }
+        return;
+    }
     const u64 t0 = Gpu::StallTrace::Now();
     u64 label = 0;
     u16 waited = 0;
@@ -820,6 +840,33 @@ bool InstallCriticalComputeFromEnvironment(u64 eboot_base) {
              "EXPERIMENT: {} - the async compute wait 0x1695e0 replaced by the same loop; the game's blocked waits "
              "counted for the command processor", cc2 ? "SSPC_CC_CRITICAL=1" : Env("SSPC_FP_WHEN") == "wait" ? "SSPC_FP_WHEN=wait"
              : Env("SSPC_CP_ROUND_NODRAIN") == "2" ? "SSPC_CP_ROUND_NODRAIN=2" : "SSPC_FB_ASYNC_COMPUTE=1");
+    return true;
+}
+
+bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base) {
+    if (Env("SSPC_REA_DEFER_WAIT_B") != "1") {
+        return true;
+    }
+    if (!g_wait_hooked) {
+        std::string error;
+        for (const GuestFunction& f : {kComputeWait, kDelay}) {
+            if (!VerifyGuestFunction(eboot_base, f, error)) {
+                SSPC_LOG(Engine, Error, "REA-3 deferred compute wait not installed: {}", error);
+                return false;
+            }
+        }
+        g_base = eboot_base;
+        g_delay = reinterpret_cast<DelayFn>(eboot_base + kDelay.rva);
+        if (!InstallJump(eboot_base + kComputeWait.rva, reinterpret_cast<const void*>(&ComputeWaitHook), error)) {
+            SSPC_LOG(Engine, Critical, "REA-3 deferred compute wait: {}", error);
+            std::abort();
+        }
+        g_wait_hooked = true;
+    }
+    g_defer_b = true;
+    SSPC_LOG(Engine, Warning,
+             "EXPERIMENT: SSPC_REA_DEFER_WAIT_B=1 - the frame's second async compute wait (0x3ee470 -> 0x1695e0) does not "
+             "block the game: the next graphics submission waits for the label on the GPU timeline instead");
     return true;
 }
 

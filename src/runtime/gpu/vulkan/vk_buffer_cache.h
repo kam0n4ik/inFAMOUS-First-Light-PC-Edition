@@ -18,10 +18,12 @@
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -166,8 +168,27 @@ public:
 
     const BufferCacheStats& Stats() const { return stats_; }
     VkBuffer Buffer() const { return buffer_; }
+    /// REA-1 diagnostic (SSPC_DIAG_LARGE_BINDS=1): the bindings Prepare left on the host import, by range and reason
+    /// (the most frequent first); empty when off.
+    std::string LargeBindReport() const;
+
+    /// REA-2 (SSPC_REA_HEAP_READS=1): the game's vertex-data heaps (one V# over 0.5-2.5 GiB, stride 2, read-only, bound
+    /// by most draws; docs/REA_ENGINE_REVERSE.md) are bound on the host import without writing back what the GPU wrote
+    /// in their address range: the GPU-only data allocated inside them (the tiled lighting's 6.25 MiB light index list)
+    /// stays in video memory. Host-import readings by such heaps that skipped the write-back are counted.
+    bool HeapReads() const { return heap_reads_; }
+    u64 HeapReadsUnflushed() const { return heap_unflushed_; }
+    u64 PoisonedBlocks() const { return poisoned_blocks_; }
+    static constexpr u64 kHeapMin = 256ull << 20;
 
 private:
+    void DiagHeapLayout(u64 addr, u64 size); ///< REA-4 diagnostic (SSPC_DIAG_LARGE_BINDS=1), once per heap binding
+    bool heap_reads_ = false, poison_ = false;
+    u64 heap_unflushed_ = 0, poisoned_blocks_ = 0;
+    bool diag_large_ = false;
+    /// (addr, size, reason: 0 larger than kMaxCached, 1 over budget, 2 the tracker cannot arm it, 3 not bound; write)
+    std::map<std::tuple<u64, u64, u8, bool>, u64> large_binds_;
+    std::map<u64, u64> diag_wb_, diag_kept_; ///< changed-words bytes / kept-back blocks by 1 MiB of address
     static constexpr u64 kBlockBits = 16; ///< 64 KiB residency blocks
     static constexpr u64 kPageBits = 12;  ///< 4 KiB validity pages (the tracker's)
     static constexpr u64 kPagesPerBlock = 1ull << (kBlockBits - kPageBits);

@@ -2,9 +2,15 @@
 #include "runtime/gpu/shader/shader_resources.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #include <fmt/format.h>
+
+#include "base/log.h"
 #include <xxhash.h>
 #include <Zydis/Zydis.h>
 
@@ -737,6 +743,51 @@ void Count(ResourceBindingPlan& plan, ResourceStatus status) {
     ++plan.status_counts[static_cast<size_t>(status)];
 }
 
+/// REA-1 diagnostic (SSPC_DIAG_LARGE_BINDS=1): a buffer binding larger than 256 MiB - its raw V#, once per (program,
+/// base, size), at most 64 lines.
+void DiagHugeBuffer(u64 program_address, const BufferBinding& out, const BufferResource& b) {
+    static const bool on = [] {
+        const char* v = std::getenv("SSPC_DIAG_LARGE_BINDS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!on) {
+        return;
+    }
+    // SSPC_DIAG_WATCH_BIND=<hex addr>:<hex size>: also every binding overlapping that range (not the huge heaps)
+    static const std::pair<u64, u64> watch = [] {
+        const char* v = std::getenv("SSPC_DIAG_WATCH_BIND");
+        u64 a = 0, s = 0;
+        if (v != nullptr) {
+            char* e = nullptr;
+            a = std::strtoull(v, &e, 16);
+            if (e != nullptr && *e == ':') {
+                s = std::strtoull(e + 1, nullptr, 16);
+            }
+        }
+        return std::pair{a, s};
+    }();
+    const bool watched = watch.second != 0 && out.size <= (256ull << 20) && out.address < watch.first + watch.second &&
+                         out.address + out.size > watch.first;
+    if (out.size <= (256ull << 20) && !watched) {
+        return;
+    }
+    static std::mutex m;
+    static std::set<std::tuple<u64, u64, u64>> seen;
+    const std::scoped_lock lock{m};
+    if (seen.size() >= 256 || !seen.emplace(program_address, out.address, out.size).second) {
+        return;
+    }
+    const auto& d = out.desc;
+    SSPC_LOG(GPU, Info, "REA-1 {} buffer: program {:#x} base {:#x} size {:#x} stride {} records {:#x} written {} "
+                        "formatted {} V# {:08x} {:08x} {:08x} {:08x}; sharp summary {} dwords {} offsets {} {} {} {} imm {:08x} {:08x} "
+                        "{:08x} {:08x} mask {:#x}",
+             watched ? "watched" : "huge", program_address, out.address, out.size, d.Stride(), d.NumRecords(), out.written,
+             out.formatted, d.raw[0], d.raw[1],
+             d.raw[2], d.raw[3], static_cast<int>(b.sharp.summary), b.sharp.dwords, b.sharp.offsets[0], b.sharp.offsets[1],
+             b.sharp.offsets[2], b.sharp.offsets[3], b.sharp.immediates[0], b.sharp.immediates[1], b.sharp.immediates[2],
+             b.sharp.immediates[3], b.sharp.load_mask);
+}
+
 /// The image type a view of `type` has (the bridge's GetViewType: arrays seen without their array index are single).
 u32 ViewType(u32 type, bool is_array) {
     if (!is_array && (type == 12 || type == 13 || type == 15)) { // 1D array, 2D array, 2D MSAA array
@@ -811,6 +862,7 @@ void DecodeResources(const ShaderReflection& r, const BindingStart& start, const
                 } else if (!InGpuSpace(out.address, out.size)) {
                     out.status = ResourceStatus::OutOfRange;
                 }
+                DiagHugeBuffer(program_address, out, b);
             }
         }
         Count(plan, out.status);

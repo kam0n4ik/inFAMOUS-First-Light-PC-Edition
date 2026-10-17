@@ -5,6 +5,7 @@
 #include "runtime/gpu/page_tracker.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -600,8 +601,27 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
     u8* run_host = nullptr;
     u64 run_begin = 0, run_size = 0;
     GuestMemory* gm = GetGuestMemory();
-    const bool backed = gm != nullptr && gm->BackingRun(addr, &run_host, &run_begin, &run_size) &&
-                        run_begin <= addr && end <= run_begin + run_size && (run_begin % align) == 0 &&
+    const bool have_run = gm != nullptr && gm->BackingRun(addr, &run_host, &run_begin, &run_size);
+    // REA-4 (SSPC_REA_MERGE_RUNS=1): the physical backing is one host allocation; runs that follow each other in both the
+    // guest's and the host's addresses are one view (the game's 542 MiB vertex-data heap crosses such a seam: imported
+    // through the guest's own pages it made its whole window untrackable - every constant buffer in it read over PCIe)
+    static const bool merge_runs = [] {
+        const char* v = std::getenv("SSPC_REA_MERGE_RUNS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    if (have_run && merge_runs) {
+        while (run_begin + run_size < end) {
+            u8* next_host = nullptr;
+            u64 next_begin = 0, next_size = 0;
+            if (!gm->BackingRun(run_begin + run_size, &next_host, &next_begin, &next_size) || next_size == 0 ||
+                next_begin != run_begin + run_size || next_host != run_host + run_size) {
+                break;
+            }
+            run_size += next_size;
+            ++stats_.merged_runs;
+        }
+    }
+    const bool backed = have_run && run_begin <= addr && end <= run_begin + run_size && (run_begin % align) == 0 &&
                         (reinterpret_cast<u64>(run_host) % align) == 0;
     if (backed) {
         lo = run_begin;
@@ -627,6 +647,15 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
             host = run_host + (tries[i].base - run_begin);
         } else if (tracker_ != nullptr) {
             tracker_->NeverArm(tries[i].base, tries[i].size);
+            static const bool diag = [] {
+                const char* lb = std::getenv("SSPC_DIAG_LARGE_BINDS");
+                return lb != nullptr && lb[0] == '1' && lb[1] == '\0';
+            }();
+            if (diag) { // REA-1: which range made a window of the guest's own pages (never tracked again)
+                SSPC_LOG(GPU, Info, "REA-1 import without backing: window [{:#x}, +{:#x}) for [{:#x}, {:#x}); backing run "
+                                    "[{:#x}, +{:#x}) host {}", tries[i].base, tries[i].size, addr, end, run_begin, run_size,
+                         static_cast<const void*>(run_host));
+            }
         }
         if (Import(tries[i].base, tries[i].size, host, w, error)) {
             w.backing = backed;

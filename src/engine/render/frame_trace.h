@@ -44,4 +44,12 @@ bool InstallCriticalComputeFromEnvironment(u64 eboot_base);
 /// at step 5 before it returns and reuses frame k-1's buffers. The same window before the guest runs.
 bool InstallEarlySubmitFromEnvironment(u64 eboot_base);
 
+/// REA-3 (SSPC_REA_DEFER_WAIT_B=1, an experiment, off by default; docs/REA_ENGINE_REVERSE.md): the frame's second async
+/// compute wait (0x3ee470's tail call to 0x1695e0, return 0x29cd5b in the main loop) waits for the particles' light DMA
+/// (0x3f3ed0: GPU-made light records copied into the frame's light list), which the frame's graphics reads. The game
+/// thread does not block there: the next graphics submission starts with WAIT_REG_MEM(label >= target)
+/// (Gpu::Gnm::SetGraphicsGate). The first wait (0x3edef0: the CPU reads emitter state) stays. After
+/// InstallCriticalComputeFromEnvironment.
+bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base);
+
 } // namespace SecondSon::Engine::Render::Trace

@@ -45,6 +45,20 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
         SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BUFFER_CACHE=off - the buffer cache is disabled for this run");
         return;
     }
+    if (char hr[4] = {}; GetEnvironmentVariableA("SSPC_REA_HEAP_READS", hr, sizeof(hr)) == 1 && hr[0] == '1') {
+        heap_reads_ = true;
+        SSPC_LOG(GPU, Warning, "REA-2: SSPC_REA_HEAP_READS=1 - the game's vertex-data heaps (read-only bindings >= 256 MiB) "
+                               "do not write back GPU-written data in their range");
+    }
+    if (char po[4] = {}; GetEnvironmentVariableA("SSPC_REA_POISON", po, sizeof(po)) == 1 && po[0] == '1') {
+        poison_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC (correctness test): SSPC_REA_POISON=1 - the host copy of every kept-back block "
+                               "is filled with 0xFFFFFFFF until a reader writes it back");
+    }
+    if (char lb[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_LARGE_BINDS", lb, sizeof(lb)) == 1 && lb[0] == '1') {
+        diag_large_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_LARGE_BINDS=1 - bindings left on the host import are counted");
+    }
     char hw[8] = {};
     if (GetEnvironmentVariableA("SSPC_DIAG_BIND_HOST_WAIT", hw, sizeof(hw)) == 1 && hw[0] == '1') {
         host_wait_binds_ = true;
@@ -583,7 +597,17 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         // import. Kept coherent with the video memory copy: what the GPU wrote there in this batch is copied back to
         // the host before this command, and a write here makes the video memory copy older.
         ++stats_.large_ranges;
-        FlushWritten(addr, size, cb, seq);
+        if (diag_large_) {
+            const u8 why = size > kMaxCached ? 0 : stats_.resident_bytes >= budget_ ? 1 : 2;
+            if (++large_binds_[{addr, size, why, write}] == 1 && size >= kHeapMin) {
+                DiagHeapLayout(addr, size);
+            }
+        }
+        if (heap_reads_ && !write && size >= kHeapMin) {
+            ++heap_unflushed_; // REA-2: a vertex-data heap - GPU-written data in its range is not what it reads
+        } else {
+            FlushWritten(addr, size, cb, seq);
+        }
         if (write) {
             Invalidate(addr, size);
             NoteHostWrite(addr, size, seq);
@@ -597,6 +621,9 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
     const bool bound = EnsureBound(first_block, last_block);
     stats_.t_bound += Gpu::Shader::FineTicks() - t0;
     if (!bound) {
+        if (diag_large_) {
+            ++large_binds_[{addr, size, u8{3}, write}];
+        }
         FlushWritten(addr, size, cb, seq);
         if (write) {
             Invalidate(addr, size);
@@ -705,6 +732,80 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
     out = {buffer_, addr, space_ - addr, true};
     prep_memo_[prep_next_++ % prep_memo_.size()] = {addr, size, seq, valid_gen_, write};
     return true;
+}
+
+void BufferCache::DiagHeapLayout(u64 addr, u64 size) {
+    // REA-4: how much of a heap binding is GPU-mapped (64 KiB blocks), whether the tracker could arm it, and its chain of
+    // physical backing runs (host-contiguous or not) - whether it could live in video memory
+    GuestMemory* gm = GetGuestMemory();
+    const u64 end = addr + size;
+    u64 mapped = 0, armable = 0, never = 0;
+    for (u64 b = addr & ~0xFFFFull; b < end; b += 0x10000) {
+        if (GuestMemory::IsValidGpuMapping(b, 0x10000)) {
+            mapped += 0x10000;
+            (tracker_ != nullptr && tracker_->CanArm(b, 0x10000) ? armable : never) += 0x10000;
+        }
+    }
+    SSPC_LOG(GPU, Info, "REA-4 heap [{:#x}, +{:#x}): GPU-mapped {} MiB (armable {} MiB, never armable {} MiB)", addr, size,
+             mapped >> 20, armable >> 20, never >> 20);
+    u64 cur = addr;
+    u8* prev_host = nullptr;
+    u64 prev_end = 0;
+    for (int i = 0; i < 64 && cur < end && gm != nullptr; ++i) {
+        u8* host = nullptr;
+        u64 rb = 0, rs = 0;
+        if (!gm->BackingRun(cur, &host, &rb, &rs) || rs == 0) {
+            SSPC_LOG(GPU, Info, "REA-4   no backing run at {:#x}", cur);
+            cur = (cur + 0x10000) & ~0xFFFFull;
+            prev_host = nullptr;
+            continue;
+        }
+        const bool contiguous = prev_host != nullptr && rb == prev_end && host == prev_host;
+        SSPC_LOG(GPU, Info, "REA-4   run [{:#x}, +{:#x}) host {} {}", rb, rs, static_cast<const void*>(host),
+                 contiguous ? "(host-contiguous with the previous run)" : "");
+        prev_host = host + rs;
+        prev_end = rb + rs;
+        cur = rb + rs;
+    }
+}
+
+std::string BufferCache::LargeBindReport() const {
+    if (!diag_large_) {
+        return {};
+    }
+    std::vector<std::pair<u64, std::tuple<u64, u64, u8, bool>>> v;
+    u64 total = 0;
+    for (const auto& [k, n] : large_binds_) {
+        v.emplace_back(n, k);
+        total += n;
+    }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    static constexpr const char* kWhy[] = {"larger than 16 MiB", "over budget", "cannot arm (import window)", "not bound"};
+    std::string out = fmt::format("REA-1 large binds: {} distinct, {} bindings\n", v.size(), total);
+    const auto top = [&](const std::map<u64, u64>& m, const char* what, u64 unit) {
+        std::vector<std::pair<u64, u64>> s(m.begin(), m.end());
+        std::sort(s.begin(), s.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        u64 sum = 0;
+        for (const auto& e : s) {
+            sum += e.second;
+        }
+        out += fmt::format("REA-1 {} by 1 MiB of address (total {}):\n", what, sum / unit);
+        for (size_t i = 0; i < s.size() && i < 24; ++i) {
+            out += fmt::format("  {:#x} {}\n", s[i].first << 20, s[i].second / unit);
+        }
+    };
+    top(diag_wb_, "changed-words write-back MiB", 1ull << 20);
+    top(diag_kept_, "blocks kept back", 1);
+    // the most frequent, then every range over the particle pools' area (0x26c000000..0x271000000) whatever its count
+    for (size_t i = 0; i < v.size(); ++i) {
+        const auto& [addr, size, why, write] = v[i].second;
+        const bool particles = addr < 0x271000000ull && addr + size > 0x26c000000ull;
+        if (i < 40 || particles) {
+            out += fmt::format("  {:>9} {:#x}+{:#x} {} {}{}\n", v[i].first, addr, size, write ? "W" : "R", kWhy[why],
+                               particles ? " [particle area]" : "");
+        }
+    }
+    return out;
 }
 
 void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) {
@@ -985,6 +1086,7 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
     }();
     (void)align;
     std::vector<std::pair<u64, u64>> segs;
+    std::vector<u64> poison_blocks; // (REA-2 SSPC_REA_POISON)
     for (const Diff& d : diffs) {
         // FB-7: the blocks wholly inside the range kept back (hidden) - the rest written back now
         segs.clear();
@@ -1002,6 +1104,12 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
                         ++deferred_count_;
                         deferred_set_.insert(blk);
                         ++stats_.lazy_deferred;
+                        if (diag_large_) {
+                            ++diag_kept_[blk >> 4]; // (1 MiB buckets)
+                        }
+                        if (poison_) {
+                            poison_blocks.push_back(blk);
+                        }
                         keep = true;
                     }
                 }
@@ -1041,6 +1149,36 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
         }
         d.sh->valid = in_step; // the shadow now holds what the host has (where the GPU wrote: the GPU's words)
     }
+    // REA-2 correctness test (SSPC_REA_POISON=1): the host copy of the blocks kept back now and their shadow's bytes
+    // are 0xFFFFFFFF - a reader of the host copy that is not written back first sees the poison; the write-back (the
+    // changed words against the shadow) still restores every word that differs
+    if (!poison_blocks.empty()) {
+        const VkMemoryBarrier2 pb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+        const VkDependencyInfo pdep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                    .pMemoryBarriers = &pb};
+        f.vkCmdPipelineBarrier2(cb, &pdep);
+        constexpr u64 kBlock = 1ull << kBlockBits;
+        for (const u64 blk : poison_blocks) {
+            const u64 a = blk << kBlockBits;
+            GuestBuffers::View v{};
+            GuestBuffers::Failure fl{};
+            if (guest_.Get(a, kBlock, seq, v, fl) && (v.offset & 3) == 0) {
+                f.vkCmdFillBuffer(cb, v.buffer, v.offset, kBlock, 0xFFFFFFFFu);
+            }
+            for (const WbShadow& sh : wb_shadows_) {
+                if (sh.buffer != VK_NULL_HANDLE && sh.addr <= a && a + kBlock <= sh.addr + sh.size) {
+                    f.vkCmdFillBuffer(cb, sh.buffer, a - sh.addr, kBlock, 0xFFFFFFFFu);
+                }
+            }
+            ++poisoned_blocks_;
+        }
+        f.vkCmdPipelineBarrier2(cb, &pdep);
+        poison_blocks.clear();
+    }
 }
 
 void BufferCache::DiffPiece(VkCommandBuffer cb, u64 a, u64 piece, const WbShadow& sh, VkBuffer host, u64 host_offset) {
@@ -1066,6 +1204,9 @@ void BufferCache::DiffPiece(VkCommandBuffer cb, u64 a, u64 piece, const WbShadow
     f.vkCmdDispatch(cb, static_cast<u32>((piece / 4 + 255) / 256), 1, 1);
     stats_.wb_diff_bytes += piece;
     ++stats_.wb_diff_dispatches;
+    if (diag_large_) {
+        diag_wb_[a >> 20] += piece;
+    }
 }
 
 bool BufferCache::KeptBack(u64 addr, u64 size) const {

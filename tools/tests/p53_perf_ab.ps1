@@ -66,6 +66,11 @@ $defs = @{
     fb7_nohost   = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_DIAG_MEASURE=wb_nohost"
     # FB-7: large GPU-written ranges' blocks kept back from the host until a reader needs them (vk_buffer_cache.h)
     fb7_lazy     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_LAZY_WB=1"
+    # REA-2: + the vertex-data heaps' host-import readings do not write back GPU-only data (docs/REA_ENGINE_REVERSE.md)
+    rea_heap     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_LAZY_WB=1;SSPC_REA_HEAP_READS=1"
+    # REA-4: host-contiguous backing runs merged (the 542 MiB heap's window trackable: its constants in video memory)
+    rea_merge    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_REA_MERGE_RUNS=1"
+    rea_all      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_REA_MERGE_RUNS=1;SSPC_FB_LAZY_WB=1;SSPC_REA_HEAP_READS=1"
     # CP-8 (the village's async compute wait): the compute ring's read pointer after every packet (the old path), the
     # compute queues' packets per round, compute first in a round
     cp8_base     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_RPTR_EVERY_PACKET=1"
