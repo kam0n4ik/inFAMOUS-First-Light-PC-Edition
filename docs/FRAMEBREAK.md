@@ -134,6 +134,18 @@ A/B (`logs/fb7/fb7_fgc_*`, FSR 3.1 Quality + FSR frame generation, unlimited, 2 
 Displayed = 2x the game's frames. `[Error]` 0, no wait timed out. The mission a10 save (the earlier deadlock) 150 s:
 no hang, game frames up to 104/s (displayed 209/s), avg 53 FPS.
 
+## FB-7: the machine's "slow mode" (not reproduced)
+
+FB-6's series had runs with the processor 2-4 ms slower (CP 20-24 ms against ~18.5). Each A/B run now also samples, once
+a second, the CPU's performance (% Processor Performance, the clock as % of base), system context switches and each
+core's load (`perf.csv`, WMI; `tools/framebreak/slow_mode.py` lines them up with FPS and CP time). Two series of the
+current build, 21 runs in a row (`logs/p53/fb7_slowmode`, `fb7_slowmode2`, unlimited pacing): **none slow** - beach
+54.2-55.9 FPS (CP 17.85-18.24 ms), harbour 49.0-51.8 (19.06-20.34), village 39.6-40.3 (20.27-20.98); the CPU at
+114-115 % of its base clock in every run (~4.1 GHz boost, no drop), 22-26 thousand context switches a second, the game
+at 2.9-3.7 cores, no core saturated. The slow runs of FB-6 (night of 2026-10-17, 00:20-00:58) fell into a time when
+other work ran on this machine; with nothing else running the effect did not appear. They stay in FB-6's statistics
+as measured; the sampler now records the clock and load of any future slow run.
+
 ## FB-7: the village's GPU - the write-backs (measured)
 
 GPU time per command (`SSPC_GPU_PROFILE=1`, `logs/fb7/fb7_prof*`, village, unlimited pacing; timestamps after every
