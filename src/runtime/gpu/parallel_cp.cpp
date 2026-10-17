@@ -635,7 +635,7 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
         // thread 2 to get there first (not a drain of thread 1's later records).
         const u64 k = p_.f_current_;
         bool ask = p_.head_.load(std::memory_order_acquire) == k;
-        if (!ask && p_.MayBeGpuWritten(addr, bytes)) {
+        if (!ask && (p_.MayBeGpuWritten(addr, bytes) || p_.exec_.KeptBack(addr, bytes))) { // (FB-7: kept back)
             Bump(p_.fc_.read_hits);
             p_.FrontWaitExecuted(k);
             ask = true;
@@ -647,7 +647,7 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
     } else if (p_.Idle()) {
         p_.ApplyPending();
         Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0); // (exact: TimelineReader's check)
-    } else if (p_.MayBeGpuWritten(addr, bytes)) {
+    } else if (p_.MayBeGpuWritten(addr, bytes) || p_.exec_.KeptBack(addr, bytes)) { // (FB-7: kept back)
         Bump(p_.fc_.read_hits);
         p_.Drain(DrainReason::FrontendRead);
         Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
@@ -902,6 +902,13 @@ void ParallelCp::Loop() {
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
     // (with the frontend thread, the records it prepared: fhead_)
     std::atomic<u64>& source = fthread_mode_ ? fhead_ : tail_;
+    // FB-7 (SSPC_FB_LAZY_WB): another thread's request for kept-back blocks is served after a record, before it is
+    // published as executed (thread 1 uses the executor only once every record is: never both at once); with the
+    // queue empty, thread 1 serves them (Backend::Loop)
+    const bool lazy = exec_.Lazy();
+    if (lazy) {
+        exec_.SetRecordThread();
+    }
     for (;;) {
         u64 t = source.load(std::memory_order_acquire);
         if (t == h) {
@@ -933,6 +940,9 @@ void ParallelCp::Loop() {
         const u64 queue = r.kind == Kind::Dispatch ? r.dispatch.queue : 0; // (P5.4: the guest queue in the trace)
         if (!stop) {
             Execute(r, h);
+            if (lazy) {
+                exec_.ServeKeptBack();
+            }
             if (rec_value_ != nullptr) {
                 rec_value_[h & (kRecRing - 1)].store(exec_.RecordedValue(), std::memory_order_relaxed);
             }

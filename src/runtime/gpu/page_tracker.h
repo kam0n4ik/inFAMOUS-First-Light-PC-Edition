@@ -44,6 +44,23 @@ public:
     /// The faulting thread: true when a write faulted on an armed page (now writable again) — resume.
     bool OnFault(u64 address, bool is_write);
 
+    // FrameBreak FB-7 (SSPC_FB_LAZY_WB): a hidden block's video memory copy is newer than the host's and was not written
+    // back - its armed pages get no access on the guest's view (never on a Vulkan import), so any CPU access faults;
+    // the fault calls the sync function (the GPU writes the block back, the call returns once that completed), then the
+    // block is shown again (armed pages read-only) and the access retries.
+    using HiddenSync = void (*)(void* ctx, u64 block_addr);
+    void SetHiddenSync(HiddenSync fn, void* ctx) {
+        hidden_sync_ctx_ = ctx;
+        hidden_sync_ = fn;
+    }
+    /// Hides the 64 KiB block at `block_addr` when every page of it is armed (true). GPU thread.
+    bool Hide(u64 block_addr);
+    /// Shows it again (armed pages read-only). Any thread.
+    void Unhide(u64 block_addr);
+    /// Some block of [addr, addr + size) is hidden. Any thread.
+    bool Hidden(u64 addr, u64 size) const;
+    u64 HiddenFaults() const { return hidden_faults_.load(std::memory_order_relaxed); }
+
     /// Calls `fn(addr, size)` for every range written since the last drain (adjacent blocks coalesced). GPU thread.
     template <class F>
     void Drain(F&& fn) {
@@ -109,6 +126,13 @@ private:
     std::atomic<u64>* written_ = nullptr; ///< one bit per block
     std::atomic<u64>* summary_ = nullptr; ///< one bit per written_ word
     std::atomic<u64>* never_ = nullptr;   ///< one bit per block imported through the guest's pages
+    std::atomic<u64>* hidden_ = nullptr;  ///< one bit per block (FB-7)
+    bool IsHidden(u64 block) const {
+        return (hidden_[block / 64].load(std::memory_order_acquire) >> (block % 64)) & 1;
+    }
+    std::atomic<HiddenSync> hidden_sync_{nullptr};
+    void* hidden_sync_ctx_ = nullptr;
+    std::atomic<u64> hidden_faults_{0};
     std::atomic<bool> any_{false};
     std::atomic<u64> armed_pages_{0}, arms_{0}, disarms_{0}, faults_{0}, faults_raced_{0}, forgotten_{0};
     std::atomic<u64> never_blocks_{0};

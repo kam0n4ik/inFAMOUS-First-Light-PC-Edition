@@ -31,7 +31,7 @@ bool PageTracker::Start(GuestMemory& memory, std::string& error) {
         error = "the page tracker is already started";
         return false;
     }
-    const u64 bytes = (kPages + kBlocks + kWrittenWords + kBlocks) / 8;
+    const u64 bytes = (kPages + kBlocks + kWrittenWords + kBlocks + kBlocks) / 8;
     void* p = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (p == nullptr) {
         error = "the page tracker's bitmaps could not be allocated";
@@ -41,6 +41,7 @@ bool PageTracker::Start(GuestMemory& memory, std::string& error) {
     written_ = armed_ + kPages / 64;
     summary_ = written_ + kWrittenWords;
     never_ = summary_ + kSummaryWords;
+    hidden_ = never_ + kBlocks / 64;
     memory_ = &memory;
     if (char v[64] = {}; GetEnvironmentVariableA("SSPC_DIAG_READ_WATCH", v, sizeof(v)) > 0) {
         char* p = v;
@@ -79,7 +80,79 @@ u64 PageTracker::Release(u64 first, u64 last, bool protect) {
         }
     }
     armed_pages_.fetch_sub(released, std::memory_order_relaxed);
+    // (FB-7: a hidden block given back is shown - Forget of unmapped memory, Disarm: the buffer cache sees it no longer
+    // hidden and drops what it kept back)
+    constexpr u64 kShift = kBlockBits - kPageBits;
+    if (first < last) {
+        for (u64 block = first >> kShift; block <= (last - 1) >> kShift; ++block) {
+            hidden_[block / 64].fetch_and(~(1ull << (block % 64)), std::memory_order_acq_rel);
+        }
+    }
     return released;
+}
+
+bool PageTracker::Hide(u64 block_addr) {
+    if (memory_ == nullptr || block_addr >= (1ull << kAddressBits)) {
+        return false;
+    }
+    const u64 block = block_addr >> kBlockBits;
+    const u64 first = block << (kBlockBits - kPageBits), n = 1ull << (kBlockBits - kPageBits);
+    Lock lock;
+    if (IsHidden(block)) {
+        return true;
+    }
+    for (u64 p = first; p < first + n; ++p) {
+        if (!Armed(p)) {
+            return false; // (a page the CPU wrote since: its write-back stays eager)
+        }
+    }
+    hidden_[block / 64].fetch_or(1ull << (block % 64), std::memory_order_acq_rel);
+    memory_->ProtectTracking(block << kBlockBits, 1ull << kBlockBits, TrackingProtection::None);
+    return true;
+}
+
+void PageTracker::Unhide(u64 block_addr) {
+    if (memory_ == nullptr || block_addr >= (1ull << kAddressBits)) {
+        return;
+    }
+    const u64 block = block_addr >> kBlockBits;
+    const u64 first = block << (kBlockBits - kPageBits), n = 1ull << (kBlockBits - kPageBits);
+    Lock lock;
+    if (!IsHidden(block)) {
+        return;
+    }
+    hidden_[block / 64].fetch_and(~(1ull << (block % 64)), std::memory_order_acq_rel);
+    // armed pages read-only again, run by run (a page given back meanwhile stays)
+    u64 run = ~0ull;
+    for (u64 p = first; p <= first + n; ++p) {
+        const bool armed = p < first + n && Armed(p);
+        if (armed && run == ~0ull) {
+            run = p;
+        } else if (!armed && run != ~0ull) {
+            memory_->ProtectTracking(run << kPageBits, (p - run) << kPageBits, TrackingProtection::Read);
+            run = ~0ull;
+        }
+    }
+}
+
+bool PageTracker::Hidden(u64 addr, u64 size) const {
+    if (hidden_ == nullptr || size == 0 || addr >= (1ull << kAddressBits)) {
+        return false;
+    }
+    const u64 first = addr >> kBlockBits, last = (std::min(addr + size, 1ull << kAddressBits) - 1) >> kBlockBits;
+    for (u64 w = first / 64; w <= last / 64; ++w) {
+        u64 bits = hidden_[w].load(std::memory_order_acquire);
+        if (bits == 0) {
+            continue;
+        }
+        const u64 lo = w == first / 64 ? first % 64 : 0, hi = w == last / 64 ? last % 64 : 63;
+        bits >>= lo;
+        bits &= hi - lo == 63 ? ~0ull : ((1ull << (hi - lo + 1)) - 1);
+        if (bits != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void PageTracker::Arm(u64 addr, u64 size) {
@@ -95,11 +168,12 @@ void PageTracker::Arm(u64 addr, u64 size) {
         const u64 block = page >> (kBlockBits - kPageBits);
         const bool need = page < last && !Armed(page) &&
                           ((never_[block / 64].load(std::memory_order_acquire) >> (block % 64)) & 1) == 0;
-        // (a run ends where the watched range starts or ends: those pages get no access)
-        const bool split = run != ~0ull && need && Watched(page) != Watched(run);
+        // (a run ends where a watched range or a hidden block starts or ends: those pages get no access)
+        const auto no_access = [&](u64 p) { return Watched(p) || IsHidden(p >> (kBlockBits - kPageBits)); };
+        const bool split = run != ~0ull && need && no_access(page) != no_access(run);
         if (run != ~0ull && (!need || split)) {
             memory_->ProtectTracking(run << kPageBits, (page - run) << kPageBits,
-                                     Watched(run) ? TrackingProtection::None : TrackingProtection::Read);
+                                     no_access(run) ? TrackingProtection::None : TrackingProtection::Read);
             run = ~0ull;
         }
         if (need) {
@@ -188,6 +262,16 @@ bool PageTracker::OnFault(u64 address, bool is_write) {
         return false;
     }
     const u64 page = address >> kPageBits;
+    if (hidden_ != nullptr && IsHidden(page >> (kBlockBits - kPageBits))) {
+        // FB-7: the GPU's copy is written back first (no lock held: the GPU thread arms pages meanwhile), then shown
+        hidden_faults_.fetch_add(1, std::memory_order_relaxed);
+        const u64 block_addr = (page >> (kBlockBits - kPageBits)) << kBlockBits;
+        if (const HiddenSync fn = hidden_sync_.load(std::memory_order_acquire)) {
+            fn(hidden_sync_ctx_, block_addr);
+        }
+        Unhide(block_addr);
+        return true; // (the access retries: a write faults again on the read-only page - the ordinary path)
+    }
     if (!is_write) {
         // SSPC_DIAG_READ_WATCH: a read of a watched armed page - counted, the page read-only again (still armed)
         if (watch_end_ == 0 || !Watched(page)) {

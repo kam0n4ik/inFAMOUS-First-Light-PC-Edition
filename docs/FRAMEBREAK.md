@@ -182,3 +182,45 @@ reads, all in 0x26d76da0c..0x26d776e8c** (~36 KiB of 12 MiB); a window up to 0x2
 per-emitter state buffers after the lists (0x270059f04..0x270157104): 757 557 reads. So the CPU reads a small part of a
 pool (some emitter's particles) and the per-emitter states constantly; a write-back kept back until a reader needs it
 would have to turn a block back to the eager write-back at its first read.
+
+## FB-7: lazy write-back (`SSPC_FB_LAZY_WB=1`, off by default)
+
+At a batch end the 64 KiB blocks wholly inside a large GPU-written range (all pages valid, every page armed) are not
+written back: the block is **hidden** (`PageTracker::Hide`) - its armed pages get no access on the guest's view (never
+the Vulkan import, so not the protection that lost the device before) and the buffer cache keeps it in a set of
+kept-back blocks. Every reader writes them back first (`BufferCache::FlushDeferred`, the changed-words shader against
+the block's shadow, adjacent blocks one dispatch; without a valid shadow a plain copy into the import and the shadows):
+
+- a GPU reader of the host import (`FlushWritten`) - the block stays hidden and is kept back again at the next batch
+  end (no protection change);
+- the executor's CPU-side reads (`TimelineReader::Read`, `SyncForFrontendRead`, `Synchronize`) and the processor's
+  (`Memory::Read` / `WriteGuest`, after a drain);
+- a guest CPU access: the fault (`PageTracker::OnFault`) posts a request (`Executor::RequestKeptBack`), served by
+  the recording thread after its record or by the processor's thread once the queue is drained (it is woken), waits
+  for the batch, then shows the block (armed pages read-only again); such a block is never kept back again (`eager`);
+- the game's own writes reported by the frontend (`OnGuestWrite`): written back before the invalidation.
+
+The parallel processor is required (without it the mode stays off). Checks: `verify` counts what would be kept back
+without doing it; the report counts CPU faults on hidden blocks, invalidations of a still hidden block (an unsynced
+writer: 0 in every run) and the readers by kind. Vulkan validation with synchronization validation, village and beach
+(`logs/fb7/fb7_lazy_val`): 0 messages. The picture matches the eager write-back (screenshots, village).
+
+Village, 90 s: ~100 blocks a frame kept back, written back by a GPU reader of the host import about once a frame
+(~3400 rounds of 90 s; 6-7 thousand runs of adjacent blocks), 6-19 CPU faults a run. Interleaved A/B, same exe
+(`logs/p53/fb7_lazy_ab3`, n = 4; beach from `fb7_lazy_ab`, n = 3, before the runs were merged):
+
+| | eager (`fb_unl`) | lazy (`fb7_lazy`) |
+|---|---|---|
+| village avg FPS | 39.51 [38.99..40.04] | **41.73 [41.51..42.09]** |
+| village 1% low | 33.35 [27.75..35.45] | 33.76 [33.37..34.23] |
+| village frame p95 ms | 27.66 [26.94..29.39] | 28.41 [28.19..28.75] |
+| village GPU busy ms | 20.83 | **18.33** |
+| harbour (`early`) avg FPS | 50.76 [49.76..51.38] | 50.68 [50.40..50.90] |
+| harbour GPU busy ms | 15.28 | 14.35 |
+| beach avg FPS / 1% low | 55.20 / 48.63 | 55.22 / 49.36 |
+
+Three village series agree: average FPS +5 % (41.5-41.7 against 39.3-39.7) and GPU busy -2.4 ms, but **1% low does
+not move and the frame p95 is ~0.8 ms higher** - more frames reach the next vblank interval, the slow frames (the
+command processor's, ~23 ms of CP) stay as slow. The first version cost the harbour 0.5 ms of CP (a dispatch per
+kept-back block); merging adjacent blocks removed it. Left off by default: the goal is the 1% low, which the GPU no
+longer limits in the village - the CP does.

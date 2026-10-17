@@ -116,6 +116,8 @@ struct ExecutorStats {
     /// P4.5 the work after the wait read the older copies)
     u64 acquires = 0, acquires_blocked = 0, acquires_applied = 0;
     u64 waits_by_held = 0; ///< WAIT_REG_MEM met in the GPU's order by a held fence (a barrier before the next command)
+    u64 lazy_served = 0;   ///< FB-7: rounds of kept-back write-backs the recording thread made for another thread
+    u64 lazy_inline = 0;   ///< FB-7: requests the recording thread made itself (a fault on its own thread)
     std::array<u64, 9> gb_sites{}; ///< global barriers by GlobalBarrier site
     u64 barriers_elided = 0; ///< dispatches/timeline copies after writes that touched none of their ranges: no barrier
     u64 barriers_war = 0;    ///< barriers for a write over a range read since the last one (no write pending)
@@ -202,6 +204,29 @@ public:
     bool SyncForFrontendRead(u64 addr, u64 bytes);
     /// The same check without the wait: such a write is pending over [addr, addr + bytes).
     bool FrontendReadPending(u64 addr, u64 bytes);
+
+    // FrameBreak FB-7 (SSPC_FB_LAZY_WB, BufferCache::FlushDeferred): blocks kept back from the host
+    /// The executor's thread (or the processor's with the queue drained): what is kept back over [addr, addr + size)
+    /// written back and completed; `eager`: never kept back again (a CPU access).
+    void SyncKeptBack(u64 addr, u64 size, bool eager);
+    /// Any other thread (the tracker's fault on a hidden block): the same by the executor's thread - posted, the
+    /// recording thread woken (`SetWake`), then waited for.
+    void RequestKeptBack(u64 addr, u64 size);
+    /// The executor's owner of the moment (the recording thread after a record; the processor's with the queue
+    /// empty): the posted requests.
+    void ServeKeptBack();
+    bool KeptBackRequested() const { return lazy_reqs_.load(std::memory_order_acquire) != 0; }
+    void SetWake(void (*fn)(void*), void* ctx) {
+        wake_ctx_ = ctx;
+        wake_.store(fn, std::memory_order_release);
+    }
+    /// Lazy write-back stays off (no recording thread of its own to serve the tracker's faults).
+    void DisableLazy() { buffers_.DisableLazy(); }
+    bool KeptBack(u64 addr, u64 size) const { return buffers_.KeptBack(addr, size); }
+    bool Lazy() const { return buffers_.Lazy() == 1; }
+    bool OnRecordThread() const;
+    /// The parallel processor's recording thread (its own fault on a hidden block is served in place).
+    void SetRecordThread();
     /// P4.10: the timeline value everything recorded so far completes at (the open batch's, else the last submitted).
     u64 RecordedValue() const;
     void CacheAction(const Cp::CacheActionOp& op) override;
@@ -593,6 +618,18 @@ private:
     void BeforeUpload();
     void OnDeviceLost(const char* where, u64 value);
     void SyncFrom(u32 source);
+    /// FB-7: the kept-back blocks over [addr, addr + size) written back in the open batch (no wait). true: some.
+    bool FlushKeptBack(u64 addr, u64 size, bool eager, u32 why);
+    struct LazyReq {
+        std::atomic<u32> state{0}; ///< 0 free, 1 claimed, 2 posted, 3 served (value set)
+        u64 addr = 0, size = 0;
+        std::atomic<u64> value{0};
+    };
+    std::array<LazyReq, 16> lazy_req_{};
+    std::atomic<u32> lazy_reqs_{0};
+    std::atomic<void (*)(void*)> wake_{nullptr};
+    void* wake_ctx_ = nullptr;
+    std::atomic<u32> record_tid_{0}; ///< the recording thread (it serves the requests)
     /// A dispatch's written guest buffers moved to dense shadows: their contents copied in (recorded now, outside
     /// rendering, after the earlier writes); `infos` point at the shadows. FinishShadows copies them back after it.
     void PrepareShadows(const void* plan, std::vector<VkDescriptorBufferInfo>& infos, u64 workgroups);

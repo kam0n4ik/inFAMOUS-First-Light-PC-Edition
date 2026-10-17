@@ -194,6 +194,8 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
       frontend_(frontend), presenter_(presenter), gds_(gds), options_(options) {
     images_.SetBeforeUpload([](void* self) { static_cast<Executor*>(self)->BeforeUpload(); }, this);
     buffers_.SetBeforeUpload([](void* self) { static_cast<Executor*>(self)->BeforeUpload(); }, this);
+    // (FB-7: a kept-back write-back bound its own compute pipeline and pushed its constants inside the batch)
+    buffers_.SetAfterDispatch([](void* self) { static_cast<Executor*>(self)->push_layout_ = VK_NULL_HANDLE; }, this);
     if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_BIND_SHADOW", v, sizeof(v)) == 2 && std::string_view(v) == "on") {
         bind_shadow_ = true;
         SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_DIAG_BIND_SHADOW=on - descriptor pushes and buffer bindings a draw "
@@ -1618,6 +1620,7 @@ bool Executor::TimelineReader::Read(u64 addr, void* dst, u64 bytes) {
                e_.buffers_.HostWritePending(addr, bytes)) {
         // a shader's write the host does not have yet (its batch has not completed): the frontend reads after it
         ++e_.stats_.gpu_write_read_syncs;
+        e_.FlushKeptBack(addr, bytes, false, 1); // (FB-7)
         e_.SyncFrom(1);
     }
     // P4.7: a run of the physical backing read before (its host view: the same bytes CopySparse copies)
@@ -1924,7 +1927,107 @@ bool Executor::WaitOldest(u64 timeout_ns) {
 
 void Executor::Synchronize(u32) {
     const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
+    FlushKeptBack(0, 1ull << 40, false, 1); // (FB-7: the CPU side may read anything after it)
     SyncFrom(0);
+}
+
+bool Executor::FlushKeptBack(u64 addr, u64 size, bool eager, u32 why) {
+    if (!buffers_.AnyDeferred() || !Begin()) {
+        return false;
+    }
+    if (!buffers_.FlushDeferred(addr, size, cur_.cb, cur_.value, eager, why)) {
+        return false;
+    }
+    ++commands_; // (the batch is submitted by the sync that follows)
+    return true;
+}
+
+void Executor::SyncKeptBack(u64 addr, u64 size, bool eager) {
+    if (FlushKeptBack(addr, size, eager, 2)) {
+        SyncFrom(2);
+    } else if (KeptBack(addr, size)) {
+        SyncFrom(2); // (written back by a batch not completed yet)
+    }
+    buffers_.Collect(timeline_.Completed()); // (shown again once completed)
+}
+
+bool Executor::OnRecordThread() const {
+    return GetCurrentThreadId() == record_tid_.load(std::memory_order_relaxed);
+}
+
+void Executor::RequestKeptBack(u64 addr, u64 size) {
+    if (OnRecordThread()) {
+        ++stats_.lazy_inline; // (the recording thread itself: no one else to wait for)
+        SyncKeptBack(addr, size, true);
+        return;
+    }
+    LazyReq* r = nullptr;
+    while (r == nullptr && !Failed()) {
+        for (LazyReq& q : lazy_req_) {
+            u32 free = 0;
+            if (q.state.compare_exchange_strong(free, 1, std::memory_order_acq_rel)) {
+                r = &q;
+                break;
+            }
+        }
+        if (r == nullptr) {
+            Sleep(0);
+        }
+    }
+    if (r == nullptr) {
+        return;
+    }
+    r->addr = addr;
+    r->size = size;
+    r->state.store(2, std::memory_order_release);
+    lazy_reqs_.fetch_add(1, std::memory_order_acq_rel);
+    for (u32 spins = 0; r->state.load(std::memory_order_acquire) != 3 && !Failed(); ++spins) {
+        if (const auto wake = wake_.load(std::memory_order_acquire); wake != nullptr && spins % 64 == 0) {
+            wake(wake_ctx_);
+        }
+        Sleep(spins < 64 ? 0 : 1);
+    }
+    const u64 v = r->value.load(std::memory_order_acquire);
+    r->state.store(0, std::memory_order_release);
+    while (v != 0 && !Failed() && !timeline_.Wait(v, 1'000'000'000ull)) {
+        if (timeline_.Lost()) {
+            break;
+        }
+    }
+}
+
+void Executor::SetRecordThread() {
+    record_tid_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+}
+
+void Executor::ServeKeptBack() {
+    if (lazy_reqs_.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    LazyReq* served[16];
+    u32 n = 0;
+    for (LazyReq& q : lazy_req_) {
+        if (q.state.load(std::memory_order_acquire) == 2) {
+            FlushKeptBack(q.addr, q.size, true, 3);
+            served[n++] = &q;
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+    u64 v = 0;
+    if (open_ && commands_ > 0) {
+        v = cur_.value;
+        Flush();
+    } else if (!in_flight_.empty()) {
+        v = in_flight_.back().value; // (written back by a batch already submitted)
+    }
+    ++stats_.lazy_served;
+    for (u32 i = 0; i < n; ++i) {
+        served[i]->value.store(v, std::memory_order_release);
+        served[i]->state.store(3, std::memory_order_release);
+        lazy_reqs_.fetch_sub(1, std::memory_order_acq_rel);
+    }
 }
 
 void Executor::SyncFrom(u32 source) {
@@ -2010,6 +2113,7 @@ bool Executor::SyncForFrontendRead(u64 addr, u64 bytes) {
     }
     if (buffers_.GpuWritePending(addr, bytes, timeline_.CompletedCached()) || buffers_.HostWritePending(addr, bytes)) {
         ++stats_.gpu_write_read_syncs;
+        FlushKeptBack(addr, bytes, false, 1); // (FB-7)
         SyncFrom(1);
         return true;
     }

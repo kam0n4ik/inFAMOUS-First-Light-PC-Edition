@@ -90,6 +90,7 @@ public:
         } else if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {
             executor->SyncFromMemoryRead();
         }
+        KeptBack(addr, bytes);
         GuestMemory* gm = GetGuestMemory();
         if (gm == nullptr || !GuestMemory::IsValidGpuMapping(addr, bytes)) {
             return false;
@@ -129,7 +130,19 @@ public:
         }
         return WriteGuest(addr, src, bytes);
     }
+    /// FB-7: the processor reads or writes guest memory the GPU kept back from the host: written back first (the
+    /// queue drained: the executor is this thread's then).
+    void KeptBack(u64 addr, u64 bytes) {
+        if (executor == nullptr || !executor->KeptBack(addr, bytes)) {
+            return;
+        }
+        if (parallel != nullptr && !executor->OnRecordThread()) {
+            parallel->Drain(DrainReason::MemoryRead);
+        }
+        executor->SyncKeptBack(addr, bytes, true);
+    }
     bool WriteGuest(u64 addr, const void* src, u64 bytes) {
+        KeptBack(addr, bytes);
         GuestMemory* gm = GetGuestMemory();
         if (gm == nullptr || !GuestMemory::IsValidGpuMapping(addr, bytes)) {
             return false;
@@ -255,8 +268,26 @@ public:
         Invalidate(addr, size);
     }
     void OnGuestWrite(u64 addr, u64 size) override {
+        SyncHidden(addr, size); // (FB-7: what the GPU kept back there first)
         Invalidate(addr, size);
     }
+    /// FB-7: blocks of [addr, addr + size) kept back from the host written back (and completed) - any thread but the
+    /// processor's (it drains the queue first: SyncHiddenFromProcessor).
+    void SyncHidden(u64 addr, u64 size) {
+        if (!executor_ || !tracker_.Hidden(addr, size)) {
+            return;
+        }
+        if (GetCurrentThreadId() == loop_tid_.load(std::memory_order_relaxed)) {
+            // (the processor's own thread: the one that would serve the request - drained, then in place)
+            if (parallel_) {
+                parallel_->Drain(DrainReason::MemoryRead);
+            }
+            executor_->SyncKeptBack(addr, size, true);
+            return;
+        }
+        executor_->RequestKeptBack(addr, size);
+    }
+    std::atomic<u32> loop_tid_{0}; ///< Loop's thread (FB-7)
 
     // ---- VideoOut::Sink (the present thread)
     bool Ready(u64 value) override {
@@ -766,6 +797,15 @@ bool Backend::Start(const Options& o, std::string& error) {
     }
     images_->SetTracker(&tracker_);
     guest_->SetTracker(&tracker_);
+    // FB-7 (SSPC_FB_LAZY_WB): a CPU access of a block kept back from the host waits for its write-back (served by the
+    // parallel processor's recording thread; without one the write-back stays as it was)
+    if (parallel_) {
+        tracker_.SetHiddenSync([](void* ctx, u64 block) { static_cast<Backend*>(ctx)->SyncHidden(block, 1ull << 16); },
+                               this);
+        executor_->SetWake([](void* ctx) { static_cast<Backend*>(ctx)->cv_.notify_one(); }, this);
+    } else {
+        executor_->DisableLazy();
+    }
     frontend_->SetCodeTracker(
         [](void* ctx, u64 addr, u64 size) {
             auto* t = static_cast<PageTracker*>(ctx);
@@ -966,6 +1006,7 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
     StallTrace::RegisterThread(StallTrace::Role::Cp);
+    loop_tid_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     std::deque<Submission> local;
     auto rate_t0 = std::chrono::steady_clock::now();
     u64 rate_flips = 0, rate_draws = 0, rate_record = 0, rate_wait = 0, rate_tw = 0, rate_gpu = 0, rate_submit = 0;
@@ -1299,6 +1340,14 @@ void Backend::Loop() {
             idle_.store(true, std::memory_order_release);
             Gnm::RaiseInterrupt(Gnm::Interrupt::GpuIdle);
         }
+        if (executor_->KeptBackRequested()) {
+            // FB-7: a CPU access of a block kept back from the host waits - served here once the queue is drained (the
+            // executor is this thread's then; the recording thread serves them after its records otherwise)
+            if (parallel_) {
+                parallel_->Drain(DrainReason::MemoryRead);
+            }
+            executor_->ServeKeptBack();
+        }
         const auto idle_t0 = Clock::now();
         const u64 idle_tsc = StallTrace::On() ? StallTrace::Now() : 0; // (P4.12)
         const bool busy = executor_->Busy();
@@ -1324,7 +1373,9 @@ void Backend::Loop() {
             executor_->WaitOldest(1'000'000); // 1 ms: completion unblocks labels
         } else {
             std::unique_lock lock{mutex_};
-            cv_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !queue_.empty() || stop_.load(); });
+            cv_.wait_for(lock, std::chrono::milliseconds(1), [&] {
+                return !queue_.empty() || stop_.load() || executor_->KeptBackRequested(); // (FB-7: a request wakes)
+            });
         }
         const u64 idle_ns = ns_since(idle_t0);
         if (idle_tsc != 0) {
@@ -1969,6 +2020,18 @@ std::string Backend::Report() {
         out += fmt::format("write-backs of changed words only (large ranges): {} MiB compared in {} dispatches, shadows "
                            "made from the host {}; prepares answered by the batch's memo {}\n",
                            b.wb_diff_bytes >> 20, b.wb_diff_dispatches, b.wb_shadow_inits, b.prep_memo_hits);
+        if (buffers_->Lazy() != 0) {
+            const auto& es = executor_->Stats();
+            out += fmt::format("FB-7 lazy write-back ({}): blocks kept back {}, would have been {}; written back by a "
+                               "reader {} times ({} blocks, {} runs of several, {} without a shadow); CPU faults on hidden blocks {}, "
+                               "served for other threads {} (on the recording thread itself {}); exact invalidations "
+                               "of a hidden block {}, dropped (unmapped) {}; written back by a GPU reader of the host "
+                               "import {}, the executor's CPU-side reads {}, the processor {}, a request {}\n",
+                               buffers_->Lazy() == 1 ? "on" : "verify", b.lazy_deferred, b.lazy_would_defer,
+                               b.lazy_flushes, b.lazy_flush_blocks, b.lazy_flush_runs, b.lazy_flush_plain, tracker_.HiddenFaults(),
+                               es.lazy_served, es.lazy_inline, b.lazy_unsynced_inval, b.lazy_dropped,
+                               b.lazy_flush_by[0], b.lazy_flush_by[1], b.lazy_flush_by[2], b.lazy_flush_by[3]);
+        }
         out += fmt::format("uploads by bindings (P4.9): prepares that uploaded {}, pages brought along with their block's "
                            "first missing page {} (blocks not importable whole {})\n",
                            b.n_upload_calls, b.block_upload_pages, b.block_upload_refused);

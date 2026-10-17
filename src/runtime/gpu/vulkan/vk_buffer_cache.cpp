@@ -224,6 +224,20 @@ void BufferCache::ApplyInvalidations() {
                 if (blk.valid == 0) {
                     continue;
                 }
+                if (blk.deferred) {
+                    // FB-7: every CPU-side writer of a hidden block has it written back first; still hidden here: a
+                    // writer that did not (counted - its bytes and the GPU's kept-back ones may not both survive);
+                    // shown again (unmapped, given back): what was kept back is gone with the mapping
+                    const bool hidden = tracker_ != nullptr && tracker_->Hidden(b << kBlockBits, 1);
+                    if (hidden) {
+                        ++stats_.lazy_unsynced_inval;
+                        continue; // (kept: the GPU's copy stays the current one until a reader writes it back)
+                    }
+                    blk.deferred = false;
+                    --deferred_count_;
+                    deferred_set_.erase(b);
+                    ++stats_.lazy_dropped;
+                }
                 // a coarse report keeps the pages the GPU wrote in a batch not completed (their data is newer)
                 const u16 mask = PageMask(b, first_page, last_page);
                 if (is_coarse && (blk.valid & mask) != 0) {
@@ -376,6 +390,15 @@ void BufferCache::InitDiff() {
     }
     f.vkDestroyShaderModule(dev, sm, nullptr);
     wb_shadows_.reserve(kMaxShadows);
+    if (char v[16] = {}; diff_pipeline_ != VK_NULL_HANDLE && tracker_ != nullptr &&
+                         GetEnvironmentVariableA("SSPC_FB_LAZY_WB", v, sizeof(v)) > 0) {
+        lazy_ = std::string_view(v) == "1" ? 1 : std::string_view(v) == "verify" ? 2 : 0;
+        if (lazy_ != 0) {
+            SSPC_LOG(GPU, Warning, "FrameBreak: SSPC_FB_LAZY_WB={} - large GPU-written ranges' blocks {} until a reader "
+                                   "needs them",
+                     v, lazy_ == 1 ? "kept back from the host" : "counted as if kept back (written back as before)");
+        }
+    }
     if (diff_pipeline_ != VK_NULL_HANDLE) {
         SSPC_LOG(GPU, Info, "native backend: buffer cache: write-backs of ranges >= {} KiB write only the words the GPU "
                             "changed (a video memory shadow per range)",
@@ -686,6 +709,8 @@ void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) 
     // through it, WRITE_DATA): the end's copy of the older video memory bytes would undo that (review HIGH 1)
     const u64 end = addr + size;
     bool any = false;
+    // FB-7: what earlier batches kept back there reaches the host first (the host import is read or written next)
+    FlushDeferred(addr, size, cb, seq, false, 0);
     for (const auto& [b, e] : written_) {
         if (b >= end || e <= addr) {
             continue;
@@ -761,6 +786,9 @@ bool BufferCache::GpuWritePending(u64 addr, u64 size, u64 completed) {
     const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
     for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
         Block* blk = FindBlock(b);
+        if (blk != nullptr && blk->deferred) {
+            return true; // (FB-7: kept back - the host has it only once a reader wrote it back)
+        }
         if (blk == nullptr || blk->gpu_pending == 0) {
             continue;
         }
@@ -787,6 +815,21 @@ void BufferCache::Collect(u64 completed) {
         CheckWriteBacks(completed);
     }
     completed_ = std::max(completed_, completed);
+    if (!unhide_pending_.empty()) {
+        // FB-7: blocks written back by a reader - shown to the CPU once that write-back completed
+        std::erase_if(unhide_pending_, [&](const std::pair<u64, u64>& u) {
+            if (u.second > completed) {
+                return false;
+            }
+            if (tracker_ != nullptr) {
+                const Block* bp = FindBlock(u.first >> kBlockBits);
+                if (bp == nullptr || !bp->deferred) { // (not kept back again since)
+                    tracker_->Unhide(u.first);
+                }
+            }
+            return true;
+        });
+    }
     if (!deferred_inval_.empty()) {
         // a coarse report's kept pages: invalid once the GPU's batch completed (written back) - unless the GPU wrote
         // them again since (then after that batch)
@@ -936,48 +979,212 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
         }
         return s;
     }();
+    (void)align;
+    std::vector<std::pair<u64, u64>> segs;
     for (const Diff& d : diffs) {
+        // FB-7: the blocks wholly inside the range kept back (hidden) - the rest written back now
+        segs.clear();
+        u64 cur = d.b;
+        if (lazy_ != 0 && tracker_ != nullptr) {
+            constexpr u64 kBlock = 1ull << kBlockBits;
+            for (u64 blk = (d.b + kBlock - 1) >> kBlockBits; blk < (d.e >> kBlockBits); ++blk) {
+                Block* bp = FindBlock(blk);
+                bool keep = bp != nullptr && bp->deferred;
+                if (!keep && bp != nullptr && !bp->eager && bp->valid == 0xFFFF) {
+                    if (lazy_ == 2) {
+                        ++stats_.lazy_would_defer;
+                    } else if (tracker_->Hide(blk << kBlockBits)) {
+                        bp->deferred = true;
+                        ++deferred_count_;
+                        deferred_set_.insert(blk);
+                        ++stats_.lazy_deferred;
+                        keep = true;
+                    }
+                }
+                if (keep) {
+                    if (cur < (blk << kBlockBits)) {
+                        segs.emplace_back(cur, blk << kBlockBits);
+                    }
+                    cur = (blk + 1) << kBlockBits;
+                }
+            }
+        }
+        if (cur < d.e) {
+            segs.emplace_back(cur, d.e);
+        }
         bool in_step = true;
-        for (u64 a = d.b; a < d.e;) {
-            const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), d.e - a);
-            GuestBuffers::View v{};
-            GuestBuffers::Failure fl{};
-            if (!guest_.Get(a, piece, seq, v, fl) || (v.offset & 3) != 0) {
-                // (no host view: the shadow no longer matches the host)
-                in_step = false;
-                if (stats_.first_error.empty()) {
-                    stats_.first_error = fmt::format("write-back of [{:#x}, {:#x}): no host import", a, a + piece);
+        for (const auto& [sb, se] : segs) {
+            for (u64 a = sb; a < se;) {
+                const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), se - a);
+                GuestBuffers::View v{};
+                GuestBuffers::Failure fl{};
+                if (!guest_.Get(a, piece, seq, v, fl) || (v.offset & 3) != 0) {
+                    // (no host view: the shadow no longer matches the host)
+                    in_step = false;
+                    if (stats_.first_error.empty()) {
+                        stats_.first_error = fmt::format("write-back of [{:#x}, {:#x}): no host import", a, a + piece);
+                    }
+                    a += piece;
+                    continue;
+                }
+                if (nohost) {
+                    DiffPiece(cb, a, piece, *d.sh, d.sh->buffer, a - d.sh->addr);
+                } else {
+                    DiffPiece(cb, a, piece, *d.sh, v.buffer, v.offset);
                 }
                 a += piece;
-                continue;
             }
-            const u64 in_sh = a - d.sh->addr; // (the shadow may hold more than this range)
-            const u64 c_off = a & ~(align - 1), s_off = in_sh & ~(align - 1), h_off = v.offset & ~(align - 1);
-            const VkDescriptorBufferInfo bi[3] = {
-                {buffer_, c_off, a + piece - c_off},
-                {d.sh->buffer, s_off, in_sh + piece - s_off},
-                nohost ? VkDescriptorBufferInfo{d.sh->buffer, s_off, in_sh + piece - s_off}
-                       : VkDescriptorBufferInfo{v.buffer, h_off, v.offset + piece - h_off}};
-            VkWriteDescriptorSet w[3];
-            for (u32 i = 0; i < 3; ++i) {
-                w[i] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                        .dstBinding = i,
-                        .descriptorCount = 1,
-                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                        .pBufferInfo = &bi[i]};
-            }
-            f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_layout_, 0, 3, w);
-            const u32 pc[4] = {static_cast<u32>(piece / 4), static_cast<u32>((a - c_off) / 4),
-                               static_cast<u32>((in_sh - s_off) / 4),
-                               static_cast<u32>(nohost ? (in_sh - s_off) / 4 : (v.offset - h_off) / 4)};
-            f.vkCmdPushConstants(cb, diff_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-            f.vkCmdDispatch(cb, static_cast<u32>((piece / 4 + 255) / 256), 1, 1);
-            stats_.wb_diff_bytes += piece;
-            ++stats_.wb_diff_dispatches;
-            a += piece;
         }
         d.sh->valid = in_step; // the shadow now holds what the host has (where the GPU wrote: the GPU's words)
     }
+}
+
+void BufferCache::DiffPiece(VkCommandBuffer cb, u64 a, u64 piece, const WbShadow& sh, VkBuffer host, u64 host_offset) {
+    const auto& f = Fn();
+    const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
+    const u64 in_sh = a - sh.addr; // (the shadow may hold more than this range)
+    const u64 c_off = a & ~(align - 1), s_off = in_sh & ~(align - 1), h_off = host_offset & ~(align - 1);
+    const VkDescriptorBufferInfo bi[3] = {{buffer_, c_off, a + piece - c_off},
+                                          {sh.buffer, s_off, in_sh + piece - s_off},
+                                          {host, h_off, host_offset + piece - h_off}};
+    VkWriteDescriptorSet w[3];
+    for (u32 i = 0; i < 3; ++i) {
+        w[i] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding = i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &bi[i]};
+    }
+    f.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_layout_, 0, 3, w);
+    const u32 pc[4] = {static_cast<u32>(piece / 4), static_cast<u32>((a - c_off) / 4), static_cast<u32>((in_sh - s_off) / 4),
+                       static_cast<u32>((host_offset - h_off) / 4)};
+    f.vkCmdPushConstants(cb, diff_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    f.vkCmdDispatch(cb, static_cast<u32>((piece / 4 + 255) / 256), 1, 1);
+    stats_.wb_diff_bytes += piece;
+    ++stats_.wb_diff_dispatches;
+}
+
+bool BufferCache::KeptBack(u64 addr, u64 size) const {
+    return lazy_ == 1 && tracker_ != nullptr && tracker_->Hidden(addr, size);
+}
+
+bool BufferCache::FlushDeferred(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool eager, u32 why) {
+    if (deferred_count_ == 0 || size == 0) {
+        return false;
+    }
+    const u64 end = std::min(addr + size, space_);
+    if (addr >= end) {
+        return false;
+    }
+    if (eager && tracker_ != nullptr) {
+        // a CPU access of blocks written back for a GPU reader but still hidden: never kept back again, shown
+        for (u64 b = addr >> kBlockBits; b <= (end - 1) >> kBlockBits && b - (addr >> kBlockBits) < 64; ++b) {
+            Block* bp = FindBlock(b);
+            if (bp != nullptr && !bp->deferred && !bp->eager && tracker_->Hidden(b << kBlockBits, 1)) {
+                bp->eager = true;
+                unhide_pending_.emplace_back(b << kBlockBits, seq);
+            }
+        }
+    }
+    // (the kept-back blocks by address: a binding of a whole 1.4 GiB pool would walk 23 thousand blocks)
+    std::vector<u64> blocks;
+    for (auto it = deferred_set_.lower_bound(addr >> kBlockBits);
+         it != deferred_set_.end() && *it <= ((end - 1) >> kBlockBits); ++it) {
+        blocks.push_back(*it);
+    }
+    if (blocks.empty()) {
+        return false;
+    }
+    const auto& f = Fn();
+    if (before_upload_ != nullptr) {
+        before_upload_(before_upload_ctx_); // (outside rendering)
+    }
+    // after the earlier writes of the video memory copy (and the shadows), before the later accesses of the host's
+    VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
+    const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                               .pMemoryBarriers = &mb};
+    f.vkCmdPipelineBarrier2(cb, &dep);
+    f.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, diff_pipeline_);
+    constexpr u64 kBlock = 1ull << kBlockBits;
+    const auto done = [&](u64 b) {
+        Block& blk = *FindBlock(b);
+        blk.deferred = false;
+        --deferred_count_;
+        deferred_set_.erase(b);
+        if (eager) {
+            // a CPU access wanted it: shown once written back, never kept back again
+            blk.eager = true;
+            unhide_pending_.emplace_back(b << kBlockBits, seq);
+        }
+        // (else - a GPU reader of the host import: the block stays hidden, kept back again at the next batch end
+        // without a protection change; a CPU access meanwhile faults and finds nothing left to write back)
+        ++stats_.lazy_flush_blocks;
+    };
+    const auto shadow_of = [&](u64 a, u64 n) -> const WbShadow* {
+        for (const WbShadow& s : wb_shadows_) {
+            if (s.valid && s.addr <= a && a + n <= s.addr + s.size) {
+                return &s;
+            }
+        }
+        return nullptr;
+    };
+    // runs of adjacent blocks inside one import window and one shadow: one dispatch each (else block by block)
+    for (size_t i = 0; i < blocks.size();) {
+        size_t j = i + 1;
+        const u64 ra = blocks[i] << kBlockBits, window_end = (ra | (kMaxCopy - 1)) + 1;
+        while (j < blocks.size() && blocks[j] == blocks[j - 1] + 1 && ((blocks[j] + 1) << kBlockBits) <= window_end) {
+            ++j;
+        }
+        if (j - i > 1) {
+            const u64 n = static_cast<u64>(j - i) << kBlockBits;
+            GuestBuffers::View v{};
+            GuestBuffers::Failure fl{};
+            const WbShadow* sh = shadow_of(ra, n);
+            if (sh != nullptr && guest_.Get(ra, n, seq, v, fl) && (v.offset & 3) == 0) {
+                DiffPiece(cb, ra, n, *sh, v.buffer, v.offset);
+                ++stats_.lazy_flush_runs;
+                for (size_t k = i; k < j; ++k) {
+                    done(blocks[k]);
+                }
+                i = j;
+                continue;
+            }
+        }
+        const u64 b = blocks[i++];
+        const u64 ba = b << kBlockBits;
+        GuestBuffers::View v{};
+        GuestBuffers::Failure fl{};
+        if (guest_.Get(ba, kBlock, seq, v, fl) && (v.offset & 3) == 0) {
+            if (const WbShadow* sh = shadow_of(ba, kBlock)) {
+                DiffPiece(cb, ba, kBlock, *sh, v.buffer, v.offset);
+            } else {
+                // (its shadow was made again or dropped since: the whole block - the CPU had no access to it meanwhile)
+                const VkBufferCopy c{.srcOffset = ba, .dstOffset = v.offset, .size = kBlock};
+                f.vkCmdCopyBuffer(cb, buffer_, v.buffer, 1, &c);
+                CopyIntoShadows(ba, kBlock, cb);
+                ++stats_.lazy_flush_plain;
+            }
+        } else if (stats_.first_error.empty()) {
+            stats_.first_error = fmt::format("kept-back write-back of {:#x}: no host import", ba);
+        }
+        done(b);
+    }
+    ++stats_.lazy_flushes;
+    ++stats_.lazy_flush_by[std::min<u32>(why, 3)];
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT;
+    f.vkCmdPipelineBarrier2(cb, &dep);
+    if (after_dispatch_ != nullptr) {
+        after_dispatch_(after_dispatch_ctx_); // (its pipeline, descriptors and push constants are bound now)
+    }
+    return true;
 }
 
 void BufferCache::CheckWriteBacks(u64 completed) {

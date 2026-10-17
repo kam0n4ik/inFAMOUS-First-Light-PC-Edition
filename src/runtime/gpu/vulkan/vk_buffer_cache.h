@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +53,13 @@ struct BufferCacheStats {
     u64 block_upload_pages = 0, block_upload_refused = 0;
     u64 wb_diff_bytes = 0, wb_diff_dispatches = 0, wb_shadow_inits = 0; ///< write-backs by the changed-words shader
     u64 wb_checked_bytes = 0, wb_dirty_chunks = 0, wb_dirty_words = 0; ///< SSPC_DIAG_WB_DIRTY (256-byte chunks, words)
+    /// FB-7 (SSPC_FB_LAZY_WB): blocks kept back (hidden), blocks that would have been (=verify), write-backs of kept-back
+    /// blocks by a reader (calls, blocks; of them without a shadow: plain copies), exact invalidations of a hidden block
+    /// (none expected: every CPU-side writer syncs first)
+    u64 lazy_deferred = 0, lazy_would_defer = 0, lazy_flushes = 0, lazy_flush_blocks = 0, lazy_flush_plain = 0,
+        lazy_flush_runs = 0;
+    u64 lazy_unsynced_inval = 0, lazy_dropped = 0;
+    std::array<u64, 4> lazy_flush_by{}; ///< FlushDeferred's `why`
     std::string first_error;
 };
 
@@ -76,6 +84,11 @@ public:
     void SetBeforeUpload(void (*hook)(void* ctx), void* ctx) {
         before_upload_ = hook;
         before_upload_ctx_ = ctx;
+    }
+    /// Called after FlushDeferred recorded its compute dispatches inside a batch (the executor forgets what it bound).
+    void SetAfterDispatch(void (*hook)(void* ctx), void* ctx) {
+        after_dispatch_ = hook;
+        after_dispatch_ctx_ = ctx;
     }
     /// The GPU accesses guest [addr, addr + size) in commands of submission `seq` recorded into `cb`: the video memory
     /// copy, with its invalid pages uploaded first (recorded into `cb`), and a write recorded for the write-back.
@@ -120,6 +133,22 @@ public:
     void RecordWriteBack(VkCommandBuffer cb, u64 seq);
     /// SSPC_GPU_PROFILE: called in RecordWriteBack after the copies, before the changed-words shader (a timestamp)
     void SetWriteBackMark(std::function<void()> mark) { wb_mark_ = std::move(mark); }
+    /// FrameBreak FB-7 (SSPC_FB_LAZY_WB=1): the changed-words write-back of a large range keeps back the 64 KiB blocks
+    /// wholly inside it whose pages are all valid and write-protected and that no reader asked for yet - hidden (the
+    /// tracker: no CPU access on the guest's view), their video memory copy the only current one. A reader writes them
+    /// back first: FlushDeferred (the GPU's readers of the host import: FlushWritten; the processor's and frontend's
+    /// reads: GpuWritePending is true there; a CPU access: the tracker's fault). =verify: the bookkeeping only (counted,
+    /// written back as before). 0 off.
+    int Lazy() const { return lazy_; }
+    void DisableLazy() { lazy_ = 0; }
+    /// Some block of [addr, addr + size) may be kept back (hidden: until its write-back completed). Any thread.
+    bool KeptBack(u64 addr, u64 size) const;
+    bool AnyDeferred() const { return deferred_count_ != 0; }
+    /// The kept-back blocks overlapping [addr, addr + size) written back in `cb` (diff against their shadow); `eager`:
+    /// never kept back again (a CPU read). true: some. GPU thread.
+    /// `why` (counted): 0 a GPU reader of the host import, 1 the executor's CPU-side reads and syncs, 2 the processor,
+    /// 3 another thread's request (a CPU access).
+    bool FlushDeferred(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool eager, u32 why);
     /// SSPC_DIAG_MEASURE=skip_wb only: the batch's written ranges forgotten (no write-back).
     void DropWriteBack() {
         written_.clear();
@@ -150,7 +179,13 @@ private:
         u16 used = 0;        ///< pages a binding asked for (P4.9: uploaded together once invalid)
         u64 pending_seq = 0;
         u64 quiet_from = 0; ///< the frame from which a small read-only range here is cached again instead of streamed
+        bool deferred = false; ///< FB-7: kept back (hidden): the host's copy is older until a reader writes it back
+        bool eager = false;    ///< FB-7: a CPU read wanted it: never kept back again
     };
+    int lazy_ = 0; ///< FB-7: 0 off, 1 on, 2 verify
+    u64 deferred_count_ = 0;
+    std::set<u64> deferred_set_; ///< the kept-back blocks (FlushDeferred finds those of a range)
+    std::vector<std::pair<u64, u64>> unhide_pending_; ///< (block address, submission): shown once it completed
     u64 frame_ = 0; ///< the frame Promotable saw last
     /// The block table: leaves of 4096 blocks (256 MiB of addresses) made when first touched - a lookup is two array
     /// indexings (it was a hash map: binding checks and scans 5.6 ms a frame for ~6200 ranges, e1).
@@ -243,7 +278,11 @@ private:
     u64 shadow_bytes_ = 0;
     VkDescriptorSetLayout diff_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout diff_layout_ = VK_NULL_HANDLE;
-    VkPipeline diff_pipeline_ = VK_NULL_HANDLE;    void InitDiff();
+    VkPipeline diff_pipeline_ = VK_NULL_HANDLE;
+    void InitDiff();
+    /// One changed-words dispatch: [a, a + piece) of the video memory copy against `sh` into the host view at
+    /// (`host`, `host_offset`) (the pipeline bound by the caller).
+    void DiffPiece(VkCommandBuffer cb, u64 a, u64 piece, const WbShadow& sh, VkBuffer host, u64 host_offset);
     void CopyIntoShadows(u64 a, u64 size, VkCommandBuffer cb);
     /// The shadow of exactly [b, e) (made, or its host bytes copied in when not in step: `inited`); nullptr: none.
     WbShadow* ShadowFor(u64 b, u64 e, VkCommandBuffer cb, u64 seq, bool& inited);
@@ -254,6 +293,8 @@ private:
     bool block_upload_ = true;
     void (*before_upload_)(void*) = nullptr;
     void* before_upload_ctx_ = nullptr;
+    void (*after_dispatch_)(void*) = nullptr;
+    void* after_dispatch_ctx_ = nullptr;
     BufferCacheStats stats_;
 };
 
