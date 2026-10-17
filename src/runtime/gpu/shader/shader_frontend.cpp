@@ -327,6 +327,12 @@ ShaderFrontend::ShaderFrontend(const FrontendOptions& options) : options_(option
                         std::string_view(v) == "verify") {
         memo_verify_ = true;
     }
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_CS_REPEAT", v, sizeof(v)) == 1 && v[0] == '1') {
+        cs_repeat_diag_ = true;
+    }
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_CC_CS_RUNTIME", v, sizeof(v)) == 1 && v[0] == '0') {
+        cs_runtime_keep_ = false;
+    }
     (void)TicksToNs(0); // the TSC calibration (20 ms) now, not at the first draw
     if (options_.async && options_.translate) {
         worker_ = std::thread([this] { WorkerLoop(); });
@@ -788,6 +794,7 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
             s.module->state.load(std::memory_order_acquire) == ModuleState::Ready) {
             if (!memo_verify_) {
                 ++stats_.memo_hits;
+                stats_.cs_memo_hits += hw == HwStage::Cs ? 1 : 0;
                 memo_hit_[si] = true; // (the view is untouched: FB-6's generation stays)
                 ++s.module->uses;
                 NoteGpuWrites(s); // (P5.2: its writes happen again with this draw)
@@ -799,6 +806,10 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         } else {
             ++(!same_inputs ? stats_.memo_miss_other
                             : !same_ud ? stats_.memo_miss_user_data : stats_.memo_miss_memory);
+            if (hw == HwStage::Cs) {
+                ++(!same_inputs ? stats_.cs_miss_other
+                                : !same_ud ? stats_.cs_miss_user_data : stats_.cs_miss_memory);
+            }
         }
         if (verify == 0 && memo_diag_) { // SSPC_DIAG_MEMO_STATS=1: why the stages miss (gpu_native.txt)
             if (same_inputs && !same_ud) {
@@ -850,6 +861,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     }
     if (g_fine_timing || g_fine_now) {
         times_.program.Add(TicksToNs(Ticks() - tp));
+        if (hw == HwStage::Cs) {
+            times_.cs_program.Add(TicksToNs(Ticks() - tp));
+        }
     }
     if (s.program == nullptr) {
         stage_epoch_[si] = 0;
@@ -942,7 +956,11 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         }
     }
     NativeRecorder recorder(memory, nbase, nbase + u64{nkey.dwords} * 4);
-    GuestReader& rmem = nmiss ? static_cast<GuestReader&>(recorder) : memory;
+    CsRecorder csrec(memory);
+    const bool cs_diag = cs_repeat_diag_ && hw == HwStage::Cs;
+    GuestReader& rmem = nmiss ? static_cast<GuestReader&>(recorder)
+                        : cs_diag ? static_cast<GuestReader&>(csrec)
+                                  : memory;
 
     // resources and the key
     const u64 tr = FineTicks();
@@ -953,6 +971,32 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         ++stats_.srt_walk_failures; // a walker SecondSonPC cannot interpret: nothing past the registers resolved
         s.plan.flat.resize(16);
         DecodeResources(r, start, fetch, user_data, addr, VertexSource{&rmem, {}}, s.plan);
+    }
+    if (cs_diag) {
+        // CC-3 diagnostics: the inputs (program, its first module, runtime parameters, user data) seen in the last 30
+        // frames, with the same bytes read from memory or other ones
+        u64 h = (addr ^ reinterpret_cast<u64>(s.program) * 31 ^ reinterpret_cast<u64>(&first) * 131) *
+                0x100000001B3ull;
+        const auto* rb = reinterpret_cast<const u8*>(&s.runtime);
+        for (size_t i = 0; i < sizeof(s.runtime); ++i) {
+            h = (h ^ rb[i]) * 0x100000001B3ull;
+        }
+        for (const u32 w : user_data) {
+            h = (h ^ w) * 0x100000001B3ull;
+        }
+        cs_rep_reads_ += csrec.reads;
+        cs_rep_bytes_ += csrec.bytes;
+        cs_rep_lines_ += csrec.lines;
+        const auto [it, fresh] = cs_seen_.try_emplace(h, csrec.hash, native_frame_);
+        if (fresh || native_frame_ - it->second.second > 30) {
+            ++cs_rep_new_;
+        } else {
+            ++(it->second.first == csrec.hash ? cs_rep_same_ : cs_rep_changed_);
+        }
+        it->second = {csrec.hash, native_frame_};
+        if (cs_seen_.size() > (1u << 20)) {
+            cs_seen_.clear();
+        }
     }
     stats_.srt_reads += s.plan.srt.reads;
     stats_.srt_faults += s.plan.srt.faults;
@@ -965,10 +1009,16 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     const u64 tk = FineTicks();
     if (g_fine_timing || g_fine_now) {
         times_.resources.Add(TicksToNs(tk - tr));
+        if (hw == HwStage::Cs) {
+            times_.cs_resources.Add(TicksToNs(tk - tr));
+        }
     }
     BuildSpecializationKey(s.runtime, start, r, fetch, s.plan, s.key);
     if (g_fine_timing || g_fine_now) {
         times_.key.Add(TicksToNs(Ticks() - tk));
+        if (hw == HwStage::Cs) {
+            times_.cs_key.Add(TicksToNs(Ticks() - tk));
+        }
     }
     s.end = EndOf(start, s.plan);
 
@@ -1310,13 +1360,29 @@ const DrawPreparation& ShaderFrontend::PrepareDispatch(const Cp::DispatchDescrip
     const u64 t0 = FineTicks();
     ++stats_.dispatches;
     prep_ = {};
-    StageView& s = stages_[static_cast<size_t>(HwStage::Cs)];
-    ++stage_gen_[static_cast<size_t>(HwStage::Cs)]; // (FB-6: the runtime is rebuilt every dispatch)
-    BuildComputeRuntime(cs, s.runtime);
-    ++runtime_ver_[static_cast<size_t>(HwStage::Cs)];
-    ++stats_.runtime_builds;
+    const size_t ci = static_cast<size_t>(HwStage::Cs);
+    StageView& s = stages_[ci];
+    // CC-1: the runtime parameters are a few registers the stream rarely changes - a new version (which every
+    // memoized preparation of the stage depends on) only when they differ
+    RuntimeParams rt;
+    BuildComputeRuntime(cs, rt);
+    if (!cs_runtime_keep_ || !cs_runtime_set_ || std::memcmp(&rt, &s.runtime, sizeof(rt)) != 0) {
+        s.runtime = rt;
+        cs_runtime_set_ = true;
+        ++runtime_ver_[ci];
+        ++stats_.runtime_builds;
+    } else {
+        ++stats_.runtime_reuse;
+    }
     const std::span<const u32, 16> ud(d.user_data);
+    const u64 ts = FineTicks();
     s.status = PrepareStage(s, HwStage::Cs, SwStage::Compute, d.shader.address, ud, BindingStart{}, memory, true);
+    if (g_fine_timing || g_fine_now) {
+        times_.cs_stage.Add(TicksToNs(Ticks() - ts));
+    }
+    if (!memo_hit_[ci]) {
+        ++stage_gen_[ci]; // (FB-6: anything but an unchanged memo hit may have changed the view)
+    }
     ++stats_.stage_status[static_cast<size_t>(s.status)];
     if (s.status == StageStatus::Ready) {
         bool created = false;
@@ -1381,6 +1447,10 @@ std::string ShaderFrontend::Report() const {
                      pc.trusted_tracked, pc.trust_mismatches, fetches_.trusted_tracked, fetches_.invalidations,
                      fetches_.trust_mismatches, gpu_writes_checked_, gpu_code_writes_, code_blocks_.size());
     t += fmt::format("runtime parameters: built {}, kept {}\n", st.runtime_builds, st.runtime_reuse);
+    t += fmt::format("compute stage memo (CC-1, SSPC_CC_CS_RUNTIME={}): taken {}, missed: guest memory changed {}, "
+                     "other user data {}, other inputs {}\n",
+                     cs_runtime_keep_ ? 1 : 0, st.cs_memo_hits, st.cs_miss_memory, st.cs_miss_user_data,
+                     st.cs_miss_other);
     t += fmt::format("modules: {} (layouts {}); key hits {}, misses {}, hash collisions {}, layout changed by the "
                      "specialization {}\n",
                      next_module_ - 1, st.layouts, st.module_hits, st.module_misses, st.module_collisions,
@@ -1412,6 +1482,21 @@ std::string ShaderFrontend::Report() const {
     t += fmt::format("  specialization key: {}\n", times_.key.Text());
     t += fmt::format("  pipeline (state + lookup, when looked up): {}\n", times_.pipeline.Text());
     t += fmt::format("time per dispatch: {}\n", times_.dispatch.Text());
+    t += fmt::format("  its stage: {}\n", times_.cs_stage.Text());
+    t += fmt::format("    program lookup: {}\n", times_.cs_program.Text());
+    t += fmt::format("    resources (SRT walk + descriptors): {}\n", times_.cs_resources.Text());
+    t += fmt::format("    specialization key: {}\n", times_.cs_key.Text());
+    t += fmt::format("  the record's copy of the stage view (ParallelCp): {}\n", times_.cs_copy.Text());
+    if (cs_repeat_diag_) {
+        const u64 n = std::max<u64>(1, cs_rep_new_ + cs_rep_same_ + cs_rep_changed_);
+        t += fmt::format("dispatch inputs (SSPC_DIAG_CS_REPEAT): new {}, seen in the last 30 frames with the same bytes "
+                         "read {} ({:.1f} %), with other bytes {}; per dispatch reads {:.1f}, bytes {:.0f}, 64-byte "
+                         "lines {:.1f}\n",
+                         cs_rep_new_, cs_rep_same_, 100.0 * static_cast<double>(cs_rep_same_) / static_cast<double>(n),
+                         cs_rep_changed_, static_cast<double>(cs_rep_reads_) / static_cast<double>(n),
+                         static_cast<double>(cs_rep_bytes_) / static_cast<double>(n),
+                         static_cast<double>(cs_rep_lines_) / static_cast<double>(n));
+    }
     t += fmt::format("translation (worker, request to result): {}\n", times_.translate.Text());
     t += fmt::format("wait from queueing to first use: {}\n", times_.wait.Text());
     return t;

@@ -182,6 +182,8 @@ struct FrontendStats {
     /// P4.7 stage memo: the stage's last preparation taken again (same program address, runtime, binding start, user
     /// data; no guest memory change since); misses: guest memory changed since / user data differ / anything else
     u64 memo_hits = 0, memo_miss_memory = 0, memo_miss_user_data = 0, memo_miss_other = 0;
+    /// CC-1: the compute stage's share of the memo (its runtime parameters kept while they compare equal)
+    u64 cs_memo_hits = 0, cs_miss_memory = 0, cs_miss_user_data = 0, cs_miss_other = 0;
     /// SSPC_DIAG_STAGE_MEMO=verify: hits prepared in full anyway / those whose full preparation differed
     u64 memo_verified = 0, memo_mismatches = 0;
     std::array<u64, static_cast<size_t>(ResourceStatus::Count)> resources{};
@@ -290,8 +292,12 @@ public:
 
     struct Timings {
         Histogram program, resources, key, pipeline, draw, dispatch, translate, wait;
+        /// CC-1: a dispatch's own share - its stage's program lookup, resources, key, the stage as a whole, and the
+        /// processor's copy of the stage view into its record (ParallelCp)
+        Histogram cs_program, cs_resources, cs_key, cs_stage, cs_copy;
     };
     const Timings& Times() const { return times_; }
+    void NoteDispatchCopy(u64 ns) { times_.cs_copy.Add(ns); }
 
 private:
     struct Job {
@@ -358,6 +364,10 @@ private:
     bool memo_on_ = false;
     bool memo_diag_ = false;                       ///< SSPC_DIAG_MEMO_STATS=1
     bool memo_verify_ = false;                     ///< SSPC_DIAG_STAGE_MEMO=verify
+    /// CC-1: a dispatch keeps the compute runtime parameters' version while they compare equal (SSPC_CC_CS_RUNTIME=0:
+    /// rebuilt and versioned at every dispatch - the stage memo never taken for compute)
+    bool cs_runtime_keep_ = true;
+    bool cs_runtime_set_ = false;
     std::unordered_map<u64, u64> memo_ud_masks_;   ///< (stage << 16 | the user data dwords that differ) -> misses
     std::array<u64, 5> memo_other_by_{};           ///< misses by input: address, binding start, runtime, epoch, status
     std::array<std::array<std::pair<u64, u64>, 8>, static_cast<size_t>(HwStage::Count)> memo_hist_{}; ///< (inputs, gen)
@@ -414,6 +424,37 @@ private:
         bool outside_ = false;
     };
     void NativeEvict();
+    /// CC-3 diagnostics (SSPC_DIAG_CS_REPEAT=1): a dispatch's reads of guest memory - their ranges and a hash of the
+    /// bytes read - to count how often a dispatch's inputs and the memory it read repeat (a cache's possible hits).
+    class CsRecorder final : public GuestReader {
+    public:
+        explicit CsRecorder(GuestReader& inner) : inner_(inner) {}
+        bool Read(u64 addr, void* dst, u64 bytes) override {
+            const bool ok = inner_.Read(addr, dst, bytes);
+            ++reads;
+            this->bytes += bytes;
+            hash = (hash ^ addr ^ (bytes << 48)) * 0x100000001B3ull;
+            if (ok) {
+                const auto* p = static_cast<const u8*>(dst);
+                for (u64 i = 0; i < bytes; ++i) {
+                    hash = (hash ^ p[i]) * 0x100000001B3ull;
+                }
+                for (u64 l = addr >> 6; l <= (addr + bytes - 1) >> 6 && bytes != 0; ++l) {
+                    lines += l != last_line ? 1 : 0;
+                    last_line = l;
+                }
+            }
+            return ok;
+        }
+        u64 reads = 0, bytes = 0, lines = 0, hash = 0xcbf29ce484222325ull;
+
+    private:
+        GuestReader& inner_;
+        u64 last_line = ~0ull;
+    };
+    bool cs_repeat_diag_ = false;
+    std::unordered_map<u64, std::pair<u64, u64>> cs_seen_; ///< inputs -> (memory hash, frame)
+    u64 cs_rep_new_ = 0, cs_rep_same_ = 0, cs_rep_changed_ = 0, cs_rep_reads_ = 0, cs_rep_bytes_ = 0, cs_rep_lines_ = 0;
     std::unordered_map<u64, NativeEntry> native_;
     std::unordered_map<u64, u32> native_seen_;                       ///< not yet cached: sightings (native_admit)
     std::unordered_map<u64, u32> native_masks_;                      ///< shape -> the user data registers it reads

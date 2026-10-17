@@ -615,7 +615,11 @@ void ParallelCp::PrepareDispatch(Record& r, u64 index) {
     {
         const GS::FineSample fine(front_fine_counter_);
         r.prep = frontend_->PrepareDispatch(r.dispatch, std::span<const u32, Cp::kComputeCount>(r.cs.values), reader_);
+        const u64 tc = GS::FineTicks();
         CopyStage(r.stage, frontend_->Stage(GS::HwStage::Cs));
+        if (tc != 0) {
+            frontend_->NoteDispatchCopy(GS::TicksToNs(__rdtsc() - tc)); // (CC-1: the copy's share)
+        }
     }
     r.prepared = true;
     bool writes = false;
