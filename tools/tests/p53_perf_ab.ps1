@@ -121,6 +121,14 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
                 }
                 $rows | Out-File "$dir\cpu_mem_raw.csv" -Encoding ascii
             }
+            # FB-7 (the machine's slow mode): the CPU's clock, system context switches and each core's load, once a
+            # second (perf.csv next to the run)
+            New-Item -ItemType Directory -Force "$out\$runTag" | Out-Null
+            $perfCsv = "$out\$runTag\perf_raw.csv"
+            $typeperf = Start-Process typeperf -PassThru -WindowStyle Hidden -ArgumentList @(
+                '"\Processor Information(_Total)\% Processor Performance"', '"\Processor Information(_Total)\Processor Frequency"',
+                '"\System\Context Switches/sec"', '"\Processor Information(*)\% Processor Time"',
+                '"\Process(SecondSonPC)\% Processor Time"', "-si", "1", "-sc", "$($Seconds + 30)", "-f", "CSV", "-y", "-o", "`"$perfCsv`"")
             $runArgs = @("-ExecutionPolicy", "Bypass", "-File", "$root\tools\tests\p46_runs.ps1", "-Tag", $runTag,
                 "-Scenes", $scene, "-Repeats", "1", "-Seconds", "$Seconds", "-OutRoot", $out)
             if ($defs[$cfgEnv]) { $runArgs += @("-Env", $defs[$cfgEnv]) } # (base: no variable at all)
@@ -135,6 +143,10 @@ for ($rep = 1; $rep -le $Repeats; $rep++) {
             Remove-Job $sampler -Force -ErrorAction SilentlyContinue
             if (Test-Path "$out\$runTag\cpu_mem_raw.csv") {
                 Move-Item "$out\$runTag\cpu_mem_raw.csv" "$out\$runTag\${scene}_1\cpu_mem.csv" -Force
+            }
+            if ($typeperf -and -not $typeperf.HasExited) { $typeperf | Stop-Process -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $perfCsv) {
+                Move-Item $perfCsv "$out\$runTag\${scene}_1\perf.csv" -Force
             }
             "$(Get-Date -Format s) $runTag $scene done" | Out-File "$out\series.txt" -Encoding utf8 -Append
         }
