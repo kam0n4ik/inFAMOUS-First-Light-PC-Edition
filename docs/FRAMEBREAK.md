@@ -111,3 +111,32 @@ A/B `logs/p53/fb6_reuse_ab2` (n = 3, interleaved, unlimited pacing; avg FPS per 
 No gain beyond the run-to-run spread (the machine's slow mode again in several runs: CP 20-24 ms against ~18.5);
 harbour lower in two of three. The copy it saves (CopyStage, ~11 % of thread 1) is not what limits the frame. Kept
 off.
+
+## FB-7: the village's GPU - the write-backs (measured)
+
+GPU time per command (`SSPC_GPU_PROFILE=1`, `logs/fb7/fb7_prof*`, village, unlimited pacing; timestamps after every
+command serialize the GPU: 35 ms a frame instead of ~20, but intervals between batch-end marks are not inflated):
+
+| | ms / frame |
+|---|---|
+| batch end (16 a frame): barrier + write-back copies (key 6, new mark) | 0.31 |
+| batch end: the changed-words shader `wb_diff.comp` (key 5) | **2.70** |
+| the same shader, its host stores sent to the shadow instead (`SSPC_DIAG_MEASURE=wb_nohost`, measurement only) | 0.55 |
+| the same shader writing whole 32-word subgroup lines where any word changed (measurement build, removed) | 3.02 |
+| smoke draw (pipeline 544, 1920x1080) | 1.85 |
+| tiled lighting dispatch (120x68 groups) | 1.32 |
+
+The written ranges are the particle pools (2 x 12 MiB at 0x26d558000 / 0x26f358000, written by most particle
+dispatches), their 1 MiB lists, and ~1.1-1.6 MiB ranges at 0x2712xxxxx - compared in full at each batch end
+(~51 MiB a frame). **~2.2-2.5 ms a frame are the shader's stores into host memory over PCIe**; writing whole lines
+costs the same as single words: the GPU changes most of the lines it touches - the volume, not the store size.
+Upper bound without them (`logs/p53/fb7_nohost_ab`, n = 3, interleaved, measurement only - the host's copy is wrong):
+village **38.6 [35.3..40.6] -> 42.8 [42.7..43.0] FPS**, GPU busy 20.3 -> 18.4 ms.
+
+The guest maps all of it CPU read/write + GPU read/write (`0x33`, one area 0x268000000..0x31fff0000): nothing says the
+CPU never reads it. Writing whole lines where the host is known to equal the shadow would have been safe (write-
+protected pages, a CPU write waiting for the write-back), but saves nothing (above). What would save the 2.2-2.5 ms is
+not writing back what no one reads: GPU-written ranges kept in video memory until a reader needs them - the
+executor's own readers (host-import bindings, timeline copies, frontend reads) can be ordered, but a guest CPU read
+can only be seen through read protection of the guest's view (not the import) with a wait for the write-back in the
+fault handler. Not done: a change of the memory model that needs its own stage and decision.
