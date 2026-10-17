@@ -309,3 +309,59 @@ Shader translation (shadPS4's recompiler) is not on the per-frame path (disk cac
 rewrite are the frontend's preparation (~10 ms of thread 1, of it ~2.5 ms the compute dispatches on the game's wait)
 and the write-back model; the recording thread and the GPU stay whatever the front end. A gain of 10 % or more is not
 guaranteed by any single part: thread 1, the recording thread and the GPU are each 70-85 % busy in a 25 ms frame.
+
+## CC: the compute critical path (village)
+
+**The game's blocked compute request, link by link** (lifecycle trace `logs/cc/cc_trace_base`, 470 frames, 944 waits;
+`tools/p54/cc_chain.py`, ms): doorbell -> the game starts waiting 0.23; **the processor reaches the label's RELEASE_MEM
+6.00 (p90 11.6)**; batch submitted 0.11; waiting on the GPU behind graphics 1.59 (p90 4.3); GPU execution of that batch
+1.68; label written 0.18; game wakes 0.03; whole wait 9.59 (p90 15.3). The game rings the doorbell and blocks 0.2 ms
+later - the request is on the critical path from its first packet.
+
+What thread 1 does in those 6.0 ms (`tools/p54/cc_window.py`): graphics slices 2.34 (11 400 packets), compute slices
+2.49 (9 000 packets), round-end drains 0.89 (2.8), drains at met WAIT_REG_MEM 0.38 (9.4), idle ~0. The slowest 10 % of
+waits (12.2 ms) are the same mix 2.3x larger - more compute work in that request (5.4 ms), not another cause.
+
+**One dispatch's preparation** (`SSPC_GPU_TIMINGS=sample:8`, new per-stage split for compute, ns): program lookup 296
+(p95 1 920: the per-frame validation of a program), SRT walk + descriptors 793, specialization key 153, the rest of the
+stage (memo, module search) ~310, runtime/pipeline ~200, the record's copy of the stage view 269 - ~2.0 us, x ~1 500 a
+frame. Repeated work: every dispatch rebuilt its runtime parameters with a new version, so the stage memo never held a
+dispatch; now the version moves only when they change (`SSPC_CC_CS_RUNTIME=0`: the old way). It still does not hit:
+consecutive dispatches run different programs (memo misses on the program 3.24 M, on user data 0.43 M). A cache of
+preparations by inputs would not either (`SSPC_DIAG_CS_REPEAT=1`): 91 % of dispatches come with inputs not seen in the
+last 30 frames (their user data point into ring allocations), 3.8 % repeat with the same bytes read (21.5 reads, 86
+bytes, 1.6 lines a dispatch). Not built.
+
+**Dependency-aware priority (CC-2, `SSPC_CC_CRITICAL=1`, off).** The engine's wait 0x1695e0 (the lifecycle trace's
+replacement loop, installed by this switch alone too) counts the game threads blocked in it
+(`runtime/gpu/critical_compute.h`); while one is, the processor steps the compute queues first, the graphics slice ends
+early when compute work is ready (every 64 packets), and is cut to `SSPC_CC_CRITICAL_GFX` (512) packets only while a
+compute queue stopped at its limit with work left - a compute queue empty or blocked (on graphics, possibly) gives
+graphics its whole slice. Without a waiting game the round is unchanged. Vulkan Validation + Sync with it and met
+waits without a drain, village and beach (`logs/cc/cc_val`): 0 messages, device lost 0.
+
+It does shorten the request: the processor reaches the RELEASE_MEM in 3.65 ms (6.00), the whole wait 7.38 (9.59), p90
+11.0 (15.3). But then 43 % of frames are held by the processor still on the previous frame (step 5 of SubmitFrame, 5.1
+ms) - the game alternates between the two limits and its own frames become 17 / 31 ms:
+
+| Village, n = 3 (`logs/p53/cc_v4`, `cc_soft`) | avg FPS | 1 % low | p95 / p99 ms | engine p95 ms | submit -> present ms | step mismatch ms |
+|---|---|---|---|---|---|---|
+| base (two undisturbed runs; cc_soft n = 3) | 40.07 / 40.27 | 35.68 / 34.79 | 26.9 / 27.6 | 28.1 | 27.2 / 26.9 | 1.1-1.2 |
+| met waits without a drain (`SSPC_P411_ASYNC_ACQUIRE=1`) | 40.19 | 35.02 | 26.76 / 27.79 | 28.1 | 26.8 | 1.15 |
+| CC-2 | 41.70 | 35.00 | 27.30 / 28.07 | 33.4 | 29.1 | 4.8 |
+| CC-2 + met waits without a drain | 41.73 | 35.60 | 27.00 / 27.71 | 33.0 | 28.9 | 5.1 |
+| CC-2, graphics share 2048 | 41.63 | 35.06 | 27.14 / 27.93 | 33.3 | 29.1 | 5.1 |
+
+(step mismatch: |the game's step between its flips - the display's step between presents| per shown frame, mean;
+`tools/framebreak/cc_pacing.py`.) **+3.5-4 % average FPS, the 1 % low and p95/p99 unchanged, but 2 ms more latency
+from the game's submission to the present and a 4x larger mismatch between the game's time steps and the display's**
+- not taken: the task allows no worse input latency or pacing. What would keep the gain: pacing the game's own loop
+(its submissions) at the rate the processor and the GPU sustain, so the time the compute wait no longer takes does not
+turn into alternating frames - a next step, not part of the processor.
+
+Met waits without a drain (P4.11) remain neutral in the village (+0.3 %): thread 1's drains are not what limits it -
+the recording thread (17.6 ms) and the GPU (20.8 ms busy, ~4 ms idle a frame waiting for the game's chain) are.
+
+Beach and harbour (`logs/p53/cc_be`, n = 2): CC-2 beach 55.43 -> 56.16 FPS, 1 % low 49.84 -> 50.23, submit -> present
+26.2 -> 26.6 ms; harbour 51.49 -> 51.63, 44.00 -> 44.68, **27.5 -> 29.5 ms**. Met waits without a drain: harbour 51.78 /
+1 % low 46.53, beach one of two runs in the machine's slow mode (48.8). Both stay off.
