@@ -80,6 +80,11 @@ $defs = @{
     # CP-8 after the read pointer / wake-up: the frontend on its own thread; lazy write-back again
     cp8_fthread  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_P53_FRONTEND_THREAD=1"
     cp8_lazy     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_FB_LAZY_WB=1"
+    cc_base      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited"
+    cc_acq       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_P411_ASYNC_ACQUIRE=1"
+    cc_crit      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CC_CRITICAL=1"
+    cc_both      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CC_CRITICAL=1;SSPC_P411_ASYNC_ACQUIRE=1"
+    cc_crit2k    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CC_CRITICAL=1;SSPC_CC_CRITICAL_GFX=2048"
     # FB-3: the same with the game's clock probe (logs\game_clock.csv; the rate: tools\framebreak\clock_rate.py)
     fbc_console  = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=console;SSPC_FB_CLOCK_PROBE=1"
     fbc_30       = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=30;SSPC_FB_CLOCK_PROBE=1"

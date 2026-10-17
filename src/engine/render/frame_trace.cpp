@@ -25,6 +25,7 @@
 #include "engine/render/dcb_scan.h"
 #include "engine/render/pass_graph.h"
 #include "engine/render/render_layout.h"
+#include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/gnm/gnm_driver.h"
 #include "runtime/gpu/stall_trace.h"
 
@@ -74,6 +75,8 @@ u64 g_base = 0;
 Options g_options;
 SubmitFrameFn g_submit = nullptr;
 bool g_lifecycle = false; ///< P5.4: SubmitFrame's span goes to the stall trace (SSPC_P54_FRAME_TRACE=1)
+bool g_critical = false;  ///< CC-2: the async compute wait counts its blocked waits (SSPC_CC_CRITICAL=1)
+bool g_wait_hooked = false; ///< the async compute wait 0x1695e0 is replaced (by the lifecycle trace or CC-2)
 void SubmitFrameTimed(u8* frame, u32 flags);
 ResetFn g_reset = nullptr;
 ReserveFn g_reserve = nullptr;
@@ -609,8 +612,14 @@ SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
         if (Volatile<u32>(label) >= target) {
             break;
         }
+        if (waited == 0 && g_critical) {
+            Gpu::CriticalCompute::Begin(); // (CC-2: the processor serves the compute queues first meanwhile)
+        }
         waited = 1;
         g_delay(50);
+    }
+    if (waited != 0 && g_critical) {
+        Gpu::CriticalCompute::End();
     }
     Gpu::StallTrace::Span(Gpu::StallTrace::Ev::GameComputeWait, t0, Gpu::StallTrace::Now(), label, target, waited);
 }
@@ -775,9 +784,37 @@ bool InstallLifecycleFromEnvironment(u64 eboot_base) {
         SSPC_LOG(Engine, Critical, "frame lifecycle trace: {}", error);
         std::abort();
     }
+    g_wait_hooked = true;
     SSPC_LOG(Engine, Warning,
              "DIAGNOSTICS: SSPC_P54_FRAME_TRACE=1 - SubmitFrame 0x1f1e30 probed, the async compute wait 0x1695e0 replaced "
              "by the same loop with a span; the events go to the stall trace (SSPC_P412_STALL_TRACE=deep,...)");
+    return true;
+}
+
+bool InstallCriticalComputeFromEnvironment(u64 eboot_base) {
+    if (Env("SSPC_CC_CRITICAL") != "1") {
+        return true;
+    }
+    if (!g_wait_hooked) {
+        std::string error;
+        for (const GuestFunction& f : {kComputeWait, kDelay}) {
+            if (!VerifyGuestFunction(eboot_base, f, error)) {
+                SSPC_LOG(Engine, Error, "critical compute (CC-2) not installed: {}", error);
+                return false;
+            }
+        }
+        g_base = eboot_base;
+        g_delay = reinterpret_cast<DelayFn>(eboot_base + kDelay.rva);
+        if (!InstallJump(eboot_base + kComputeWait.rva, reinterpret_cast<const void*>(&ComputeWaitHook), error)) {
+            SSPC_LOG(Engine, Critical, "critical compute (CC-2): {}", error);
+            std::abort();
+        }
+        g_wait_hooked = true;
+    }
+    g_critical = true;
+    SSPC_LOG(Engine, Warning,
+             "EXPERIMENT: SSPC_CC_CRITICAL=1 - the async compute wait 0x1695e0 replaced by the same loop; while the game "
+             "is blocked in it the command processor serves the compute queues first");
     return true;
 }
 

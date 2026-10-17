@@ -849,6 +849,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (FrameBreak FB-3)
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
+    Engine::Render::Trace::InstallCriticalComputeFromEnvironment(linker.GetModule(eboot_index)->Base());
     if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)
         Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
     } else if (char es[4] = {}; GetEnvironmentVariableA("SSPC_P54_EARLY_SUBMIT", es, sizeof(es)) == 1 && es[0] == '1') {

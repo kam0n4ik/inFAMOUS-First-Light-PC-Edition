@@ -32,6 +32,9 @@ bool InstallFromEnvironment(u64 eboot_base);
 /// (SSPC_P412_STALL_TRACE, runtime/gpu/stall_trace.h) as GameSubmitFrame / GameComputeWait. After
 /// InstallFromEnvironment (it shares the SubmitFrame probe); the same window before the guest runs.
 bool InstallLifecycleFromEnvironment(u64 eboot_base);
+/// FrameBreak CC-2: SSPC_CC_CRITICAL=1 - the async compute wait 0x1695e0 (the lifecycle trace's replacement, installed
+/// here when the trace is off) counts the game's blocked waits in Gpu::CriticalCompute; after InstallLifecycle.
+bool InstallCriticalComputeFromEnvironment(u64 eboot_base);
 
 /// P5.4 early frame submission (SSPC_P54_EARLY_SUBMIT=1, an experiment, off by default; the same document): SubmitFrame
 /// calls sceGnmSubmitDone (its step 4, mode 0) with its list of DCBs complete, then waits for the previous frame's label

@@ -28,6 +28,7 @@
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/cpu_sampler.h"
+#include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
 #include "runtime/gpu/shader_trace.h"
@@ -430,6 +431,16 @@ private:
     /// queue's slice ends at its next 64-packet check (the round ends as usual; the next one takes the submission)
     std::atomic<bool> compute_rung_{false};
     u64 preempted_ = 0; ///< graphics slices ended early for it (the GPU thread)
+    u64 critical_rounds_ = 0, critical_cut_ = 0, critical_preempted_ = 0; ///< CC-2 (the GPU thread)
+    /// CC-2: a mapped compute queue has work its processor can step now (not blocked on a wait)
+    bool ComputeReady() const {
+        for (u32 q = Cp::kGraphicsQueue + 1; q < Cp::kNumQueues; ++q) {
+            if (mapped_[q] && cp_->PendingSubmissions(q) != 0 && cp_->BlockedPoll(q) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
     std::deque<Submission> queue_;
     std::atomic<bool> idle_{true};
     std::atomic<bool> quiet_{true};    ///< IsQuiet (diagnostics)
@@ -1133,19 +1144,42 @@ void Backend::Loop() {
             }
             return on;
         }();
+        // FrameBreak CC-2: SSPC_CC_CRITICAL=1 - while the game is blocked in its async compute wait (critical_compute.h)
+        // the compute queues go first in the round; the graphics queue then gets SSPC_CC_CRITICAL_GFX packets (512)
+        // when a compute queue stopped at its limit with work left, its whole slice otherwise (the compute queue empty
+        // or blocked - on graphics work, possibly); a graphics slice ends early when the game starts such a wait with
+        // a doorbell rung. Without a waiting game the round is as before.
+        static const bool critical_on = [] {
+            char v[8] = {};
+            return GetEnvironmentVariableA("SSPC_CC_CRITICAL", v, sizeof(v)) == 1 && v[0] == '1';
+        }();
+        static const u32 critical_gfx = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_CC_CRITICAL_GFX", v, sizeof(v)) > 0
+                       ? std::clamp<u32>(static_cast<u32>(std::strtoul(v, nullptr, 10)), 64u, 1u << 20)
+                       : 512u;
+        }();
+        const bool critical = critical_on && CriticalCompute::Waiting();
+        critical_rounds_ += critical ? 1 : 0;
+        bool compute_left = false; // (CC-2: a compute queue stopped at its limit this round)
         for (u32 k = 0; k < Cp::kNumQueues; ++k) {
-            const u32 q = compute_first ? (k + 1) % Cp::kNumQueues : k;
+            const u32 q = compute_first || critical ? (k + 1) % Cp::kNumQueues : k;
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
                 continue;
             }
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
-            const u32 limit = q == Cp::kGraphicsQueue ? round_limit : compute_limit;
-            const bool preemptible = compute_preempt && q == Cp::kGraphicsQueue;
+            const bool cut = q == Cp::kGraphicsQueue && critical && compute_left;
+            critical_cut_ += cut ? 1 : 0;
+            const u32 limit = q != Cp::kGraphicsQueue ? compute_limit : cut ? critical_gfx : round_limit;
+            const bool preemptible = (compute_preempt || critical_on) && q == Cp::kGraphicsQueue;
             for (; i < limit; ++i) {
-                if (preemptible && (i & 63) == 63 && compute_rung_.load(std::memory_order_relaxed)) {
-                    ++preempted_; // (CP-8: the compute work the game waits for, first in the next round)
+                if (preemptible && (i & 63) == 63 &&
+                    (compute_preempt ? compute_rung_.load(std::memory_order_relaxed)
+                                     : CriticalCompute::Waiting() &&
+                                           (compute_rung_.load(std::memory_order_relaxed) || ComputeReady()))) {
+                    ++(compute_preempt ? preempted_ : critical_preempted_); // (the compute work first next round)
                     break;
                 }
                 const Cp::StepStatus st = cp_->Step(q);
@@ -1173,6 +1207,7 @@ void Backend::Loop() {
                                  i == limit ? u16{2} : slice_stop);
             }
             round_packets += i; // (P4.12: the round's packets; a queue that stopped at the limit)
+            compute_left |= q != Cp::kGraphicsQueue && i == limit;
             round_capped += i == limit ? 1 : 0;
             graphics_capped |= i == limit && q == Cp::kGraphicsQueue;
             pending |= cp_->PendingSubmissions(q) != 0;
@@ -2040,6 +2075,11 @@ std::string Backend::Report() {
                 out += fmt::format("idle waits for the GPU ended by a submission of the game: {} (CP-8; "
                                    "SSPC_CP_GPU_WAIT_WAKE=0: off); graphics slices ended early by a compute doorbell "
                                    "{}\n", wakes_, preempted_);
+                out += fmt::format("critical compute (CC-2, SSPC_CC_CRITICAL): the game's async compute waits that "
+                                   "blocked {}; rounds with the game waiting {}, graphics slices cut to the critical "
+                                   "share {}, ended early for the compute queues {}\n",
+                                   CriticalCompute::g_blocked_waits.load(), critical_rounds_, critical_cut_,
+                                   critical_preempted_);
             }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
