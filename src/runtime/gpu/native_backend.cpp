@@ -2011,6 +2011,10 @@ std::string Backend::Report() {
         out += fmt::format("write tracking: armed pages {}, arms {}, disarms {}, write faults {} (raced {}), never-armed blocks {}, forgotten "
                            "pages {}\n",
                            t.armed_pages, t.arms, t.disarms, t.faults, t.faults_raced, t.never_armed_blocks, t.forgotten);
+        if (t.watch_reads != 0 || GetEnvironmentVariableA("SSPC_DIAG_READ_WATCH", nullptr, 0) != 0) {
+            out += fmt::format("read watch (SSPC_DIAG_READ_WATCH): CPU reads of armed pages {}, first {:#x}, last {:#x}\n",
+                               t.watch_reads, t.watch_first, t.watch_last);
+        }
     }
     if (presenter_) {
         const auto p = presenter_->GetStats();

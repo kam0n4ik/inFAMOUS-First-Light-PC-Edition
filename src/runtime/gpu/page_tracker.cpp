@@ -42,6 +42,11 @@ bool PageTracker::Start(GuestMemory& memory, std::string& error) {
     summary_ = written_ + kWrittenWords;
     never_ = summary_ + kSummaryWords;
     memory_ = &memory;
+    if (char v[64] = {}; GetEnvironmentVariableA("SSPC_DIAG_READ_WATCH", v, sizeof(v)) > 0) {
+        char* p = v;
+        watch_begin_ = std::strtoull(p, &p, 16);
+        watch_end_ = *p == ':' ? watch_begin_ + std::strtoull(p + 1, nullptr, 16) : watch_begin_;
+    }
     g_tracker = this;
     InstallTrackingFaultHandler(&Fault);
     return true;
@@ -90,6 +95,13 @@ void PageTracker::Arm(u64 addr, u64 size) {
         const u64 block = page >> (kBlockBits - kPageBits);
         const bool need = page < last && !Armed(page) &&
                           ((never_[block / 64].load(std::memory_order_acquire) >> (block % 64)) & 1) == 0;
+        // (a run ends where the watched range starts or ends: those pages get no access)
+        const bool split = run != ~0ull && need && Watched(page) != Watched(run);
+        if (run != ~0ull && (!need || split)) {
+            memory_->ProtectTracking(run << kPageBits, (page - run) << kPageBits,
+                                     Watched(run) ? TrackingProtection::None : TrackingProtection::Read);
+            run = ~0ull;
+        }
         if (need) {
             if (run == ~0ull) {
                 run = page;
@@ -97,9 +109,6 @@ void PageTracker::Arm(u64 addr, u64 size) {
             // the bit before the protection: a fault can only follow the protection
             armed_[page / 64].fetch_or(1ull << (page % 64), std::memory_order_acq_rel);
             ++armed;
-        } else if (run != ~0ull) {
-            memory_->ProtectTracking(run << kPageBits, (page - run) << kPageBits, TrackingProtection::Read);
-            run = ~0ull;
         }
     }
     if (armed != 0) {
@@ -175,10 +184,28 @@ void PageTracker::Forget(u64 addr, u64 size) {
 }
 
 bool PageTracker::OnFault(u64 address, bool is_write) {
-    if (memory_ == nullptr || !is_write || address >= (1ull << kAddressBits)) {
+    if (memory_ == nullptr || address >= (1ull << kAddressBits)) {
         return false;
     }
     const u64 page = address >> kPageBits;
+    if (!is_write) {
+        // SSPC_DIAG_READ_WATCH: a read of a watched armed page - counted, the page read-only again (still armed)
+        if (watch_end_ == 0 || !Watched(page)) {
+            return false;
+        }
+        Lock lock;
+        if (Armed(page)) {
+            if (watch_reads_.fetch_add(1, std::memory_order_relaxed) == 0) {
+                watch_first_.store(address, std::memory_order_relaxed);
+            }
+            watch_last_.store(address, std::memory_order_relaxed);
+            memory_->ProtectTracking(page << kPageBits, 1ull << kPageBits, TrackingProtection::Read);
+            return true;
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        return VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT &&
+               (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE)) != 0; // (given back meanwhile: retry)
+    }
     const u64 per_block = 1ull << (kBlockBits - kPageBits);
     const u64 first = page & ~(per_block - 1);
     // Under the lock: a Release on another thread (another fault in the same block, a Disarm) clears the bits before it
@@ -218,6 +245,9 @@ PageTracker::Stats PageTracker::GetStats() const {
     s.faults_raced = faults_raced_.load(std::memory_order_relaxed);
     s.forgotten = forgotten_.load(std::memory_order_relaxed);
     s.never_armed_blocks = never_blocks_.load(std::memory_order_relaxed);
+    s.watch_reads = watch_reads_.load(std::memory_order_relaxed);
+    s.watch_first = watch_first_.load(std::memory_order_relaxed);
+    s.watch_last = watch_last_.load(std::memory_order_relaxed);
     return s;
 }
 

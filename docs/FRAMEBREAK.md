@@ -140,3 +140,11 @@ not writing back what no one reads: GPU-written ranges kept in video memory unti
 executor's own readers (host-import bindings, timeline copies, frontend reads) can be ordered, but a guest CPU read
 can only be seen through read protection of the guest's view (not the import) with a wait for the write-back in the
 fault handler. Not done: a change of the memory model that needs its own stage and decision.
+
+**Who reads the pool (`SSPC_DIAG_READ_WATCH=<hex address>:<hex size>`, diagnostic).** Armed (write-protected) pages
+in the window get no access on the guest's view (never the Vulkan import); a CPU read faults, is counted and gets the
+page back read-only. Village, 90 s (`logs/fb7/fb7_watch*`): the pool 0x26d558000 + its list (to 0x26e258000) - **1385
+reads, all in 0x26d76da0c..0x26d776e8c** (~36 KiB of 12 MiB); a window up to 0x270158000 also took the small
+per-emitter state buffers after the lists (0x270059f04..0x270157104): 757 557 reads. So the CPU reads a small part of a
+pool (some emitter's particles) and the per-emitter states constantly; a write-back kept back until a reader needs it
+would have to turn a block back to the eager write-back at its first read.

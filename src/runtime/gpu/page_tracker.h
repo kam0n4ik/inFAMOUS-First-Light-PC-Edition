@@ -86,6 +86,7 @@ public:
     struct Stats {
         u64 armed_pages = 0;  ///< currently write-protected
         u64 arms = 0, disarms = 0, faults = 0, faults_raced = 0, forgotten = 0, never_armed_blocks = 0;
+        u64 watch_reads = 0, watch_first = 0, watch_last = 0; ///< SSPC_DIAG_READ_WATCH: CPU reads seen, first/last address
     };
     Stats GetStats() const;
 
@@ -111,6 +112,13 @@ private:
     std::atomic<bool> any_{false};
     std::atomic<u64> armed_pages_{0}, arms_{0}, disarms_{0}, faults_{0}, faults_raced_{0}, forgotten_{0};
     std::atomic<u64> never_blocks_{0};
+    // SSPC_DIAG_READ_WATCH=<hex address>:<hex size> (FrameBreak FB-7, diagnostic): armed pages there get no access at
+    // all (the guest's view only, never an import); a read faults, is counted, and gets the page back read-only
+    u64 watch_begin_ = 0, watch_end_ = 0;
+    std::atomic<u64> watch_reads_{0}, watch_first_{0}, watch_last_{0};
+    bool Watched(u64 page) const {
+        return (page << kPageBits) >= watch_begin_ && (page << kPageBits) < watch_end_;
+    }
     static constexpr u64 kFaultRing = 4096;
     u64 fault_addr_[kFaultRing] = {}; ///< under the lock
     u64 fault_head_ = 0, fault_tail_ = 0;
