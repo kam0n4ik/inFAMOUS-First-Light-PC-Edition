@@ -1,5 +1,6 @@
 # SecondSonPC FrameBreak FB-7: the machine's "slow mode" - each run of a p53_perf_ab series with its CPU clock, context
-# switches and core loads (perf.csv, typeperf once a second) over the frame window, next to its FPS and CP time.
+# switches and core loads (perf.csv, WMI once a second) and the game's CPU (cpu_mem.csv) over the frame window, next to
+# its FPS and CP time.
 #   py -I tools\framebreak\slow_mode.py logs\p53\<series> [--from 62 --to 88]
 import argparse
 import csv
@@ -10,41 +11,27 @@ from pathlib import Path
 
 
 def perf_window(path, t0, t1):
-    with open(path, newline="", encoding="utf-8", errors="replace") as f:
-        rows = list(csv.reader(f))
-    if len(rows) < 3:
+    rows = [r for r in csv.DictReader(path.read_text(encoding="ascii").splitlines())
+            if t0 <= float(r["t_s"]) <= t1]
+    if not rows:
         return None
-    head = rows[0]
-    cols = {}
-    for i, h in enumerate(head):
-        cols.setdefault("perf" if h.endswith("(_Total)\\% Processor Performance") else
-                        "freq" if h.endswith("(_Total)\\Processor Frequency") else
-                        "ctx" if h.endswith("\\Context Switches/sec") else
-                        "game" if h.endswith("Process(SecondSonPC)\\% Processor Time") else
-                        "core" if "% Processor Time" in h and "Processor Information(" in h and "_Total" not in h
-                        else "other", []).append(i)
-    data = rows[1 + int(t0):1 + int(t1)]  # (one row a second from the run's start; the game starts ~2 s later)
-
-    def values(i):
-        out = []
-        for r in data:
-            try:
-                out.append(float(r[i]))
-            except (ValueError, IndexError):
-                pass
-        return out
-
-    def mean(key):
-        vals = [v for i in cols.get(key, []) for v in values(i)]
-        return statistics.fmean(vals) if vals else float("nan")
-
-    core_means = [statistics.fmean(v) for v in (values(i) for i in cols.get("core", [])) if v]
+    cores = [[float(c) for c in r["cores_pct"].split()] for r in rows]
+    per_core = [statistics.fmean(c[i] for c in cores) for i in range(min(len(c) for c in cores))]
     return {
-        "perf_pct": mean("perf"), "freq_mhz": mean("freq"), "ctx_per_s": mean("ctx"), "game_pct": mean("game"),
-        "core_max": max(core_means) if core_means else float("nan"),
-        "core_min": min(core_means) if core_means else float("nan"),
-        "cores_over_80": sum(1 for c in core_means if c > 80),
+        "perf_pct": statistics.fmean(float(r["perf_pct"]) for r in rows),
+        "freq_mhz": statistics.fmean(float(r["freq_mhz"]) for r in rows),
+        "ctx_per_s": statistics.fmean(float(r["ctx_per_s"]) for r in rows),
+        "core_max": max(per_core), "core_min": min(per_core),
+        "cores_over_80": sum(1 for c in per_core if c > 80),
     }
+
+
+def game_cpu(path, t0, t1):
+    rows = [r for r in csv.DictReader(path.read_text(encoding="ascii").splitlines()) if t0 <= float(r["t_s"]) <= t1]
+    if len(rows) < 2:
+        return float("nan")
+    dt = float(rows[-1]["t_s"]) - float(rows[0]["t_s"])
+    return 100.0 * (float(rows[-1]["cpu_s"]) - float(rows[0]["cpu_s"])) / dt if dt > 0 else float("nan")
 
 
 def main():
@@ -54,7 +41,7 @@ def main():
     ap.add_argument("--to", dest="t1", type=float, default=88)
     a = ap.parse_args()
     root = Path(a.series)
-    print("| run | scene | FPS | cp ms | rec ms | GPU ms | CPU perf % | MHz | ctx/s | game % | core max / min % | cores >80 % |")
+    print("| run | scene | FPS | cp ms | rec ms | GPU ms | CPU perf % | MHz | ctx/s | game % of a core | core max / min % | cores >80 % |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for stats in sorted(root.glob("*/*_1/stats.json")):
         run, scene = stats.parent.parent.name, stats.parent.name[:-2]
@@ -62,9 +49,11 @@ def main():
         perf = stats.parent / "perf.csv"
         p = perf_window(perf, a.t0, a.t1) if perf.exists() else None
         pf = (lambda k: f"{p[k]:.0f}") if p else (lambda k: "-")
+        cm = stats.parent / "cpu_mem.csv"
+        g = game_cpu(cm, a.t0, a.t1) if cm.exists() else float("nan")
         print(f"| {run} | {scene} | {s.get('avg_fps', 0):.1f} | {s.get('mean_cp_ms', 0):.2f} | "
               f"{s.get('mean_record_ms', 0):.2f} | {s.get('mean_gpu_busy_ms', 0):.2f} | "
-              f"{pf('perf_pct')} | {pf('freq_mhz')} | {pf('ctx_per_s')} | {pf('game_pct')} | "
+              f"{pf('perf_pct')} | {pf('freq_mhz')} | {pf('ctx_per_s')} | {g:.0f} | "
               f"{pf('core_max')} / {pf('core_min')} | {pf('cores_over_80')} |")
 
 
