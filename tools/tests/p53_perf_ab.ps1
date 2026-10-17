@@ -71,6 +71,8 @@ $defs = @{
     # REA-4: host-contiguous backing runs merged (the 542 MiB heap's window trackable: its constants in video memory)
     rea_merge    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_REA_MERGE_RUNS=1"
     rea_all      = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_REA_MERGE_RUNS=1;SSPC_FB_LAZY_WB=1;SSPC_REA_HEAP_READS=1"
+    # REA-5: merged runs + wait B as a graphics gate + the processor's round end and met memory waits without a drain (CP-9)
+    rea_combo    = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_REA_MERGE_RUNS=1;SSPC_REA_DEFER_WAIT_B=1;SSPC_CP_ROUND_NODRAIN=1;SSPC_P411_ASYNC_ACQUIRE=1"
     # CP-8 (the village's async compute wait): the compute ring's read pointer after every packet (the old path), the
     # compute queues' packets per round, compute first in a round
     cp8_base     = "SSPC_CP_MODE=native;SSPC_FB_FRAME_LIMIT=unlimited;SSPC_CP_RPTR_EVERY_PACKET=1"

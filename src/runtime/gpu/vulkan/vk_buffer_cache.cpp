@@ -471,6 +471,17 @@ BufferCache::WbShadow* BufferCache::ShadowFor(u64 b, u64 e, VkCommandBuffer cb, 
     if (!match->valid) {
         // the host's bytes now (before this batch's write-back: what the host had since the last sync), all of it
         const auto& f = Fn();
+        // REA-5 (Sync Validation in the village with merged runs): ordered after the copies this write-back recorded
+        // already (into the host and into the shadows) and before the ones after it - an execution and memory
+        // dependency between transfers on both sides (inits are rare: tens a run)
+        const VkMemoryBarrier2 tb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+        const VkDependencyInfo tdep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                    .pMemoryBarriers = &tb};
+        f.vkCmdPipelineBarrier2(cb, &tdep);
         const u64 sb = match->addr, se = match->addr + match->size;
         for (u64 a = sb; a < se;) {
             const u64 piece = std::min(kMaxCopy - (a & (kMaxCopy - 1)), se - a);
@@ -483,6 +494,7 @@ BufferCache::WbShadow* BufferCache::ShadowFor(u64 b, u64 e, VkCommandBuffer cb, 
             f.vkCmdCopyBuffer(cb, v.buffer, match->buffer, 1, &c);
             a += piece;
         }
+        f.vkCmdPipelineBarrier2(cb, &tdep);
         ++stats_.wb_shadow_inits;
         inited = true;
     }
@@ -571,8 +583,38 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         ++stats_.uncached;
         GuestBuffers::View v{};
         GuestBuffers::Failure fl{};
-        if (!guest_.Get(addr, size, seq, v, fl)) {
-            return false;
+        u64 take = size;
+        // REA-7: a vertex-data heap's V# (read-only, >= 256 MiB) may reach past the memory the game committed (it grows
+        // as meshes stream in): the largest importable prefix, found once per (addr, size); reads past it get the
+        // robust access's zeros instead of the whole draw being skipped
+        if (!write && size >= kHeapMin) {
+            if (const auto it = heap_clamp_.find({addr, size}); it != heap_clamp_.end()) {
+                take = it->second;
+            }
+        }
+        if (take == 0 || !guest_.Get(addr, take, seq, v, fl)) {
+            if (write || size < kHeapMin || take != size) {
+                return false;
+            }
+            u64 s = size;
+            if (GuestMemory* gm = GetGuestMemory()) {
+                s = std::min(s, gm->ClampRangeSize(addr, size));
+            }
+            bool found = false;
+            for (int tries = 0; tries < 24 && s >= kHeapMin; ++tries) {
+                if (s != size && guest_.Get(addr, s, seq, v, fl)) {
+                    found = true;
+                    break;
+                }
+                s = (s - std::max<u64>(s / 16, 1ull << 20)) & ~0xFFFFull;
+            }
+            heap_clamp_[{addr, size}] = found ? s : 0;
+            if (!found) {
+                return false;
+            }
+            ++stats_.heap_clamped;
+            SSPC_LOG(GPU, Warning, "native backend: heap binding [{:#x}, +{:#x}) bound as its importable [{:#x}, +{:#x}) "
+                                   "(REA-7)", addr, size, addr, s);
         }
         out = {v.buffer, v.offset, v.size - v.offset, false};
         return true;
@@ -1045,6 +1087,18 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
             a += piece;
         }
         ++stats_.writebacks;
+    }
+    if (any_init) {
+        // a shadow made from the host just now read host bytes the plain copies below may write (REA-5: the merged heap
+        // window made it one buffer - Sync Validation's WRITE_AFTER_READ): those copies after that read
+        const VkMemoryBarrier2 sb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+        const VkDependencyInfo sdep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                    .pMemoryBarriers = &sb};
+        f.vkCmdPipelineBarrier2(cb, &sdep);
     }
     std::ranges::stable_sort(wb_regions_, [](const auto& x, const auto& y) { return x.first < y.first; });
     wb_copies_.clear();

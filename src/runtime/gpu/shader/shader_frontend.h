@@ -315,6 +315,12 @@ private:
                              const Cp::EngineTable* engine = nullptr);
     Module* NewModule(Program& program, const RuntimeParams& runtime, const BindingStart& start,
                       std::span<const u32, 16> user_data);
+    /// REA-8 (SSPC_DIAG_BINDING_LOG=<file>): each module's first use in a run - the program's footer hash, the stage,
+    /// its key and every binding's location in the flattened user data with the descriptor read there (JSON lines;
+    /// the table "slot -> descriptor" that predicts unseen programs' specialization offline)
+    void LogBindings(const Program& program, HwStage hw, const BindingStart& start, const StageView& s);
+    std::FILE* binding_log_ = nullptr;
+    std::unordered_set<u32> binding_logged_;
     bool Enqueue(Job job);
     void Run(Job& job);
     /// P4.14: the disk cache's modules of a program met for the first time, as Pending modules that read their record

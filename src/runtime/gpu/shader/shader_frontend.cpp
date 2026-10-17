@@ -315,7 +315,57 @@ GuestReader& GameMemory() {
 
 // ---- the frontend
 
+void ShaderFrontend::LogBindings(const Program& program, HwStage hw, const BindingStart& start, const StageView& s) {
+    if (s.module == nullptr || !binding_logged_.insert(s.module->id).second) {
+        return;
+    }
+    const auto offs = [](const SharpLocation& l) {
+        return fmt::format("[{},{},{},{},{},{},{},{}]", l.offsets[0], l.offsets[1], l.offsets[2], l.offsets[3],
+                           l.offsets[4], l.offsets[5], l.offsets[6], l.offsets[7]);
+    };
+    std::string o = fmt::format("{{\"fh\":\"{:x}\",\"hw\":{},\"start\":[{},{}],\"key\":[", program.footer_hash,
+                                static_cast<int>(hw), start.unified, start.buffer);
+    for (size_t i = 0; i < s.key.words.size(); ++i) {
+        o += fmt::format("{}{}", i ? "," : "", s.key.words[i]);
+    }
+    o += "],\"b\":[";
+    const ShaderReflection* r = s.module->state.load(std::memory_order_acquire) == ModuleState::Ready
+                                    ? &s.module->result.reflection
+                                    : nullptr;
+    for (size_t i = 0; i < s.plan.buffers.size(); ++i) {
+        const BufferBinding& b = s.plan.buffers[i];
+        const SharpLocation* l = r != nullptr && i < r->buffers.size() ? &r->buffers[i].sharp : nullptr;
+        o += fmt::format("{}[{},{},{},{},{},[{},{},{},{}]]", i ? "," : "", static_cast<int>(b.kind),
+                         static_cast<int>(b.status), l ? static_cast<int>(l->summary) : -1, l ? l->load_mask : 0,
+                         l ? offs(*l) : "[]", b.desc.raw[0], b.desc.raw[1], b.desc.raw[2], b.desc.raw[3]);
+    }
+    o += "],\"i\":[";
+    for (size_t i = 0; i < s.plan.images.size(); ++i) {
+        const ImageBinding& im = s.plan.images[i];
+        const SharpLocation* l = r != nullptr && i < r->images.size() ? &r->images[i].sharp : nullptr;
+        o += fmt::format("{}[{},{},{},{},[{},{},{},{},{},{},{},{}]]", i ? "," : "", static_cast<int>(im.status),
+                         l ? static_cast<int>(l->summary) : -1, l ? l->load_mask : 0, l ? offs(*l) : "[]",
+                         im.desc.raw[0], im.desc.raw[1], im.desc.raw[2], im.desc.raw[3], im.desc.raw[4],
+                         im.desc.raw[5], im.desc.raw[6], im.desc.raw[7]);
+    }
+    o += "],\"s\":[";
+    for (size_t i = 0; i < s.plan.samplers.size(); ++i) {
+        const SamplerBinding& sm = s.plan.samplers[i];
+        o += fmt::format("{}[{},[{},{},{},{}]]", i ? "," : "", static_cast<int>(sm.status), sm.desc.raw[0],
+                         sm.desc.raw[1], sm.desc.raw[2], sm.desc.raw[3]);
+    }
+    o += "]}\n";
+    static std::mutex m;
+    const std::scoped_lock lock{m};
+    std::fputs(o.c_str(), binding_log_);
+}
+
 ShaderFrontend::ShaderFrontend(const FrontendOptions& options) : options_(options) {
+    if (char path[512] = {}; GetEnvironmentVariableA("SSPC_DIAG_BINDING_LOG", path, sizeof(path)) > 0) {
+        binding_log_ = std::fopen(path, "ab");
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_BINDING_LOG - each module's bindings written to {} ({})", path,
+                 binding_log_ != nullptr ? "open" : "cannot open");
+    }
     translator_ = options_.translator != nullptr ? options_.translator : GetShaderTranslator();
     programs_.SetValidation(options_.validation);
     memo_on_ = options_.stage_memo;
@@ -1033,6 +1083,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         ++stats_.module_hits;
     }
     s.module = m;
+    if (binding_log_ != nullptr) {
+        LogBindings(program, hw, start, s);
+    }
     if (!m->queued && may_queue && m->state.load(std::memory_order_acquire) == ModuleState::Pending) {
         if (m->disk_record != 0) {
             std::copy(user_data.begin(), user_data.end(), m->user_data.begin()); // (the record replaces them)

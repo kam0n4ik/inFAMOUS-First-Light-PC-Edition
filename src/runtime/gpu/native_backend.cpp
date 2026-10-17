@@ -2061,6 +2061,10 @@ std::string Backend::CacheReport() {
                        "description again {}, taken precompiled {} (waited for {} of them, {:.1f} ms)\n",
                        ps.graphics + ps.compute, ps.feedback, ps.cache_hits, ps.feedback - ps.cache_hits, ps.desc_reuse,
                        ps.prebuilt, ps.prebuilt_waited, static_cast<double>(ps.prebuilt_wait_ns) / 1e6);
+    if (ps.async_queued != 0) {
+        out += fmt::format("background pipelines (SSPC_ASYNC_PIPELINES): queued {}, built {}, failed {}; draws skipped "
+                           "while building {}\n", ps.async_queued, ps.async_built, ps.async_failed, ps.async_skips);
+    }
     if (const Vk::PipelinePrecompiler* pre = pipelines_->Precompiler()) {
         const auto p = pre->Progress();
         out += fmt::format("start-up precompiler: {} pipelines in the manifest, built {} ({:.0f} ms of the workers' time, "

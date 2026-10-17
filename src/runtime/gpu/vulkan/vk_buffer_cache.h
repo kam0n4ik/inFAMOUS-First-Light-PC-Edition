@@ -61,6 +61,7 @@ struct BufferCacheStats {
     u64 lazy_deferred = 0, lazy_would_defer = 0, lazy_flushes = 0, lazy_flush_blocks = 0, lazy_flush_plain = 0,
         lazy_flush_runs = 0;
     u64 lazy_unsynced_inval = 0, lazy_dropped = 0;
+    u64 heap_clamped = 0; ///< REA-7: heap bindings bound as their importable prefix
     std::array<u64, 4> lazy_flush_by{}; ///< FlushDeferred's `why`
     std::string first_error;
 };
@@ -189,6 +190,7 @@ private:
     /// (addr, size, reason: 0 larger than kMaxCached, 1 over budget, 2 the tracker cannot arm it, 3 not bound; write)
     std::map<std::tuple<u64, u64, u8, bool>, u64> large_binds_;
     std::map<u64, u64> diag_wb_, diag_kept_; ///< changed-words bytes / kept-back blocks by 1 MiB of address
+    std::map<std::pair<u64, u64>, u64> heap_clamp_; ///< REA-7: (addr, size) of a heap binding -> its importable size (0: none)
     static constexpr u64 kBlockBits = 16; ///< 64 KiB residency blocks
     static constexpr u64 kPageBits = 12;  ///< 4 KiB validity pages (the tracker's)
     static constexpr u64 kPagesPerBlock = 1ull << (kBlockBits - kPageBits);

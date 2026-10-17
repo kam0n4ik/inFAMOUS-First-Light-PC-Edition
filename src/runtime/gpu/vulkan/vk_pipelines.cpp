@@ -124,9 +124,60 @@ PipelineFactory::PipelineFactory(DeviceContext& ctx, const GS::DeviceProfile& pr
         share_layouts_ = true;
         SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_DIAG_SHARED_LAYOUTS=on - one pipeline layout per binding signature");
     }
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_ASYNC_PIPELINES", v, sizeof(v)) == 1 && (v[0] == '1' || v[0] == '2') &&
+                        !share_layouts_) {
+        async_ = true;
+        async_compute_ = v[0] == '2'; // (=2: compute pipelines too - their dispatches skipped until ready)
+        for (int i = 0; i < 3; ++i) {
+            async_workers_.emplace_back([this] { AsyncWorker(); });
+        }
+        SSPC_LOG(GPU, Warning, "SSPC_ASYNC_PIPELINES={} - new {} pipelines are built on 3 background threads; their "
+                               "draws{} are skipped until ready (no stall on the driver's compiler)",
+                 v[0], async_compute_ ? "graphics and compute" : "graphics", async_compute_ ? " and dispatches" : "");
+    }
+}
+
+void PipelineFactory::AsyncWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        AsyncJob* j = nullptr;
+        {
+            std::unique_lock lk{async_mutex_};
+            async_cv_.wait(lk, [&] { return async_stop_ || !async_queue_.empty(); });
+            if (async_stop_) {
+                return;
+            }
+            j = async_queue_.front();
+            async_queue_.pop_front();
+        }
+        j->state.store(1, std::memory_order_relaxed);
+        auto obj = std::make_unique<PipelineObjects>();
+        const u64 t0 = NowNs();
+        const bool ok = Build(j->desc, j->vs, j->ps, *obj, j->flags, j->error);
+        j->ns = NowNs() - t0;
+        if (ok) {
+            j->obj = std::move(obj);
+        }
+        j->state.store(ok ? 2 : 3, std::memory_order_release);
+    }
 }
 
 PipelineFactory::~PipelineFactory() {
+    if (!async_workers_.empty()) { // (before anything they use goes: a pipeline being built finishes first)
+        {
+            std::scoped_lock lk{async_mutex_};
+            async_stop_ = true;
+        }
+        async_cv_.notify_all();
+        for (std::thread& t : async_workers_) {
+            t.join();
+        }
+        for (auto& [k, j] : async_jobs_) {
+            if (j->obj) {
+                Destroy(*j->obj);
+            }
+        }
+    }
     StopPrecompile();
     pre_.reset(); // (destroys the pipelines it built through Destroy)
     const auto& f = Fn();
@@ -622,6 +673,45 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
         }
         return nullptr;
     };
+    const bool async = async_ && (!desc.compute || async_compute_);
+    if (async) {
+        if (const auto it = async_jobs_.find(key); it != async_jobs_.end()) {
+            AsyncJob& j = *it->second;
+            const u8 s = j.state.load(std::memory_order_acquire);
+            if (s < 2) {
+                ++stats_.async_skips;
+                error = "async pipeline still being built (SSPC_ASYNC_PIPELINES)";
+                return nullptr;
+            }
+            if (s == 3) {
+                ++stats_.async_failed;
+                std::string why = std::move(j.error);
+                async_jobs_.erase(it);
+                return fail(std::move(why));
+            }
+            // ready: installed as one created here
+            ++stats_.async_built;
+            CountCreation(stats_, j.ns, [&] { return fmt::format("{} (built in the background)", label()); });
+            ++(desc.compute ? stats_.compute : stats_.graphics);
+            if ((j.flags & ShaderTrace::kPipeFeedback) != 0) {
+                ++stats_.feedback;
+                stats_.cache_hits += (j.flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0;
+            }
+            if (ctx_.Caps().debug_utils) {
+                ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(j.obj->pipeline), label().c_str());
+            }
+            const PipelineObjects* raw = j.obj.get();
+            owned_.push_back(std::move(j.obj));
+            pipelines_.emplace(key, raw);
+            by_desc_.emplace(hash, std::pair{desc, raw});
+            created_.fetch_add(1, std::memory_order_relaxed);
+            if (disk_ != nullptr) {
+                disk_->AddPipeline(desc, hash, j.ns);
+            }
+            async_jobs_.erase(it);
+            return raw;
+        }
+    }
     const VkShaderModule vs_mod = Module(*vs, error);
     if (vs_mod == VK_NULL_HANDLE) {
         return fail(error);
@@ -632,6 +722,26 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
         if (ps_mod == VK_NULL_HANDLE) {
             return fail(error);
         }
+    }
+    if (async) { // handed to the background workers; this draw is skipped
+        auto job = std::make_unique<AsyncJob>();
+        job->key = key;
+        job->hash = hash;
+        job->desc = desc;
+        job->vs = vs_mod;
+        job->ps = ps_mod;
+        job->pipeline_id = pipeline_id;
+        AsyncJob* raw = job.get();
+        async_jobs_.emplace(key, std::move(job));
+        {
+            std::scoped_lock lk{async_mutex_};
+            async_queue_.push_back(raw);
+        }
+        async_cv_.notify_one();
+        ++stats_.async_queued;
+        ++stats_.async_skips;
+        error = "async pipeline queued (SSPC_ASYNC_PIPELINES)";
+        return nullptr;
     }
     auto obj = std::make_unique<PipelineObjects>();
     u32 flags = 0;

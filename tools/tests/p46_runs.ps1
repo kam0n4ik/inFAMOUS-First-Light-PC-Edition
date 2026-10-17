@@ -41,7 +41,11 @@ $summary = "$outRoot\summary.txt"
 
 for ($rep = 1; $rep -le $Repeats; $rep++) {
     foreach ($scene in ($Scenes -split ',' | Where-Object { $_ })) {
-        if (-not $sources.ContainsKey($scene)) { throw "unknown scene '$scene'" }
+        # REA-8: a save backup's folder (userdata\savedata_backups\<name>) is a scene too, named by its folder
+        if (-not $sources.ContainsKey($scene)) {
+            $bk = "$root\userdata\savedata_backups\$scene"
+            if (Test-Path $bk) { $sources[$scene] = $bk } else { throw "unknown scene '$scene'" }
+        }
         $profileDir = "$root\logs\p46\profile"
         if (Test-Path $profileDir) { Remove-Item $profileDir -Recurse -Force }
         New-Item -ItemType Directory -Force $profileDir | Out-Null

@@ -13,7 +13,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <thread>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -66,6 +68,9 @@ struct PipelineStats {
     u64 prebuilt_waited = 0; ///< ... still being built by a worker: waited for
     u64 prebuilt_wait_ns = 0;
     u64 feedback = 0, cache_hits = 0; ///< created on demand with the driver's creation feedback / application cache hits
+    /// SSPC_ASYNC_PIPELINES: graphics pipelines handed to the background workers, draws skipped while one was being
+    /// built, built / failed there
+    u64 async_queued = 0, async_skips = 0, async_built = 0, async_failed = 0;
 };
 
 class PipelineFactory {
@@ -146,6 +151,28 @@ private:
     std::unique_ptr<PipelinePrecompiler> pre_;
     std::atomic<u64> created_{0};
     PipelineStats stats_;
+
+    // SSPC_ASYNC_PIPELINES=1: a graphics pipeline nothing has built yet is built by background workers; its draws are
+    // skipped until it is ready (the recording thread never waits for the driver's compiler). Compute stays synchronous.
+    struct AsyncJob {
+        u64 key = 0, hash = 0;
+        GS::PipelineDesc desc;
+        VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE;
+        u32 pipeline_id = 0;
+        std::atomic<u8> state{0}; ///< 0 queued, 1 building, 2 ready, 3 failed
+        std::unique_ptr<PipelineObjects> obj;
+        u32 flags = 0;
+        u64 ns = 0;
+        std::string error;
+    };
+    void AsyncWorker();
+    bool async_ = false, async_compute_ = false;
+    std::unordered_map<u64, std::unique_ptr<AsyncJob>, U64Hash> async_jobs_; ///< by key (the recording thread's)
+    std::mutex async_mutex_;
+    std::condition_variable async_cv_;
+    std::deque<AsyncJob*> async_queue_;
+    std::vector<std::thread> async_workers_;
+    bool async_stop_ = false;
 };
 
 /// The layout signature of plans (binding numbers, kinds, counts): part of a pipeline's key.
