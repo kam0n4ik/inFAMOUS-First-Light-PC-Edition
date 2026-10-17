@@ -112,6 +112,28 @@ No gain beyond the run-to-run spread (the machine's slow mode again in several r
 harbour lower in two of three. The copy it saves (CopyStage, ~11 % of thread 1) is not what limits the frame. Kept
 off.
 
+## FB-7: frame generation paced by its own presents (taken)
+
+`cfc43d5` kept flips at the emulated 59.94 Hz vblank while FSR frame generation is on (its present blocked inside the
+queue's lock - a deadlock). Measured: the game's frames then stop at 59.9/s and every frame that misses a vblank
+waits for the next - the 1 % low back at ~29 FPS, p99 ~34 ms, as before FB-2. Now the presenter waits, before the
+present and outside the queue's lock, until at most one game frame's presents are still pending in FFX (its present
+count, `FsrFrameGen::WaitForPresents`; 100 ms at most, then logged); the free pacing and the frame rate limit apply
+with frame generation too. FFX's own `WAIT_FOR_PRESENTS` dispatch lost the device here (it waits on the game's queue,
+which other threads submit to); waiting until all presents were shown left a gap (beach 53 game frames/s).
+`SSPC_FB_FG_VBLANK=1` brings the vblank back.
+
+A/B (`logs/fb7/fb7_fgc_*`, FSR 3.1 Quality + FSR frame generation, unlimited, 2 rounds, old = the exe of `3a6727c`):
+
+| Scene | game frames/s old -> new | 1 % low old -> new | p99 ms old -> new |
+|---|---|---|---|
+| beach | 52.4 / 52.0 -> 52.9 / 53.6 | 29.5 / 29.4 -> **45.3 / 47.9** | 33.8 -> 20.3-20.8 |
+| harbour | 48.9 / 49.1 -> 49.4 / 48.2 | 29.4 / 29.4 -> **44.7 / 43.5** | 33.9 -> 21.9-22.6 |
+| village | 40.2 / 40.3 -> 41.7 / 41.3 | 29.2 / 29.2 -> **35.6 / 35.7** | 34.2 -> 27.5-27.6 |
+
+Displayed = 2x the game's frames. `[Error]` 0, no wait timed out. The mission a10 save (the earlier deadlock) 150 s:
+no hang, game frames up to 104/s (displayed 209/s), avg 53 FPS.
+
 ## FB-7: the village's GPU - the write-backs (measured)
 
 GPU time per command (`SSPC_GPU_PROFILE=1`, `logs/fb7/fb7_prof*`, village, unlimited pacing; timestamps after every

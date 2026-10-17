@@ -2,6 +2,7 @@
 #include "runtime/gpu/upscale/fsr_framegen.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <limits>
 
@@ -83,6 +84,8 @@ struct FsrFrameGen::Impl {
     u64 frame_id = 0;
     bool configured_on = false;
     u64 last_present_count = 0;
+    u64 issued = 0;        ///< FrameBreak: FFX's present count once everything presented so far is shown
+    u64 wait_timeouts = 0; ///< WaitForPresents gave up (100 ms)
 
     void DestroyContext() {
         if (context != nullptr) {
@@ -228,6 +231,7 @@ VkResult FsrFrameGen::CreateSwapchain(const VkSwapchainCreateInfoKHR& info, VkSw
     s.swapchain = handle;
     s.format = info.imageFormat;
     s.last_present_count = s.fn.pOutGetLastPresentCountFFXAPI ? s.fn.pOutGetLastPresentCountFFXAPI(handle) : 0;
+    s.issued = s.last_present_count;
     SSPC_LOG(GPU, Info, "[FSR-FG] swapchain {}x{} format {}", info.imageExtent.width, info.imageExtent.height,
              static_cast<int>(info.imageFormat));
     return VK_SUCCESS;
@@ -261,7 +265,32 @@ VkResult FsrFrameGen::Acquire(VkSwapchainKHR swapchain, u64 timeout, VkSemaphore
 }
 
 VkResult FsrFrameGen::Present(VkQueue queue, const VkPresentInfoKHR& info) {
-    return impl_->fn.pOutQueuePresentKHR(queue, &info);
+    Impl& s = *impl_;
+    // FFX presents this game frame and the one it generates before it (when generating)
+    s.issued += generating_ ? 2 : 1;
+    return s.fn.pOutQueuePresentKHR(queue, &info);
+}
+
+void FsrFrameGen::WaitForPresents() {
+    // (not FFX's WAIT_FOR_PRESENTS dispatch: it lost the device here - it waits on the game's queue, which other
+    // threads submit to under the backend's lock; FFX's present count is read without touching a queue)
+    // At most one game frame's presents still pending: FFX takes the next without waiting for room, and the game's
+    // frames are not held back further (waiting for all of them left a gap: beach 53 instead of ~60 game frames/s).
+    Impl& s = *impl_;
+    if (s.swapchain == VK_NULL_HANDLE || s.fn.pOutGetLastPresentCountFFXAPI == nullptr) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    while (s.fn.pOutGetLastPresentCountFFXAPI(s.swapchain) + 2 < s.issued) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(100)) {
+            if (s.wait_timeouts++ == 0) { // (a present FFX dropped or counts otherwise: never a hang)
+                SSPC_LOG(GPU, Warning, "[FSR-FG] waited 100 ms for earlier presents (present count {}, expected {})",
+                         s.fn.pOutGetLastPresentCountFFXAPI(s.swapchain), s.issued);
+            }
+            break;
+        }
+        Sleep(0);
+    }
 }
 
 void FsrFrameGen::SetFrame(VkCommandBuffer cb, const Inputs* in, VkExtent2D backbuffer, float frame_ms) {
@@ -357,6 +386,7 @@ VkResult FsrFrameGen::Acquire(VkSwapchainKHR, u64, VkSemaphore, VkFence, u32*) {
 VkResult FsrFrameGen::Present(VkQueue, const VkPresentInfoKHR&) {
     return VK_ERROR_FEATURE_NOT_PRESENT;
 }
+void FsrFrameGen::WaitForPresents() {}
 void FsrFrameGen::SetFrame(VkCommandBuffer, const Inputs*, VkExtent2D, float) {}
 u32 FsrFrameGen::TakeShown() {
     return 1;

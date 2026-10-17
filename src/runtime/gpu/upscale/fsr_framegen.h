@@ -43,6 +43,9 @@ public:
     VkResult GetImages(VkSwapchainKHR swapchain, std::vector<VkImage>& images);
     VkResult Acquire(VkSwapchainKHR swapchain, u64 timeout, VkSemaphore semaphore, VkFence fence, u32* index);
     VkResult Present(VkQueue queue, const VkPresentInfoKHR& info);
+    /// Waits until every frame presented so far (generated ones included) reached the display: the next Present
+    /// then does not wait for room in FFX's queue (FrameBreak: called before a flip, outside the queue's lock).
+    void WaitForPresents();
 
     struct Inputs {
         VkImage depth = VK_NULL_HANDLE;  ///< R32F, render size (in SHADER_READ_ONLY_OPTIMAL)

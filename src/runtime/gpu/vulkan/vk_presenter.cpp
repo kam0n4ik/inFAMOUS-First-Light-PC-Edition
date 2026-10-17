@@ -1031,6 +1031,14 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     if (const int want = m.fg_wanted.exchange(-1, std::memory_order_acq_rel); want >= 0) {
         m.SwitchFrameGen(want == 1);
     }
+    if (m.fg) {
+        // FrameBreak: FFX's present waits for room in its queue - inside the queue's lock below, where the backend's
+        // flush waits too (a deadlock when the game's frames came faster than FFX shows them). Waiting for its earlier
+        // presents here, outside the lock, paces the game's frames by what frame generation shows (not by the
+        // emulated 59.94 Hz vblank).
+        const StallTrace::Scope trace_fg(StallTrace::Ev::PresentFence, flip_id);
+        m.fg->WaitForPresents();
+    }
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(m.window, &w, &h);
     if (w <= 0 || h <= 0 || (SDL_GetWindowFlags(m.window) & SDL_WINDOW_MINIMIZED)) {

@@ -266,7 +266,13 @@ public:
         return value == 0 || (timeline_ && timeline_->Wait(value, timeout_ns));
     }
     bool NeedsVblank() override {
-        return presenter_ && presenter_->FrameGenActive();
+        // (FrameBreak: the presenter waits for frame generation's earlier presents outside the queue's lock now, so
+        // the frame rate limit applies with it too; SSPC_FB_FG_VBLANK=1: flips at the vblank with it, as in cfc43d5)
+        static const bool fg_vblank = [] {
+            char v[4] = {};
+            return GetEnvironmentVariableA("SSPC_FB_FG_VBLANK", v, sizeof(v)) == 1 && v[0] == '1';
+        }();
+        return fg_vblank && presenter_ && presenter_->FrameGenActive();
     }
     void Present(const VideoOut::FlipRequest& r) override {
         if (presenter_) {

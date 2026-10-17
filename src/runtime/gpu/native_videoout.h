@@ -50,8 +50,8 @@ public:
     virtual bool Ready(u64 gpu_value) = 0;
     /// Waits up to `timeout_ns` for it (the free pacing: a frame shown as soon as its work completed). true: done.
     virtual bool WaitReady(u64 gpu_value, u64 /*timeout_ns*/) { return Ready(gpu_value); }
-    /// Must flips stay at the vblank now whatever the pacing? (FSR frame generation: its present blocks inside the
-    /// queue's lock when real frames come faster than it shows them - a deadlock with the GPU thread's submissions)
+    /// Must flips stay at the vblank now whatever the pacing? (FSR frame generation with SSPC_FB_FG_VBLANK=1 only: the
+    /// presenter waits for its earlier presents outside the queue's lock instead)
     virtual bool NeedsVblank() { return false; }
     /// Shows `request` (its buffer, or blank). Called on the present thread.
     virtual void Present(const FlipRequest& request) = 0;
