@@ -66,9 +66,25 @@ std::vector<Edit> ForLanguageTable(const std::string& bytes, bool russian) {
     return edits;
 }
 
-std::vector<Edit> ForFile(std::string_view guest, const std::filesystem::path& host) {
+namespace {
+LanguageTableHook g_table_hook;
+
+bool IsLanguageTable(std::string_view guest) {
+    const auto slash = guest.find_last_of('/');
+    const std::string_view name = slash == std::string_view::npos ? guest : guest.substr(slash + 1);
+    return name.starts_with("lang_") && name.ends_with("_text.xpps");
+}
+} // namespace
+
+void SetLanguageTableHook(LanguageTableHook hook) {
+    g_table_hook = hook;
+}
+
+FilePatch ForFile(std::string_view guest, const std::filesystem::path& host) {
     bool russian = false;
-    if (!IsLanguagePatchTable(guest, russian)) {
+    const bool patch_table = IsLanguagePatchTable(guest, russian);
+    const bool table = !patch_table && IsLanguageTable(guest) && g_table_hook.open != nullptr;
+    if (!patch_table && !table) {
         return {};
     }
     std::ifstream in(host, std::ios::binary);
@@ -76,12 +92,24 @@ std::vector<Edit> ForFile(std::string_view guest, const std::filesystem::path& h
     if (bytes.size() < 16 || bytes.compare(0, 4, "KCAP") != 0) {
         return {};
     }
-    auto edits = ForLanguageTable(bytes, russian);
+    if (table) {
+        return g_table_hook.open(guest, bytes);
+    }
+    FilePatch patch;
+    patch.edits = ForLanguageTable(bytes, russian);
     SSPC_LOG(Filesystem, Info,
              "{}: {} of the game's strings replaced as read (PC Edition: the Settings screen's \"Additional "
              "settings\" item; the file is unchanged)",
-             guest, edits.size());
-    return edits;
+             guest, patch.edits.size());
+    return patch;
+}
+
+void Observe(const FilePatch& patch, std::string_view guest, u64 offset, u64 address, u64 n) {
+    const u64 b = std::max(offset, patch.watch_offset);
+    const u64 e = std::min(offset + n, patch.watch_offset + patch.watch_size);
+    if (b < e && g_table_hook.read != nullptr) {
+        g_table_hook.read(guest, b, address + (b - offset), e - b);
+    }
 }
 
 void Apply(const std::vector<Edit>& edits, u64 offset, u8* buf, u64 n) {

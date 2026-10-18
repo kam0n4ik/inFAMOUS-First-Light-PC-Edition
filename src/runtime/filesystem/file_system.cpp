@@ -93,7 +93,7 @@ struct File {
     Access access = Access::Read;
     u64 pos = 0;
     std::unique_ptr<Directory> dir;
-    std::vector<ContentPatch::Edit> edits; // the PC Edition's replacements in what the game reads (read only)
+    ContentPatch::FilePatch patch; // the PC Edition's replacements in what the game reads (read only)
     std::mutex mutex;
 
     bool WriteOnly() const {
@@ -214,10 +214,13 @@ s64 ReadRegular(File& f, void* buf, u64 nbytes, u64 offset) {
         t_bounce.resize(nbytes);
     }
     const u64 got = ReadAt(f.handle, offset, t_bounce.data(), nbytes);
-    if (!f.edits.empty()) {
-        ContentPatch::Apply(f.edits, offset, t_bounce.data(), got);
+    if (!f.patch.edits.empty()) {
+        ContentPatch::Apply(f.patch.edits, offset, t_bounce.data(), got);
     }
     std::memcpy(buf, t_bounce.data(), got);
+    if (f.patch.watch_size != 0) {
+        ContentPatch::Observe(f.patch, f.guest, offset, reinterpret_cast<u64>(buf), got);
+    }
     return static_cast<s64>(got);
 }
 
@@ -312,7 +315,7 @@ s32 PosixOpen(const char* raw_path, s32 flags, u16 mode) {
         if (r) {
             file->handle = OpenHost(r->host, access);
             if (access == Access::Read && file->handle != INVALID_HANDLE_VALUE) {
-                file->edits = ContentPatch::ForFile(file->guest, r->host);
+                file->patch = ContentPatch::ForFile(file->guest, r->host);
             }
         }
         if (file->handle == INVALID_HANDLE_VALUE) {
@@ -908,6 +911,12 @@ const Runtime::Export kExports[] = {
 };
 
 } // namespace
+
+void NotifyHostWrite(u64 address, u64 size) {
+    if (g_host != nullptr && size != 0) {
+        g_host->InvalidateGuestMemory(address, size);
+    }
+}
 
 void SetHost(FsHost* host) {
     g_host = host;

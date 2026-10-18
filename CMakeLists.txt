@@ -219,13 +219,14 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/settings/settings_service.cpp
     src/settings/user_store.cpp
     src/ui/overlay_win32.cpp
+    src/ui/prompt_icons.cpp
     src/ui/settings_menu.cpp
 )
 # Settings and draw commands are written with designated initializers that leave the other fields at their defaults.
 set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp tools/settings_tests/main.cpp
                             PROPERTIES COMPILE_OPTIONS "-Wno-missing-designated-field-initializers")
-target_sources(sspc_runtime PRIVATE ${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp)
-target_link_libraries(sspc_runtime PUBLIC d2d1 dwrite)
+target_sources(sspc_runtime PRIVATE ${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp src/ui/prompt_service.cpp)
+target_link_libraries(sspc_runtime PUBLIC d2d1 dwrite windowscodecs ole32)
 target_sources(shadps4 PRIVATE ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/settings_host.cpp) # the bridge's live settings
 
 # Standalone tests of the PC settings and screenshots of the menu: SecondSonPC's sources only, no bridge, no game

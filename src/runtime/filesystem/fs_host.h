@@ -46,4 +46,7 @@ public:
 
 void SetHost(FsHost* host);
 
+/// Host code wrote guest memory [address, address + size): the GPU's copies there (textures, buffers) are refreshed.
+void NotifyHostWrite(u64 address, u64 size);
+
 } // namespace SecondSon::Filesystem

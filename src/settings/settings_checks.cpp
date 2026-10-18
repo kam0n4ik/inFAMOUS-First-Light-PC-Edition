@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -22,6 +23,7 @@
 #include "settings/registry.h"
 #include "settings/settings_service.h"
 #include "settings/user_store.h"
+#include "ui/prompt_icons.h"
 #include "ui/settings_menu.h"
 
 namespace SecondSon::Settings {
@@ -462,11 +464,128 @@ void DeviceChecks(const CheckFn& check) {
           to_pad && nudge_kept && hold_kept && moved && jitter_kept && button_now &&
               d.Active() == Input::Device::KeyboardMouse,
           fmt::format("{} switches", d.Switches()));
+    Input::DeviceTracker c;
+    c.PadConnected(5000 * ms);
+    c.PadAxis(Input::Device::Xbox, 0.9, 5100 * ms); // a new controller's first reports
+    c.PadButton(Input::Device::Xbox, 5200 * ms);
+    const bool quiet = c.Active() == Input::Device::KeyboardMouse;
+    c.PadButton(Input::Device::Xbox, 6100 * ms);
+    check(g, "a controller just connected switches nothing for 1 s, then its use does",
+          quiet && c.Active() == Input::Device::Xbox, "");
     check(g, "hints: auto follows the device, a fixed style wins",
           Input::ResolvePrompts("auto", Input::Device::PlayStation) == Input::PromptStyle::PlayStation &&
               Input::ResolvePrompts("auto", Input::Device::OtherGamepad) == Input::PromptStyle::Xbox &&
               Input::ResolvePrompts("keyboard", Input::Device::PlayStation) == Input::PromptStyle::Keyboard,
           "");
+}
+
+/// The game's button icons (ui/prompt_icons.h): the atlas codec on any bytes; with the game's language table at hand
+/// (SSPC_GAME_DIR, else E:\shdps4\CUSA00004) the real atlas: found, decoded and encoded back to the same bytes, the
+/// three styles built, PNGs of them in `dir` (prompt_*.png) to look at.
+void PromptIconChecks(const CheckFn& check, const fs::path& dir) {
+    namespace P = Ui::PromptIcons;
+    const auto g = "Ui.prompts";
+    std::vector<u8> tiled(P::kAtlasBytes), rgba(P::kAtlasBytes), back(P::kAtlasBytes);
+    u32 seed = 12345;
+    for (auto& b : tiled) {
+        seed = seed * 1664525u + 1013904223u;
+        b = static_cast<u8>(seed >> 24);
+    }
+    P::Detile(tiled.data(), rgba.data());
+    P::Tile(rgba.data(), back.data());
+    check(g, "atlas codec: tile(detile(x)) == x (random 1 MiB)", back == tiled, "");
+    // element (x, y) of the image: tile (x/8, (511-y)/8), Morton order inside
+    const u32 x = 13, y = 500, sy = 511 - y;
+    const u32 i = (x & 1) | ((sy & 1) << 1) | ((x & 2) << 1) | ((sy & 2) << 2) | ((x & 4) << 2) | ((sy & 4) << 3);
+    const u64 t = ((u64{sy / 8} * 64 + x / 8) * 64 + i) * 4;
+    check(g, "atlas codec: 8x8 Morton micro tiles, rows bottom-up",
+          std::memcmp(rgba.data() + (u64{y} * 512 + x) * 4, tiled.data() + t, 4) == 0, "");
+
+    char* env = nullptr;
+    size_t env_len = 0;
+    const bool have_env = _dupenv_s(&env, &env_len, "SSPC_GAME_DIR") == 0 && env != nullptr;
+    const fs::path game = have_env ? fs::path(env) : fs::path(L"E:\\shdps4\\CUSA00004");
+    std::free(env);
+    const fs::path table = game / "art" / "cache" / "lang_russian_text.xpps";
+    std::error_code ec;
+    if (!fs::exists(table, ec)) {
+        check(g, "game atlas: skipped (no game files)", true, table.string());
+        return;
+    }
+    const std::string file = ReadFile(table);
+    std::string why;
+    const auto info = P::Locate(file, &why);
+    check(g, "game atlas: located in lang_russian_text.xpps by its id, descriptor and hash", info.has_value(),
+          info ? fmt::format("data @{:#x}, glyphs @{:#x}, {} cells", info->data_offset, info->glyph_offset,
+                             info->cells.size())
+               : why);
+    if (!info) {
+        return;
+    }
+    const u8* orig = reinterpret_cast<const u8*>(file.data()) + info->data_offset;
+    P::Detile(orig, rgba.data());
+    P::Tile(rgba.data(), back.data());
+    check(g, "game atlas: decode -> encode gives the same bytes", std::memcmp(back.data(), orig, P::kAtlasBytes) == 0,
+          "");
+    const auto cell = [&](u16 code) {
+        for (const auto& c : info->cells) {
+            if (c.code == code) {
+                return c;
+            }
+        }
+        return P::Cell{};
+    };
+    const P::Cell cross = cell(0xF083), l1 = cell(0xF084);
+    check(g, "game atlas: cross 50x50, L1 58x50 (the glyph table)",
+          cross.w == 50 && cross.h == 50 && l1.w == 58 && l1.h == 50, "");
+    // the cross's circle: opaque at its rim, transparent at its corner (white shapes in alpha)
+    const auto alpha = [&](const P::Cell& c, u32 dx, u32 dy) { return rgba[((u64{c.y} + dy) * 512 + c.x + dx) * 4 + 3]; };
+    check(g, "game atlas: decoded icons are white shapes in alpha", alpha(cross, 25, 8) > 200 && alpha(cross, 1, 1) == 0,
+          fmt::format("{} {}", alpha(cross, 25, 8), alpha(cross, 1, 1)));
+    P::SavePng((dir / "prompt_playstation.png").wstring(), rgba.data(), 512, 512);
+
+    const auto layout = Input::DefaultSettings();
+    std::string error;
+    u32 drawn = 0;
+    const auto ps = P::BuildAtlas(orig, info->cells, Input::PromptStyle::PlayStation, layout, &drawn, &error);
+    check(g, "PlayStation: the game's atlas byte for byte", ps.size() == P::kAtlasBytes &&
+                                                              std::memcmp(ps.data(), orig, P::kAtlasBytes) == 0, "");
+    const auto kb = P::BuildAtlas(orig, info->cells, Input::PromptStyle::Keyboard, layout, &drawn, &error);
+    check(g, "keyboard: 19 cells redrawn (U+F080..F08D, F090..F094)", kb.size() == P::kAtlasBytes && drawn == 19,
+          fmt::format("{} {}", drawn, error));
+    if (kb.size() == P::kAtlasBytes) {
+        P::Detile(kb.data(), back.data());
+        P::SavePng((dir / "prompt_keyboard.png").wstring(), back.data(), 512, 512);
+        // outside the redrawn cells nothing changed (the logo, the second set, the cursors)
+        const P::Cell logo = cell(0xF095);
+        bool same = logo.w != 0;
+        for (u32 yy = 0; yy < logo.h && same; ++yy) {
+            same = std::memcmp(back.data() + ((u64{logo.y} + yy) * 512 + logo.x) * 4,
+                               rgba.data() + ((u64{logo.y} + yy) * 512 + logo.x) * 4, u64{logo.w} * 4) == 0;
+        }
+        check(g, "keyboard: other glyphs untouched (U+F095 logo)", same, "");
+        // the space bar's cell is not the DualShock cross any more, and stays a white shape
+        const auto a2 = [&](const P::Cell& c, u32 dx, u32 dy) { return back[((u64{c.y} + dy) * 512 + c.x + dx) * 4 + 3]; };
+        check(g, "keyboard: cross -> a wide key (Space), opaque at its edge", a2(cross, 5, 25) > 200 &&
+                                                                                  alpha(cross, 5, 25) < 50,
+              fmt::format("{} {}", a2(cross, 5, 25), alpha(cross, 5, 25)));
+    }
+    // a binding changed (cross on F instead of Space): the cell follows
+    auto moved = layout;
+    moved.bindings[static_cast<size_t>(Input::Action::Cross)] = {Key(SDL_SCANCODE_F)};
+    const auto a1 = P::Draw(cross, Input::PromptStyle::Keyboard, layout);
+    const auto a3 = P::Draw(cross, Input::PromptStyle::Keyboard, moved);
+    check(g, "keyboard: rebinding cross Space -> F changes its icon", a1.drawn && a3.drawn && a1.alpha != a3.alpha, "");
+    moved.bindings[static_cast<size_t>(Input::Action::Cross)].clear();
+    check(g, "keyboard: an unbound button keeps the DualShock icon",
+          !P::Draw(cross, Input::PromptStyle::Keyboard, moved).drawn, "");
+    const auto xb = P::BuildAtlas(orig, info->cells, Input::PromptStyle::Xbox, layout, &drawn, &error);
+    check(g, "Xbox: 14 cells redrawn (face, shoulders, triggers, sticks, Menu/View; the d-pad stays)",
+          xb.size() == P::kAtlasBytes && drawn == 14, fmt::format("{} {}", drawn, error));
+    if (xb.size() == P::kAtlasBytes) {
+        P::Detile(xb.data(), back.data());
+        P::SavePng((dir / "prompt_xbox.png").wstring(), back.data(), 512, 512);
+    }
 }
 
 void MenuChecks(const CheckFn& check, const fs::path& dir) {
@@ -610,6 +729,7 @@ void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     KeyboardMouseChecks(check);
     GamepadChecks(check);
     DeviceChecks(check);
+    PromptIconChecks(check, scratch);
     MenuChecks(check, scratch);
 }
 
