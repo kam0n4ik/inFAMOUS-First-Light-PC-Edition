@@ -41,11 +41,14 @@ struct ImageUse {
     bool written = false; ///< image_store / an atomic: a storage image
     bool array = false;   ///< the instructions' DA (an array view of an array type)
     bool sampled = false; ///< image_sample / image_gather on it
+    bool depth = false;   ///< ... with a depth compare (_c): the runtime's view is a depth one (D32 / D16)
 };
 
-/// A sampler (S#: 4 dwords).
+/// A sampler (S#: 4 dwords). A compare's (depth) is another sampler, as the bridge's: the runtime creates it with
+/// the S#'s DEPTH_COMPARE_FUNC.
 struct SamplerUse {
     std::array<ScalarValue, 4> sharp{};
+    bool depth = false;
 };
 
 /// A buffer the program reads or writes: its V# dwords.

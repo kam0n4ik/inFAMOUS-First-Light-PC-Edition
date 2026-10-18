@@ -656,12 +656,13 @@ private:
         }
         for (const ImageUse& im : ri.images) {
             refl.images.push_back({.sharp = Location(im.sharp, im.r128 ? 4 : 8),
+                                   .is_depth = im.depth,
                                    .is_array = im.array,
                                    .is_written = im.written,
                                    .is_r128 = im.r128});
         }
         for (const SamplerUse& s : ri.samplers) {
-            refl.samplers.push_back({.sharp = Location(s.sharp, 4)});
+            refl.samplers.push_back({.sharp = Location(s.sharp, 4), .is_depth = s.depth});
         }
         refl.has_storage_images = std::ranges::any_of(ri.images, [](const ImageUse& im) { return im.written; });
         refl.flatbuf_dwords = ri.flat_dwords;

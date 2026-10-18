@@ -111,6 +111,13 @@ void Analysis::Image(const State& s, u32 index, bool record) {
     use.array = ((in.w0 >> 14) & 1) != 0;
     use.written = name.starts_with("image_store") || name.starts_with("image_atomic");
     use.sampled = name.starts_with("image_sample") || name.starts_with("image_gather");
+    if (use.sampled) {
+        // the modifier "c" (image_sample_c_lz, image_gather4_c_o...; not "cd" / "cl")
+        for (size_t p = name.find('_', 6); p != std::string_view::npos; p = name.find('_', p + 1)) {
+            const size_t e = name.find('_', p + 1);
+            use.depth = use.depth || name.substr(p + 1, e == std::string_view::npos ? e : e - p - 1) == "c";
+        }
+    }
     const u32 t = o.src[2], n = use.r128 ? 4 : 8;
     for (u32 i = 0; i < n; ++i) {
         use.sharp[i] = sgpr(t + i);
@@ -124,6 +131,7 @@ void Analysis::Image(const State& s, u32 index, bool record) {
             out_.images[k].written = out_.images[k].written || use.written;
             out_.images[k].array = out_.images[k].array || use.array;
             out_.images[k].sampled = out_.images[k].sampled || use.sampled;
+            out_.images[k].depth = out_.images[k].depth || use.depth;
             found = static_cast<s32>(k);
         }
     }
@@ -138,6 +146,7 @@ void Analysis::Image(const State& s, u32 index, bool record) {
         return;
     }
     SamplerUse sampler;
+    sampler.depth = use.depth;
     const u32 sr = o.src[3];
     for (u32 i = 0; i < 4; ++i) {
         sampler.sharp[i] = sgpr(sr + i);
@@ -147,7 +156,7 @@ void Analysis::Image(const State& s, u32 index, bool record) {
     }
     s32 sfound = -1;
     for (u32 k = 0; k < out_.samplers.size(); ++k) {
-        if (out_.samplers[k].sharp == sampler.sharp) {
+        if (out_.samplers[k].sharp == sampler.sharp && out_.samplers[k].depth == sampler.depth) {
             sfound = static_cast<s32>(k);
         }
     }

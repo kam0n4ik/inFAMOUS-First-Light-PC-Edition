@@ -1145,8 +1145,8 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
             lz = lz || t == "lz";
             rest = u == std::string_view::npos ? std::string_view{} : rest.substr(u);
         }
-        if (cmp) {
-            return Decline(" (a depth compare)");
+        if (cmp && (im.kind != 0 || im.conversion != 0)) {
+            return Decline(" (a depth compare on a non-float image)");
         }
         if (deriv) {
             return Decline(" (explicit derivatives)");
@@ -1207,9 +1207,21 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         }
         const Id sampler = b_.Op(Op::OpLoad, b_.TypeSampler(), {samplers_[si]});
         const Id sampled = b_.Op(Op::OpSampledImage, b_.TypeSampledImage(im.type), {image, sampler});
+        // a depth compare: the reference after [offset] [bias] (the runtime's sampler compares with the S#'s
+        // DEPTH_COMPARE_FUNC); the result (r, 0, 0, 0) as the bridge's
+        const u32 dref_reg = vaddr + (bias ? 1 : 0);
+        const u32 coords_reg = dref_reg + (cmp ? 1 : 0);
+        const auto sample = [&](Op op, Op dref_op, std::vector<u32> ops) {
+            if (!cmp) {
+                return b_.Op(op, im.texel, std::span<const u32>(ops.data(), ops.size()));
+            }
+            ops.insert(ops.begin() + 2, GetF(dref_reg, in));
+            const Id r = b_.Op(dref_op, t_f32_, std::span<const u32>(ops.data(), ops.size()));
+            return b_.Op(Op::OpCompositeConstruct, im.texel, {r, b_.F32(0.0f), b_.F32(0.0f), b_.F32(0.0f)});
+        };
         if (implicit) {
-            // the coordinates after [offset] [bias]; the LOD clamp after them (a minimum LOD)
-            const u32 first = vaddr + (bias ? 1 : 0);
+            // the coordinates after [offset] [bias] [z-compare]; the LOD clamp after them (a minimum LOD)
+            const u32 first = coords_reg;
             std::vector<u32> ops{sampled, sample_coords(first)};
             u32 mask = 0;
             if (bias) {
@@ -1228,16 +1240,16 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
                     ops.push_back(GetF(first + im.coords, in));
                 }
             }
-            results(b_.Op(Op::OpImageSampleImplicitLod, im.texel, std::span<const u32>(ops.data(), ops.size())), false);
+            results(sample(Op::OpImageSampleImplicitLod, Op::OpImageSampleDrefImplicitLod, std::move(ops)), false);
             return true;
         }
         if (bias) {
             return Decline(" (a bias with an explicit LOD)");
         }
-        const Id lod = lod_given ? GetF(vaddr + im.coords, in) : b_.F32(0.0f);
+        const Id lod = lod_given ? GetF(coords_reg + im.coords, in) : b_.F32(0.0f);
         if (!has_offset) {
-            results(b_.Op(Op::OpImageSampleExplicitLod, im.texel,
-                          {sampled, sample_coords(vaddr), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+            results(sample(Op::OpImageSampleExplicitLod, Op::OpImageSampleDrefExplicitLod,
+                           {sampled, sample_coords(coords_reg), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
                     false);
             return true;
         }
@@ -1257,7 +1269,7 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         for (u32 k = 0; k < qn; ++k) {
             const bool layer = im.arrayed && k == qn - 1;
             const bool row = im.one_d && k == 1;
-            Id v = row ? b_.F32(0.0f) : GetF(vaddr + reg++, in);
+            Id v = row ? b_.F32(0.0f) : GetF(coords_reg + reg++, in);
             if (!layer && !row) {
                 const Id off = b_.Op(Op::OpConvertSToF, t_f32_,
                                      {b_.Op(Op::OpBitFieldSExtract, t_i32_, {Bit(t_i32_, packed), b_.U32(8 * (im.one_d ? 0 : k)), b_.U32(6)})});
@@ -1267,8 +1279,8 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
             c.push_back(v);
         }
         const Id coord = b_.Op(Op::OpCompositeConstruct, b_.TypeVector(t_f32_, qn), std::span<const u32>(c.data(), c.size()));
-        results(b_.Op(Op::OpImageSampleExplicitLod, im.texel,
-                      {sampled, coord, static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+        results(sample(Op::OpImageSampleExplicitLod, Op::OpImageSampleDrefExplicitLod,
+                       {sampled, coord, static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
                 false);
         return true;
     }
