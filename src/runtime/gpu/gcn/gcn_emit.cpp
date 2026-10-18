@@ -1486,6 +1486,12 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         VDstF(in, d, rev ? fop(op, c, a) : fop(op, a, c));
     };
     const auto f1 = [&](GLSLstd450 g) { VDstF(in, d, Glsl(g, t_f32_, {f(0)})); };
+    // the legacy (DX9) multiply: 0 * x is 0 for every x, infinities and NaN too (the bridge's LegacyMul)
+    const auto legacy_mul = [&](Id a, Id c) {
+        const Id zero = b_.F32(0.0f);
+        const Id either = Or(b_.Op(Op::OpFOrdEqual, t_bool_, {a, zero}), b_.Op(Op::OpFOrdEqual, t_bool_, {c, zero}));
+        return Select(t_f32_, either, zero, fop(Op::OpFMul, a, c));
+    };
     const auto ubin = [&](Op op) { Set(d, b_.Op(op, t_u32_, {u(0), u(1)})); };
     const auto shift = [&](Op op, bool rev) {
         const Id a = u(0), c = u(1);
@@ -1518,8 +1524,11 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         fbin(Op::OpFSub);
     } else if (name == "v_subrev_f32") {
         fbin(Op::OpFSub, true);
-    } else if (name == "v_mul_f32" || name == "v_mul_legacy_f32") {
+    } else if (name == "v_mul_f32") {
         fbin(Op::OpFMul);
+    } else if (name == "v_mul_legacy_f32") {
+        const Id a = f(0), c = f(1);
+        VDstF(in, d, legacy_mul(a, c));
     } else if (name == "v_min_f32" || name == "v_min_legacy_f32") {
         const Id a = f(0), c = f(1);
         VDstF(in, d, Glsl(GLSLstd450NMin, t_f32_, {a, c}));
@@ -1528,10 +1537,12 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         VDstF(in, d, Glsl(GLSLstd450NMax, t_f32_, {a, c}));
     } else if (name == "v_mac_f32" || name == "v_mac_legacy_f32") {
         const Id a = f(0), c = f(1);
-        VDstF(in, d, fop(Op::OpFAdd, fop(Op::OpFMul, a, c), GetF(d, in)));
+        const Id m = name == "v_mac_legacy_f32" ? legacy_mul(a, c) : fop(Op::OpFMul, a, c);
+        VDstF(in, d, fop(Op::OpFAdd, m, GetF(d, in)));
     } else if (name == "v_mad_f32" || name == "v_mad_legacy_f32") {
         const Id a = f(0), c = f(1), e = f(2);
-        VDstF(in, d, fop(Op::OpFAdd, fop(Op::OpFMul, a, c), e));
+        const Id m = name == "v_mad_legacy_f32" ? legacy_mul(a, c) : fop(Op::OpFMul, a, c);
+        VDstF(in, d, fop(Op::OpFAdd, m, e));
     } else if (name == "v_fma_f32") {
         const Id a = f(0), c = f(1), e = f(2);
         VDstF(in, d, Glsl(GLSLstd450Fma, t_f32_, {a, c, e}));
@@ -1551,7 +1562,12 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
     } else if (name == "v_min3_f32") {
         const Id a = f(0), c = f(1), e = f(2);
         VDstF(in, d, Glsl(GLSLstd450NMin, t_f32_, {Glsl(GLSLstd450NMin, t_f32_, {a, c}), e}));
-    } else if (name == "v_rcp_f32" || name == "v_rcp_legacy_f32" || name == "v_rcp_iflag_f32") {
+    } else if (name == "v_rcp_legacy_f32") {
+        // an infinite result is a zero of its sign (the bridge's)
+        const Id r = fop(Op::OpFDiv, b_.F32(1.0f), f(0));
+        const Id signed_zero = Bit(t_f32_, b_.Op(Op::OpBitwiseAnd, t_u32_, {Bit(t_u32_, r), b_.U32(0x80000000u)}));
+        VDstF(in, d, Select(t_f32_, b_.Op(Op::OpIsInf, t_bool_, {r}), signed_zero, r));
+    } else if (name == "v_rcp_f32" || name == "v_rcp_iflag_f32") {
         VDstF(in, d, fop(Op::OpFDiv, b_.F32(1.0f), f(0)));
     } else if (name == "v_rsq_f32" || name == "v_rsq_legacy_f32") {
         f1(GLSLstd450InverseSqrt);

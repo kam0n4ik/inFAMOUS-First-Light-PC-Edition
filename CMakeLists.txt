@@ -206,6 +206,22 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_sspc_gen_input
 set_source_files_properties(src/runtime/gpu/shader/shader_disk_cache.cpp PROPERTIES
     COMPILE_DEFINITIONS "SSPC_NATIVE_SHADER_GENERATION=\"${SSPC_NATIVE_SHADER_GENERATION}\"")
 message(STATUS "SecondSonPC: native shader cache generation ${SSPC_NATIVE_SHADER_GENERATION}")
+# The own GCN translator's generation (src/runtime/gpu/gcn/*: not part of the one above): play_rea_own.cmd's cache
+# (native_own) is seeded again from the main one when it changes (tools/seed_own_shader_cache.py reads this file), so
+# no module of an earlier own translator is used.
+file(GLOB _sspc_own_inputs CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/gpu/gcn/*.cpp
+     ${CMAKE_SOURCE_DIR}/src/runtime/gpu/gcn/*.h ${CMAKE_SOURCE_DIR}/src/runtime/gpu/gcn/*.inc)
+list(SORT _sspc_own_inputs)
+set(_sspc_own_acc "")
+foreach(_f IN LISTS _sspc_own_inputs)
+    file(SHA256 "${_f}" _h)
+    get_filename_component(_n "${_f}" NAME)
+    string(APPEND _sspc_own_acc "|${_n}:${_h}")
+endforeach()
+string(SHA256 _sspc_own_full "${_sspc_own_acc}")
+string(SUBSTRING "${_sspc_own_full}" 0 16 SSPC_OWN_TRANSLATOR_GENERATION)
+file(WRITE ${CMAKE_BINARY_DIR}/bin/own_translator_generation.txt "${SSPC_OWN_TRANSLATOR_GENERATION}
+")
 
 # P3.6.6: the SecondSonPC <-> bridge boundary, checked whenever a source, a patch or the allowlist changes
 # (cmake/sspc_boundary_check.cmake; report in the build directory). A violation fails the build.
