@@ -134,6 +134,7 @@ struct Config {
     bool shader_cache = true;
     std::filesystem::path shader_cache_dir;
     bool clear_shader_cache = false;         // --clear-shader-cache: delete <dir>\<game> and exit
+    bool gcn_verify_decoder = false;         // --gcn-verify-decoder: SecondSonPC's GCN decoder vs the oracle's
     bool gcn_inventory = false;              // --gcn-inventory: the instructions of every game program, then exit
     bool scan_game_shaders = false;          // --scan-game-shaders: index the game's GCN programs and exit (P4.14)
     std::filesystem::path predict_shaders;   // --predict-shaders <templates>: material draws' modules from the packs

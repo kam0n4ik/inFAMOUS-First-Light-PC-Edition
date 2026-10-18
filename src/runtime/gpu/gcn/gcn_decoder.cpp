@@ -46,6 +46,91 @@ std::string_view FormatName(Format f) {
     return kFormatNames[static_cast<size_t>(f)];
 }
 
+Operands GetOperands(const Inst& in) {
+    Operands o;
+    const u32 w = in.w0, w1 = in.w1;
+    const auto src = [&](u32 v) { o.src[o.num_src++] = static_cast<u16>(v); };
+    const auto dst = [&](u32 v) { o.dst[o.num_dst++] = static_cast<u16>(v); };
+    switch (in.format) {
+    case Format::Sop2:
+        src(Bits(w, 0, 8));
+        src(Bits(w, 8, 8));
+        dst(Bits(w, 16, 7));
+        break;
+    case Format::Sopk:
+        dst(Bits(w, 16, 7));
+        break;
+    case Format::Sop1:
+        src(Bits(w, 0, 8));
+        dst(Bits(w, 16, 7));
+        break;
+    case Format::Sopc:
+        src(Bits(w, 0, 8));
+        src(Bits(w, 8, 8));
+        break;
+    case Format::Smrd:
+        src(Bits(w, 9, 6) << 1); // sbase: an SGPR pair
+        if (Bits(w, 8, 1) == 0) {
+            src(Bits(w, 0, 8)); // the offset in an SGPR (255: the literal)
+        }
+        dst(Bits(w, 15, 7));
+        break;
+    case Format::Vop2:
+        src(Bits(w, 0, 9));
+        // v_readlane_b32 / v_writelane_b32: the lane select is a scalar operand; readlane writes an SGPR
+        src(in.op == 1 || in.op == 2 ? Bits(w, 9, 8) : kVgpr + Bits(w, 9, 8));
+        dst(in.op == 1 ? Bits(w, 17, 8) : kVgpr + Bits(w, 17, 8));
+        break;
+    case Format::Vop1:
+        src(Bits(w, 0, 9));
+        dst(in.op == 2 ? Bits(w, 17, 8) : kVgpr + Bits(w, 17, 8)); // v_readfirstlane_b32 writes an SGPR
+        break;
+    case Format::Vopc:
+        src(Bits(w, 0, 9));
+        src(kVgpr + Bits(w, 9, 8));
+        dst(kVccLo);
+        break;
+    case Format::Vop3:
+        src(Bits(w1, 0, 9));
+        src(Bits(w1, 9, 9));
+        src(Bits(w1, 18, 9));
+        // a compare writes an SGPR pair (the field holds its number); everything else a VGPR
+        dst(in.op < 256 ? Bits(w, 0, 8) : kVgpr + Bits(w, 0, 8));
+        break;
+    case Format::Vintrp:
+        src(kVgpr + Bits(w, 0, 8));
+        dst(kVgpr + Bits(w, 18, 8));
+        break;
+    case Format::Mubuf:
+    case Format::Mtbuf:
+        src(kVgpr + Bits(w1, 0, 8));   // vaddr
+        src(kVgpr + Bits(w1, 8, 8));   // vdata
+        src(Bits(w1, 16, 5) << 2);     // srsrc: an SGPR quad
+        src(Bits(w1, 24, 8));          // soffset
+        break;
+    case Format::Mimg:
+        src(kVgpr + Bits(w1, 0, 8));   // vaddr
+        src(kVgpr + Bits(w1, 8, 8));   // vdata
+        src(Bits(w1, 16, 5) << 2);     // srsrc
+        src(Bits(w1, 21, 5) << 2);     // ssamp
+        break;
+    case Format::Ds:
+        src(kVgpr + Bits(w1, 0, 8));   // addr
+        src(kVgpr + Bits(w1, 8, 8));   // data0
+        src(kVgpr + Bits(w1, 16, 8));  // data1
+        dst(kVgpr + Bits(w1, 24, 8));  // vdst
+        break;
+    case Format::Exp:
+        for (u32 i = 0; i < 4; ++i) {
+            src(kVgpr + Bits(w1, i * 8, 8));
+        }
+        break;
+    default:
+        break;
+    }
+    return o;
+}
+
 std::string_view Mnemonic(Format f, u32 op) {
     const auto& m = NameMap();
     const auto it = m.find((static_cast<u32>(f) << 16) | op);

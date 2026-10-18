@@ -1,0 +1,11 @@
+GCN decoder check: SecondSonPC's decoder against the oracle's on the game's programs
+10301 programs, 5352218 instructions, 14398158 operands compared; 32 differences in 4 kinds
+
+       2  length VOP2 v_mul_i32_i24
+          e.g. art/cache/all_shaders.xpps @ 0x70e28 dword 38: v_mul_i32_i24 (VOP2 9): ours 4 bytes, oracle 8
+       2  length VOPC v_cmp_lg_u32
+          e.g. art/cache/all_shaders.xpps @ 0x57c28 dword 118: v_cmp_lg_u32 (VOPC 197): ours 4 bytes, oracle 8
+       2  opcode VOP3 v_cubetc_f32 -> v_lshl_add_u32
+          e.g. art/cache/all_shaders.xpps @ 0x57c28 dword 38: v_cubetc_f32 (VOP3 326)
+      26  opcode VOP3 v_div_scale_f32 -> v_add3_u32
+          e.g. art/cache/all_shaders.xpps @ 0x57c28 dword 15: v_div_scale_f32 (VOP3 365)

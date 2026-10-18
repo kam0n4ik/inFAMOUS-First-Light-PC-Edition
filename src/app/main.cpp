@@ -102,6 +102,7 @@
 #include "base/log.h"
 #include "base/vram_monitor.h"
 #include "bridge/shadps4/bootstrap.h"
+#include "bridge/shadps4/gcn_decoder_check.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "runtime/gpu/cp_replay.h"
@@ -195,7 +196,7 @@ int main(int argc, char* argv[]) {
         } else if (a == "--no-user-settings" || a == "--press" || a == "--selftest" || a == "--fault-test" ||
                    a == "--patch-race-test" || a == "--gpu-stability-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
                    a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache" ||
-                   a == "--scan-game-shaders" || a == "--predict-shaders" || a == "--gcn-inventory") {
+                   a == "--scan-game-shaders" || a == "--predict-shaders" || a == "--gcn-inventory" || a == "--gcn-verify-decoder") {
             user_settings = false;
         }
     }
@@ -413,6 +414,8 @@ int main(int argc, char* argv[]) {
             config->shader_cache = false;
         } else if (arg == "--clear-shader-cache") {
             config->clear_shader_cache = true;
+        } else if (arg == "--gcn-verify-decoder") {
+            config->gcn_verify_decoder = true;
         } else if (arg == "--gcn-inventory") {
             config->gcn_inventory = true;
         } else if (arg == "--scan-game-shaders") {
@@ -619,6 +622,9 @@ int main(int argc, char* argv[]) {
         std::printf("SecondSonPC: %llu shader cache generation(s) removed from %s\n",
                     static_cast<unsigned long long>(removed), config->shader_cache_dir.string().c_str());
         return 0;
+    }
+    if (config->gcn_verify_decoder) {
+        return Bridge::RunGcnDecoderCheck(*config);
     }
     if (config->gcn_inventory) {
         // Phase 4, own translator: what SecondSonPC's GCN decoder makes of every program of the game (read only)

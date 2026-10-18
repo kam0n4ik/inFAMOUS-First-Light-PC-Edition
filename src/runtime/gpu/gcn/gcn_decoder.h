@@ -5,6 +5,7 @@
 // This layer only splits the code into instructions and names them; operands are read by the translator.
 #pragma once
 
+#include <array>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,6 +47,25 @@ struct Inst {
     u32 lit = 0;        ///< the literal, when `literal`
     u32 offset = 0;     ///< in dwords from the program's start
 };
+
+/// An operand as the ISA encodes a source: 0-103 SGPRs, 106/107 VCC, 124 M0, 126/127 EXEC, 128 zero, 129-192 the
+/// integers 1..64, 193-208 -1..-16, 240-247 the float constants, 251 VCCZ, 252 EXECZ, 253 SCC, 255 the literal,
+/// 256-511 the VGPRs (256 + n). Fixed register fields are put in the same space (a VGPR field n is 256 + n, an SGPR
+/// field is its register: SMRD's sbase and the buffer/image resources are register numbers, not the field's /2, /4).
+constexpr u16 kVgpr = 256;
+constexpr u16 kLiteralOperand = 255;
+constexpr u16 kVccLo = 106;
+
+struct Operands {
+    u8 num_src = 0;
+    u8 num_dst = 0;
+    std::array<u16, 4> src{};
+    std::array<u16, 2> dst{};
+};
+
+/// The register / constant operands of an instruction (the ISA's fields; immediates such as SOPP's simm16, offsets
+/// and the memory controls are read from the words by the translator). Formats not described yet: none of either.
+Operands GetOperands(const Inst& in);
 
 /// The mnemonic of (format, opcode), or "" when the table has none (an opcode SecondSonPC does not know).
 std::string_view Mnemonic(Format f, u32 op);
