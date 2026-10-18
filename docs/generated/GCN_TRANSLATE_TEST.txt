@@ -1,0 +1,48 @@
+SecondSonPC's own GCN translator on the game's programs: 10301 programs, 10296 emitted (100.0 %), 10248 valid (spirv-val, vulkan1.3; 99.5 %), 155078367 words
+
+stopped at (programs, first example):
+       2  operand 249                              art/cache/all_shaders.xpps@70e28
+       2  v_div_scale_f32                          art/cache/all_shaders.xpps@57c28
+       1  v_cvt_f64_i32                            art/cache/all_shaders.xpps@6cd28
+
+invalid modules: 8 kinds (each kind's first module: C:\Users\kamon\AppData\Local\Temp\sspc_gcn_translate\invalid_<n>.spv)
+       7  error: line ####: Header block '##[%##]' is contained in the loop construct headed by '##[%##]', but its merge block '##
+          art/cache/augustine.xpps@1631db4: error: line 5613: Header block '30[%30]' is contained in the loop construct headed by '29[%29]', but its merge block '42[%42]' is not
+  %30 = OpLabel
+
+
+       1  error: line ####: The continue construct with the continue target '##[%##]' is not structurally post dominated by the ba
+          art/cache/all_shaders.xpps@67428: error: line 2547: The continue construct with the continue target '13[%13]' is not structurally post dominated by the back-edge block '1925[%1925]'
+  %1925 = OpLabel
+
+
+       2  error: line ####: block <ID> '###[%###]' exits the selection headed by <ID> '###[%###]', but not via a structured exit
+          art/cache/all_shaders.xpps@68228: error: line 1009: block <ID> '607[%607]' exits the selection headed by <ID> '607[%607]', but not via a structured exit
+  %607 = OpLabel
+
+
+       2  error: line ###: Block '##[%##]' is already a merge block for another header
+          art/cache/augustine.xpps@162ddb4: error: line 110: Block '43[%43]' is already a merge block for another header
+  %11 = OpFunction %void None %10
+
+
+       1  error: line ###: Header block '##[%##]' is contained in the loop construct headed by '##[%##]', but its merge block '##[
+          art/cache/all_shaders.xpps@7a518: error: line 534: Header block '18[%18]' is contained in the loop construct headed by '13[%13]', but its merge block '24[%24]' is not
+  %18 = OpLabel
+
+
+       3  error: line ###: The continue construct with the continue target '##[%##]' is not structurally post dominated by the bac
+          art/cache/graffiti_a8_family.xpps@7942d0: error: line 634: The continue construct with the continue target '13[%13]' is not structurally post dominated by the back-edge block '416[%416]'
+  %416 = OpLabel
+
+
+      30  error: line ###: block <ID> '###[%###]' exits the selection headed by <ID> '###[%###]', but not via a structured exit
+          art/cache/a1.xpps@3da094: error: line 262: block <ID> '145[%145]' exits the selection headed by <ID> '145[%145]', but not via a structured exit
+  %145 = OpLabel
+
+
+       2  error: line ##: Block '##[%##]' is already a merge block for another header
+          art/cache/all_shaders.xpps@5a828: error: line 66: Block '17[%17]' is already a merge block for another header
+  %11 = OpFunction %void None %10
+
+

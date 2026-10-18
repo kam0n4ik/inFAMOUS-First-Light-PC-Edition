@@ -196,7 +196,7 @@ int main(int argc, char* argv[]) {
         } else if (a == "--no-user-settings" || a == "--press" || a == "--selftest" || a == "--fault-test" ||
                    a == "--patch-race-test" || a == "--gpu-stability-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
                    a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache" ||
-                   a == "--scan-game-shaders" || a == "--predict-shaders" || a == "--gcn-inventory" || a == "--gcn-verify-decoder") {
+                   a == "--scan-game-shaders" || a == "--predict-shaders" || a == "--gcn-inventory" || a == "--gcn-verify-decoder" || a == "--gcn-translate-test") {
             user_settings = false;
         }
     }
@@ -416,6 +416,8 @@ int main(int argc, char* argv[]) {
             config->clear_shader_cache = true;
         } else if (arg == "--gcn-verify-decoder") {
             config->gcn_verify_decoder = true;
+        } else if (arg == "--gcn-translate-test") {
+            config->gcn_translate_test = true;
         } else if (arg == "--gcn-inventory") {
             config->gcn_inventory = true;
         } else if (arg == "--scan-game-shaders") {
@@ -625,6 +627,15 @@ int main(int argc, char* argv[]) {
     }
     if (config->gcn_verify_decoder) {
         return Bridge::RunGcnDecoderCheck(*config);
+    }
+    if (config->gcn_translate_test) {
+        std::string error;
+        const auto report = App::RootDir() / "logs" / "gcn_translate_test.txt";
+        if (!Gpu::Gcn::RunTranslateTest(config->game_dir, config->shader_cache_dir, report, error)) {
+            return Fail("--gcn-translate-test: " + error);
+        }
+        std::printf("SecondSonPC: GCN translate test -> %s\n", report.string().c_str());
+        return 0;
     }
     if (config->gcn_inventory) {
         // Phase 4, own translator: what SecondSonPC's GCN decoder makes of every program of the game (read only)

@@ -13,6 +13,7 @@
 
 #include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
+#include "runtime/gpu/gcn/gcn_emit.h"
 #include "runtime/gpu/gcn/gcn_structure.h"
 #include "runtime/gpu/shader/game_shader_index.h"
 
@@ -165,6 +166,108 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
     text += dump_text;
     for (const auto& s : failures) {
         text += "  " + s + "\n";
+    }
+    std::ofstream out(report, std::ios::binary | std::ios::trunc);
+    out << text;
+    return static_cast<bool>(out);
+}
+
+bool RunTranslateTest(const std::filesystem::path& game_dir, const std::filesystem::path& cache_dir,
+                      const std::filesystem::path& report, std::string& error) {
+    Gpu::Shader::GameShaderIndex index;
+    const auto idx = Gpu::Shader::NativeCacheRoot(cache_dir, game_dir.filename().string()) / "game_programs.idx";
+    if (!index.Load(idx, error)) {
+        error = fmt::format("{} ({}; make it with --scan-game-shaders)", error, idx.string());
+        return false;
+    }
+    const auto tmp = std::filesystem::temp_directory_path() / "sspc_gcn_translate";
+    std::filesystem::create_directories(tmp);
+    std::map<std::string, u64> stopped; // the first unsupported instruction -> programs
+    std::map<std::string, std::string> stopped_example;
+    std::map<std::string, u64> invalid; // the validator's first message (digits masked) -> programs
+    std::map<std::string, std::string> invalid_example;
+    u64 programs = 0, emitted = 0, valid = 0, words = 0;
+    std::vector<u32> code;
+    std::vector<Inst> insts;
+    std::map<u32, std::ifstream> files;
+    Cfg cfg;
+    for (const auto& p : index.Programs()) {
+        ++programs;
+        const auto& loc = index.Members()[p.first_member];
+        auto& f = files[loc.pack];
+        if (!f.is_open()) {
+            f.open(game_dir / index.Packs()[loc.pack], std::ios::binary);
+        }
+        code.assign(p.length / 4, 0);
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(loc.offset));
+        f.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(code.size() * 4));
+        insts.clear();
+        std::string why;
+        const std::string where = fmt::format("{}@{:x}", index.Packs()[loc.pack], loc.offset);
+        if (!f || !Decode(code, insts, why, true) || !BuildCfg(insts, cfg, why) || !cfg.Reducible()) {
+            ++stopped["(decode / graph)"];
+            continue;
+        }
+        const Structure st = AnalyzeStructure(cfg);
+        EmitOptions eo;
+        eo.stub_memory = std::getenv("SSPC_GCN_STUB_MEMORY") != nullptr; // (tests: the control flow and the ALU alone)
+        const EmitResult r = EmitProgram(insts, cfg, st, eo);
+        if (!r.ok) {
+            const std::string key = r.unsupported.empty() ? r.error : r.unsupported;
+            if (stopped[key]++ == 0) {
+                stopped_example[key] = where;
+            }
+            continue;
+        }
+        ++emitted;
+        words += r.spirv.size();
+        const auto spv_file = tmp / "module.spv";
+        {
+            std::ofstream out(spv_file, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(r.spirv.data()), static_cast<std::streamsize>(r.spirv.size() * 4));
+        }
+        const std::string cmd =
+            "E:\\VulkanSDK\\Bin\\spirv-val.exe --target-env vulkan1.3 \"" + spv_file.string() + "\" 2>&1";
+        std::string out;
+        int rc = -1;
+        if (FILE* pipe = _popen(cmd.c_str(), "r")) {
+            char buf[512];
+            while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+                out += buf;
+            }
+            rc = _pclose(pipe);
+        }
+        if (rc == 0) {
+            ++valid;
+            continue;
+        }
+        const std::string first = out.substr(0, out.find('\n'));
+        std::string key;
+        for (size_t i = 0; i < first.size() && key.size() < 120; ++i) {
+            const char c = first[i];
+            key += (c >= '0' && c <= '9') ? '#' : c;
+        }
+        if (invalid[key]++ == 0) {
+            invalid_example[key] = where + ": " + out.substr(0, 600);
+            std::filesystem::copy_file(spv_file, tmp / fmt::format("invalid_{}.spv", invalid.size()),
+                                       std::filesystem::copy_options::overwrite_existing);
+        }
+    }
+    std::string text = fmt::format(
+        "SecondSonPC's own GCN translator on the game's programs: {} programs, {} emitted ({:.1f} %), {} valid "
+        "(spirv-val, vulkan1.3; {:.1f} %), {} words\n\nstopped at (programs, first example):\n",
+        programs, emitted, 100.0 * emitted / std::max<u64>(programs, 1), valid,
+        100.0 * valid / std::max<u64>(programs, 1), words);
+    std::vector<std::pair<std::string, u64>> rows(stopped.begin(), stopped.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (const auto& [k, n] : rows) {
+        text += fmt::format("{:>8}  {:<40} {}\n", n, k, stopped_example[k]);
+    }
+    text += fmt::format("\ninvalid modules: {} kinds (each kind's first module: {}\\invalid_<n>.spv)\n",
+                        invalid.size(), tmp.string());
+    for (const auto& [k, n] : invalid) {
+        text += fmt::format("{:>8}  {}\n          {}\n", n, k, invalid_example[k]);
     }
     std::ofstream out(report, std::ios::binary | std::ios::trunc);
     out << text;

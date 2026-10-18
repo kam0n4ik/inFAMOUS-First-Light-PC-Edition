@@ -122,6 +122,7 @@ add_library(sspc_runtime STATIC
     src/runtime/media/videodec.cpp
     src/runtime/gpu/gcn/gcn_cfg.cpp
     src/runtime/gpu/gcn/gcn_decoder.cpp
+    src/runtime/gpu/gcn/gcn_emit.cpp
     src/runtime/gpu/gcn/gcn_inventory.cpp
     src/runtime/gpu/gcn/gcn_structure.cpp
     src/runtime/gpu/gcn/spirv_builder.cpp
