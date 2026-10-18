@@ -74,17 +74,99 @@ GS::SharpLocation Location(const BufferUse& b) {
     return Location(b.sharp, 4);
 }
 
+/// The stages SSPC_OWN_SHADERS names ("cs", "vs", "ps", comma-separated): bit 0 compute, 1 vertex, 2 fragment.
+u32 OwnStages() {
+    const char* v = std::getenv("SSPC_OWN_SHADERS");
+    u32 stages = 0;
+    std::string_view s = v != nullptr ? std::string_view(v) : std::string_view{};
+    while (!s.empty()) {
+        const size_t comma = s.find(',');
+        const std::string_view item = s.substr(0, comma);
+        stages |= item == "cs" ? 1u : (item == "vs" ? 2u : (item == "ps" ? 4u : 0u));
+        s = comma == std::string_view::npos ? std::string_view{} : s.substr(comma + 1);
+    }
+    return stages;
+}
+
+/// The bridge's RemapNumberFormat / MapNumberConversion / Buffer::DstSelect (RemapSwizzle) for a vertex attribute of
+/// data format `dfmt`, number format `nfmt`, the V#'s DST_SEL `dst_sel`.
+EmitOptions::VertexInput VertexInputOf(u32 dfmt, u32 nfmt, u32 dst_sel) {
+    EmitOptions::VertexInput in;
+    const bool f32 = dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14;
+    u32 cls = nfmt; // the remapped number format
+    switch (nfmt) {
+    case 0: // unorm
+        cls = f32 ? 4 : 0;
+        in.conversion = f32 ? 6 : 0;
+        break;
+    case 2: // uscaled
+        cls = 4;
+        in.conversion = 1;
+        break;
+    case 3: // sscaled
+        cls = 5;
+        in.conversion = 2;
+        break;
+    case 6: // snorm_nz
+        cls = 5;
+        in.conversion = (dfmt == 1 || dfmt == 3 || dfmt == 10) ? 4 : ((dfmt == 2 || dfmt == 5 || dfmt == 12) ? 5 : 0);
+        break;
+    case 7: // float (8-bit: the stencil's uint)
+        cls = dfmt == 1 ? 4 : 7;
+        break;
+    case 10: // ubnorm
+        cls = 0;
+        in.conversion = 3;
+        break;
+    default:
+        break;
+    }
+    in.kind = cls == 4 ? 1 : (cls == 5 ? 2 : 0);
+    std::array<u8, 4> s{};
+    for (u32 c = 0; c < 4; ++c) {
+        s[c] = static_cast<u8>((dst_sel >> (3 * c)) & 7);
+    }
+    std::array<u8, 4> r = s;
+    switch (dfmt) {
+    case 17: // 1_5_5_5
+    case 7:  // 11_11_10
+    case 16: // 5_6_5
+        r = {s[2], s[1], s[0], s[3]};
+        break;
+    case 8: // 10_10_10_2
+        r = {s[3], s[2], s[1], s[0]};
+        break;
+    case 19: // 4_4_4_4
+        r = {s[1], s[2], s[3], s[0]};
+        break;
+    case 1:
+    case 2:
+    case 4: // one channel: alpha is red
+        for (u8& c : r) {
+            c = c == 7 ? 4 : c;
+        }
+        break;
+    default:
+        break;
+    }
+    in.swizzle = r;
+    return in;
+}
+
 class OwnTranslator final : public GS::ShaderTranslator {
 public:
-    explicit OwnTranslator(GS::ShaderTranslator* fallback)
-        : fallback_(fallback), only_(HashList("SSPC_OWN_SHADERS_ONLY")), skip_(HashList("SSPC_OWN_SHADERS_SKIP")) {}
+    OwnTranslator(GS::ShaderTranslator* fallback, u32 stages)
+        : fallback_(fallback), stages_(stages), only_(HashList("SSPC_OWN_SHADERS_ONLY")),
+          skip_(HashList("SSPC_OWN_SHADERS_SKIP")) {}
 
     std::string_view Name() const override {
-        return "SecondSonPC GCN translator (compute), the bridge's for the rest";
+        return "SecondSonPC GCN translator, the bridge's for the rest";
     }
 
     GS::TranslationResult Translate(const GS::TranslationRequest& req) override {
-        if (req.hw == GS::HwStage::Cs && req.sw == GS::SwStage::Compute && Wanted(req.footer_hash)) {
+        const bool cs = req.hw == GS::HwStage::Cs && req.sw == GS::SwStage::Compute && (stages_ & 1) != 0;
+        const bool vs = req.hw == GS::HwStage::Vs && req.sw == GS::SwStage::Vertex && (stages_ & 2) != 0;
+        if ((cs || vs) && Wanted(req.footer_hash)) {
             GS::TranslationResult res;
             std::string why;
             u32 walk_loads = 0;
@@ -93,16 +175,26 @@ public:
                 res.translate_us = static_cast<u64>(
                     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
                 const u32 n = ++own_;
-                SSPC_LOG(GPU, Info,
-                         "own GCN translator: compute {:016x} at {:#x} ({} dwords) translated - {} SPIR-V words, {} "
-                         "buffers, flat {} dwords, walk {} loads, group {}x{}x{} [{} own so far]",
-                         req.footer_hash, req.address, req.code.size(), res.spirv.size(), res.reflection.buffers.size(),
-                         res.reflection.flatbuf_dwords, walk_loads, req.runtime.threads[0], req.runtime.threads[1],
-                         req.runtime.threads[2], n);
+                if (cs) {
+                    SSPC_LOG(GPU, Info,
+                             "own GCN translator: compute {:016x} at {:#x} ({} dwords) translated - {} SPIR-V words, {} "
+                             "buffers, flat {} dwords, walk {} loads, group {}x{}x{} [{} own so far]",
+                             req.footer_hash, req.address, req.code.size(), res.spirv.size(),
+                             res.reflection.buffers.size(), res.reflection.flatbuf_dwords, walk_loads,
+                             req.runtime.threads[0], req.runtime.threads[1], req.runtime.threads[2], n);
+                } else {
+                    SSPC_LOG(GPU, Info,
+                             "own GCN translator: vertex {:016x} at {:#x} ({} dwords) translated - {} SPIR-V words, {} "
+                             "buffers, {} images, {} attributes, flat {} dwords, walk {} loads [{} own so far]",
+                             req.footer_hash, req.address, req.code.size(), res.spirv.size(),
+                             res.reflection.buffers.size(), res.reflection.images.size(),
+                             res.reflection.fetch.attributes.size(), res.reflection.flatbuf_dwords, walk_loads, n);
+                }
                 return res;
             }
-            if (const u32 n = ++declined_; n <= 200) {
-                SSPC_LOG(GPU, Info, "own GCN translator: compute {:016x} to the bridge's ({})", req.footer_hash, why);
+            if (const u32 n = ++declined_; n <= 400) {
+                SSPC_LOG(GPU, Info, "own GCN translator: {} {:016x} to the bridge's ({})", cs ? "compute" : "vertex",
+                         req.footer_hash, why);
             }
         }
         return fallback_->Translate(req);
@@ -123,13 +215,169 @@ private:
         return (only_.empty() || only_.contains(hash)) && !skip_.contains(hash);
     }
 
+    /// A vertex program's parameters (the bridge's ToRuntime / MapOutputs / translator prologue) and its fetch shader:
+    /// read from the request (or guest memory), parsed, its attributes' V#s read - res.fetch_code / vertex_sharps as
+    /// the bridge's adapter gives them (the runtime keys the module on them).
+    static bool PrepareVertex(const GS::TranslationRequest& req, std::span<const Inst> insts,
+                              EmitOptions::VertexOptions& vs, GS::FetchShader& fetch, GS::TranslationResult& res,
+                              std::string& why) {
+        const GS::RuntimeParams& p = req.runtime;
+        const GS::DeviceProfile& prof = *req.profile;
+        if (p.rect_list != 0 || p.quad_list != 0) {
+            why = "a rect / quad list (drawn as patches: the auxiliary tessellation stages read the outputs)";
+            return false;
+        }
+        vs.input_vgprs = (p.rsrc1 >> 24) & 3;
+        vs.step_rate0 = p.step_rate0;
+        vs.step_rate1 = p.step_rate1;
+        // an indirect draw's SH offsets of base vertex / start instance: user data registers (SPI_SHADER_USER_DATA_VS_0
+        // is SH offset 0x4C)
+        const auto ud_reg = [&](u32 offset, s32& out) {
+            out = -1;
+            if (offset == 0) {
+                return true;
+            }
+            if (offset < 0x4C || offset - 0x4C >= 16) {
+                why = fmt::format("an indirect SGPR at SH offset {:#x}", offset);
+                return false;
+            }
+            out = static_cast<s32>(offset - 0x4C);
+            return true;
+        };
+        if (!ud_reg(p.vertex_sgpr_offset, vs.base_vertex_sgpr) || !ud_reg(p.instance_sgpr_offset, vs.base_instance_sgpr)) {
+            return false;
+        }
+        // POS1..3 (PA_CL_VS_OUT_CNTL; MapOutputs)
+        const u32 ctl = p.vs_out_cntl;
+        u32 n = 0;
+        if (((ctl >> 21) & 1) != 0) { // VS_OUT_MISC_VEC_ENA
+            auto& misc = vs.pos_outputs[n++];
+            misc[0] = ((ctl >> 16) & 1) != 0 ? 1 : 0;                                         // point size
+            misc[1] = (((ctl >> 17) & 1) != 0 || ((ctl >> 25) & 1) != 0) ? 255 : 0;            // edge / cut flag
+            misc[2] = (((ctl >> 20) & 1) != 0 || ((ctl >> 18) & 1) != 0) ? 255 : 0;            // kill flag / layer
+            misc[3] = ((ctl >> 19) & 1) != 0 ? 255 : 0;                                        // viewport index
+        }
+        for (u32 vec = 0; vec < 2; ++vec) {
+            if (((ctl >> (22 + vec)) & 1) == 0) { // VS_OUT_CCDIST0/1_VEC_ENA
+                continue;
+            }
+            auto& o = vs.pos_outputs[n++];
+            for (u32 i = 0; i < 4; ++i) {
+                const u32 k = vec * 4 + i;
+                o[i] = ((ctl >> k) & 1) != 0 ? static_cast<u8>(2 + k) : (((ctl >> (8 + k)) & 1) != 0 ? static_cast<u8>(10 + k) : 0);
+            }
+        }
+        if (prof.needs_clip_distance_emulation && (ctl & 0xFF) != 0) {
+            why = "clip distances on a device that emulates them";
+            return false;
+        }
+        vs.depth_minus_one_to_one = !prof.depth_clip_control && ((p.clip_cntl >> 19) & 1) == 0;
+        vs.clip_space = ((p.clip_cntl >> 16) & 1) != 0;
+        vs.viewport_w = static_cast<float>(std::min<u32>(prof.max_viewport_width / 2, 8192));
+        vs.viewport_h = static_cast<float>(std::min<u32>(prof.max_viewport_height / 2, 8192));
+        // the fetch shader: the s_swappc_b64 at the program's start (its SSRC0 the user data pair of its address)
+        const Inst* call = nullptr;
+        for (const Inst& in : insts) {
+            if (in.format == Format::Sop1 && Mnemonic(in.format, in.op) == "s_swappc_b64") {
+                if (call != nullptr) {
+                    why = "two s_swappc_b64";
+                    return false;
+                }
+                call = &in;
+            }
+        }
+        if (call == nullptr) {
+            return true;
+        }
+        const u32 sgpr = call->w0 & 0xFF;
+        if (sgpr + 1 >= 16) {
+            why = fmt::format("the fetch shader's address in s[{}:{}] (not user data)", sgpr, sgpr + 1);
+            return false;
+        }
+        std::vector<u32> code;
+        std::string e;
+        if (!req.fetch_code.empty()) {
+            code.assign(req.fetch_code.begin(), req.fetch_code.end());
+            if (!GS::ParseFetchShaderCode(code, sgpr, fetch, e)) {
+                why = "the fetch shader: " + e;
+                return false;
+            }
+        } else {
+            // read up to its s_setpc_b64 (bounded, as the bridge's adapter)
+            const u64 addr = (req.user_data[sgpr] | (u64{req.user_data[sgpr + 1]} << 32)) & 0xFFFFFFFFFFFFull;
+            constexpr u32 kMaxFetchDwords = 512;
+            bool parsed = false;
+            for (u32 have = 0; have < kMaxFetchDwords && !parsed;) {
+                const u32 chunk = std::min<u32>(64, kMaxFetchDwords - have);
+                code.resize(have + chunk);
+                if (req.memory == nullptr || !req.memory->Read(addr + have * 4ull, code.data() + have, chunk * 4ull)) {
+                    why = fmt::format("the fetch shader at {:#x} is unreadable", addr);
+                    return false;
+                }
+                have += chunk;
+                parsed = GS::ParseFetchShaderCode(code, sgpr, fetch, e);
+                if (!parsed && e.rfind("no s_setpc_b64", 0) != 0 && e.rfind("a buffer load cut", 0) != 0) {
+                    break;
+                }
+            }
+            if (!parsed) {
+                why = "the fetch shader: " + e;
+                return false;
+            }
+            code.resize(fetch.size / 4);
+        }
+        if (fetch.vertex_offset_sgpr >= 0 && vs.base_vertex_sgpr >= 0 && fetch.vertex_offset_sgpr != vs.base_vertex_sgpr) {
+            why = "the fetch shader's vertex offset is not the indirect draw's base vertex";
+            return false;
+        }
+        if (fetch.instance_offset_sgpr >= 0 && vs.base_instance_sgpr >= 0 &&
+            fetch.instance_offset_sgpr != vs.base_instance_sgpr) {
+            why = "the fetch shader's instance offset is not the indirect draw's start instance";
+            return false;
+        }
+        vs.fetch = true;
+        vs.fetch_adds_base_vertex = fetch.vertex_offset_sgpr >= 0;
+        vs.fetch_adds_base_instance = fetch.instance_offset_sgpr >= 0;
+        // the attributes' V#s (the vertex buffer table: a user data pair, the V# at a dword offset in it)
+        const bool given = req.vertex_sharps.size() == fetch.attributes.size() && !req.vertex_sharps.empty();
+        for (u32 i = 0; i < fetch.attributes.size(); ++i) {
+            const GS::FetchAttribute& a = fetch.attributes[i];
+            std::array<u32, 4> raw{};
+            if (given) {
+                raw = req.vertex_sharps[i];
+            } else {
+                if (a.sgpr_base + 1 >= 16) {
+                    why = fmt::format("attribute {}'s vertex buffer table in s[{}:{}]", i, a.sgpr_base, a.sgpr_base + 1);
+                    return false;
+                }
+                const u64 table =
+                    (req.user_data[a.sgpr_base] | (u64{req.user_data[a.sgpr_base + 1]} << 32)) & 0xFFFFFFFFFFFFull;
+                if (req.memory == nullptr || !req.memory->Read(table + u64{a.dword_offset} * 4, raw.data(), 16)) {
+                    why = fmt::format("attribute {}'s V# at {:#x} is unreadable", i, table + u64{a.dword_offset} * 4);
+                    return false;
+                }
+            }
+            res.vertex_sharps.push_back(raw);
+            const GS::BufferDesc d{raw};
+            const u32 dfmt = a.data_format != 0 ? a.data_format : d.DataFormat();
+            const u32 nfmt = a.data_format != 0 ? a.num_format : d.NumFormat();
+            EmitOptions::VertexInput in = VertexInputOf(dfmt, nfmt, raw[3] & 0xFFF);
+            in.dest_vgpr = a.dest_vgpr;
+            in.num_elements = a.num_elements;
+            vs.inputs.push_back(in);
+        }
+        res.fetch_code = std::move(code);
+        return true;
+    }
+
     static bool TryOwn(const GS::TranslationRequest& req, GS::TranslationResult& res, std::string& why,
                        u32& walk_loads) {
         if (req.code.empty() || req.profile == nullptr) {
             why = "no code or no device profile";
             return false;
         }
-        if (!(req.start == GS::BindingStart{})) {
+        const bool vertex = req.hw == GS::HwStage::Vs;
+        if (!vertex && !(req.start == GS::BindingStart{})) {
             why = "its bindings do not start at 0";
             return false;
         }
@@ -186,17 +434,30 @@ private:
             }
         }
         eo.flat = res.flatbuf;
-        eo.compute = true;
-        eo.threads = req.runtime.threads;
         eo.rsrc2 = rsrc2;
         eo.subgroup_size = subgroup;
+        eo.binding_base = req.start.unified;
+        eo.buffer_base = req.start.buffer;
+        GS::FetchShader fetch;
+        if (vertex) {
+            eo.vertex = true;
+            if (!PrepareVertex(req, insts, eo.vs, fetch, res, why)) {
+                return false;
+            }
+        } else {
+            eo.compute = true;
+            eo.threads = req.runtime.threads;
+        }
         EmitResult r = EmitProgram(insts, cfg, st, eo);
         const ResourceInfo& ri = r.ok ? r.resources : pre;
         GS::ShaderReflection& refl = res.reflection;
-        if (HashList("SSPC_OWN_SHADERS_DUMP").contains(req.footer_hash)) {
+        const char* dump_env = std::getenv("SSPC_OWN_SHADERS_DUMP");
+        if (dump_env != nullptr &&
+            (std::string_view(dump_env) == "all" || HashList("SSPC_OWN_SHADERS_DUMP").contains(req.footer_hash))) {
             // SSPC_OWN_SHADERS_DUMP=<footer hashes>: the program, its buffers' V#s as the translation saw them, the SPIR-V
             // (a program not translated too: its code and why)
-            std::string text = fmt::format("compute {:016x} at {:#x}, rsrc2 {:#x}, group {}x{}x{}{}\n", req.footer_hash,
+            std::string text = fmt::format("{} {:016x} at {:#x}, rsrc2 {:#x}, group {}x{}x{}{}\n",
+                                           vertex ? "vertex" : "compute", req.footer_hash,
                                            req.address, rsrc2, eo.threads[0], eo.threads[1], eo.threads[2],
                                            r.ok ? "" : " - not translated: " + r.error);
             for (u32 b = 0; b < ri.buffers.size(); ++b) {
@@ -220,7 +481,7 @@ private:
                 text += fmt::format("{:5} {:<28} {:08x} {:08x}{}{}\n", in.offset, Mnemonic(in.format, in.op), in.w0, in.w1,
                                     in.literal ? fmt::format(" lit {:08x}", in.lit) : "", regs);
             }
-            const std::string base = fmt::format("logs/own_cs_{:016x}", req.footer_hash);
+            const std::string base = fmt::format("logs/own_{}_{:016x}", vertex ? "vs" : "cs", req.footer_hash);
             std::ofstream(base + ".txt", std::ios::binary) << text;
             std::ofstream(base + ".spv", std::ios::binary)
                 .write(reinterpret_cast<const char*>(r.spirv.data()), static_cast<std::streamsize>(r.spirv.size() * 4));
@@ -237,6 +498,9 @@ private:
         refl.hw = req.hw;
         refl.sw = req.sw;
         refl.footer_hash = req.footer_hash;
+        if (fetch.present) {
+            refl.fetch = std::move(fetch);
+        }
         // the bridge's order (the executor's game fixes, e.g. the particle sort's split, know the buffers by it): the
         // V#s, the flattened user data, GDS
         for (const BufferUse& b : ri.buffers) {
@@ -270,6 +534,7 @@ private:
     }
 
     GS::ShaderTranslator* fallback_;
+    u32 stages_ = 0; ///< SSPC_OWN_SHADERS: bit 0 compute, 1 vertex, 2 fragment
     std::unordered_set<u64> only_, skip_;
     std::atomic<u32> own_{0}, declined_{0};
 };
@@ -277,8 +542,8 @@ private:
 } // namespace
 
 void InstallOwnTranslatorIfEnabled() {
-    const char* v = std::getenv("SSPC_OWN_SHADERS");
-    if (v == nullptr || std::string_view(v) != "cs") {
+    const u32 stages = OwnStages();
+    if (stages == 0) {
         return;
     }
     GS::ShaderTranslator* fallback = GS::GetShaderTranslator();
@@ -286,9 +551,10 @@ void InstallOwnTranslatorIfEnabled() {
         SSPC_LOG(GPU, Warning, "own GCN translator: no translator installed to wrap - not enabled");
         return;
     }
-    static OwnTranslator own(fallback);
+    static OwnTranslator own(fallback, stages);
     GS::InstallShaderTranslator(&own);
-    SSPC_LOG(GPU, Info, "own GCN translator: enabled for compute programs (SSPC_OWN_SHADERS=cs), {} for the rest",
+    SSPC_LOG(GPU, Info, "own GCN translator: enabled for{}{} programs (SSPC_OWN_SHADERS={}), {} for the rest",
+             (stages & 1) != 0 ? " compute" : "", (stages & 2) != 0 ? " vertex" : "", std::getenv("SSPC_OWN_SHADERS"),
              fallback->Name());
 }
 

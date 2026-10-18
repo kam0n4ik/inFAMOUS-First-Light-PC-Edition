@@ -30,6 +30,8 @@ struct EmitResult {
     /// the resources (bindings: buffers[i] at i, the flattened user data at buffers.size(), GDS after it; push
     /// constants: PushData, buf_offsets[i] for buffers[i])
     ResourceInfo resources;
+    u8 mrt_mask = 0;          ///< a fragment program: the MRTs it exports to (the bridge's info.mrt_mask)
+    bool has_discard = false; ///< ... an export with VM
 };
 
 struct EmitOptions {
@@ -52,6 +54,69 @@ struct EmitOptions {
     /// module is specialized on (the runtime's key holds them) - buffer_*_format's DATA/NUM_FORMAT and DST_SEL.
     /// Empty: those instructions are not translated.
     std::span<const u32> flat;
+    /// the stage's first descriptor binding and its first buffer's index in PushData.buf_offsets (a graphics
+    /// pipeline numbers its stages' bindings one after another, the fragment stage's first)
+    u32 binding_base = 0, buffer_base = 0;
+
+    /// a vertex program (the hardware VS stage; the bridge's conventions, which its fragment programs read):
+    /// the fetch shader's attributes are vertex inputs at locations 0.., read where the program calls it
+    /// (s_swappc_b64), converted and swizzled as the V# says; v0 the vertex index, v1-v3 the instance ids; POS0 is
+    /// gl_Position, PARAMn an output vec4 at location n
+    struct VertexInput {
+        u32 dest_vgpr = 0, num_elements = 0;
+        u32 kind = 0;       ///< the input's type: 0 float, 1 uint, 2 sint (the format's number class, remapped)
+        u32 conversion = 0; ///< 0 none, 1 uscaled, 2 sscaled, 3 ubnorm, 4 snorm_nz 8-bit, 5 snorm_nz 16-bit, 6 unorm 32
+        std::array<u8, 4> swizzle{4, 5, 6, 7}; ///< per register component: 0 zero, 1 one, 4-7 the input's x-w
+    };
+    struct VertexOptions {
+        bool fetch = false;              ///< the program calls a fetch shader
+        std::vector<VertexInput> inputs; ///< (in the fetch shader's order: location i)
+        u32 input_vgprs = 0;             ///< SPI_SHADER_PGM_RSRC1_VS.VGPR_COMP_CNT (v1..v3 given)
+        u32 step_rate0 = 0, step_rate1 = 0;
+        s32 base_vertex_sgpr = -1, base_instance_sgpr = -1; ///< indirect draws: the SGPRs given BaseVertex / BaseInstance
+        bool fetch_adds_base_vertex = false, fetch_adds_base_instance = false; ///< (else v0 / v3 have them taken off)
+        /// POS1..POS3's components: 0 none, 1 point size, 2 + k clip distance k, 10 + k cull distance k, 255 not
+        /// translated (edge / kill / cut flag, render target / viewport index)
+        std::array<std::array<u8, 4>, 3> pos_outputs{};
+        bool depth_minus_one_to_one = false; ///< z = (z + w) / 2 at the end (no VK_EXT_depth_clip_control)
+        bool clip_space = false;             ///< CLIP_DISABLE / a rect list: the position is in screen space
+        float viewport_w = 0, viewport_h = 0; ///< (clip_space: half the device's largest viewport, at most 8 K)
+    };
+    bool vertex = false;
+    VertexOptions vs;
+
+    /// a fragment program (the hardware PS stage; the bridge's conventions): the VGPRs SPI_PS_INPUT_ADDR lays out
+    /// (the barycentrics' I/J only name the interpolation: v_interp_p2 reads the interpolated input, p1 does nothing),
+    /// the position / front face SPI_PS_INPUT_ENA gives; input slot i (v_interp's ATTR) is the vec4 at location
+    /// SPI_PS_INPUT_CNTL_i.OFFSET; MRTn an output at location n, MRTZ the depth; an export with VM discards the lanes
+    /// EXEC does not hold
+    struct FragmentInput {
+        u32 location = 0;
+        bool flat = false, is_default = false;
+        u32 default_value = 0; ///< (0, 0, 0, 0), (0, 0, 0, 1), (1, 1, 1, 0), (1, 1, 1, 1)
+    };
+    struct ColorTarget {
+        u32 export_format = 0; ///< SPI_SHADER_COL_FORMAT's field (0: none)
+        u32 kind = 0;          ///< the output's type: 0 float, 1 uint, 2 sint (the target's number class, remapped)
+        u32 conversion = 0;    ///< as VertexInput's, in the write direction
+        std::array<u8, 4> map{0, 1, 2, 3}; ///< output component i = the exported component map[i] (CB COMP_SWAP)
+    };
+    struct FragmentOptions {
+        u32 input_addr = 0, input_ena = 0; ///< SPI_PS_INPUT_ADDR / ENA
+        bool front_face_all_bits = false;
+        u32 num_inputs = 0;
+        std::array<FragmentInput, 32> inputs{};
+        std::array<ColorTarget, 8> targets{};
+        u32 mrtz_mask = 0; ///< bit 0 depth, 1 stencil, 2 sample mask (DB_SHADER_CONTROL)
+    };
+    bool fragment = false;
+    FragmentOptions fs;
+};
+
+/// What a fragment program's emission found (the reflection's): the MRTs it exports to, whether it discards.
+struct FragmentFacts {
+    u8 mrt_mask = 0;
+    bool has_discard = false;
 };
 
 EmitResult EmitProgram(std::span<const Inst> insts, const Cfg& cfg, const Structure& st,

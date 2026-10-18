@@ -169,6 +169,18 @@ private:
     /// a source operand's value when it is a constant of the operand space (inline or literal)
     static std::optional<u32> ConstOperand(u32 code, const Inst& in);
     void InitCompute(); ///< the thread ids (v0-v2) and the group ids / TG_SIZE after the user data (COMPUTE_PGM_RSRC2)
+    // the vertex stage (EmitOptions::vertex)
+    void InitVertex();   ///< v0-v3 (the vertex / instance ids), the base vertex / instance SGPRs, the inputs
+    void EmitFetch();    ///< the fetch shader's call: its attributes into their VGPRs
+    void EmitExport(const Inst& in);
+    void VertexEpilogue(); ///< before the return: the position's depth mode and clip space
+    Id OutputComponent(Id var, u32 c) {
+        return b_.Op(Op::OpAccessChain, t_ptr_out_f32_, {var, b_.U32(c)});
+    }
+    Id t_vec4_ = 0, t_ptr_out_f32_ = 0;
+    Id position_ = 0, point_size_ = 0, clip_dist_ = 0, cull_dist_ = 0;
+    std::array<Id, 32> params_{};
+    std::vector<Id> vinputs_;
     std::unordered_map<u32, Id> regs_; ///< register code -> its function variable
 };
 
@@ -196,7 +208,28 @@ void Emitter::BuildGraph() {
         h.loop_header = true;
         h.loop_merge = l.merge;
         h.loop_continue = static_cast<s32>(l.latches.front());
+        if (l.merge >= 0) {
+            // a merge block of the loop's own (its exits go to it, it goes on): the block the loop exits to may merge
+            // an enclosing selection too (a selection around the loop that skips it), and a block merges one construct
+            const s32 m = static_cast<s32>(nodes_.size());
+            for (u32 x = 0; x < n; ++x) {
+                if (l.body[x]) {
+                    for (s32& s : nodes_[x].succ) {
+                        if (s == l.merge) {
+                            s = m;
+                        }
+                    }
+                }
+            }
+            Node mn;
+            mn.succ = {l.merge};
+            nodes_.push_back(mn);
+            idom.push_back(static_cast<s32>(l.header));
+            nodes_[l.header].loop_merge = m;
+        }
     }
+    // a loop's merge as the emitted graph has it (its own block)
+    const auto merge_of = [&](const LoopInfo& l) { return nodes_[l.header].loop_merge; };
     const auto dominates = [&](s32 a, s32 x) {
         for (; x >= 0; x = idom[x]) {
             if (x == a) {
@@ -212,7 +245,7 @@ void Emitter::BuildGraph() {
             return false;
         }
         const LoopInfo& l = st_.loops[li];
-        return target == l.merge || target == static_cast<s32>(l.header) ||
+        return target == merge_of(l) || target == static_cast<s32>(l.header) ||
                target == static_cast<s32>(l.latches.front());
     };
     std::vector<u32> sel;
@@ -235,7 +268,12 @@ void Emitter::BuildGraph() {
             nd.break_branch = true; // (a latch's back edge / a break / a continue)
             continue;
         }
-        const s32 merge = st_.selection_merge[b];
+        s32 merge = st_.selection_merge[b];
+        for (const LoopInfo& l : st_.loops) {
+            if (merge >= 0 && merge == l.merge && b < l.body.size() && l.body[b]) {
+                merge = merge_of(l); // (a selection in the loop merging where the loop exits: the loop's merge block)
+            }
+        }
         if (merge == -2) {
             nd.selection_merge = -2;
             continue;
@@ -423,13 +461,21 @@ void Emitter::DeclareResources() {
         return v;
     };
     t_ptr_sb_u32_ = b_.TypePointer(spv::StorageClass::StorageBuffer, t_u32_);
+    const u32 base = options_.binding_base;
     for (u32 i = 0; i < res_.buffers.size(); ++i) {
-        buffers_.push_back(ssbo(res_.buffers[i].written, i));
+        buffers_.push_back(ssbo(res_.buffers[i].written, base + i));
     }
     // the bridge's order (the executor's game fixes know the buffers by it): the V#s, the flattened user data, GDS
-    flat_ = ssbo(false, static_cast<u32>(res_.buffers.size()));
+    flat_ = ssbo(false, base + static_cast<u32>(res_.buffers.size()));
     if (res_.uses_gds) {
-        gds_ = ssbo(true, 1 + static_cast<u32>(res_.buffers.size()));
+        gds_ = ssbo(true, base + 1 + static_cast<u32>(res_.buffers.size()));
+    }
+    if (res_.uses_lds && (options_.vertex || options_.fragment)) {
+        throw Unsupported{"the local data share outside a compute program"};
+    }
+    if (options_.buffer_base + res_.buffers.size() > 56) {
+        throw Unsupported{fmt::format("buffers {}..{} (PushData has 56 offsets)", options_.buffer_base,
+                                      options_.buffer_base + res_.buffers.size())};
     }
     if (res_.uses_lds) {
         // the local data share: 32 KiB of dwords (the most a GCN workgroup gets)
@@ -438,7 +484,7 @@ void Emitter::DeclareResources() {
         lds_ = b_.Variable(b_.TypePointer(spv::StorageClass::Workgroup, arr), spv::StorageClass::Workgroup);
         interface_.push_back(lds_);
     }
-    DeclareImages(static_cast<u32>(res_.buffers.size()) + 1 + (res_.uses_gds ? 1 : 0));
+    DeclareImages(base + static_cast<u32>(res_.buffers.size()) + 1 + (res_.uses_gds ? 1 : 0));
     // PushData: float xoffset, yoffset, xscale, yscale; u8 buf_offsets[56] (as 14 dwords)
     const Id f4 = b_.TypeArray(t_f32_, b_.U32(4));
     b_.Decorate(f4, spv::Decoration::ArrayStride, {4});
@@ -459,7 +505,7 @@ Id Emitter::FlatDword(Id index) {
 }
 
 Id Emitter::BufOffset(u32 buffer) {
-    const u32 k = buffer; // (the V#s are the first bindings)
+    const u32 k = options_.buffer_base + buffer; // (the V#s are the stage's first buffers)
     const Id word =
         b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_pc_u32_, {push_, b_.U32(1), b_.U32(k / 4)})});
     return b_.Op(Op::OpBitFieldUExtract, t_u32_, {word, b_.U32((k % 4) * 8), b_.U32(8)});
@@ -1177,6 +1223,222 @@ void Emitter::InitCompute() {
     }
 }
 
+void Emitter::InitVertex() {
+    const EmitOptions::VertexOptions& vs = options_.vs;
+    t_vec4_ = b_.TypeVector(t_f32_, 4);
+    t_ptr_out_f32_ = b_.TypePointer(spv::StorageClass::Output, t_f32_);
+    const auto input = [&](spv::BuiltIn builtin) {
+        const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::Input, t_u32_), spv::StorageClass::Input);
+        b_.Decorate(v, spv::Decoration::BuiltIn, {static_cast<u32>(builtin)});
+        interface_.push_back(v);
+        return b_.Op(Op::OpLoad, t_u32_, {v});
+    };
+    Id vertex = input(spv::BuiltIn::VertexIndex);
+    Id instance = input(spv::BuiltIn::InstanceIndex);
+    if (vs.base_vertex_sgpr >= 0 || vs.base_instance_sgpr >= 0) {
+        b_.Capability(spv::Capability::DrawParameters);
+    }
+    // an indirect draw's base vertex / start instance: the SGPRs the GPU writes them to; the vertex / instance index
+    // without them unless the fetch shader adds that SGPR (VertexIndex / InstanceIndex include them - the bridge's)
+    if (vs.base_vertex_sgpr >= 0) {
+        const Id base = input(spv::BuiltIn::BaseVertex);
+        Set(static_cast<u32>(vs.base_vertex_sgpr), base);
+        if (!vs.fetch_adds_base_vertex) {
+            vertex = b_.Op(Op::OpISub, t_u32_, {vertex, base});
+        }
+    }
+    if (vs.base_instance_sgpr >= 0) {
+        const Id base = input(spv::BuiltIn::BaseInstance);
+        Set(static_cast<u32>(vs.base_instance_sgpr), base);
+        if (!vs.fetch_adds_base_instance) {
+            instance = b_.Op(Op::OpISub, t_u32_, {instance, base});
+        }
+    }
+    // v0 the vertex index; VGPR_COMP_CNT: v1 the instance over step rate 0, v2 over step rate 1, v3 the instance
+    Set(kVgpr, vertex);
+    const auto stepped = [&](u32 rate) { return rate != 0 ? b_.Op(Op::OpUDiv, t_u32_, {instance, b_.U32(rate)}) : b_.U32(0); };
+    if (vs.input_vgprs > 0) {
+        Set(kVgpr + 1, stepped(vs.step_rate0));
+    }
+    if (vs.input_vgprs > 1) {
+        Set(kVgpr + 2, stepped(vs.step_rate1));
+    }
+    if (vs.input_vgprs > 2) {
+        Set(kVgpr + 3, instance);
+    }
+    // the fetch shader's attributes: location i, the format's number class
+    for (u32 i = 0; i < vs.inputs.size(); ++i) {
+        const Id scalar = vs.inputs[i].kind == 0 ? t_f32_ : (vs.inputs[i].kind == 1 ? t_u32_ : t_i32_);
+        const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::Input, b_.TypeVector(scalar, 4)),
+                                 spv::StorageClass::Input);
+        b_.Decorate(v, spv::Decoration::Location, {i});
+        interface_.push_back(v);
+        vinputs_.push_back(v);
+    }
+    position_ = b_.Variable(b_.TypePointer(spv::StorageClass::Output, t_vec4_), spv::StorageClass::Output);
+    b_.Decorate(position_, spv::Decoration::BuiltIn, {static_cast<u32>(spv::BuiltIn::Position)});
+    interface_.push_back(position_);
+}
+
+void Emitter::EmitFetch() {
+    const EmitOptions::VertexOptions& vs = options_.vs;
+    for (u32 i = 0; i < vs.inputs.size(); ++i) {
+        const EmitOptions::VertexInput& a = vs.inputs[i];
+        const Id scalar = a.kind == 0 ? t_f32_ : (a.kind == 1 ? t_u32_ : t_i32_);
+        const Id value = b_.Op(Op::OpLoad, b_.TypeVector(scalar, 4), {vinputs_[i]});
+        // the number conversion of the V#'s format (the bridge's ApplyReadNumberConversion): the register's bits
+        const bool float_result = a.kind == 0 || a.conversion != 0;
+        std::array<Id, 4> comp{};
+        for (u32 c = 0; c < 4; ++c) {
+            const Id x = b_.Op(Op::OpCompositeExtract, scalar, {value, c});
+            Id f = 0;
+            switch (a.conversion) {
+            case 0:
+                comp[c] = scalar == t_u32_ ? x : Bit(t_u32_, x);
+                continue;
+            case 1:
+                f = b_.Op(Op::OpConvertUToF, t_f32_, {x});
+                break;
+            case 2:
+                f = b_.Op(Op::OpConvertSToF, t_f32_, {x});
+                break;
+            case 3:
+                f = b_.Op(Op::OpFSub, t_f32_, {b_.Op(Op::OpFMul, t_f32_, {x, b_.F32(2.0f)}), b_.F32(1.0f)});
+                break;
+            case 4:
+            case 5: {
+                const Id s = Bit(t_u32_, x);
+                const Id odd = b_.Op(Op::OpIAdd, t_u32_, {b_.Op(Op::OpIMul, t_u32_, {s, b_.U32(2)}), b_.U32(1)});
+                f = b_.Op(Op::OpFDiv, t_f32_, {b_.Op(Op::OpConvertSToF, t_f32_, {Bit(t_i32_, odd)}),
+                                               b_.F32(a.conversion == 4 ? 255.0f : 65535.0f)});
+                break;
+            }
+            case 6:
+                f = b_.Op(Op::OpFDiv, t_f32_, {b_.Op(Op::OpConvertUToF, t_f32_, {x}), b_.F32(4294967295.0f)});
+                break;
+            default:
+                throw Unsupported{fmt::format("vertex attribute conversion {}", a.conversion)};
+            }
+            comp[c] = Bit(t_u32_, f);
+        }
+        // DST_SEL (0 zero, 1 one, 4-7 x-w), then the registers the load wrote
+        for (u32 j = 0; j < a.num_elements && j < 4; ++j) {
+            const u32 sel = a.swizzle[j];
+            const Id v = sel >= 4 ? comp[sel - 4]
+                                  : (sel == 1 ? b_.U32(float_result ? std::bit_cast<u32>(1.0f) : 1u) : b_.U32(0));
+            Set(kVgpr + a.dest_vgpr + j, v);
+        }
+    }
+}
+
+void Emitter::EmitExport(const Inst& in) {
+    const u32 en = in.w0 & 0xF, target = (in.w0 >> 4) & 0x3F;
+    const bool compr = ((in.w0 >> 10) & 1) != 0;
+    const auto vsrc = [&](u32 c) { return GetF(kVgpr + ((in.w1 >> (8 * c)) & 0xFF), in); };
+    if (compr) {
+        throw Unsupported{fmt::format("exp to target {} compressed (a vertex program)", target)};
+    }
+    if (target == 12) {
+        for (u32 c = 0; c < 4; ++c) {
+            if (((en >> c) & 1) != 0) {
+                b_.OpNoResult(Op::OpStore, {OutputComponent(position_, c), vsrc(c)});
+            }
+        }
+        return;
+    }
+    if (target >= 13 && target <= 15) {
+        // POS1..3: what PA_CL_VS_OUT_CNTL makes of them (the bridge's MapOutputs / ExportPosition)
+        for (u32 c = 0; c < 4; ++c) {
+            if (((en >> c) & 1) == 0) {
+                continue;
+            }
+            const u32 out = options_.vs.pos_outputs[target - 13][c];
+            if (out == 0) {
+                continue; // (not mapped: the bridge skips it too)
+            }
+            const auto array8 = [&](spv::BuiltIn builtin) {
+                const Id type = b_.TypeArray(t_f32_, b_.U32(8));
+                const std::array<Id, 8> zero{b_.F32(0), b_.F32(0), b_.F32(0), b_.F32(0),
+                                             b_.F32(0), b_.F32(0), b_.F32(0), b_.F32(0)};
+                const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::Output, type), spv::StorageClass::Output,
+                                         b_.ConstantComposite(type, zero));
+                b_.Decorate(v, spv::Decoration::BuiltIn, {static_cast<u32>(builtin)});
+                interface_.push_back(v);
+                return v;
+            };
+            if (out == 1) {
+                if (point_size_ == 0) {
+                    point_size_ = b_.Variable(t_ptr_out_f32_, spv::StorageClass::Output);
+                    b_.Decorate(point_size_, spv::Decoration::BuiltIn, {static_cast<u32>(spv::BuiltIn::PointSize)});
+                    interface_.push_back(point_size_);
+                }
+                b_.OpNoResult(Op::OpStore, {point_size_, vsrc(c)});
+            } else if (out >= 2 && out < 10) {
+                if (clip_dist_ == 0) {
+                    b_.Capability(spv::Capability::ClipDistance);
+                    clip_dist_ = array8(spv::BuiltIn::ClipDistance);
+                }
+                b_.OpNoResult(Op::OpStore, {OutputComponent(clip_dist_, out - 2), vsrc(c)});
+            } else if (out >= 10 && out < 18) {
+                if (cull_dist_ == 0) {
+                    b_.Capability(spv::Capability::CullDistance);
+                    cull_dist_ = array8(spv::BuiltIn::CullDistance);
+                }
+                b_.OpNoResult(Op::OpStore, {OutputComponent(cull_dist_, out - 10), vsrc(c)});
+            } else {
+                throw Unsupported{fmt::format("exp to POS{} component {} (PA_CL_VS_OUT_CNTL output {})", target - 12, c,
+                                              out)};
+            }
+        }
+        return;
+    }
+    if (target >= 32 && target < 64) {
+        // PARAMn: an output vec4 at location n (the fragment program's SPI_PS_INPUT_CNTL offsets name it)
+        Id& p = params_[target - 32];
+        if (p == 0) {
+            p = b_.Variable(b_.TypePointer(spv::StorageClass::Output, t_vec4_), spv::StorageClass::Output);
+            b_.Decorate(p, spv::Decoration::Location, {target - 32});
+            interface_.push_back(p);
+        }
+        for (u32 c = 0; c < 4; ++c) {
+            if (((en >> c) & 1) != 0) {
+                b_.OpNoResult(Op::OpStore, {OutputComponent(p, c), vsrc(c)});
+            }
+        }
+        return;
+    }
+    throw Unsupported{fmt::format("exp to target {} (a vertex program)", target)};
+}
+
+void Emitter::VertexEpilogue() {
+    const EmitOptions::VertexOptions& vs = options_.vs;
+    if (!vs.depth_minus_one_to_one && !vs.clip_space) {
+        return;
+    }
+    Id pos = b_.Op(Op::OpLoad, t_vec4_, {position_});
+    Id x = b_.Op(Op::OpCompositeExtract, t_f32_, {pos, 0}), y = b_.Op(Op::OpCompositeExtract, t_f32_, {pos, 1});
+    Id z = b_.Op(Op::OpCompositeExtract, t_f32_, {pos, 2});
+    const Id w = b_.Op(Op::OpCompositeExtract, t_f32_, {pos, 3});
+    if (vs.depth_minus_one_to_one) {
+        // [-w, w] to [0, w] (the bridge's ConvertDepthMode)
+        z = b_.Op(Op::OpFMul, t_f32_, {b_.Op(Op::OpFAdd, t_f32_, {z, w}), b_.F32(0.5f)});
+    }
+    if (vs.clip_space) {
+        // a screen-space position to the clip space of the device's largest viewport (ConvertPositionToClipSpace;
+        // PushData's xoffset, yoffset, xscale, yscale)
+        const Id ptr = b_.TypePointer(spv::StorageClass::PushConstant, t_f32_);
+        const auto pd = [&](u32 k) {
+            return b_.Op(Op::OpLoad, t_f32_, {b_.Op(Op::OpAccessChain, ptr, {push_, b_.U32(0), b_.U32(k)})});
+        };
+        const Id wx = b_.Op(Op::OpFAdd, t_f32_, {b_.Op(Op::OpFMul, t_f32_, {x, pd(2)}), pd(0)});
+        x = b_.Op(Op::OpFSub, t_f32_, {b_.Op(Op::OpFDiv, t_f32_, {wx, b_.F32(vs.viewport_w)}), b_.F32(1.0f)});
+        const Id wy = b_.Op(Op::OpFAdd, t_f32_, {b_.Op(Op::OpFMul, t_f32_, {y, pd(3)}), pd(1)});
+        y = b_.Op(Op::OpFSub, t_f32_, {b_.Op(Op::OpFDiv, t_f32_, {wy, b_.F32(vs.viewport_h)}), b_.F32(1.0f)});
+    }
+    pos = b_.Op(Op::OpCompositeConstruct, t_vec4_, {x, y, z, w});
+    b_.OpNoResult(Op::OpStore, {position_, pos});
+}
+
 void Emitter::Float64() {
     if (t_f64_ == 0) {
         b_.Capability(spv::Capability::Float64);
@@ -1369,6 +1631,16 @@ void Emitter::Emit(const Inst& in) {
         }
         EmitStub(in, name);
         return;
+    case Format::Exp:
+        if (options_.vertex) {
+            EmitExport(in);
+            return;
+        }
+        if (options_.stub_memory) {
+            EmitStub(in, name);
+            return;
+        }
+        throw Unsupported{std::string(name)};
     case Format::Mubuf:
         if (res_.buffer_of[cur_index_] >= 0 && BufferKnown(res_.buffer_of[cur_index_]) &&
             (name.starts_with("buffer_load_format_") || name.starts_with("buffer_store_format_")
@@ -1449,6 +1721,13 @@ void Emitter::EmitScalar(const Inst& in, std::string_view name) {
     const auto nz32 = [&](Id v) { return b_.Op(Op::OpINotEqual, t_bool_, {v, b_.U32(0)}); };
     const auto nz64 = [&](std::pair<Id, Id> v) { return LaneBit(v.first, v.second); }; // (the oracle's SCC of a mask)
     const auto simm = [&]() { return b_.U32(static_cast<u32>(static_cast<s32>(static_cast<s16>(in.w0 & 0xFFFF)))); };
+    if (options_.vertex && name == "s_swappc_b64") {
+        if (!options_.vs.fetch) {
+            throw Unsupported{"s_swappc_b64 (no fetch shader parsed)"};
+        }
+        EmitFetch(); // (its return address in SDST: nothing reads it)
+        return;
+    }
     if (options_.stub_memory && (name == "s_swappc_b64" || name == "s_getpc_b64")) {
         return; // (tests: the fetch shader's call)
     }
@@ -2227,6 +2506,9 @@ EmitResult Emitter::Run() {
         if (options_.compute) {
             InitCompute();
         }
+        if (options_.vertex) {
+            InitVertex();
+        }
         b_.OpNoResult(Op::OpBranch, {labels_[0]});
         for (const u32 x : Rpo()) {
             const Node& nd = nodes_[x];
@@ -2265,6 +2547,9 @@ EmitResult Emitter::Run() {
                 }
             }
             if (nd.exit || nd.succ.empty()) {
+                if (options_.vertex) {
+                    VertexEpilogue();
+                }
                 b_.OpNoResult(Op::OpReturn, {});
                 continue;
             }
@@ -2303,8 +2588,14 @@ EmitResult Emitter::Run() {
             b_.OpNoResult(Op::OpUnreachable, {});
         }
         b_.EndFunction();
-        b_.EntryPoint(spv::ExecutionModel::GLCompute, fn, "main", interface_);
-        if (options_.compute) {
+        if (options_.vertex) {
+            b_.EntryPoint(spv::ExecutionModel::Vertex, fn, "main", interface_);
+        } else {
+            b_.EntryPoint(spv::ExecutionModel::GLCompute, fn, "main", interface_);
+        }
+        if (options_.vertex) {
+            // (no execution mode)
+        } else if (options_.compute) {
             b_.ExecutionMode(fn, spv::ExecutionMode::LocalSize,
                              {std::max(options_.threads[0], 1u), std::max(options_.threads[1], 1u),
                               std::max(options_.threads[2], 1u)});
