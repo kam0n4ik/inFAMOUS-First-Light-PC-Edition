@@ -1,6 +1,7 @@
 // SecondSonPC — the game's button icons follow the input device (see prompt_service.h).
 #include "ui/prompt_service.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -26,9 +27,19 @@ namespace P = PromptIcons;
 namespace ContentPatch = Filesystem::ContentPatch;
 using Input::PromptStyle;
 
-/// Where the game put (part of) the atlas it read: atlas bytes [at, at + size) at guest address `address`.
+/// Where the game put (part of) the watched span of the table: span bytes [at, at + size) at guest address `address`.
 struct Copy {
     u64 at = 0, address = 0, size = 0;
+};
+
+/// A hint that names the controller in words ("Hold Wireless Controller Sideways", "the Touch Pad Button"): with
+/// the keyboard its text names the keys bound now. The new text is written where the game's text starts (the key
+/// name and the game's pointers stay), inside the text and its zero padding (`room` bytes, the last zero kept).
+struct Text {
+    const char* key = "";
+    u64 offset = 0; // of the text in the file
+    u32 room = 0;
+    std::string original; // `room` bytes as in the file
 };
 
 struct State {
@@ -38,6 +49,10 @@ struct State {
     std::vector<P::Cell> cells;
     u64 data_offset = 0;              // in the table opened last
     std::string table;                // its guest path
+    bool russian = false;             // its language (the hint texts: Russian or English tables only)
+    std::vector<Text> texts;          // its hints naming the controller
+    std::vector<std::string> applied_texts; // their bytes now in the game's memory (`room` each)
+    u64 span_lo = 0, span_hi = 0;     // the watched file range: the hint texts and the atlas
     std::vector<Copy> copies;         // where the game keeps it
     PromptStyle applied = PromptStyle::PlayStation; // what the game read / what is written there now
     u64 applied_layout = ~0ull;       // the keyboard layout generation of `applied` (keyboard only)
@@ -120,6 +135,117 @@ PromptStyle WantedNow() {
     return style;
 }
 
+/// A key's name in a hint: the SDL name for keys ("Tab", "G", "Left Shift"), the mouse as players write it.
+std::string KeyLabel(Input::Action action, bool russian) {
+    const Input::Settings layout = Input::Player1().Layout();
+    const auto& b = layout.bindings[static_cast<size_t>(action)];
+    if (b.empty()) {
+        return {};
+    }
+    const Input::InputCode c = b.front();
+    if (c.kind == Input::InputCode::Kind::MouseButton) {
+        switch (c.code) {
+        case 1: return russian ? "ЛКМ" : "LMB";
+        case 2: return russian ? "СКМ" : "MMB";
+        case 3: return russian ? "ПКМ" : "RMB";
+        default: break;
+        }
+    }
+    return Input::InputName(c);
+}
+
+void ReplaceAll(std::string& s, std::string_view what, std::string_view with) {
+    for (size_t at = s.find(what); at != std::string::npos; at = s.find(what, at + with.size())) {
+        s.replace(at, what.size(), with);
+    }
+}
+
+constexpr const char* kHintKeys[] = {
+    "u_brief_tilt_controller",      "u_hint_three_powers",          "u_hint_two_powers",
+    "u_hint_vor_door",              "u_interact_press_for_details", "u_powerk_desc_concretedrain",
+    "u_powerk_desc_concretedrain_alt", "u_powerk_desc_laserdrain",  "u_powerk_desc_laserdrain_alt",
+    "u_powerk_desc_smokedrain",     "u_powerk_desc_smokedrain_alt", "u_powerk_desc_tvdrain",
+    "u_powerk_desc_tvdrain_alt",    "u_protip_ftp_12",              "u_stencil_shake_controller",
+    "u_stencil_sideways_controller", "u_trainer_smi_push_car",      "u_trainer_smi_push_car_alt",
+};
+
+/// The keyboard text of a hint (empty: none - the game's stays): the game's own sentence with the controller's
+/// part replaced by the keys bound now (touch pad, two-finger click, swipe, sideways, rattle, spray).
+std::string KeyboardText(const Text& t, bool russian) {
+    using A = Input::Action;
+    const std::string tp = KeyLabel(A::TouchPad, russian), two = KeyLabel(A::TouchTwoFingers, russian),
+                      drag = KeyLabel(A::TouchDrag, russian), side = KeyLabel(A::MotionMode, russian),
+                      shake = KeyLabel(A::Shake, russian), spray = KeyLabel(A::R2, russian);
+    const std::string_view key = t.key;
+    std::string s(t.original.c_str()); // (the text up to its zero)
+    if (key == "u_stencil_sideways_controller") {
+        return side.empty() ? "" : russian ? "Нажмите " + side + ", чтобы держать боком" : "Press " + side + " to hold sideways";
+    }
+    if (key == "u_stencil_shake_controller") {
+        return shake.empty() ? "" : russian ? "Встряхните: держите " + shake : "Hold " + shake + " to rattle";
+    }
+    if (key == "u_brief_tilt_controller") {
+        return spray.empty() ? "" : russian ? "Распыляйте " + spray + ", наводите мышью"
+                                            : "Spray with " + spray + ", aim with the mouse";
+    }
+    if (tp.empty() || two.empty() || drag.empty()) {
+        return {};
+    }
+    if (russian) {
+        ReplaceAll(s, "кнопку сенсорной панели двумя пальцами", "клавишу " + two);
+        ReplaceAll(s, "кнопку сенсорной панели", "клавишу " + tp);
+        ReplaceAll(s, "Проведите пальцем по сенсорной панели", "Удерживайте " + drag + " и ведите мышью");
+    } else {
+        ReplaceAll(s, "the Touch Pad Button with both thumbs", two);
+        ReplaceAll(s, "the Touch Pad Button", tp);
+        ReplaceAll(s, "Touch Pad Button", tp);
+        ReplaceAll(s, "Swipe the Touch Pad", "Hold " + drag + " + mouse");
+    }
+    return s == t.original.c_str() ? "" : s;
+}
+
+/// A hint's `room` bytes for `style`: the game's own, or the keyboard text with zeros (if it fits).
+std::string TextBytes(const Text& t, PromptStyle style, bool russian) {
+    if (style != PromptStyle::Keyboard) {
+        return t.original;
+    }
+    const std::string s = KeyboardText(t, russian);
+    if (s.empty() || s.size() + 1 > t.room) {
+        return t.original;
+    }
+    std::string out(t.room, '\0');
+    std::memcpy(out.data(), s.data(), s.size());
+    return out;
+}
+
+/// The hints of a language table: "key\0text\0" entries found by their key names.
+std::vector<Text> FindTexts(const std::string& bytes) {
+    std::vector<Text> out;
+    for (const char* key : kHintKeys) {
+        const std::string pat = std::string(1, '\0') + key + std::string(1, '\0');
+        const size_t at = bytes.find(pat);
+        if (at == std::string::npos || bytes.find(pat, at + 1) != std::string::npos) {
+            continue; // (absent, or not one entry)
+        }
+        const size_t text = at + pat.size();
+        const size_t end = bytes.find('\0', text);
+        if (end == std::string::npos) {
+            continue;
+        }
+        size_t pad = end;
+        while (pad < bytes.size() && bytes[pad] == '\0') {
+            ++pad;
+        }
+        Text t;
+        t.key = key;
+        t.offset = text;
+        t.room = static_cast<u32>(pad - 1 - text); // (the last zero before the next entry kept)
+        t.original = bytes.substr(text, t.room);
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
 /// The atlas for `style` (cached). Drawing runs on a thread of its own: the caller may be a guest thread (Direct2D,
 /// COM and their stack depth belong on a host thread). Mutex held.
 const std::vector<u8>* AtlasFor(State& st, PromptStyle style, u64 layout_gen) {
@@ -168,6 +294,16 @@ ContentPatch::FilePatch OnOpen(std::string_view guest, const std::string& bytes)
     st.table = std::string(guest);
     st.copies.clear(); // (another language: the previous table's copies are not ours any more)
     st.found = true;
+    const bool ru = guest.find("lang_russian_text") != std::string_view::npos;
+    const bool en = guest.find("lang_english_text") != std::string_view::npos;
+    st.russian = ru;
+    st.texts = ru || en ? FindTexts(bytes) : std::vector<Text>{};
+    st.span_lo = info->data_offset;
+    st.span_hi = info->data_offset + P::kAtlasBytes;
+    for (const Text& t : st.texts) {
+        st.span_lo = std::min(st.span_lo, t.offset);
+        st.span_hi = std::max<u64>(st.span_hi, t.offset + t.room);
+    }
     PromptStyle style = g_wanted.load();
     const u64 gen = g_wanted_layout.load();
     const std::vector<u8>* atlas = AtlasFor(st, style, gen);
@@ -179,14 +315,27 @@ ContentPatch::FilePatch OnOpen(std::string_view guest, const std::string& bytes)
     st.applied_layout = gen;
     st.applied_bytes = *atlas;
     ContentPatch::FilePatch patch;
-    patch.watch_offset = info->data_offset;
-    patch.watch_size = P::kAtlasBytes;
+    patch.watch_offset = st.span_lo;
+    patch.watch_size = st.span_hi - st.span_lo;
     if (style != PromptStyle::PlayStation) {
         ContentPatch::Edit e;
         e.offset = info->data_offset;
         e.bytes.assign(reinterpret_cast<const char*>(atlas->data()), atlas->size());
         patch.edits.push_back(std::move(e));
     }
+    st.applied_texts.clear();
+    u32 replaced = 0;
+    for (const Text& t : st.texts) {
+        st.applied_texts.push_back(TextBytes(t, style, ru));
+        if (st.applied_texts.back() != t.original) {
+            patch.edits.push_back({t.offset, st.applied_texts.back()});
+            ++replaced;
+        }
+    }
+    std::sort(patch.edits.begin(), patch.edits.end(),
+              [](const ContentPatch::Edit& a, const ContentPatch::Edit& b) { return a.offset < b.offset; });
+    SSPC_LOG(App, Info, "button icons: {} - {} hints naming the controller found, {} read with the keys", guest,
+             st.texts.size(), replaced);
     SSPC_LOG(App, Info,
              "button icons: {} - icon atlas @{:#x}, {} glyphs; the game reads the {} icons (the file is unchanged)",
              guest, info->data_offset, info->cells.size(), StyleName(style));
@@ -196,11 +345,12 @@ ContentPatch::FilePatch OnOpen(std::string_view guest, const std::string& bytes)
 void OnRead(std::string_view guest, u64 offset, u64 address, u64 size) {
     auto& st = S();
     std::scoped_lock lock{st.mutex};
-    if (!st.found || guest != st.table || offset < st.data_offset) {
+    if (!st.found || guest != st.table || offset < st.span_lo) {
         return;
     }
-    st.copies.push_back({offset - st.data_offset, address, size});
-    SSPC_LOG(App, Info, "button icons: atlas bytes {:#x}+{:#x} read to {:#x}", offset - st.data_offset, size, address);
+    st.copies.push_back({offset - st.span_lo, address, size});
+    SSPC_LOG(App, Info, "button icons: table bytes {:#x}+{:#x} (icon atlas, hints) read to {:#x}", offset, size,
+             address);
 }
 
 /// [address, address + size) is committed memory of this process (the game did not unmap it).
@@ -248,24 +398,45 @@ void Update(u64 now_ns) {
         st.applied_layout = gen;
         return;
     }
-    u32 written = 0;
-    for (auto it = st.copies.begin(); it != st.copies.end();) {
-        const Copy c = *it;
-        const bool ok = c.at + c.size <= P::kAtlasBytes && Mapped(c.address, c.size) &&
-                        std::memcmp(reinterpret_cast<const void*>(c.address), st.applied_bytes.data() + c.at, c.size) == 0;
-        if (!ok) {
-            SSPC_LOG(App, Warning,
-                     "button icons: the game no longer keeps the atlas at {:#x} (freed or reused) - not written there",
-                     c.address);
-            it = st.copies.erase(it);
-            continue;
+    // a region of the span ([at, at + n) span bytes): written in every copy that holds all of it, only where those
+    // bytes are still exactly what was written there (the game may have freed or reused the memory)
+    const auto rewrite = [&](u64 at, u64 n, const u8* expected, const u8* bytes, bool gpu) {
+        u32 done = 0;
+        for (const Copy& c : st.copies) {
+            if (at < c.at || at + n > c.at + c.size) {
+                continue;
+            }
+            const u64 a = c.address + (at - c.at);
+            if (!Mapped(a, n) || std::memcmp(reinterpret_cast<const void*>(a), expected, n) != 0) {
+                SSPC_LOG(App, Warning, "button icons: the game no longer keeps {} at {:#x} (freed or reused) - not "
+                                       "written there", gpu ? "the atlas" : "a hint", a);
+                continue;
+            }
+            if (gpu) {
+                Filesystem::NotifyHostWrite(a, n); // (the GPU side gives the pages back first)
+            }
+            std::memcpy(reinterpret_cast<void*>(a), bytes, n);
+            if (gpu) {
+                Filesystem::NotifyHostWrite(a, n); // its textures there are uploaded again
+            }
+            ++done;
         }
-        Filesystem::NotifyHostWrite(c.address, c.size); // (the GPU side gives the pages back first)
-        std::memcpy(reinterpret_cast<void*>(c.address), atlas->data() + c.at, c.size);
-        Filesystem::NotifyHostWrite(c.address, c.size); // its textures there are uploaded again
-        ++written;
-        ++it;
+        return done;
+    };
+    const u32 written = rewrite(st.data_offset - st.span_lo, P::kAtlasBytes, st.applied_bytes.data(), atlas->data(),
+                                true);
+    u32 texts = 0;
+    for (size_t i = 0; i < st.texts.size() && i < st.applied_texts.size(); ++i) {
+        const Text& t = st.texts[i];
+        std::string next = TextBytes(t, style, st.russian);
+        if (next != st.applied_texts[i] &&
+            rewrite(t.offset - st.span_lo, t.room, reinterpret_cast<const u8*>(st.applied_texts[i].data()),
+                    reinterpret_cast<const u8*>(next.data()), false) != 0) {
+            st.applied_texts[i] = std::move(next);
+            ++texts;
+        }
     }
+    SSPC_LOG(App, Info, "button icons: {} hint texts rewritten", texts);
     SSPC_LOG(App, Info, "button icons: {} -> {} ({} cop{} in the game's memory rewritten)", StyleName(st.applied),
              StyleName(style), written, written == 1 ? "y" : "ies");
     st.applied = style;
