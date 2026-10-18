@@ -13,6 +13,8 @@ set SSPC_CP_MODE=native
 set SSPC_REA_MERGE_RUNS=1
 set SSPC_CP_ROUND_NODRAIN=1
 set SSPC_P411_ASYNC_ACQUIRE=1
-rem new pipelines (graphics and compute) built on 3 background threads; their draws/dispatches skipped until ready
-set SSPC_ASYNC_PIPELINES=2
+rem new graphics pipelines built on 3 background threads, their draws skipped until ready. Compute stays
+rem synchronous (=1, not 2): a skipped dispatch loses GPU particle simulation state - effects, fire and smoke
+rem missing for good (2026-10-18, after a shader cache change)
+set SSPC_ASYNC_PIPELINES=1
 call "%~dp0play_native.cmd" %*
