@@ -119,6 +119,7 @@ add_library(sspc_runtime STATIC
     src/runtime/kernel/equeue.cpp
     src/runtime/savedata/savedata.cpp
     src/runtime/audio/audio_out.cpp
+    src/runtime/media/videodec.cpp
     src/runtime/kernel/event_queues.cpp
     src/runtime/kernel/guest_errno.cpp
     src/runtime/kernel/kernel_memory.cpp
@@ -158,6 +159,8 @@ target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi SDL3::SDL
 # Zydis (x86 decoder, MIT): SecondSonPC's FS patcher (src/runtime/cpu, P3.3). An independent library that
 # comes from the bridge's externals until SecondSonPC vendors its own copy (Phase 5).
 target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
+# libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
+target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
 # (src/runtime/gpu/vulkan). No loader is linked: the system vulkan-1.dll is loaded at run time, as the bridge does.
 target_link_libraries(sspc_runtime PRIVATE Vulkan::Headers)

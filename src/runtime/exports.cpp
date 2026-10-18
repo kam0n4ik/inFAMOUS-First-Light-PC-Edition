@@ -24,6 +24,10 @@ namespace SecondSon::Loader {
 std::span<const Runtime::Export> RtldExports(); // loader/rtld.cpp
 }
 
+namespace SecondSon::Media {
+std::span<const Runtime::Export> VideodecExports(); // runtime/media/videodec.cpp
+}
+
 namespace SecondSon::Audio {
 std::span<const Runtime::Export> AudioOutExports(); // runtime/audio/audio_out.cpp
 }
@@ -88,7 +92,7 @@ std::vector<Export> Collect() {
     // Order matters: the first entry for an import key wins (native FileSystem before the Phase 0
     // observers of the same functions, which stay for --loader shadps4 / --bridge fs).
     for (const auto group : {std::span<const Export>(kSystemExports), Loader::RtldExports(),
-                             Sysmodule::SysmoduleExports(), SaveData::Exports(), Audio::AudioOutExports(), Filesystem::FileSystemExports(),
+                             Sysmodule::SysmoduleExports(), SaveData::Exports(), Audio::AudioOutExports(), Media::VideodecExports(), Filesystem::FileSystemExports(),
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
                              AppContent::AppContentExports(), Pad::PadExports(),
                              Kernel::KernelExports(), Kernel::SemaphoreExports(),
