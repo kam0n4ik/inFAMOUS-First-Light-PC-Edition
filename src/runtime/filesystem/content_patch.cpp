@@ -85,6 +85,9 @@ FilePatch ForFile(std::string_view guest, const std::filesystem::path& host) {
     const bool patch_table = IsLanguagePatchTable(guest, russian);
     const bool table = !patch_table && IsLanguageTable(guest) && g_table_hook.open != nullptr;
     if (!patch_table && !table) {
+        if (g_table_hook.pack_open != nullptr && guest.ends_with(".xpps") && !IsLanguageTable(guest)) {
+            return g_table_hook.pack_open(guest, host);
+        }
         return {};
     }
     std::ifstream in(host, std::ios::binary);

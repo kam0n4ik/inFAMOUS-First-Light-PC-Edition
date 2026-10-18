@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,6 +20,7 @@
 #include "runtime/filesystem/fs_host.h"
 #include "settings/settings_service.h"
 #include "ui/prompt_icons.h"
+#include "ui/prompt_textures.h"
 
 namespace SecondSon::Ui::PromptService {
 
@@ -64,6 +67,19 @@ struct State {
     u32 rewrites = 0;
     bool reported_failure = false;
 };
+
+/// A pack with button pictures (ui/prompt_textures.h): its pictures' places, original bytes and what the game read.
+struct Picture {
+    const PromptTextures::Location* at = nullptr;
+    std::vector<u8> original, applied;
+};
+struct Pack {
+    std::vector<Picture> pictures;
+    u64 span_lo = 0, span_hi = 0;
+    std::vector<Copy> copies;
+};
+std::map<std::string, Pack, std::less<>> g_packs; // by guest path (State::mutex)
+std::map<std::pair<int, u64>, std::vector<u8>> g_built; // (kind, style << 32 | layout generation) -> bytes
 
 State& S() {
     static State s;
@@ -246,6 +262,75 @@ std::vector<Text> FindTexts(const std::string& bytes) {
     return out;
 }
 
+/// A picture for `style` (cached by kind, style and layout). Mutex held; drawn on a host thread (Direct2D).
+const std::vector<u8>& PictureFor(const Picture& p, PromptStyle style, u64 layout_gen) {
+    if (style != PromptStyle::Keyboard) {
+        return p.original;
+    }
+    const auto key = std::make_pair(static_cast<int>(p.at->kind), (u64{static_cast<u32>(style)} << 32) | layout_gen);
+    auto it = g_built.find(key);
+    if (it == g_built.end()) {
+        const Input::Settings layout = Input::Player1().Layout();
+        std::vector<u8> built;
+        std::thread worker([&] { built = PromptTextures::Build(p.at->kind, p.original.data(), style, layout); });
+        worker.join();
+        it = g_built.emplace(key, std::move(built)).first;
+    }
+    return it->second;
+}
+
+ContentPatch::FilePatch OnPackOpen(std::string_view guest, const std::filesystem::path& host) {
+    const auto slash = guest.find_last_of('/');
+    const std::string_view name = slash == std::string_view::npos ? guest : guest.substr(slash + 1);
+    const auto places = PromptTextures::InPack(name);
+    if (places.empty()) {
+        return {};
+    }
+    Pack pack;
+    std::ifstream in(host, std::ios::binary);
+    for (const auto* l : places) {
+        Picture p;
+        p.at = l;
+        p.original.resize(PromptTextures::Bytes(l->kind));
+        in.seekg(static_cast<std::streamoff>(l->offset));
+        if (!in.read(reinterpret_cast<char*>(p.original.data()), static_cast<std::streamsize>(p.original.size())) ||
+            !PromptTextures::IsOriginal(l->kind, p.original.data())) {
+            in.clear();
+            SSPC_LOG(App, Warning, "button pictures: {} @{:#x} - other bytes than the game's; left as it is", guest,
+                     l->offset);
+            continue;
+        }
+        pack.pictures.push_back(std::move(p));
+    }
+    if (pack.pictures.empty()) {
+        return {};
+    }
+    auto& st = S();
+    std::scoped_lock lock{st.mutex};
+    const PromptStyle style = g_wanted.load();
+    const u64 gen = g_wanted_layout.load();
+    ContentPatch::FilePatch patch;
+    pack.span_lo = ~0ull;
+    u32 changed = 0;
+    for (Picture& p : pack.pictures) {
+        p.applied = PictureFor(p, style, gen);
+        pack.span_lo = std::min(pack.span_lo, p.at->offset);
+        pack.span_hi = std::max<u64>(pack.span_hi, p.at->offset + p.original.size());
+        if (p.applied != p.original) {
+            patch.edits.push_back({p.at->offset, std::string(p.applied.begin(), p.applied.end())});
+            ++changed;
+        }
+    }
+    std::sort(patch.edits.begin(), patch.edits.end(),
+              [](const ContentPatch::Edit& a, const ContentPatch::Edit& b) { return a.offset < b.offset; });
+    patch.watch_offset = pack.span_lo;
+    patch.watch_size = pack.span_hi - pack.span_lo;
+    SSPC_LOG(App, Info, "button pictures: {} - {} picture(s), {} read for the {} (the file is unchanged)", guest,
+             pack.pictures.size(), changed, StyleName(style));
+    g_packs.insert_or_assign(std::string(guest), std::move(pack));
+    return patch;
+}
+
 /// The atlas for `style` (cached). Drawing runs on a thread of its own: the caller may be a guest thread (Direct2D,
 /// COM and their stack depth belong on a host thread). Mutex held.
 const std::vector<u8>* AtlasFor(State& st, PromptStyle style, u64 layout_gen) {
@@ -345,6 +430,12 @@ ContentPatch::FilePatch OnOpen(std::string_view guest, const std::string& bytes)
 void OnRead(std::string_view guest, u64 offset, u64 address, u64 size) {
     auto& st = S();
     std::scoped_lock lock{st.mutex};
+    if (const auto it = g_packs.find(guest); it != g_packs.end()) {
+        if (offset >= it->second.span_lo) {
+            it->second.copies.push_back({offset - it->second.span_lo, address, size});
+        }
+        return;
+    }
     if (!st.found || guest != st.table || offset < st.span_lo) {
         return;
     }
@@ -373,7 +464,7 @@ void Install() {
     ParseForced();
     g_wanted = WantedNow();
     g_wanted_layout = Input::Player1().LayoutGeneration();
-    ContentPatch::SetLanguageTableHook({.open = &OnOpen, .read = &OnRead});
+    ContentPatch::SetLanguageTableHook({.open = &OnOpen, .read = &OnRead, .pack_open = &OnPackOpen});
     SSPC_LOG(App, Info, "button icons: following the input device ([Interface] prompts = \"{}\"; now {})",
              Settings::Instance().Current().pc.prompts, StyleName(g_wanted.load()));
 }
@@ -437,6 +528,35 @@ void Update(u64 now_ns) {
         }
     }
     SSPC_LOG(App, Info, "button icons: {} hint texts rewritten", texts);
+    u32 pictures = 0;
+    for (auto& [guest, pack] : g_packs) {
+        for (Picture& p : pack.pictures) {
+            const std::vector<u8>& next = PictureFor(p, style, gen);
+            if (next == p.applied) {
+                continue;
+            }
+            const u64 at = p.at->offset - pack.span_lo, n = p.original.size();
+            u32 done = 0;
+            for (const Copy& c : pack.copies) {
+                if (at < c.at || at + n > c.at + c.size) {
+                    continue;
+                }
+                const u64 a = c.address + (at - c.at);
+                if (!Mapped(a, n) || std::memcmp(reinterpret_cast<const void*>(a), p.applied.data(), n) != 0) {
+                    continue; // (freed or reused by the game: not ours any more)
+                }
+                Filesystem::NotifyHostWrite(a, n);
+                std::memcpy(reinterpret_cast<void*>(a), next.data(), n);
+                Filesystem::NotifyHostWrite(a, n);
+                ++done;
+            }
+            if (done != 0) {
+                p.applied = next;
+                ++pictures;
+            }
+        }
+    }
+    SSPC_LOG(App, Info, "button pictures: {} rewritten in the game's memory", pictures);
     SSPC_LOG(App, Info, "button icons: {} -> {} ({} cop{} in the game's memory rewritten)", StyleName(st.applied),
              StyleName(style), written, written == 1 ? "y" : "ies");
     st.applied = style;

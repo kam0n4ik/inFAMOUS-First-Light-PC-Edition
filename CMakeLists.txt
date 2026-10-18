@@ -221,6 +221,7 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/settings/user_store.cpp
     src/ui/overlay_win32.cpp
     src/ui/prompt_icons.cpp
+    src/ui/prompt_textures.cpp
     src/ui/settings_menu.cpp
 )
 # Settings and draw commands are written with designated initializers that leave the other fields at their defaults.

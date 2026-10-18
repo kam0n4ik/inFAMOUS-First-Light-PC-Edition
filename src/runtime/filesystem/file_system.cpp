@@ -221,6 +221,23 @@ s64 ReadRegular(File& f, void* buf, u64 nbytes, u64 offset) {
     if (f.patch.watch_size != 0) {
         ContentPatch::Observe(f.patch, f.guest, offset, reinterpret_cast<u64>(buf), got);
     }
+    // DIAGNOSTIC (SSPC_DIAG_PACK_READS=1): where each read of a pack landed (logs\pack_reads.csv: path, file offset,
+    // guest address, bytes) - a texture's address in a frame back to its file
+    static std::FILE* pack_log = [] {
+        char v[4] = {};
+        std::FILE* out = nullptr;
+        if (GetEnvironmentVariableA("SSPC_DIAG_PACK_READS", v, sizeof(v)) == 1 && v[0] == '1') {
+            _wfopen_s(&out, L"logs\\pack_reads.csv", L"w");
+        }
+        return out;
+    }();
+    if (pack_log != nullptr && f.guest.find("/art/cache/") != std::string::npos) {
+        static std::mutex m;
+        std::scoped_lock lock{m};
+        std::fprintf(pack_log, "%s,%llu,%llu,%llu\n", f.guest.c_str(), static_cast<unsigned long long>(offset),
+                     static_cast<unsigned long long>(reinterpret_cast<u64>(buf)), static_cast<unsigned long long>(got));
+        std::fflush(pack_log);
+    }
     return static_cast<s64>(got);
 }
 

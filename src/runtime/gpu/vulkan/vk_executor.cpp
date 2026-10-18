@@ -21,6 +21,7 @@
 #include "base/log.h"
 #include "engine/render/native_render_ops.h"
 #include "runtime/gpu/critical_compute.h"
+#include "runtime/gpu/diag_request.h"
 #include "runtime/gpu/frame_log.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -4123,6 +4124,33 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
             ProfDescribe((u64{prep.pipeline} << 2) | 0x8000000000000000ull, "draw: pixel stage", &ps, bound);
         }
     }
+    if (texdump_.active) { // (F8: the textures this draw reads, once each)
+        for (const auto* sv : {&vs, &ps}) {
+            if (sv == &ps && !has_ps) {
+                continue;
+            }
+            for (const auto& im : sv->plan.images) {
+                const u64 base = (u64{im.desc.raw[0]} | (u64{im.desc.raw[1] & 0xFF} << 32)) << 8;
+                if (base == 0 || texdump_.lines.contains(base)) {
+                    continue;
+                }
+                const CachedImage* img = nullptr;
+                for (const CachedImage* b : bound) {
+                    img = b->layout.guest_address == base ? b : img;
+                }
+                texdump_.lines[base] = fmt::format(
+                    "{:#x} T# {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} | pipeline {} vs {:#x} ps {:#x} | "
+                    "{} size {} fmt {} {}x{} levels {} layers {} tile {} pitch {} gpu_written {}",
+                    base, im.desc.raw[0], im.desc.raw[1], im.desc.raw[2], im.desc.raw[3], im.desc.raw[4],
+                    im.desc.raw[5], im.desc.raw[6], im.desc.raw[7], prep.pipeline, vs.address, has_ps ? ps.address : 0,
+                    img != nullptr ? "cached" : "-", img != nullptr ? img->layout.guest_size : 0,
+                    img != nullptr ? img->layout.pixel_format : 0, img != nullptr ? img->layout.size.width : 0,
+                    img != nullptr ? img->layout.size.height : 0, img != nullptr ? img->layout.levels : 0,
+                    img != nullptr ? img->layout.layers : 0, img != nullptr ? static_cast<u32>(img->layout.tile_mode) : 0,
+                    img != nullptr ? img->layout.pitch : 0, img != nullptr && img->gpu_written);
+            }
+        }
+    }
     ++stats_.draws_executed;
     if (histo_.active) {
         auto& e = histo_.draws[prep.pipeline];
@@ -5114,6 +5142,42 @@ void Executor::DrawHistogram() {
     histo_.active = id + 1 >= range[0] && id + 1 < range[0] + range[1];
 }
 
+void Executor::TexDumpFlip() {
+    // the frame that collected ends: its list and every texture's bytes (as the game keeps them) into a folder
+    if (texdump_.active) {
+        texdump_.active = false;
+        const std::filesystem::path dir =
+            options_.capture_path.parent_path().parent_path() / "frame_textures" / std::to_string(texdump_.number);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream index(dir / "index.txt");
+        u32 saved = 0;
+        for (const auto& [base, line] : texdump_.lines) {
+            index << line << '\n';
+            const auto at = line.find(" size ");
+            const u64 size = at == std::string::npos ? 0 : std::strtoull(line.c_str() + at + 6, nullptr, 10);
+            if (size == 0 || size > (16u << 20) || line.find("gpu_written true") != std::string::npos) {
+                continue;
+            }
+            std::vector<u8> bytes(size);
+            if (GS::GameMemory().Read(base, bytes.data(), size)) {
+                std::ofstream(dir / fmt::format("{:x}.bin", base), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(size));
+                ++saved;
+            }
+        }
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: F8 - {} textures of a frame listed, {} saved -> {}", texdump_.lines.size(),
+                 saved, dir.string());
+        texdump_.lines.clear();
+    }
+    const u32 req = Diag::g_texture_dump_request.load(std::memory_order_relaxed);
+    if (req != texdump_.seen_request) {
+        texdump_.seen_request = req;
+        texdump_.active = true;
+        ++texdump_.number;
+    }
+}
+
 void Executor::CaptureImageAt() {
     // SSPC_DIAG_CAPTURE_IMAGE=<hex address>:<flip>[+<flips>][,...]: the GPU-written image at that address as it is at
     // that flip's end (+<flips>: at each of that many flips from it) -> logs\p45\image_<address>_<flip>.raw/.txt (+ .png
@@ -5794,6 +5858,7 @@ void Executor::Flip(const Cp::FlipMarker&) {
     }
     eviction_due_.store(images_.OverBudget(), std::memory_order_release);
     CaptureImageAt();
+    TexDumpFlip();
     DrawHistogram();
     RaceCheck();
     CmdTraceFlip();

@@ -24,6 +24,7 @@
 #include "settings/settings_service.h"
 #include "settings/user_store.h"
 #include "ui/prompt_icons.h"
+#include "ui/prompt_textures.h"
 #include "ui/settings_menu.h"
 
 namespace SecondSon::Settings {
@@ -588,6 +589,80 @@ void PromptIconChecks(const CheckFn& check, const fs::path& dir) {
     }
 }
 
+/// The game's button pictures (ui/prompt_textures.h): each found at its first place in the game's files, its bytes the
+/// game's, the BC3 codec stable on it, the keyboard picture drawn (different bytes) - before/after PNGs in `dir`.
+void PromptPictureChecks(const CheckFn& check, const fs::path& dir) {
+    namespace T = Ui::PromptTextures;
+    const auto g = "Ui.prompt pictures";
+    char* env = nullptr;
+    size_t env_len = 0;
+    const bool have_env = _dupenv_s(&env, &env_len, "SSPC_GAME_DIR") == 0 && env != nullptr;
+    const fs::path cache = (have_env ? fs::path(env) : fs::path(L"E:\\shdps4\\CUSA00004")) / "art" / "cache";
+    std::free(env);
+    const Input::Settings layout = Input::DefaultSettings();
+    struct One {
+        const char* pack;
+        T::PictureKind kind;
+        u32 w, h;
+        const char* name;
+    };
+    const One all[] = {{"a8.hires.xpps", T::PictureKind::kSideways256, 256, 256, "sideways"},
+                       {"a8.hires.xpps", T::PictureKind::kRattle1024, 1024, 256, "rattle"},
+                       {"core_common.sprig.xpps", T::PictureKind::kTouchPrint256, 256, 256, "touchprint"},
+                       {"core_common.sprig.xpps", T::PictureKind::kDpad256, 256, 256, "dpad"},
+                       {"core_common.sprig.xpps", T::PictureKind::kDpadKarma256, 256, 256, "dpad_karma"},
+                       {"core_common.sprig.xpps", T::PictureKind::kDpad64, 64, 64, "dpad64"}};
+    for (const One& o : all) {
+        const T::Location* at = nullptr;
+        for (const auto* l : T::InPack(o.pack)) {
+            at = l->kind == o.kind ? l : at;
+        }
+        std::vector<u8> orig(T::Bytes(o.kind));
+        std::ifstream in(cache / o.pack, std::ios::binary);
+        const bool read = at != nullptr && in.seekg(static_cast<std::streamoff>(at->offset)) &&
+                          in.read(reinterpret_cast<char*>(orig.data()), static_cast<std::streamsize>(orig.size()));
+        if (!read) {
+            check(g, fmt::format("{}: in the game's files (skipped: no game files)", o.name), true, "");
+            continue;
+        }
+        check(g, fmt::format("{}: the game's bytes at its place in {}", o.name, o.pack), T::IsOriginal(o.kind, orig.data()),
+              "");
+        std::vector<u8> rgba(size_t{o.w} * o.h * 4), again(orig.size());
+        T::DecodeBc3(orig.data(), o.w, o.h, rgba.data());
+        T::EncodeBc3(rgba.data(), o.w, o.h, again.data());
+        std::vector<u8> rgba2(rgba.size());
+        T::DecodeBc3(again.data(), o.w, o.h, rgba2.data());
+        // alpha everywhere; colour where it is seen (a transparent texel's colour is free - the encoder takes the
+        // block's colours from its visible texels)
+        int worst_a = 0, worst_c = 0;
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+            worst_a = std::max(worst_a, std::abs(int(rgba[i + 3]) - int(rgba2[i + 3])));
+            if (rgba[i + 3] >= 64) {
+                for (int c = 0; c < 3; ++c) {
+                    worst_c = std::max(worst_c, std::abs(int(rgba[i + c]) - int(rgba2[i + c])));
+                }
+            }
+        }
+        check(g, fmt::format("{}: BC3 decode -> encode -> decode: alpha within 24, seen colour within 48", o.name),
+              worst_a <= 24 && worst_c <= 48, fmt::format("alpha {} colour {}", worst_a, worst_c));
+        const auto kb = T::Build(o.kind, orig.data(), Input::PromptStyle::Keyboard, layout);
+        check(g, fmt::format("{}: keyboard picture drawn", o.name), kb.size() == orig.size() && kb != orig, "");
+        check(g, fmt::format("{}: PlayStation = the game's own", o.name),
+              T::Build(o.kind, orig.data(), Input::PromptStyle::PlayStation, layout) == orig, "");
+        const auto save = [&](const std::vector<u8>& tiled, const char* suffix) {
+            std::vector<u8> px(size_t{o.w} * o.h * 4), top(px.size());
+            T::DecodeBc3(tiled.data(), o.w, o.h, px.data());
+            for (u32 y = 0; y < o.h; ++y) { // (stored bottom-up)
+                std::memcpy(top.data() + size_t{y} * o.w * 4, px.data() + size_t{o.h - 1 - y} * o.w * 4, size_t{o.w} * 4);
+            }
+            Ui::PromptIcons::SavePng((dir / fmt::format("picture_{}_{}.png", o.name, suffix)).wstring(), top.data(), o.w,
+                                     o.h);
+        };
+        save(orig, "ps");
+        save(kb, "keyboard");
+    }
+}
+
 void MenuChecks(const CheckFn& check, const fs::path& dir) {
     const auto g = "Ui.menu";
     const auto defaults = TestConfig();
@@ -730,6 +805,7 @@ void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     GamepadChecks(check);
     DeviceChecks(check);
     PromptIconChecks(check, scratch);
+    PromptPictureChecks(check, scratch);
     MenuChecks(check, scratch);
 }
 

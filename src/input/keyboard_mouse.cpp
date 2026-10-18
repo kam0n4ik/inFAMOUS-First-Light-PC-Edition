@@ -12,6 +12,7 @@
 #include <windows.h>
 
 #include "base/log.h"
+#include "runtime/gpu/diag_request.h"
 
 namespace SecondSon::Input {
 
@@ -325,6 +326,16 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         const auto sc = static_cast<size_t>(e.key.scancode);
         if (down && sc == SDL_SCANCODE_F10) {
             result.hotkey = Hotkey::ToggleFps;
+            break;
+        }
+        // DIAGNOSTIC (SSPC_DIAG_TEX_KEY=1): F8 dumps the textures of the next frame (runtime/gpu/diag_request.h)
+        static const bool tex_key = [] {
+            char v[4] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_TEX_KEY", v, sizeof(v)) == 1 && v[0] == '1';
+        }();
+        if (down && sc == SDL_SCANCODE_F8 && tex_key) {
+            Gpu::Diag::g_texture_dump_request.fetch_add(1, std::memory_order_relaxed);
+            SSPC_LOG(Input, Warning, "DIAGNOSTIC: F8 - the next frame's textures are dumped");
             break;
         }
         if (down && sc == SDL_SCANCODE_F11) {

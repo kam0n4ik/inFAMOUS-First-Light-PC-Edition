@@ -40,6 +40,8 @@ FilePatch ForFile(std::string_view guest, const std::filesystem::path& host);
 struct LanguageTableHook {
     FilePatch (*open)(std::string_view guest, const std::string& bytes) = nullptr;
     void (*read)(std::string_view guest, u64 offset, u64 address, u64 size) = nullptr;
+    /// Any other pack (/app0/art/cache/*.xpps): its patch from its file (`host`); the same `read` reports.
+    FilePatch (*pack_open)(std::string_view guest, const std::filesystem::path& host) = nullptr;
 };
 void SetLanguageTableHook(LanguageTableHook hook);
 

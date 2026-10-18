@@ -621,6 +621,13 @@ private:
         std::ofstream out, args;
         u64 last_flip_tsc = 0, last_submit_tsc = 0;
     };
+    // SSPC_DIAG_TEX_KEY=1 (F8): the textures one frame's draws read -> logs/frame_textures/<n>/
+    struct TexDump {
+        bool active = false;
+        u32 seen_request = 0, number = 0;
+        std::unordered_map<u64, std::string> lines; // by guest address
+    } texdump_;
+    void TexDumpFlip();
     struct ArgsReadback {
         u64 value, flip, addr;
         OwnedBuffer buffer;

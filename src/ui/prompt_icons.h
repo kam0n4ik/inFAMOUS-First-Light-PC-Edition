@@ -62,6 +62,10 @@ struct CellArt {
 /// The cell of `cell.code` for `style` with the keyboard/mouse layout `layout` (the first input bound to the button).
 CellArt Draw(const Cell& cell, Input::PromptStyle style, const Input::Settings& layout);
 
+/// One input (a key, a mouse button) drawn as the keyboard icons are, scaled to a `side` x `side` alpha mask (top-down)
+/// for the game's larger button pictures. Empty when Direct2D is unavailable.
+std::vector<u8> DrawInputAlpha(Input::InputCode in, u32 side);
+
 /// The atlas for `style`: the original (tiled, 1 MiB) with the cells redrawn; PlayStation: the original unchanged.
 /// `drawn`: how many cells were redrawn. Empty when Direct2D is unavailable (`error`).
 std::vector<u8> BuildAtlas(const u8* original_tiled, const std::vector<Cell>& cells, Input::PromptStyle style,

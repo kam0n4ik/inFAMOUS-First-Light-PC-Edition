@@ -859,6 +859,40 @@ CellArt DrawWith(Gfx& g, const Cell& cell, Input::PromptStyle style, const Input
 
 } // namespace
 
+std::vector<u8> DrawInputAlpha(Input::InputCode in, u32 side) {
+    Gfx g;
+    if (!g.Ok() || side == 0) {
+        return {};
+    }
+    // drawn at the font's cell size (the shapes' proportions are made for it), then scaled up: bilinear, and the
+    // edge's ramp narrowed back to about a pixel so the larger shape stays crisp
+    constexpr u32 kCell = 50;
+    Canvas c(g, kCell, kCell);
+    DrawInput(c, in);
+    std::vector<u8> a;
+    if (!c.Finish(a) || a.size() != size_t{kCell} * kCell) {
+        return {};
+    }
+    std::vector<u8> out(size_t{side} * side);
+    const float k = static_cast<float>(kCell) / static_cast<float>(side);
+    const float ramp = std::min(0.5f, 1.5f * k); // the edge's width in source pixels -> about 1.5 output pixels
+    for (u32 y = 0; y < side; ++y) {
+        const float fy = std::clamp((y + 0.5f) * k - 0.5f, 0.0f, kCell - 1.0f);
+        const u32 y0 = static_cast<u32>(fy), y1 = std::min(y0 + 1, kCell - 1);
+        const float ty = fy - y0;
+        for (u32 x = 0; x < side; ++x) {
+            const float fx = std::clamp((x + 0.5f) * k - 0.5f, 0.0f, kCell - 1.0f);
+            const u32 x0 = static_cast<u32>(fx), x1 = std::min(x0 + 1, kCell - 1);
+            const float tx = fx - x0;
+            const float v = ((a[y0 * kCell + x0] * (1 - tx) + a[y0 * kCell + x1] * tx) * (1 - ty) +
+                             (a[y1 * kCell + x0] * (1 - tx) + a[y1 * kCell + x1] * tx) * ty) / 255.0f;
+            const float s = std::clamp((v - 0.5f) / (2.0f * ramp) + 0.5f, 0.0f, 1.0f);
+            out[size_t{y} * side + x] = static_cast<u8>(std::lround(s * 255.0f));
+        }
+    }
+    return out;
+}
+
 CellArt Draw(const Cell& cell, Input::PromptStyle style, const Input::Settings& layout) {
     Gfx g;
     return DrawWith(g, cell, style, layout);
