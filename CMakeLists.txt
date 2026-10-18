@@ -124,6 +124,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/gcn/gcn_decoder.cpp
     src/runtime/gpu/gcn/gcn_inventory.cpp
     src/runtime/gpu/gcn/gcn_structure.cpp
+    src/runtime/gpu/gcn/spirv_builder.cpp
     src/runtime/kernel/event_queues.cpp
     src/runtime/kernel/guest_errno.cpp
     src/runtime/kernel/kernel_memory.cpp
@@ -168,6 +169,8 @@ target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
 # (src/runtime/gpu/vulkan). No loader is linked: the system vulkan-1.dll is loaded at run time, as the bridge does.
 target_link_libraries(sspc_runtime PRIVATE Vulkan::Headers)
+# the Khronos SPIR-V tables of SecondSonPC's own shader translator (runtime/gpu/gcn/spirv_builder)
+target_include_directories(sspc_runtime PRIVATE ${CMAKE_SOURCE_DIR}/third_party/spirv_headers/include)
 # P4.3: xxHash (BSD-2, from the bridge's externals like Zydis): programs' content identity, cache keys.
 target_link_libraries(sspc_runtime PRIVATE xxHash::xxhash)
 # P3.4: the commit in fatal exception reports (as of the last configure; "-dirty" with local changes then).
@@ -266,6 +269,7 @@ set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${
 add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     tools/engine_tests/main.cpp
     src/runtime/psf/param_sfo.cpp
+    src/runtime/gpu/gcn/spirv_builder.cpp
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp
@@ -279,7 +283,8 @@ add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     src/runtime/gpu/pm4.cpp
     src/base/log.cpp
 )
-target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/spirv_headers/include)
 target_compile_definitions(sspc_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(sspc_engine_tests PRIVATE /utf-8 /W4)
 target_link_libraries(sspc_engine_tests PRIVATE fmt::fmt)

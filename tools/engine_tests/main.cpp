@@ -3,6 +3,7 @@
 // System V entry points the game's PLT stubs have.
 //   sspc_engine_tests [--bench]   -> stdout, exit code = failures
 //     --bench   the queue's throughput with each wait policy (many tiny jobs, 5 workers + a waiting thread)
+#include <cstdlib>
 #include <iterator>
 #include <fstream>
 #include <filesystem>
@@ -20,6 +21,7 @@
 
 #include <windows.h>
 
+#include "runtime/gpu/gcn/spirv_builder.h"
 #include "runtime/psf/param_sfo.h"
 #include "engine/guest_hooks.h"
 #include "engine/guest_probe.h"
@@ -211,6 +213,74 @@ void TestParamSfo() {
     CHECK(r.GetString("MAINTITLE") == std::string("Second Son"));
     CHECK(r.GetInteger("SAVEDATA_LIST_PARAM") == 7u);
     CHECK(r.GetBinary("SAVEDATA_BLOCKS").has_value() && r.GetBinary("SAVEDATA_BLOCKS")->size() == 8);
+}
+
+// SecondSonPC's SPIR-V builder (runtime/gpu/gcn/spirv_builder): a compute module with a storage buffer, the
+// invocation id, a selection and a loop - spirv-val (Vulkan 1.3) must accept it.
+void TestSpirvBuilder() {
+    std::printf("spirv builder\n");
+    namespace G = SecondSon::Gpu::Gcn;
+    G::SpirvBuilder b;
+    b.Capability(spv::Capability::Shader);
+    b.MemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+    const G::Id u32t = b.TypeInt(32, false);
+    const G::Id v3 = b.TypeVector(u32t, 3);
+    const G::Id rta = b.TypeRuntimeArray(u32t);
+    b.Decorate(rta, spv::Decoration::ArrayStride, {4});
+    const G::Id members[] = {rta};
+    const G::Id block = b.TypeStruct(members);
+    b.Decorate(block, spv::Decoration::Block);
+    b.MemberDecorate(block, 0, spv::Decoration::Offset, {0});
+    const G::Id buf = b.Variable(b.TypePointer(spv::StorageClass::StorageBuffer, block), spv::StorageClass::StorageBuffer);
+    b.Decorate(buf, spv::Decoration::DescriptorSet, {0});
+    b.Decorate(buf, spv::Decoration::Binding, {0});
+    const G::Id gid = b.Variable(b.TypePointer(spv::StorageClass::Input, v3), spv::StorageClass::Input);
+    b.Decorate(gid, spv::Decoration::BuiltIn, {static_cast<u32>(spv::BuiltIn::GlobalInvocationId)});
+    const G::Id voidt = b.TypeVoid();
+    const G::Id fn = b.BeginFunction(voidt, b.TypeFunction(voidt));
+    const G::Id entry = b.NewId(), then = b.NewId(), merge = b.NewId(), header = b.NewId(), body = b.NewId(),
+                cont = b.NewId(), done = b.NewId();
+    b.Label(entry);
+    const G::Id counter = b.LocalVariable(b.TypePointer(spv::StorageClass::Function, u32t), b.U32(0));
+    const G::Id g = b.Op(spv::Op::OpLoad, v3, {gid});
+    const G::Id x = b.Op(spv::Op::OpCompositeExtract, u32t, {g, 0});
+    const G::Id odd = b.Op(spv::Op::OpINotEqual, b.TypeBool(), {b.Op(spv::Op::OpBitwiseAnd, u32t, {x, b.U32(1)}), b.U32(0)});
+    b.OpNoResult(spv::Op::OpSelectionMerge, {merge, static_cast<u32>(spv::SelectionControlMask::MaskNone)});
+    b.OpNoResult(spv::Op::OpBranchConditional, {odd, then, merge});
+    b.Label(then);
+    b.OpNoResult(spv::Op::OpStore, {counter, b.U32(3)});
+    b.OpNoResult(spv::Op::OpBranch, {merge});
+    b.Label(merge);
+    b.OpNoResult(spv::Op::OpBranch, {header});
+    b.Label(header);
+    b.OpNoResult(spv::Op::OpLoopMerge, {done, cont, static_cast<u32>(spv::LoopControlMask::MaskNone)});
+    b.OpNoResult(spv::Op::OpBranch, {body});
+    b.Label(body);
+    const G::Id c = b.Op(spv::Op::OpLoad, u32t, {counter});
+    const G::Id ptr = b.Op(spv::Op::OpAccessChain, b.TypePointer(spv::StorageClass::StorageBuffer, u32t), {buf, b.U32(0), x});
+    b.OpNoResult(spv::Op::OpStore, {ptr, b.Op(spv::Op::OpIAdd, u32t, {c, x})});
+    b.OpNoResult(spv::Op::OpBranch, {cont});
+    b.Label(cont);
+    const G::Id c2 = b.Op(spv::Op::OpIAdd, u32t, {b.Op(spv::Op::OpLoad, u32t, {counter}), b.U32(1)});
+    b.OpNoResult(spv::Op::OpStore, {counter, c2});
+    const G::Id more = b.Op(spv::Op::OpULessThan, b.TypeBool(), {c2, b.U32(8)});
+    b.OpNoResult(spv::Op::OpBranchConditional, {more, header, done});
+    b.Label(done);
+    b.OpNoResult(spv::Op::OpReturn, {});
+    b.EndFunction();
+    const G::Id iface[] = {buf, gid};
+    b.EntryPoint(spv::ExecutionModel::GLCompute, fn, "main", iface);
+    b.ExecutionMode(fn, spv::ExecutionMode::LocalSize, {64, 1, 1});
+    const std::vector<u32> words = b.Assemble();
+    const auto file = std::filesystem::temp_directory_path() / "sspc_spirv_builder_test.spv";
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
+    }
+    const std::string cmd = "E:\\VulkanSDK\\Bin\\spirv-val.exe --target-env vulkan1.3 \"" + file.string() + "\"";
+    const int rc = std::system(cmd.c_str());
+    std::printf("  %zu words, spirv-val -> %d\n", words.size(), rc);
+    CHECK(rc == 0);
 }
 
 void TestHash() {
@@ -930,6 +1000,7 @@ int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     TestHash();
     TestParamSfo();
+    TestSpirvBuilder();
     TestOrder();
     TestIterators();
     TestWaitHelps();
