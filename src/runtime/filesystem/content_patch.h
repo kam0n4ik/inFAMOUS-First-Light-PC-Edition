@@ -24,8 +24,27 @@ struct Edit {
     std::string bytes; // what the game reads there instead
 };
 
-/// The edits of a file the game opens for reading (`guest` path, `host` file); none for most files.
-std::vector<Edit> ForFile(std::string_view guest, const std::filesystem::path& host);
+/// What a file the game opens for reading gets: byte replacements, and a range whose reads are reported (where in
+/// guest memory the game put those bytes: the button icon atlas, rewritten there when the input device changes).
+struct FilePatch {
+    std::vector<Edit> edits;
+    u64 watch_offset = 0, watch_size = 0;
+};
+
+/// The patch of a file the game opens for reading (`guest` path, `host` file); empty for most files.
+FilePatch ForFile(std::string_view guest, const std::filesystem::path& host);
+
+/// The game's language tables (lang_<language>_text.xpps, not the _p ones): the button icons (ui/prompt_service.h).
+/// `open`: the table's bytes as on disk -> its patch (any thread: a guest thread opens files). `read`: `size` bytes of
+/// the watched range at file offset `offset` landed at guest address `address` (the reading guest thread).
+struct LanguageTableHook {
+    FilePatch (*open)(std::string_view guest, const std::string& bytes) = nullptr;
+    void (*read)(std::string_view guest, u64 offset, u64 address, u64 size) = nullptr;
+};
+void SetLanguageTableHook(LanguageTableHook hook);
+
+/// A read of `n` bytes at file offset `offset` into guest memory `address`: the watched part reported.
+void Observe(const FilePatch& patch, std::string_view guest, u64 offset, u64 address, u64 n);
 
 /// The edits of a language table's bytes (tests): `russian` picks the replacement texts' language.
 std::vector<Edit> ForLanguageTable(const std::string& bytes, bool russian);

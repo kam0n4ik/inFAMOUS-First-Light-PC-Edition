@@ -27,6 +27,7 @@
 #include "settings/registry.h"
 #include "settings/settings_service.h"
 #include "ui/overlay_win32.h"
+#include "ui/prompt_service.h"
 #include "ui/settings_menu.h"
 
 namespace SecondSon::Ui {
@@ -57,7 +58,6 @@ struct State {
     std::string overlay_error;
     bool reported_unavailable = false;
     std::unique_ptr<SettingsMenu> menu;
-    Input::DeviceTracker tracker;
     Input::Device pad_kind = Input::Device::OtherGamepad;
     std::string pad_name;
     u32 pad_held = 0;        // SDL gamepad buttons held (bits)
@@ -78,6 +78,7 @@ struct State {
     std::vector<std::pair<u32, u32>> window_sizes;
     // PC Edition: the PC settings are an entry of the game's own Settings screen (Esc / Options during play)
     u32 poll_event = 0;          // SDL user event of the game-menu poll timer
+    u32 prompt_event = 0;        // SDL user event of the button icons' timer (ui/prompt_service.h)
     bool dev_f1 = false;         // SSPC_DEV_F1=1 (development): F1 opens the menu anywhere
     bool game_menu_open = false; // one of the game's pausing screens is shown
     bool entry_shown = false;    // the game's Settings screen is in front (its "Additional settings" item opens ours)
@@ -149,8 +150,65 @@ Input::Device PadKind(SDL_JoystickID id) {
     case SDL_GAMEPAD_TYPE_XBOXONE:
         return Input::Device::Xbox;
     default:
+        break;
+    }
+    // types SDL does not name (a generic mapping): by maker - Sony, Microsoft
+    switch (SDL_GetGamepadVendorForID(id)) {
+    case 0x054C:
+        return Input::Device::PlayStation;
+    case 0x045E:
+        return Input::Device::Xbox;
+    default:
         return Input::Device::OtherGamepad;
     }
+}
+
+/// The game window's input feeds the device tracker (the game's button icons and the menu's hints): keys, mouse
+/// buttons and the wheel at once, mouse movement past a threshold, controller buttons and sticks/triggers past half
+/// way - not while the window is in the background (controllers report there too), not a controller's first second
+/// (connecting one is not using it), never its motion sensors.
+void FeedDevices(const SDL_Event& e, u64 now) {
+    auto& d = Input::Devices();
+    const auto& st = S();
+    const bool focused = st.opt.test_mode || st.opt.window == nullptr ||
+                         (SDL_GetWindowFlags(st.opt.window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    switch (e.type) {
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_WHEEL:
+        d.KeyOrMouseButton(now);
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        d.MouseMotion(e.motion.xrel, e.motion.yrel, now);
+        break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+        d.PadConnected(now);
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        if (focused) {
+            d.PadButton(PadKind(e.gbutton.which), now);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+        if (focused) {
+            d.PadButton(PadKind(e.gtouchpad.which), now);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (focused) {
+            d.PadAxis(PadKind(e.gaxis.which), std::abs(static_cast<double>(e.gaxis.value) / 32767.0), now);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+u32 PromptTimer(void*, SDL_TimerID, u32 interval) {
+    SDL_Event ev{};
+    ev.type = S().prompt_event;
+    SDL_PushEvent(&ev);
+    return interval;
 }
 
 SDL_DisplayID FindDisplay(const std::string& name) {
@@ -246,9 +304,9 @@ MenuEnv BuildEnv() {
             env.game_panel = {f.x + 315.0f * k, f.y + 92.0f * k, 742.0f * k, 895.0f * k};
         }
     }
-    env.prompts = Input::ResolvePrompts(cfg.pc.prompts, st.tracker.Active());
+    env.prompts = Input::ResolvePrompts(cfg.pc.prompts, Input::Devices().Active());
     env.confirm_is_circle = !cfg.enter_button_cross;
-    env.device_label = st.tracker.Active() == Input::Device::KeyboardMouse
+    env.device_label = Input::Devices().Active() == Input::Device::KeyboardMouse
                            ? std::string(env.ru ? "Клавиатура и мышь" : "Keyboard and mouse")
                            : (st.pad_name.empty() ? std::string(env.ru ? "Контроллер" : "Controller") : st.pad_name);
     const bool bridge = (st.opt.capabilities & Settings::Capability::BridgePresenter) != 0;
@@ -509,7 +567,6 @@ void TrackPad(const SDL_Event& e, bool down) {
         st.pad_kind = PadKind(e.gbutton.which);
         const char* name = SDL_GetGamepadNameForID(e.gbutton.which);
         st.pad_name = name != nullptr ? name : "";
-        st.tracker.PadButton(st.pad_kind, NowNs());
     }
     if (st.block_until_release && st.pad_held == 0 && !(st.menu && st.menu->IsOpen())) {
         st.block_until_release = false;
@@ -738,6 +795,12 @@ MenuController& Menu() {
 void MenuController::Install(const Options& options) {
     auto& st = S();
     st.opt = options;
+    // the game's button icons follow the device in every run (automated ones too)
+    PromptService::Install();
+    st.prompt_event = SDL_RegisterEvents(1);
+    if (st.prompt_event != 0) {
+        SDL_AddTimer(100, &PromptTimer, nullptr);
+    }
     if (options.test_mode || options.window == nullptr) {
         SSPC_LOG(App, Info, "settings menu: off ({})", options.test_mode ? "automated run" : "no window");
         return;
@@ -867,6 +930,17 @@ void MenuController::Close() {
 }
 
 EventRoute MenuController::OnEvent(const SDL_Event& e) {
+    if (S().prompt_event != 0 && e.type == S().prompt_event) {
+        PromptService::Update(NowNs());
+        return EventRoute::Consumed;
+    }
+    {
+        const u32 before = Input::Devices().Switches();
+        FeedDevices(e, NowNs());
+        if (Input::Devices().Switches() != before) {
+            PromptService::Update(NowNs()); // at once (else within kMinGapNs by the timer)
+        }
+    }
     if (!installed_) {
         return EventRoute::Normal;
     }
@@ -890,7 +964,6 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         const bool on_item = AdditionalItemChosen(Gpu::MenuFocus::Latest());
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && on_item &&
             Input::Player1().KeyTriggers(static_cast<u16>(e.key.scancode), Input::Action::Cross)) {
-            st.tracker.KeyOrMouseButton(now);
             Open();
             return EventRoute::Consumed;
         }
@@ -917,8 +990,7 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
             const auto [x, y] = ToPixels(e.button.x, e.button.y);
             const auto [fx, fy] = ToFrame(x, y);
             if (InList(fx, fy)) {
-                st.tracker.KeyOrMouseButton(now);
-                st.hover_pending = false;
+                    st.hover_pending = false;
                 // the item: cross; its value (a choice, a volume bar): left / right
                 const u32 button = fx < kValueLeft     ? Input::Button::Cross
                                    : fx < kValueMiddle ? Input::Button::Left
@@ -948,7 +1020,6 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         const bool down = e.type == SDL_EVENT_KEY_DOWN;
         const auto sc = e.key.scancode;
         if (down) {
-            st.tracker.KeyOrMouseButton(now);
         }
         if (!open) {
             if (!down || e.key.repeat) {
@@ -992,7 +1063,6 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         return EventRoute::Consumed;
     }
     case SDL_EVENT_MOUSE_MOTION:
-        st.tracker.MouseMotion(e.motion.xrel, e.motion.yrel, now);
         if (!open) {
             return EventRoute::Normal;
         }
@@ -1006,7 +1076,6 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
     case SDL_EVENT_MOUSE_BUTTON_UP: {
         const bool down = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
         if (down) {
-            st.tracker.KeyOrMouseButton(now);
         }
         if (!open) {
             return EventRoute::Normal;
@@ -1114,12 +1183,8 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         } else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) {
             st.stick_y = v;
         } else {
-            if (std::abs(v) >= Input::DeviceTracker::kStickThreshold) {
-                st.tracker.PadAxis(PadKind(e.gaxis.which), std::abs(v), now);
-            }
             return open ? EventRoute::BridgeOnly : EventRoute::Normal;
         }
-        st.tracker.PadAxis(PadKind(e.gaxis.which), std::max(std::abs(st.stick_x), std::abs(st.stick_y)), now);
         if (!open) {
             return EventRoute::Normal;
         }

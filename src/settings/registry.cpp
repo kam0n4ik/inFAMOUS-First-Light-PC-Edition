@@ -679,12 +679,15 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "interface.prompts", .table = "Interface", .key = "prompts", .category = Category::Interface,
-        .type = Type::Choice, .apply = Apply::Live, .choices = kPrompts, .en = "Button hints in this menu",
-        .ru = "Подсказки кнопок в меню",
-        .help_en = "Button symbols in SecondSonPC's menu. Automatic: the last device used. The game's own hints stay "
-                   "DualShock 4 symbols (replacing them is a separate task).",
-        .help_ru = "Обозначения кнопок в меню SecondSonPC. «Автоматически» — по последнему устройству ввода. "
-                   "Подсказки самой игры остаются символами DualShock 4 (их замена — отдельная задача).",
+        .type = Type::Choice, .apply = Apply::Live, .choices = kPrompts, .en = "Button hints",
+        .ru = "Подсказки кнопок",
+        .help_en = "Button icons in the game's hints and in this menu. Automatic: the device used last (keyboard and "
+                   "mouse show the keys bound to each action; an Xbox controller its buttons; a PlayStation controller "
+                   "the game's own icons). Connecting a controller does not switch them, using it does.",
+        .help_ru = "Значки кнопок в подсказках игры и в этом меню. «Автоматически» — по последнему устройству: для "
+                   "клавиатуры и мыши — клавиши, назначенные действиям; для контроллера Xbox — его кнопки; для "
+                   "контроллера PlayStation — оригинальные значки игры. Подключение контроллера их не переключает, "
+                   "переключает его использование.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.prompts; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.prompts = std::get<std::string>(x); },
     });

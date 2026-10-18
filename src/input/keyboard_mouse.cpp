@@ -82,6 +82,7 @@ constexpr ButtonOf kButtons[] = {
 void KeyboardMouse::Configure(const Settings& settings) {
     std::scoped_lock lock{mutex_};
     settings_ = settings;
+    ++layout_generation_;
     key_actions_.fill(0);
     mouse_actions_.fill(0);
     wheel_actions_.fill(0);
@@ -179,6 +180,16 @@ void KeyboardMouse::MenuPress(u32 buttons) {
 size_t KeyboardMouse::MenuPressesQueued() const {
     std::scoped_lock lock{mutex_};
     return menu_queue_.size() + (menu_latched_ != 0 ? 1 : 0);
+}
+
+Settings KeyboardMouse::Layout() const {
+    std::scoped_lock lock{mutex_};
+    return settings_;
+}
+
+u64 KeyboardMouse::LayoutGeneration() const {
+    std::scoped_lock lock{mutex_};
+    return layout_generation_;
 }
 
 u16 KeyboardMouse::KeyFor(Action a) const {

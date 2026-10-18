@@ -90,6 +90,9 @@ public:
     void MenuPress(u32 buttons);
     /// Presses still queued (0: all were read).
     size_t MenuPressesQueued() const;
+    /// The layout in use (bindings, any thread) and a number that changes with each Configure.
+    Settings Layout() const;
+    u64 LayoutGeneration() const;
     /// The first keyboard key bound to `a` (SDL scancode), 0 if none.
     u16 KeyFor(Action a) const;
     /// `scancode` is bound to `a`.
@@ -135,6 +138,7 @@ private:
 
     mutable std::mutex mutex_;
     Settings settings_ = DefaultSettings();
+    u64 layout_generation_ = 0;
     std::array<u32, 512> key_actions_{}; // scancode -> action bits
     std::array<u32, 8> mouse_actions_{}; // SDL mouse button -> action bits
     std::array<u32, 4> wheel_actions_{}; // wheel up/down/left/right -> action bits

@@ -33,14 +33,30 @@ void DeviceTracker::MouseMotion(double dx, double dy, u64 now_ns) {
     }
 }
 
+bool DeviceTracker::PadQuiet(u64 now_ns) const {
+    return connected_once_ && now_ns >= connected_ns_ && now_ns - connected_ns_ < kConnectQuietNs;
+}
+
+void DeviceTracker::PadConnected(u64 now_ns) {
+    connected_ns_ = now_ns;
+    connected_once_ = true;
+}
+
 void DeviceTracker::PadButton(Device pad, u64 now_ns) {
-    Use(pad, now_ns, false);
+    if (!PadQuiet(now_ns)) {
+        Use(pad, now_ns, false);
+    }
 }
 
 void DeviceTracker::PadAxis(Device pad, double deflection, u64 now_ns) {
-    if (deflection >= kStickThreshold) {
+    if (deflection >= kStickThreshold && !PadQuiet(now_ns)) {
         Use(pad, now_ns, true);
     }
+}
+
+DeviceTracker& Devices() {
+    static DeviceTracker tracker;
+    return tracker;
 }
 
 PromptStyle ResolvePrompts(std::string_view setting, Device active) {
