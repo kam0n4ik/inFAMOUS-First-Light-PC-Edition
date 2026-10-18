@@ -1,48 +1,83 @@
-SecondSonPC's own GCN translator on the game's programs: 10301 programs, 10296 emitted (100.0 %), 10248 valid (spirv-val, vulkan1.3; 99.5 %), 155078367 words
+SecondSonPC's own GCN translator on the game's programs: 10301 programs, 4309 emitted (41.8 %), 4308 valid (spirv-val, vulkan1.3; 41.8 %), 67211230 words
 
 stopped at (programs, first example):
-       2  operand 249                              art/cache/all_shaders.xpps@70e28
+    3509  tbuffer_load_format_xyzw                 art/cache/a1.xpps@3a4a94
+    1888  v_interp_p1_f32                          art/cache/a1.xpps@3d3694
+     282  s_swappc_b64                             art/cache/a1.xpps@3bb294
+      69  image_sample_lz                          art/cache/all_shaders.xpps@64128
+      58  ds_append                                art/cache/a8.xpps@1343d48
+      38  image_load_mip                           art/cache/a11.xpps@1021fac
+      35  ds_write_b32                             art/cache/concrete_knight.xpps@ea93e8
+      12  exp                                      art/cache/a1.xpps@40cb94
+       9  image_sample                             art/cache/a25.xpps@10af78c
+       5  buffer_load_format_xyzw                  art/cache/all_shaders.xpps@59b28
+       5  s_buffer_load_dwordx4 (resource: dword 1331: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b23.xpps@ea5fb0
+       4  buffer_load_format_xyz                   art/cache/all_shaders.xpps@71328
+       4  v_interp_mov_f32                         art/cache/a1.xpps@3ddf94
+       3  s_buffer_load_dwordx16 (resource: dword 352: s_buffer_load_dwordx16 - the V# in s[32:35] is not found) art/cache/angel_demon.xpps@185f898
+       3  image_load                               art/cache/all_shaders.xpps@85018
+       2  image_get_resinfo                        art/cache/all_shaders.xpps@67b28
+       2  s_buffer_load_dwordx4 (resource: dword 1299: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_cb.sprig.xpps@840ed8
+       2  s_buffer_load_dwordx4 (resource: dword 1297: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fb9c5e4
+       2  s_buffer_load_dwordx4 (resource: dword 1320: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_knight.xpps@ea34e8
+       2  s_buffer_load_dwordx4 (resource: dword 1329: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b10.xpps@13e32b4
+       2  s_buffer_load_dwordx4 (resource: dword 149: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1060c4e4
+       2  s_buffer_load_dwordx4 (resource: dword 58: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a587e4
+       2  s_buffer_load_dwordx4 (resource: dword 879: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_bishop.xpps@e7272c
+       2  s_buffer_load_dwordx4 (resource: dword 945: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@183c598
        2  v_div_scale_f32                          art/cache/all_shaders.xpps@57c28
+       1  s_buffer_load_dwordx4 (resource: dword 114: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/msn_lb.sprig.xpps@8532b4
+       1  s_buffer_load_dwordx4 (resource: dword 115: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1086e3e4
+       1  s_buffer_load_dwordx4 (resource: dword 116: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1058c3e4
+       1  s_buffer_load_dwordx4 (resource: dword 124: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@104073e4
+       1  s_buffer_load_dwordx4 (resource: dword 1268: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd984e4
+       1  s_buffer_load_dwordx4 (resource: dword 1280: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fecbce4
+       1  s_buffer_load_dwordx4 (resource: dword 1285: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fea21e4
+       1  s_buffer_load_dwordx4 (resource: dword 1286: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fe55fe4
+       1  s_buffer_load_dwordx4 (resource: dword 1289: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd50de4
+       1  s_buffer_load_dwordx4 (resource: dword 1291: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b32_i.xpps@106f79c
+       1  s_buffer_load_dwordx4 (resource: dword 1296: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd6b4e4
+       1  s_buffer_load_dwordx4 (resource: dword 1311: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@618ccdc
+       1  s_buffer_load_dwordx4 (resource: dword 1314: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff431e4
+       1  s_buffer_load_dwordx4 (resource: dword 1315: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@100792e4
+       1  s_buffer_load_dwordx4 (resource: dword 1316: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff3a5e4
+       1  s_buffer_load_dwordx4 (resource: dword 1317: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@618ebdc
+       1  buffer_load_format_x                     art/cache/all_shaders.xpps@7fb18
+       1  s_buffer_load_dwordx4 (resource: dword 1323: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd491e4
+       1  s_buffer_load_dwordx4 (resource: dword 1326: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@6156bdc
+       1  s_buffer_load_dwordx4 (resource: dword 1327: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@6178cdc
+       1  s_buffer_load_dwordx4 (resource: dword 1328: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fdf42e4
+       1  buffer_store_format_x                    art/cache/all_shaders.xpps@77318
+       1  ds_write_b64                             art/cache/all_shaders.xpps@4ff28
+       1  s_buffer_load_dwordx4 (resource: dword 1335: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fce31e4
+       1  s_buffer_load_dwordx4 (resource: dword 1345: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc612e4
+       1  buffer_load_dwordx4                      art/cache/core_common.sprig.xpps@1036f6e4
+       1  s_buffer_load_dwordx4 (resource: dword 153: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fbaede4
+       1  s_buffer_load_dwordx4 (resource: dword 159: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1062bfe4
+       1  s_buffer_load_dwordx4 (resource: dword 2143: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fb628e4
+       1  image_sample_c_lz                        art/cache/all_shaders.xpps@65f28
+       1  s_buffer_load_dwordx4 (resource: dword 34: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@109143e4
+       1  s_buffer_load_dwordx4 (resource: dword 454: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@103c91e4
+       1  s_buffer_load_dwordx4 (resource: dword 506: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_seaport.sprig.xpps@61508dc
+       1  s_buffer_load_dwordx4 (resource: dword 52: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a5dfe4
+       1  s_buffer_load_dwordx4 (resource: dword 577: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104937e4
+       1  image_store                              art/cache/all_shaders.xpps@65828
+       1  s_buffer_load_dwordx4 (resource: dword 65: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a513e4
+       1  s_buffer_load_dwordx4 (resource: dword 662: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@1852f98
+       1  s_buffer_load_dwordx4 (resource: dword 245: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_cbc.sprig.xpps@103b28
+       1  s_buffer_load_dwordx4 (resource: dword 101: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/msn_cbc.sprig.xpps@104f28
+       1  s_buffer_load_dwordx4 (resource: dword 105: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fa0b0e4
+       1  s_load_dwordx4 (resource: dword 219: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@10884be4
+       1  s_buffer_load_dwordx4 (resource: dword 109: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10982ae4
+       1  s_buffer_load_dwordx4 (resource: dword 111: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1011b7e4
        1  v_cvt_f64_i32                            art/cache/all_shaders.xpps@6cd28
+       1  s_buffer_load_dwordx4 (resource: dword 112: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/laser_boss.xpps@17dfe5c
+       1  s_buffer_load_dwordx4 (resource: dword 113: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@108843e4
+       1  s_buffer_load_dwordx4 (resource: dword 71: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/tv_boss.xpps@1355fc8
 
-invalid modules: 8 kinds (each kind's first module: C:\Users\kamon\AppData\Local\Temp\sspc_gcn_translate\invalid_<n>.spv)
-       7  error: line ####: Header block '##[%##]' is contained in the loop construct headed by '##[%##]', but its merge block '##
-          art/cache/augustine.xpps@1631db4: error: line 5613: Header block '30[%30]' is contained in the loop construct headed by '29[%29]', but its merge block '42[%42]' is not
-  %30 = OpLabel
-
-
-       1  error: line ####: The continue construct with the continue target '##[%##]' is not structurally post dominated by the ba
-          art/cache/all_shaders.xpps@67428: error: line 2547: The continue construct with the continue target '13[%13]' is not structurally post dominated by the back-edge block '1925[%1925]'
-  %1925 = OpLabel
-
-
-       2  error: line ####: block <ID> '###[%###]' exits the selection headed by <ID> '###[%###]', but not via a structured exit
-          art/cache/all_shaders.xpps@68228: error: line 1009: block <ID> '607[%607]' exits the selection headed by <ID> '607[%607]', but not via a structured exit
-  %607 = OpLabel
-
-
-       2  error: line ###: Block '##[%##]' is already a merge block for another header
-          art/cache/augustine.xpps@162ddb4: error: line 110: Block '43[%43]' is already a merge block for another header
-  %11 = OpFunction %void None %10
-
-
+invalid modules: 1 kinds (each kind's first module: C:\Users\kamon\AppData\Local\Temp\sspc_gcn_translate\invalid_<n>.spv)
        1  error: line ###: Header block '##[%##]' is contained in the loop construct headed by '##[%##]', but its merge block '##[
-          art/cache/all_shaders.xpps@7a518: error: line 534: Header block '18[%18]' is contained in the loop construct headed by '13[%13]', but its merge block '24[%24]' is not
-  %18 = OpLabel
-
-
-       3  error: line ###: The continue construct with the continue target '##[%##]' is not structurally post dominated by the bac
-          art/cache/graffiti_a8_family.xpps@7942d0: error: line 634: The continue construct with the continue target '13[%13]' is not structurally post dominated by the back-edge block '416[%416]'
-  %416 = OpLabel
-
-
-      30  error: line ###: block <ID> '###[%###]' exits the selection headed by <ID> '###[%###]', but not via a structured exit
-          art/cache/a1.xpps@3da094: error: line 262: block <ID> '145[%145]' exits the selection headed by <ID> '145[%145]', but not via a structured exit
-  %145 = OpLabel
-
-
-       2  error: line ##: Block '##[%##]' is already a merge block for another header
-          art/cache/all_shaders.xpps@5a828: error: line 66: Block '17[%17]' is already a merge block for another header
-  %11 = OpFunction %void None %10
+          art/cache/all_shaders.xpps@7a518: error: line 705: Header block '39[%39]' is contained in the loop construct headed by '34[%34]', but its merge block '45[%45]' is not
+  %39 = OpLabel
 
 

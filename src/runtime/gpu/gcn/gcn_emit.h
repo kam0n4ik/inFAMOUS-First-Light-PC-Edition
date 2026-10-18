@@ -17,6 +17,7 @@
 #include "base/abi.h"
 #include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
+#include "runtime/gpu/gcn/gcn_resources.h"
 #include "runtime/gpu/gcn/gcn_structure.h"
 
 namespace SecondSon::Gpu::Gcn {
@@ -26,12 +27,16 @@ struct EmitResult {
     std::string error;       ///< the first instruction not handled ("unsupported: <mnemonic>") or a structure problem
     std::string unsupported; ///< its mnemonic alone (empty: none)
     std::vector<u32> spirv;
+    /// the resources (bindings: 0 the flattened user data, then buffers[i] at 1 + i; push constants: PushData)
+    ResourceInfo resources;
 };
 
 struct EmitOptions {
     /// tests only: memory, interpolation and export instructions do nothing and their destinations get zeros (the
     /// control flow, the registers and the ALU of every program can be checked before resources exist)
     bool stub_memory = false;
+    /// SGPRs holding user data at the start (SPI_SHADER_PGM_RSRC2.USER_SGPR)
+    u32 user_sgprs = 16;
 };
 
 EmitResult EmitProgram(std::span<const Inst> insts, const Cfg& cfg, const Structure& st,

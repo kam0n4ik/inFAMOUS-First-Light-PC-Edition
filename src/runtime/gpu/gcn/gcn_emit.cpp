@@ -109,6 +109,19 @@ private:
     Id glsl_ = 0;
     Id exec_ = 0, scc_ = 0;
     Id lane_id_ = 0;            ///< SubgroupLocalInvocationId (on first use)
+    // resources
+    ResourceInfo res_;
+    Id flat_ = 0, push_ = 0;  ///< the flattened user data (binding 0), PushData
+    std::vector<Id> buffers_; ///< binding 1 + i
+    Id t_ptr_sb_u32_ = 0, t_ptr_pc_u32_ = 0;
+    void DeclareResources();
+    Id FlatDword(Id index);   ///< flat[index]
+    Id BufOffset(u32 buffer); ///< buf_offsets[1 + buffer] (bytes the descriptor's start was moved down)
+    Id SharpDword(u32 buffer, u32 dword);
+    bool BufferKnown(s32 buffer) const;
+    void EmitSmrd(const Inst& in, u32 index, std::string_view name);
+    bool EmitBuffer(const Inst& in, u32 index, std::string_view name);
+    u32 cur_index_ = 0;
     std::vector<Id> interface_; ///< the entry point's interface (every global variable used: SPIR-V 1.4+)
     Id LaneId();
     std::unordered_map<u32, Id> regs_; ///< register code -> its function variable
@@ -325,6 +338,174 @@ std::pair<Id, Id> Emitter::Ballot(Id cond) {
     return {b_.Op(Op::OpCompositeExtract, t_u32_, {v, 0}), b_.Op(Op::OpCompositeExtract, t_u32_, {v, 1})};
 }
 
+bool Emitter::BufferKnown(s32 buffer) const {
+    for (const ScalarValue& v : res_.buffers[buffer].sharp) {
+        if (v.kind == ScalarValue::Kind::Unknown) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Emitter::DeclareResources() {
+    // a storage buffer of dwords: struct { uint data[]; } (std430: array stride 4)
+    const auto ssbo = [&](bool written, u32 binding) {
+        const Id rta = b_.TypeRuntimeArray(t_u32_);
+        b_.Decorate(rta, spv::Decoration::ArrayStride, {4});
+        const Id members[] = {rta};
+        const Id st = b_.TypeStruct(members);
+        b_.Decorate(st, spv::Decoration::Block);
+        b_.MemberDecorate(st, 0, spv::Decoration::Offset, {0});
+        if (!written) {
+            b_.MemberDecorate(st, 0, spv::Decoration::NonWritable);
+        }
+        const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::StorageBuffer, st), spv::StorageClass::StorageBuffer);
+        b_.Decorate(v, spv::Decoration::DescriptorSet, {0});
+        b_.Decorate(v, spv::Decoration::Binding, {binding});
+        interface_.push_back(v);
+        return v;
+    };
+    t_ptr_sb_u32_ = b_.TypePointer(spv::StorageClass::StorageBuffer, t_u32_);
+    flat_ = ssbo(false, 0);
+    for (u32 i = 0; i < res_.buffers.size(); ++i) {
+        buffers_.push_back(ssbo(res_.buffers[i].written, 1 + i));
+    }
+    // PushData: float xoffset, yoffset, xscale, yscale; u8 buf_offsets[56] (as 14 dwords)
+    const Id f4 = b_.TypeArray(t_f32_, b_.U32(4));
+    b_.Decorate(f4, spv::Decoration::ArrayStride, {4});
+    const Id u14 = b_.TypeArray(t_u32_, b_.U32(14));
+    b_.Decorate(u14, spv::Decoration::ArrayStride, {4});
+    const Id members[] = {f4, u14};
+    const Id pd = b_.TypeStruct(members);
+    b_.Decorate(pd, spv::Decoration::Block);
+    b_.MemberDecorate(pd, 0, spv::Decoration::Offset, {0});
+    b_.MemberDecorate(pd, 1, spv::Decoration::Offset, {16});
+    push_ = b_.Variable(b_.TypePointer(spv::StorageClass::PushConstant, pd), spv::StorageClass::PushConstant);
+    interface_.push_back(push_);
+    t_ptr_pc_u32_ = b_.TypePointer(spv::StorageClass::PushConstant, t_u32_);
+}
+
+Id Emitter::FlatDword(Id index) {
+    return b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {flat_, b_.U32(0), index})});
+}
+
+Id Emitter::BufOffset(u32 buffer) {
+    const u32 k = 1 + buffer; // (the flattened user data is binding 0)
+    const Id word =
+        b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_pc_u32_, {push_, b_.U32(1), b_.U32(k / 4)})});
+    return b_.Op(Op::OpBitFieldUExtract, t_u32_, {word, b_.U32((k % 4) * 8), b_.U32(8)});
+}
+
+Id Emitter::SharpDword(u32 buffer, u32 dword) {
+    const ScalarValue& v = res_.buffers[buffer].sharp[dword];
+    return v.kind == ScalarValue::Kind::Const ? b_.U32(v.value) : FlatDword(b_.U32(v.value));
+}
+
+void Emitter::EmitSmrd(const Inst& in, u32 index, std::string_view name) {
+    const Operands o = GetOperands(in);
+    const u32 n = name.ends_with("x16") ? 16 : name.ends_with("x8") ? 8 : name.ends_with("x4") ? 4
+                  : name.ends_with("x2") ? 2 : 1;
+    if (res_.load_of[index] >= 0) {
+        // s_load_dword*: the walk copied it into flat
+        const WalkLoad& w = res_.walk[res_.load_of[index]];
+        for (u32 i = 0; i < n; ++i) {
+            Set(o.dst[0] + i, FlatDword(b_.U32(w.dst + i)));
+        }
+        return;
+    }
+    // s_buffer_load_dword*: from the buffer of its V#, the offset in bytes
+    const u32 buffer = static_cast<u32>(res_.buffer_of[index]);
+    Id offset = 0;
+    if (((in.w0 >> 8) & 1) != 0) {
+        offset = b_.U32((in.w0 & 0xFF) * 4);
+    } else if ((in.w0 & 0xFF) == kLiteralOperand) {
+        offset = b_.U32(in.lit * 4);
+    } else {
+        offset = b_.Op(Op::OpBitwiseAnd, t_u32_, {Get(in.w0 & 0xFF, in), b_.U32(~3u)});
+    }
+    const Id first =
+        b_.Op(Op::OpShiftRightLogical, t_u32_, {b_.Op(Op::OpIAdd, t_u32_, {offset, BufOffset(buffer)}), b_.U32(2)});
+    for (u32 i = 0; i < n; ++i) {
+        const Id idx = i == 0 ? first : b_.Op(Op::OpIAdd, t_u32_, {first, b_.U32(i)});
+        Set(o.dst[0] + i,
+            b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {buffers_[buffer], b_.U32(0), idx})}));
+    }
+}
+
+bool Emitter::EmitBuffer(const Inst& in, u32 index, std::string_view name) {
+    // raw dword loads / stores and the integer atomics; the formatted ones need the V#'s format (not yet)
+    u32 n = 0;
+    enum class Kind { Load, Store, Atomic } kind = Kind::Load;
+    Op atomic = Op::OpNop;
+    const auto width = [&]() -> u32 {
+        return name.ends_with("x4") ? 4 : name.ends_with("x3") ? 3 : name.ends_with("x2") ? 2 : 1;
+    };
+    if (name.starts_with("buffer_load_dword")) {
+        n = width();
+    } else if (name.starts_with("buffer_store_dword")) {
+        kind = Kind::Store;
+        n = width();
+    } else if (name.starts_with("buffer_atomic_")) {
+        kind = Kind::Atomic;
+        n = 1;
+        static constexpr std::pair<std::string_view, Op> kAtomics[] = {
+            {"buffer_atomic_add", Op::OpAtomicIAdd},  {"buffer_atomic_sub", Op::OpAtomicISub},
+            {"buffer_atomic_umax", Op::OpAtomicUMax}, {"buffer_atomic_umin", Op::OpAtomicUMin},
+            {"buffer_atomic_smax", Op::OpAtomicSMax}, {"buffer_atomic_smin", Op::OpAtomicSMin},
+            {"buffer_atomic_and", Op::OpAtomicAnd},   {"buffer_atomic_or", Op::OpAtomicOr},
+            {"buffer_atomic_xor", Op::OpAtomicXor},   {"buffer_atomic_swap", Op::OpAtomicExchange},
+        };
+        for (const auto& [nm, op] : kAtomics) {
+            if (name == nm) {
+                atomic = op;
+            }
+        }
+        if (atomic == Op::OpNop) {
+            return false; // (inc/dec wrap, cmpswap, 64-bit: not yet)
+        }
+    } else {
+        return false;
+    }
+    if (((in.w0 >> 15) & 1) != 0 || ((in.w0 >> 16) & 1) != 0) {
+        return false; // addr64 / lds
+    }
+    const u32 buffer = static_cast<u32>(res_.buffer_of[index]);
+    const bool offen = ((in.w0 >> 12) & 1) != 0, idxen = ((in.w0 >> 13) & 1) != 0, glc = ((in.w0 >> 14) & 1) != 0;
+    const u32 vaddr = kVgpr + (in.w1 & 0xFF), vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    // byte address = soffset + offset12 + (idxen ? index * stride) + (offen ? voffset)
+    Id addr = b_.Op(Op::OpIAdd, t_u32_, {Get((in.w1 >> 24) & 0xFF, in), b_.U32(in.w0 & 0xFFF)});
+    if (idxen) {
+        const Id stride = b_.Op(Op::OpBitFieldUExtract, t_u32_, {SharpDword(buffer, 1), b_.U32(16), b_.U32(14)});
+        addr = b_.Op(Op::OpIAdd, t_u32_, {addr, b_.Op(Op::OpIMul, t_u32_, {Get(vaddr, in), stride})});
+    }
+    if (offen) {
+        addr = b_.Op(Op::OpIAdd, t_u32_, {addr, Get(idxen ? vaddr + 1 : vaddr, in)});
+    }
+    const Id first =
+        b_.Op(Op::OpShiftRightLogical, t_u32_, {b_.Op(Op::OpIAdd, t_u32_, {addr, BufOffset(buffer)}), b_.U32(2)});
+    for (u32 i = 0; i < n; ++i) {
+        const Id idx = i == 0 ? first : b_.Op(Op::OpIAdd, t_u32_, {first, b_.U32(i)});
+        const Id ptr = b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {buffers_[buffer], b_.U32(0), idx});
+        switch (kind) {
+        case Kind::Load:
+            Set(vdata + i, b_.Op(Op::OpLoad, t_u32_, {ptr}));
+            break;
+        case Kind::Store:
+            b_.OpNoResult(Op::OpStore, {ptr, Get(vdata + i, in)});
+            break;
+        case Kind::Atomic: {
+            const Id old =
+                b_.Op(atomic, t_u32_, {ptr, b_.U32(static_cast<u32>(spv::Scope::Device)), b_.U32(0), Get(vdata, in)});
+            if (glc) {
+                Set(vdata, old); // (GLC: the value before)
+            }
+            break;
+        }
+        }
+    }
+    return true;
+}
+
 Id Emitter::LaneId() {
     if (lane_id_ == 0) {
         lane_id_ = b_.Variable(b_.TypePointer(spv::StorageClass::Input, t_u32_), spv::StorageClass::Input);
@@ -394,6 +575,26 @@ void Emitter::Emit(const Inst& in) {
     case Format::Vop3:
     case Format::Vopc:
         EmitVector(in, name);
+        return;
+    case Format::Smrd:
+        if (res_.buffer_of[cur_index_] >= 0 ? BufferKnown(res_.buffer_of[cur_index_]) : res_.load_of[cur_index_] >= 0) {
+            EmitSmrd(in, cur_index_, name);
+            return;
+        }
+        if (!options_.stub_memory) {
+            throw Unsupported{fmt::format("{} (resource: {})", name, res_.error)};
+        }
+        EmitStub(in, name);
+        return;
+    case Format::Mubuf:
+        if (res_.buffer_of[cur_index_] >= 0 && BufferKnown(res_.buffer_of[cur_index_]) &&
+            EmitBuffer(in, cur_index_, name)) {
+            return;
+        }
+        if (!options_.stub_memory) {
+            throw Unsupported{std::string(name)};
+        }
+        EmitStub(in, name);
         return;
     default:
         if (options_.stub_memory) {
@@ -1160,6 +1361,8 @@ EmitResult Emitter::Run() {
     try {
         BuildGraph();
         Setup();
+        AnalyzeResources(insts_, cfg_, options_.user_sgprs, res_); // (an unknown V# fails at its instruction)
+        DeclareResources();
         for (const Inst& in : insts_) {
             writes_exec_ = writes_exec_ || WritesExec(in);
         }
@@ -1177,6 +1380,9 @@ EmitResult Emitter::Run() {
         b_.Label(b_.NewId());
         exec_ = b_.LocalVariable(t_ptr_bool_, b_.ConstantBool(true));
         scc_ = b_.LocalVariable(t_ptr_bool_, b_.ConstantBool(false));
+        for (u32 i = 0; i < std::min<u32>(options_.user_sgprs, 16); ++i) {
+            Set(i, FlatDword(b_.U32(i))); // the user data registers
+        }
         b_.OpNoResult(Op::OpBranch, {labels_[0]});
         for (const u32 x : Rpo()) {
             const Node& nd = nodes_[x];
@@ -1192,6 +1398,7 @@ EmitResult Emitter::Run() {
                 const Block& blk = cfg_.blocks[nd.orig];
                 for (u32 i = blk.first; i <= blk.last;) {
                     if (!writes_exec_ || !IsVector(insts_[i])) {
+                        cur_index_ = i;
                         Emit(insts_[i++]);
                         continue;
                     }
@@ -1203,6 +1410,7 @@ EmitResult Emitter::Run() {
                     b_.Label(run);
                     while (i <= blk.last && IsVector(insts_[i])) {
                         const bool ends = WritesExec(insts_[i]);
+                        cur_index_ = i;
                         Emit(insts_[i++]);
                         if (ends) {
                             break;
@@ -1254,6 +1462,7 @@ EmitResult Emitter::Run() {
         b_.EntryPoint(spv::ExecutionModel::GLCompute, fn, "main", interface_);
         b_.ExecutionMode(fn, spv::ExecutionMode::LocalSize, {64, 1, 1});
         res.spirv = b_.Assemble();
+        res.resources = res_;
         res.ok = true;
     } catch (const Unsupported& u) {
         res.unsupported = u.what;
