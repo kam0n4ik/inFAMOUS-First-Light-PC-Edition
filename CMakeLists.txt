@@ -84,6 +84,8 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/shader/shader_frontend.cpp
     src/runtime/gpu/shader/shader_resources.cpp
     src/runtime/gpu/shader/shader_translator.cpp
+    src/runtime/gpu/static/static_draws.cpp
+    src/runtime/gpu/static/static_predictor.cpp
     src/runtime/gpu/vulkan/vk_buffer_cache.cpp
     src/runtime/gpu/vulkan/vk_device_context.cpp
     src/runtime/gpu/vulkan/vk_diagnostics.cpp

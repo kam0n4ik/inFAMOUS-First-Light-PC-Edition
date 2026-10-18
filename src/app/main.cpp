@@ -69,6 +69,8 @@
 //     --clear-shader-cache     deletes the cache generations under [ShaderCache] dir and exits
 //     --scan-game-shaders      indexes every GCN program of the game's .xpps packs (read only) into
 //                              [ShaderCache] dir\<game>\native\game_programs.idx and exits (P4.14)
+//     --predict-shaders <t>    the material draws' VS/PS modules predicted from the packs (templates <t>) and
+//                              translated into the native shader cache, no game (docs\REA_ENGINE_REVERSE.md §8)
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
 //   PC settings (docs/PC_SETTINGS_IMPLEMENTATION.md): the in-game menu (F1) saves changes to
@@ -147,7 +149,7 @@ int main(int argc, char* argv[]) {
         } else if (a == "--no-user-settings" || a == "--press" || a == "--selftest" || a == "--fault-test" ||
                    a == "--patch-race-test" || a == "--gpu-stability-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
                    a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache" ||
-                   a == "--scan-game-shaders") {
+                   a == "--scan-game-shaders" || a == "--predict-shaders") {
             user_settings = false;
         }
     }
@@ -362,6 +364,8 @@ int main(int argc, char* argv[]) {
             config->clear_shader_cache = true;
         } else if (arg == "--scan-game-shaders") {
             config->scan_game_shaders = true;
+        } else if (arg == "--predict-shaders" && has_value) {
+            config->predict_shaders = std::filesystem::absolute(argv[++i]);
         } else {
             return Fail(std::string("unknown argument: ") + std::string(arg));
         }

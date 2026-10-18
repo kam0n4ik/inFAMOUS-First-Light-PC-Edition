@@ -29,6 +29,7 @@ struct Options {
     bool shader_cache = false;             ///< [ShaderCache] enabled (--no-shader-cache: off)
     std::filesystem::path shader_cache_dir; ///< [ShaderCache] dir: <dir>\<game>\native\<generation>
     std::string game = "CUSA00004";
+    std::filesystem::path game_dir;        ///< the game's files (the static shader prediction reads its packs)
     bool precompile = true;                ///< [ShaderCache] precompile: the manifest's pipelines before the game
     u32 cache_max_mib = 2048;              ///< [ShaderCache] maxSizeMiB
     u32 precompile_threads = 0;            ///< [ShaderCache] precompileThreads (0: auto)
@@ -62,6 +63,17 @@ struct ShaderCacheInfo {
     u64 cached_in_game = 0;  ///< ... the cache has
 };
 ShaderCacheInfo CacheInfo();
+
+/// --predict-shaders (docs/REA_ENGINE_REVERSE.md §8): the material draws' modules predicted from the packs and translated
+/// into this device's shader cache generation; a device without presentation, no game. The translator must be installed.
+struct PredictShadersOptions {
+    s32 device_index = -1;
+    std::filesystem::path game_dir, templates, shader_cache_dir, logs_dir;
+    std::string game = "CUSA00004";
+    u32 cache_max_mib = 2048;
+    u32 threads = 0;
+};
+bool PredictShaders(const PredictShadersOptions& options, std::string& summary);
 
 /// Brings the backend up (device, caches, threads, ownership). false with `error`: nothing claimed, nothing running.
 bool Start(const Options& options, std::string& error);

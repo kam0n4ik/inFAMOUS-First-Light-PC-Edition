@@ -774,6 +774,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         if (!serial.empty()) {
             no.game = serial;
         }
+        no.game_dir = cfg.game_dir;
         no.precompile = cfg.pc.shader_precompile;
         if (char v[4] = {}; GetEnvironmentVariableA("SSPC_SHADER_PRECOMPILE", v, sizeof(v)) == 1) {
             no.precompile = v[0] == '1'; // (a diagnostic switch for test runs: 0 off, 1 on)
@@ -1217,6 +1218,25 @@ GameMetadata ReadGameMetadataShad(Core::FileSys::MntPoints& mnt) {
 
 } // namespace
 
+/// --predict-shaders <templates> (docs/REA_ENGINE_REVERSE.md §8): the material draws' modules predicted from the packs
+/// and translated into the native backend's shader cache, before any guest memory or game code exists.
+int RunPredictShaders(const App::Config& cfg, const std::string& game) {
+    InstallShaderTranslatorAdapter();
+    Gpu::Native::PredictShadersOptions po;
+    po.device_index = cfg.gpu_device;
+    po.game_dir = cfg.game_dir;
+    po.templates = cfg.predict_shaders;
+    po.shader_cache_dir = cfg.shader_cache_dir;
+    po.game = game;
+    po.cache_max_mib = cfg.pc.shader_cache_max_mib;
+    po.threads = cfg.pc.shader_precompile_threads;
+    po.logs_dir = cfg.logs_dir;
+    std::string summary;
+    const bool ok = Gpu::Native::PredictShaders(po, summary);
+    std::printf("SecondSonPC: %s\n", summary.c_str());
+    return ok ? 0 : 1;
+}
+
 void RunGame(const App::Config& cfg) {
     const bool own_loader = cfg.loader == LoaderBackend::Sspc;
     Common::SetCurrentThreadName("SecondSonPC:Main");
@@ -1295,6 +1315,9 @@ void RunGame(const App::Config& cfg) {
     if (cfg.patch_race_test) {
         // Before the game window exists: a window that pumps no messages for half a minute looks hung.
         std::quick_exit(RunPatchRaceTest(cfg));
+    }
+    if (!cfg.predict_shaders.empty()) {
+        std::quick_exit(RunPredictShaders(cfg, id));
     }
 
     SSPC_LOG(Bridge, Info, "game {} \"{}\" v{} fw {:#x}", id, title, app_version, fw_version);

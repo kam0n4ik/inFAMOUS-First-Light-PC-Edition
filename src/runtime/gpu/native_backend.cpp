@@ -38,6 +38,7 @@
 #include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
+#include "runtime/gpu/static/static_predictor.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
@@ -374,6 +375,8 @@ private:
     /// P4.14: the persistent shader cache, the driver's pipeline cache and the start-up precompiler (Start).
     void StartShaderCache(const Options& o);
     void RunPrecompile(const Options& o);
+    /// SSPC_STATIC_SHADERS=<templates>: the material draws' modules predicted from the packs (static_predictor.h)
+    void RunStaticPrediction(const Options& o);
     /// The disk cache's thread every 10 s: the pipeline cache saved when pipelines were added and none for 10 s.
     void MaybeSavePipelineCache();
     std::string CacheReport();
@@ -1966,10 +1969,46 @@ void Backend::StartShaderCache(const Options& o) {
     if (pcache_ && disk_->Writable()) {
         disk_->SetPeriodic([](void* self) { static_cast<Backend*>(self)->MaybeSavePipelineCache(); }, this, 10000);
     }
+    RunStaticPrediction(o);
     if (o.precompile) {
         RunPrecompile(o);
     } else {
         SSPC_LOG(GPU, Info, "shader precompiler: off ([ShaderCache] precompile = false)");
+    }
+}
+
+void Backend::RunStaticPrediction(const Options& o) {
+    // docs/REA_ENGINE_REVERSE.md §8: off unless SSPC_STATIC_SHADERS names a template file (E:\research\rea\q\
+    // templates.py + state_table.py); SSPC_STATIC_SHADERS_EXIT=1 ends the process once the modules are written (an
+    // offline run whose cache is compared with scenes' caches)
+    char path[1024] = {};
+    const DWORD n = GetEnvironmentVariableA("SSPC_STATIC_SHADERS", path, sizeof(path));
+    if (n == 0 || n >= sizeof(path)) {
+        return;
+    }
+    GS::ShaderTranslator* translator = GS::GetShaderTranslator();
+    if (translator == nullptr || o.game_dir.empty()) {
+        SSPC_LOG(GPU, Warning, "static shader prediction: no translator or no game directory");
+        return;
+    }
+    Static::PredictOptions po;
+    po.threads = o.precompile_threads;
+    if (!o.logs_dir.empty()) {
+        po.report = o.logs_dir / "static_predict_modules.tsv";
+    }
+    std::string summary;
+    const bool ran = Static::RunPrediction(o.game_dir, path, *translator, profile_, disk_.get(), po, summary);
+    if (ran) {
+        SSPC_LOG(GPU, Info, "{}", summary);
+    } else {
+        SSPC_LOG(GPU, Warning, "static shader prediction: {}", summary);
+    }
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_STATIC_SHADERS_EXIT", v, sizeof(v)) == 1 && v[0] == '1') {
+        if (disk_) {
+            disk_->Close();
+        }
+        std::fflush(nullptr);
+        ExitProcess(0);
     }
 }
 
@@ -2523,6 +2562,40 @@ bool SetFrameLimit(const std::string& limit) {
 
 std::string Report() {
     return g_backend != nullptr ? g_backend->Report() : std::string("the native backend is not running\n");
+}
+
+bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
+    Vk::ContextOptions co;
+    co.device_index = o.device_index;
+    co.presentation = false;
+    std::string error;
+    const auto ctx = Vk::DeviceContext::Create(co, error);
+    GS::ShaderTranslator* translator = GS::GetShaderTranslator();
+    if (!ctx || translator == nullptr) {
+        summary = "--predict-shaders: " + (ctx ? std::string("no translator") : error);
+        SSPC_LOG(GPU, Error, "{}", summary);
+        return false;
+    }
+    GS::DeviceProfile profile;
+    ctx->QueryProfile(profile);
+    const auto root = GS::NativeCacheRoot(o.shader_cache_dir, o.game);
+    const std::string gen = GS::ShaderCacheGeneration(profile);
+    GS::ShaderDiskCache disk;
+    if (!disk.Open({.dir = root / gen, .generation = gen, .max_bytes = u64{o.cache_max_mib} << 20}, error)) {
+        summary = fmt::format("--predict-shaders: the shader cache {}: {}", (root / gen).string(), error);
+        SSPC_LOG(GPU, Error, "{}", summary);
+        return false;
+    }
+    Static::PredictOptions po;
+    po.threads = o.threads;
+    if (!o.logs_dir.empty()) {
+        po.report = o.logs_dir / "static_predict_modules.tsv";
+    }
+    const bool ok = Static::RunPrediction(o.game_dir, o.templates, *translator, profile, &disk, po, summary);
+    disk.Close();
+    summary += fmt::format("\n-> {}", (root / gen).string());
+    SSPC_LOG(GPU, Info, "{}", summary);
+    return ok;
 }
 
 } // namespace SecondSon::Gpu::Native
