@@ -11,6 +11,7 @@
 
 #include <fmt/format.h>
 
+#include "runtime/gpu/gcn/gcn_aux.h"
 #include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
 #include "runtime/gpu/gcn/gcn_emit.h"
@@ -294,6 +295,51 @@ bool RunTranslateTest(const std::filesystem::path& game_dir, const std::filesyst
                         invalid.size(), tmp.string());
     for (const auto& [k, n] : invalid) {
         text += fmt::format("{:>8}  {}\n          {}\n", n, k, invalid_example[k]);
+    }
+    // the auxiliary stages of rect / quad lists (gcn_aux): each kind without a fragment stage and with inputs of each
+    // kind (interpolated, flat, a default value - no varying -, a default with FLAT_SHADE - a varying -, a location twice)
+    {
+        Gpu::Shader::RuntimeParams fs{};
+        fs.num_interp = 6;
+        fs.ps_input_cntl[0] = 0;                          // location 0
+        fs.ps_input_cntl[1] = 3 | (1u << 10);             // location 3, flat
+        fs.ps_input_cntl[2] = 7 | (1u << 5);              // a default value
+        fs.ps_input_cntl[3] = 9 | (1u << 5) | (1u << 10); // location 9 (DEFAULT + FLAT_SHADE)
+        fs.ps_input_cntl[4] = 3;                          // location 3 again
+        fs.ps_input_cntl[5] = 31;                         // location 31
+        u32 aux_total = 0, aux_valid = 0;
+        std::string aux_failures;
+        using Aux = Gpu::Shader::AuxStage;
+        for (const Aux stage : {Aux::RectListTcs, Aux::QuadListTcs, Aux::PassthroughTes}) {
+            const Gpu::Shader::RuntimeParams* const fragments[] = {nullptr, &fs};
+            for (const Gpu::Shader::RuntimeParams* f : fragments) {
+                ++aux_total;
+                std::string err;
+                const std::vector<u32> spirv = EmitAuxTessStage(stage, f, err);
+                const auto spv_file = tmp / fmt::format("aux_{}_{}.spv", static_cast<u32>(stage), f != nullptr ? 1 : 0);
+                {
+                    std::ofstream o(spv_file, std::ios::binary | std::ios::trunc);
+                    o.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * 4));
+                }
+                const std::string cmd =
+                    "E:\\VulkanSDK\\Bin\\spirv-val.exe --target-env vulkan1.3 \"" + spv_file.string() + "\" 2>&1";
+                std::string vout;
+                int rc = -1;
+                if (FILE* pipe = _popen(cmd.c_str(), "r")) {
+                    char buf[512];
+                    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+                        vout += buf;
+                    }
+                    rc = _pclose(pipe);
+                }
+                if (!spirv.empty() && rc == 0) {
+                    ++aux_valid;
+                } else {
+                    aux_failures += fmt::format("    {}: {}\n", spv_file.string(), spirv.empty() ? err : vout.substr(0, 300));
+                }
+            }
+        }
+        text += fmt::format("\nauxiliary stages (rect / quad lists): {} of {} valid\n{}", aux_valid, aux_total, aux_failures);
     }
     std::ofstream out(report, std::ios::binary | std::ios::trunc);
     out << text;

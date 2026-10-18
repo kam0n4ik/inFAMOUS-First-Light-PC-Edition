@@ -16,6 +16,7 @@
 #include "base/log.h"
 #include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
+#include "runtime/gpu/gcn/gcn_aux.h"
 #include "runtime/gpu/gcn/gcn_emit.h"
 #include "runtime/gpu/gcn/gcn_resources.h"
 #include "runtime/gpu/gcn/gcn_structure.h"
@@ -210,7 +211,24 @@ public:
 
     std::vector<u32> EmitAuxStage(GS::AuxStage stage, const GS::RuntimeParams* fragment, const GS::DeviceProfile& profile,
                                   std::string& error) override {
-        return fallback_->EmitAuxStage(stage, fragment, profile, error);
+        // rect / quad lists: the patches' stages when vertex programs are ours (theirs read our outputs)
+        if ((stages_ & 2) == 0) {
+            return fallback_->EmitAuxStage(stage, fragment, profile, error);
+        }
+        std::vector<u32> spirv = EmitAuxTessStage(stage, fragment, error);
+        const u32 n = ++aux_;
+        if (const char* dump = std::getenv("SSPC_OWN_SHADERS_DUMP"); dump != nullptr && std::string_view(dump) == "all") {
+            std::ofstream(fmt::format("logs/own_aux_{}_{}.spv", static_cast<u32>(stage), n), std::ios::binary)
+                .write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * 4));
+        }
+        if (n <= 32) {
+            SSPC_LOG(GPU, Info, "own GCN translator: auxiliary stage {} ({} SPIR-V words, {} varyings){}",
+                     stage == GS::AuxStage::RectListTcs   ? "rect-list control"
+                     : stage == GS::AuxStage::QuadListTcs ? "quad-list control"
+                                                          : "pass-through evaluation",
+                     spirv.size(), fragment != nullptr ? fragment->num_interp : 0u, spirv.empty() ? " - " + error : "");
+        }
+        return spirv;
     }
 
     bool CompareRuntime(const GS::RuntimeParams& ours, const GS::DeviceProfile& profile, std::span<const u8> reference,
@@ -231,10 +249,10 @@ private:
                               std::string& why) {
         const GS::RuntimeParams& p = req.runtime;
         const GS::DeviceProfile& prof = *req.profile;
-        if (p.rect_list != 0 || p.quad_list != 0) {
-            why = "a rect / quad list (drawn as patches: the auxiliary tessellation stages read the outputs)";
-            return false;
-        }
+        // a rect / quad list: drawn as patches - the outputs as for triangles, read by the auxiliary stages; what the
+        // last stage before the rasterizer must give (point size, render target / viewport index) is not passed on
+        // (the bridge's ExportPosition)
+        vs.tess_emulated = p.rect_list != 0 || p.quad_list != 0;
         vs.input_vgprs = (p.rsrc1 >> 24) & 3;
         vs.step_rate0 = p.step_rate0;
         vs.step_rate1 = p.step_rate1;
@@ -280,7 +298,7 @@ private:
         vs.ucp_mask = (ctl & 0xFF) != 0 ? 0 : (p.clip_cntl & 0x3F);
         vs.emulate_clip = prof.needs_clip_distance_emulation && ((ctl & 0xFF) != 0 || (p.clip_cntl & 0x3F) != 0);
         vs.depth_minus_one_to_one = !prof.depth_clip_control && ((p.clip_cntl >> 19) & 1) == 0;
-        vs.clip_space = ((p.clip_cntl >> 16) & 1) != 0;
+        vs.clip_space = ((p.clip_cntl >> 16) & 1) != 0 || p.rect_list != 0; // (a rect list: screen space)
         vs.viewport_w = static_cast<float>(std::min<u32>(prof.max_viewport_width / 2, 8192));
         vs.viewport_h = static_cast<float>(std::min<u32>(prof.max_viewport_height / 2, 8192));
         // the fetch shader: the s_swappc_b64 at the program's start (its SSRC0 the user data pair of its address)
@@ -679,7 +697,7 @@ private:
     GS::ShaderTranslator* fallback_;
     u32 stages_ = 0; ///< SSPC_OWN_SHADERS: bit 0 compute, 1 vertex, 2 fragment
     std::unordered_set<u64> only_, skip_;
-    std::atomic<u32> own_{0}, declined_{0};
+    std::atomic<u32> own_{0}, declined_{0}, aux_{0};
 };
 
 } // namespace

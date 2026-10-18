@@ -88,6 +88,9 @@ struct EmitOptions {
         /// the device emulates clip distances (the bridge's needs_clip_distance_emulation): distances 0-3 are a vec4
         /// output at location 0, the PARAMs at n + 1 (the fragment program discards where one is negative)
         bool emulate_clip = false;
+        /// a rect / quad list drawn as patches (the auxiliary tessellation stages come after): the point size and the
+        /// render target / viewport index are not put out (the bridge's ExportPosition drops them so)
+        bool tess_emulated = false;
     };
     bool vertex = false;
     VertexOptions vs;

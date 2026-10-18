@@ -1663,6 +1663,9 @@ void Emitter::EmitExport(const Inst& in) {
             if (out == 0) {
                 continue; // (not mapped: the bridge skips it too)
             }
+            if (options_.vs.tess_emulated && (out == 1 || out == 255)) {
+                continue; // (the last stage before the rasterizer's: not passed through the patches' stages)
+            }
             const auto array8 = [&](spv::BuiltIn builtin) {
                 const Id type = b_.TypeArray(t_f32_, b_.U32(8));
                 const std::array<Id, 8> zero{b_.F32(0), b_.F32(0), b_.F32(0), b_.F32(0),

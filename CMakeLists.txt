@@ -120,6 +120,7 @@ add_library(sspc_runtime STATIC
     src/runtime/savedata/savedata.cpp
     src/runtime/audio/audio_out.cpp
     src/runtime/media/videodec.cpp
+    src/runtime/gpu/gcn/gcn_aux.cpp
     src/runtime/gpu/gcn/gcn_cfg.cpp
     src/runtime/gpu/gcn/gcn_decoder.cpp
     src/runtime/gpu/gcn/gcn_emit.cpp
