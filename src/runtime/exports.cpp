@@ -16,6 +16,7 @@
 #include "runtime/kernel/signal.h"
 #include "runtime/kernel/thread.h"
 #include "runtime/pad/pad.h"
+#include "runtime/savedata/savedata.h"
 #include "runtime/system/system_service.h"
 #include "runtime/user/user_service.h"
 
@@ -83,7 +84,7 @@ std::vector<Export> Collect() {
     // Order matters: the first entry for an import key wins (native FileSystem before the Phase 0
     // observers of the same functions, which stay for --loader shadps4 / --bridge fs).
     for (const auto group : {std::span<const Export>(kSystemExports), Loader::RtldExports(),
-                             Sysmodule::SysmoduleExports(), Filesystem::FileSystemExports(),
+                             Sysmodule::SysmoduleExports(), SaveData::Exports(), Filesystem::FileSystemExports(),
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
                              AppContent::AppContentExports(), Pad::PadExports(),
                              Kernel::KernelExports(), Kernel::SemaphoreExports(),

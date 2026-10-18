@@ -57,6 +57,7 @@
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "bridge/shadps4/settings_host.h"
+#include "runtime/savedata/savedata.h"
 #include "runtime/gpu/upscale/reflex.h"
 #include "ui/menu_controller.h"
 #include "bridge/shadps4/track_diag.h"
@@ -1393,6 +1394,21 @@ void RunGame(const App::Config& cfg) {
     }
 
     SSPC_LOG(Bridge, Info, "game {} \"{}\" v{} fw {:#x}", id, title, app_version, fw_version);
+    {
+        // SecondSonPC's SaveData (group "savedata"): the same folders as the bridge's below.
+        ::SecondSon::SaveData::Settings s;
+        s.home = cfg.user_data_dir / "home";
+        s.title_dir = id;
+        ::SecondSon::Psf::ParamSfo game_sfo;
+        std::string sfo_error;
+        if (game_sfo.Load(game_folder / "sce_sys" / "param.sfo", sfo_error)) {
+            s.title_dir = game_sfo.GetString("INSTALL_DIR_SAVEDATA").value_or(id);
+        }
+        s.firmware = fw_version & 0xFFF00000u;
+        s.language_id = cfg.language_id;
+        s.icon = game_folder / "sce_sys" / "save_data.png";
+        ::SecondSon::SaveData::Configure(s);
+    }
     SSPC_LOG(SaveData, Info, "/savedata0 root: {}\\<user>\\savedata\\{}\\<dir>",
              (cfg.user_data_dir / "home").string(), id);
 
