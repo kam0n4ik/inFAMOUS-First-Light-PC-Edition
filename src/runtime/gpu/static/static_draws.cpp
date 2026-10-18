@@ -241,6 +241,7 @@ bool StaticDraws::Scan(const std::filesystem::path& game_dir, StaticScanStats& s
     stats.textures = textures_.size();
     stats.shaders = shaders_.size();
     stats.fetches = fetches_.size();
+    stats.computes = computes_.size();
     stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
@@ -337,6 +338,37 @@ void StaticDraws::ScanPack(const std::vector<u8>& data, u32 pack, StaticScanStat
         fetches_.push_back(std::move(w));
         return static_cast<u32>(fetches_.size());
     };
+
+    // compute shaders: a Gnmx CsShader struct wherever a kind-4 link is a CS program's address (the struct's code link
+    // at +8): RSRC1/2 at +0x10, COMPUTE_NUM_THREAD_X/Y/Z at +0x18, its input usage slots at +0x28 (count: the common
+    // header's top byte); one per footer hash (E:\research\rea\q\pack_shader_index.py)
+    for (const auto& [loc, code] : p.addr) {
+        GS::ProgramFooter f;
+        u64 end = 0;
+        if (loc < 8 || !ProgramAt(p, code, f, end) || f.type != 4) {
+            continue;
+        }
+        const u32 s = loc - 8;
+        const u32 nslots = p.U32(s) >> 24;
+        if (shader_by_hash_.contains(f.shader_hash) || !p.Has(s + 0x28, u64{nslots} * 4)) {
+            continue;
+        }
+        StaticShader sh;
+        sh.footer_hash = f.shader_hash;
+        sh.cs = true;
+        sh.image.assign(p.d.begin() + code, p.d.begin() + static_cast<ptrdiff_t>(end));
+        sh.rsrc1 = p.U32(s + 0x10);
+        sh.rsrc2 = p.U32(s + 0x14);
+        for (u32 i = 0; i < 3; ++i) {
+            sh.regs[i] = p.U32(s + 0x18 + i * 4);
+        }
+        for (u32 i = 0; i < nslots; ++i) {
+            sh.slots.push_back(p.U32(s + 0x28 + i * 4));
+        }
+        shader_by_hash_.emplace(f.shader_hash, static_cast<u32>(shaders_.size()));
+        computes_.push_back(static_cast<u32>(shaders_.size()));
+        shaders_.push_back(std::move(sh));
+    }
 
     // pass elements: a DIC fixup at E+0x20 (the pass class) and a PS struct at E+0x40
     std::unordered_set<u32> pass_elems;

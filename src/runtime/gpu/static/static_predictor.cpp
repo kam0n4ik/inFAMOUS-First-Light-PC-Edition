@@ -349,8 +349,8 @@ void FillUserData(Context& c, const StaticShader& sh, const StaticPass& pass, u8
 
 /// Translates one request, adds the module, gives the next stage's first bindings (false: failed).
 bool Translate(Context& c, const Request& r, GS::BindingStart& end) {
-    const bool ps = r.shader->ps;
-    const GS::HwStage hw = ps ? GS::HwStage::Ps : GS::HwStage::Vs;
+    const bool ps = r.shader->ps, cs = r.shader->cs;
+    const GS::HwStage hw = cs ? GS::HwStage::Cs : ps ? GS::HwStage::Ps : GS::HwStage::Vs;
     SynthMemory mem;
     mem.Map(kProgramAddr, r.shader->image.data(), r.shader->image.size(), 256);
     mem.Map(kEudAddr, r.ud.eud.data(), r.ud.eud.size() * 4, kEudBytes);
@@ -403,7 +403,7 @@ bool Translate(Context& c, const Request& r, GS::BindingStart& end) {
     }
     GS::TranslationRequest req;
     req.hw = hw;
-    req.sw = ps ? GS::SwStage::Fragment : GS::SwStage::Vertex;
+    req.sw = cs ? GS::SwStage::Compute : ps ? GS::SwStage::Fragment : GS::SwStage::Vertex;
     req.address = kProgramAddr;
     req.code = img.code;
     req.user_data = r.ud.regs;
@@ -418,7 +418,7 @@ bool Translate(Context& c, const Request& r, GS::BindingStart& end) {
         for (const u32 w : r.ud.regs) {
             ud += fmt::format("{:08x} ", w);
         }
-        fmt::print(c.trace, "start {:x} {} {},{} ud {}\n", r.shader->footer_hash, ps ? "ps" : "vs", r.start.unified,
+        fmt::print(c.trace, "start {:x} {} {},{} ud {}\n", r.shader->footer_hash, cs ? "cs" : ps ? "ps" : "vs", r.start.unified,
                    r.start.buffer, ud);
         std::fflush(c.trace);
     }
@@ -516,6 +516,199 @@ void Parallel(u32 threads, size_t n, const std::function<void(size_t)>& fn) {
     }
     for (auto& t : pool) {
         t.join();
+    }
+}
+
+/// Bytes a MUBUF op moves (Sea Islands; atomics: 4, their x2 forms 8).
+u32 MubufBytes(u32 op) {
+    static constexpr u8 kBytes[32] = {4, 8, 12, 16, 4, 8, 12, 16, 1, 1, 2, 2, 4, 8, 16, 12,
+                                      0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 4, 8, 16, 12};
+    return op < 32 && kBytes[op] != 0 ? kBytes[op] : op >= 80 ? 8 : 4;
+}
+
+/// The strides a compute shader's indexed buffer accesses imply, by the start register of the slot its V# came from
+/// (E:\research\rea\q\gcn_buf.py; cs_stride.py: 1 350 of 1 582 RW buffer slots of three scenes' dispatches): the
+/// largest offset + size of the MUBUF/MTBUF accesses with IDXEN through that V# - in the user data SGPRs, or loaded
+/// from the extended user data by an S_LOAD - rounded up to 16 when an access moves 16 bytes or more or an offset is not
+/// 16-aligned. Walks the instructions by their encodings' lengths to S_ENDPGM.
+std::unordered_map<u32, u32> BufferStrides(const StaticShader& sh) {
+    s32 eud = -1;
+    std::unordered_map<u32, u32> reg_of; // SGPR holding a V# -> the slot's start register
+    for (const u32 slot : sh.slots) {
+        const u8 type = slot & 0xFF, reg = (slot >> 16) & 0xFF, flags = slot >> 24;
+        if (type == kExtendedUserDataPtr && eud < 0) {
+            eud = reg;
+        }
+        if ((type == kResource || type == kConstantBuffer || type == kRwResource) && (flags & 1) == 0 && reg < 16) {
+            reg_of[reg] = reg;
+        }
+    }
+    struct Acc {
+        u32 end = 0, largest = 0;
+        bool unaligned = false;
+    };
+    std::unordered_map<u32, Acc> acc;
+    std::vector<u32> w(sh.image.size() / 4);
+    std::memcpy(w.data(), sh.image.data(), w.size() * 4);
+    for (size_t i = 0; i < w.size();) {
+        const u32 d = w[i], top = d >> 26;
+        if ((d >> 31) == 0) { // VOP2 / VOP1 / VOPC (+ a literal; V_MADMK/MADAK always have one)
+            const u32 op = (d >> 25) & 0x3F;
+            i += ((d & 0x1FF) == 255 || (op < 0x3E && (op == 32 || op == 33))) ? 2 : 1;
+            continue;
+        }
+        if ((d >> 30) == 2) { // scalar ALU
+            const u32 hi = d >> 23;
+            if (hi == 0x17F) { // SOPP
+                if (((d >> 16) & 0x7F) == 1) {
+                    break; // S_ENDPGM
+                }
+                ++i;
+            } else if (hi == 0x17D || hi == 0x17E) { // SOP1 / SOPC
+                i += ((d & 0xFF) == 255 || (hi == 0x17E && ((d >> 8) & 0xFF) == 255)) ? 2 : 1;
+            } else if ((d >> 28) == 0xB) { // SOPK (S_SETREG_IMM32_B32 has a literal)
+                i += ((d >> 23) & 0x1F) == 21 ? 2 : 1;
+            } else { // SOP2
+                i += ((d & 0xFF) == 255 || ((d >> 8) & 0xFF) == 255) ? 2 : 1;
+            }
+            continue;
+        }
+        if ((d >> 27) == 0x18) { // SMRD
+            const u32 op = (d >> 22) & 0x1F, imm = (d >> 8) & 1, off = d & 0xFF;
+            if (eud >= 0 && ((d >> 9) & 0x3F) * 2 == static_cast<u32>(eud) && imm != 0 && op >= 1 && op <= 3) {
+                reg_of[(d >> 15) & 0x7F] = 16 + off; // S_LOAD_DWORDX2/4/8 from the extended user data
+            }
+            i += (imm == 0 && off == 255) ? 2 : 1;
+            continue;
+        }
+        if (top == 0x32) { // VINTRP
+            ++i;
+            continue;
+        }
+        if (i + 1 >= w.size()) {
+            break;
+        }
+        if (top == 0x38 || top == 0x3A) { // MUBUF / MTBUF
+            const u32 e = w[i + 1];
+            const bool idxen = ((d >> 13) & 1) != 0;
+            const auto it = reg_of.find(((e >> 16) & 0x1F) * 4);
+            if (idxen && it != reg_of.end()) {
+                const u32 off = d & 0xFFF;
+                const u32 bytes = top == 0x3A ? 4 * (((d >> 16) & 3) + 1) : MubufBytes((d >> 18) & 0x7F);
+                Acc& a = acc[it->second];
+                a.end = std::max(a.end, off + bytes);
+                a.largest = std::max(a.largest, bytes);
+                a.unaligned |= off % 16 != 0;
+            }
+        }
+        i += 2;
+    }
+    std::unordered_map<u32, u32> out;
+    for (const auto& [reg, a] : acc) {
+        out[reg] = (a.largest >= 16 || a.unaligned) ? (a.end + 15) / 16 * 16 : a.end;
+    }
+    return out;
+}
+
+/// A compute shader's user data: each resource slot's sharp from the template (by its slot list and register, else by
+/// the slot), a RW buffer's stride from its code; the extended user data at kEudAddr.
+void FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& strides_from_code) {
+    const StaticTemplates& t = c.templates;
+    u64 sig = 0xCBF29CE484222325ull;
+    for (const u32 w : cs.slots) {
+        sig = (sig ^ w) * 0x100000001B3ull;
+    }
+    const auto strides = BufferStrides(cs);
+    for (const u32 slot : cs.slots) {
+        const u8 type = slot & 0xFF, api = (slot >> 8) & 0xFF, reg = (slot >> 16) & 0xFF, flags = slot >> 24;
+        if (type == kExtendedUserDataPtr) {
+            ud.PutAddress(reg, kEudAddr);
+            continue;
+        }
+        if (type != kResource && type != kRwResource && type != kSampler && type != kConstantBuffer) {
+            continue;
+        }
+        const bool image = (type == kResource || type == kRwResource) && (flags & 1) != 0;
+        const size_t n = image ? 8 : 4;
+        std::vector<u32> w;
+        if (const auto it = t.cs_by_signature.find({sig, reg}); it != t.cs_by_signature.end() && it->second.size() == n) {
+            w = it->second;
+        } else if (const auto jt = t.cs_by_slot.find(type | (u32{api} << 8) | (u32{flags} << 16));
+                   jt != t.cs_by_slot.end() && jt->second.size() == n) {
+            w = jt->second;
+        } else if (image) {
+            w.assign(8, 0);
+            if (!t.textures.empty()) {
+                std::copy(t.textures.begin()->second.begin(), t.textures.begin()->second.end(), w.begin());
+            }
+        } else if (type == kSampler && !t.samplers.empty()) {
+            w.assign(t.samplers.front().begin(), t.samplers.front().end());
+        } else {
+            w.assign(t.constant_buffer.begin(), t.constant_buffer.end());
+        }
+        if (type == kRwResource && !image) {
+            if (const auto s = strides.find(reg); s != strides.end()) {
+                w[1] = (w[1] & ~(0x3FFFu << 16)) | ((s->second & 0x3FFFu) << 16);
+                ++strides_from_code;
+            }
+        }
+        if (w[0] == 0 && w[1] == 0) {
+            w[0] = 0x1000; // (a base of 0 would read as no descriptor)
+        }
+        ud.Put(reg, w.data(), static_cast<u32>(n));
+    }
+}
+
+/// Every compute shader of the packs: its runtime parameters from its struct (as BuildComputeRuntime makes them from a
+/// dispatch's registers: checked equal on 233 / 233 cached modules), its descriptors as FillComputeUserData predicts.
+void PredictCompute(Context& c, const PredictOptions& options, u32 threads, std::unordered_set<u64>& requested,
+                    PredictStats& stats) {
+    const auto& shaders = c.draws.Shaders();
+    std::vector<Request> reqs;
+    std::vector<u64> hashes;
+    u64 from_code = 0;
+    for (const u32 si : c.draws.Computes()) {
+        const StaticShader& cs = shaders[si];
+        Request r;
+        r.shader = &cs;
+        r.runtime.hw = GS::HwStage::Cs;
+        r.runtime.sw = GS::SwStage::Compute;
+        r.runtime.rsrc1 = cs.rsrc1 & GS::Rsrc1TranslationMask(GS::HwStage::Cs);
+        r.runtime.rsrc2 = cs.rsrc2 & GS::Rsrc2TranslationMask(GS::HwStage::Cs);
+        for (u32 i = 0; i < 3; ++i) {
+            r.runtime.threads[i] = cs.regs[i] & 0xFFFF;
+        }
+        FillComputeUserData(c, cs, r.ud, from_code);
+        const u64 h = RequestHash(r);
+        hashes.push_back(h);
+        if (requested.insert(h).second) {
+            reqs.push_back(std::move(r));
+        }
+    }
+    Parallel(threads, reqs.size(), [&](size_t i) {
+        GS::BindingStart end;
+        Translate(c, reqs[i], end);
+    });
+    stats.compute_shaders = c.draws.Computes().size();
+    stats.compute_requests = reqs.size();
+    stats.compute_strides_from_code = from_code;
+    stats.requests += reqs.size();
+    if (!options.compute_pipeline) {
+        return;
+    }
+    std::unordered_set<u64> made;
+    for (const u64 h : hashes) {
+        const auto o = c.outcomes.find(h);
+        if (o == c.outcomes.end() || !made.insert(h).second) {
+            continue;
+        }
+        GS::Module m;
+        m.spirv_hash = o->second.spirv;
+        m.runtime = o->second.runtime;
+        m.start = o->second.start;
+        m.key = o->second.key;
+        options.compute_pipeline(m, o->second.plan);
+        ++stats.compute_pipelines;
     }
 }
 
@@ -776,6 +969,23 @@ bool StaticTemplates::Load(const std::filesystem::path& file, std::string& error
                 ok = s.runtime.size() == sizeof(GS::RuntimeParams);
                 states.push_back(std::move(s));
             }
+        } else if (kind == "csig" || kind == "cslot") {
+            u64 a = 0, b = 0, f = 0, v = 0;
+            std::vector<u32> w;
+            if (kind == "csig") {
+                ok = ParseHex(ls, a) && static_cast<bool>(ls >> b);
+            } else {
+                ok = static_cast<bool>(ls >> a >> b >> f);
+            }
+            while (ok && ParseHex(ls, v)) {
+                w.push_back(static_cast<u32>(v));
+            }
+            ok = ok && (w.size() == 4 || w.size() == 8);
+            if (ok && kind == "csig") {
+                cs_by_signature[{a, static_cast<u32>(b)}] = std::move(w);
+            } else if (ok) {
+                cs_by_slot[static_cast<u32>(a | (b << 8) | (f << 16))] = std::move(w);
+            }
         } else if (kind == "pipe") {
             u64 cls = 0, col = 0;
             u32 count = 0;
@@ -835,7 +1045,7 @@ bool RunPrediction(const std::filesystem::path& game_dir, const std::filesystem:
         "{}, textures {}, shaders {}, fetch shaders {}; instance textures not found {}\n"
         "static shader prediction: {} requests ({} duplicates) in {:.1f} s - translated {}, failed {}, added {} ({} "
         "layouts); passes {} (no state {}, no instance {}); named textures unknown {}, buffers unknown {}; SRT-walk "
-        "key mismatches {}; resumed {}, skipped {}{}{}",
+        "key mismatches {}; resumed {}, skipped {}{}{}{}",
         ss.packs, static_cast<double>(ss.bytes) / (1ull << 30), ss.ms / 1000.0, ss.programs, ss.passes, ss.instances,
         ss.geometries, ss.textures, ss.shaders, ss.fetches, ss.instance_textures_missing, ps.requests,
         ps.duplicate_requests, ps.ms / 1000.0, ps.translated, ps.failed, ps.added, ps.layouts, ps.passes,
@@ -845,7 +1055,13 @@ bool RunPrediction(const std::filesystem::path& game_dir, const std::filesystem:
                                        "state {}, draws a stage of which did not translate {}; {} joint states)",
                                        ps.pipelines, ps.pipeline_draws, ps.pipeline_no_state, ps.pipeline_no_module,
                                        templates.pipes.size())
-                         : std::string());
+                         : std::string(),
+        options.compute ? fmt::format("\nstatic shader prediction: compute shaders {} ({} requests, RW buffer strides "
+                                      "from the code {}, {} template descriptors), compute pipelines {}",
+                                      ps.compute_shaders, ps.compute_requests, ps.compute_strides_from_code,
+                                      templates.cs_by_signature.size() + templates.cs_by_slot.size(),
+                                      ps.compute_pipelines)
+                        : std::string());
     return true;
 }
 
@@ -855,7 +1071,7 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
     const auto t0 = std::chrono::steady_clock::now();
     stats = {};
     Context c(draws, templates, translator, profile, disk);
-    c.keep_outcomes = static_cast<bool>(options.pipeline);
+    c.keep_outcomes = static_cast<bool>(options.pipeline) || static_cast<bool>(options.compute_pipeline);
     if (!options.report.empty()) {
         c.report.open(options.report, std::ios::app); // (a resumed run adds to an interrupted one's)
         if (const char* t = std::getenv("SSPC_STATIC_TRACE"); t != nullptr && t[0] == '1') {
@@ -1082,6 +1298,9 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
     });
     stats.requests = ps_reqs.size() + vs_reqs.size();
 
+    if (options.compute) {
+        PredictCompute(c, options, threads, requested, stats);
+    }
     if (options.pipeline) {
         PredictPipelines(c, options, threads, materials, vertices, inst_mat, geo_vert, geo_skin, requested, stats);
     }

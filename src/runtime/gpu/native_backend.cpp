@@ -2695,6 +2695,47 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
         SSPC_LOG(GPU, Error, "{}", summary);
         return false;
     }
+    // SSPC_STATIC_KEYS=<a cache generation directory>: instead of predicting, the specialization keys of that cache's
+    // modules as the frontend makes them (a layout's from its own translation) -> logs\cache_module_keys.tsv (the
+    // prediction's keys are scored against them: tools\static_shaders\compare_keys.py); read only
+    if (char kd[1024] = {}; GetEnvironmentVariableA("SSPC_STATIC_KEYS", kd, sizeof(kd)) > 0) {
+        GS::ShaderDiskCache other;
+        const std::filesystem::path dir = kd;
+        if (!other.Open({.dir = dir, .generation = dir.filename().string(), .read_only = true}, error)) {
+            summary = "SSPC_STATIC_KEYS: " + error;
+            return false;
+        }
+        std::ofstream out(o.logs_dir / "cache_module_keys.tsv", std::ios::trunc);
+        u64 n = 0, bad = 0;
+        for (const GS::ProgramIdentity& id : other.ProgramIdentities()) {
+            for (const GS::ModuleStub& st : other.Stubs(id)) {
+                GS::DiskModule dm;
+                std::string derr;
+                if (!other.LoadModule(st.record, dm, derr)) {
+                    ++bad;
+                    continue;
+                }
+                const GS::ShaderReflection& dr = dm.result.reflection;
+                const GS::FetchShader* fetch = dr.fetch.present ? &dr.fetch : nullptr;
+                GS::ResourceBindingPlan dp;
+                dp.flat = dm.result.flatbuf;
+                GS::DecodeResources(dr, dm.start, fetch, dm.user_data, 0,
+                                    GS::VertexSource{nullptr, dm.result.vertex_sharps}, dp);
+                GS::SpecializationKey key;
+                GS::BuildSpecializationKey(dm.runtime, dm.start, dr, fetch, dp, key);
+                std::string kw;
+                for (const u32 w : key.words) {
+                    kw += fmt::format("{:x},", w);
+                }
+                out << fmt::format("{:016x}{:016x}\t{}\t{}\t{}\t{}\n", id.hash.lo, id.hash.hi, id.length,
+                                   static_cast<u32>(id.stage), dm.layout ? 1 : 0, kw);
+                ++n;
+            }
+        }
+        summary = fmt::format("SSPC_STATIC_KEYS: {} modules of {} ({} unreadable) -> {}", n, dir.string(), bad,
+                              (o.logs_dir / "cache_module_keys.tsv").string());
+        return true;
+    }
     Static::PredictOptions po;
     po.threads = o.threads;
     if (!o.logs_dir.empty()) {
@@ -2716,6 +2757,21 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
         po.pipeline = [&](const GS::GraphicsPipelineState& state, const GS::Module& vs, const GS::ResourceBindingPlan& vsp,
                           const GS::Module& ps, const GS::ResourceBindingPlan& psp) {
             GS::PipelineDesc d = Vk::PipelineFactory::DescribeGraphics(state, &vs, vsp, &ps, &psp);
+            const u64 h = d.Hash();
+            if (!desc_seen.insert(h).second) {
+                return;
+            }
+            if (manifest) {
+                disk.AddPipeline(d, h, 0);
+            }
+            descs.push_back(std::move(d));
+        };
+    }
+    // the packs' compute shaders (SSPC_STATIC_COMPUTE=0: not): their pipelines are their module and bindings
+    po.compute = env_on("SSPC_STATIC_COMPUTE", true);
+    if (po.compute && po.pipeline) {
+        po.compute_pipeline = [&](const GS::Module& cs, const GS::ResourceBindingPlan& plan) {
+            GS::PipelineDesc d = Vk::PipelineFactory::DescribeCompute(cs, plan);
             const u64 h = d.Hash();
             if (!desc_seen.insert(h).second) {
                 return;

@@ -27,6 +27,7 @@ namespace SecondSon::Gpu::Static {
 struct StaticShader {
     u64 footer_hash = 0;
     bool ps = false;
+    bool cs = false;             ///< a compute shader (its struct's NUM_THREAD_X/Y/Z in regs[0..2])
     std::vector<u8> image;       ///< the program from its first instruction to the end of its footer
     u32 rsrc1 = 0, rsrc2 = 0;
     /// PS: Z_FORMAT, COL_FORMAT, PS_INPUT_ENA, PS_INPUT_ADDR, PS_IN_CONTROL, BARYC_CNTL, DB_SHADER_CONTROL, CB_SHADER_MASK
@@ -69,7 +70,7 @@ struct StaticGeometry {
 
 struct StaticScanStats {
     u64 packs = 0, bytes = 0, unreadable = 0;
-    u64 programs = 0, passes = 0, instances = 0, geometries = 0, textures = 0, shaders = 0, fetches = 0;
+    u64 programs = 0, passes = 0, instances = 0, geometries = 0, textures = 0, shaders = 0, fetches = 0, computes = 0;
     u64 instance_textures_missing = 0;
     double ms = 0.0;
 };
@@ -81,6 +82,8 @@ public:
               void (*progress)(void* ctx, u64 done, u64 total) = nullptr, void* ctx = nullptr);
 
     const std::vector<StaticShader>& Shaders() const { return shaders_; }
+    /// The compute shaders of every pack (Shaders() indices): bound by the engine's code, not by a program object.
+    const std::vector<u32>& Computes() const { return computes_; }
     const std::vector<std::vector<u32>>& Fetches() const { return fetches_; }
     const std::vector<std::array<u32, 8>>& Textures() const { return textures_; }
     const std::vector<StaticProgram>& Programs() const { return programs_; }
@@ -95,6 +98,7 @@ private:
     std::vector<std::string> packs_;
     std::vector<StaticShader> shaders_;
     std::unordered_map<u64, u32> shader_by_hash_;
+    std::vector<u32> computes_;
     std::vector<std::vector<u32>> fetches_;
     std::unordered_map<u64, u32> fetch_by_hash_;
     std::vector<std::array<u32, 8>> textures_;

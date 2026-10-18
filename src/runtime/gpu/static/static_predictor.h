@@ -20,6 +20,7 @@
 #include <array>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -62,6 +63,10 @@ struct StaticTemplates {
         Gpu::Shader::GraphicsPipelineState state;
     };
     std::vector<Pipe> pipes; ///< most frequent first within a (class, COL_FORMAT)
+    /// The compute shaders' descriptors (E:\research\rea\q\cs_table.py), from earlier dispatches: by (the FNV-1a 64 of
+    /// the struct's input usage slot words, start register), and by (usage type | api slot << 8 | flags << 16).
+    std::map<std::pair<u64, u32>, std::vector<u32>> cs_by_signature;
+    std::map<u32, std::vector<u32>> cs_by_slot;
     bool Load(const std::filesystem::path& file, std::string& error);
 };
 
@@ -80,6 +85,10 @@ struct PredictOptions {
                        const Gpu::Shader::ResourceBindingPlan& vs_plan, const Gpu::Shader::Module& ps,
                        const Gpu::Shader::ResourceBindingPlan& ps_plan)>
         pipeline;
+    bool compute = true; ///< the packs' compute shaders too (their descriptors from the template's cs lines)
+    /// A predicted compute pipeline: its module (SPIR-V hash, runtime parameters set) and binding plan. Called on the
+    /// calling thread, once per distinct module; nullptr: none.
+    std::function<void(const Gpu::Shader::Module& cs, const Gpu::Shader::ResourceBindingPlan& plan)> compute_pipeline;
 };
 
 struct PredictStats {
@@ -93,6 +102,8 @@ struct PredictStats {
     u64 pipeline_draws = 0;      ///< (pass, joint state, material/vertex pair) tried
     u64 pipeline_no_state = 0;   ///< passes whose (class, COL_FORMAT) has no joint state
     u64 pipeline_no_module = 0;  ///< draws a stage of which did not translate
+    u64 compute_shaders = 0, compute_requests = 0, compute_pipelines = 0;
+    u64 compute_strides_from_code = 0; ///< RW buffer strides taken from the program's indexed accesses
     double ms = 0.0;
     std::string first_error;
 };
