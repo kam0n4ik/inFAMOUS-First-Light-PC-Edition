@@ -111,3 +111,90 @@ with the compute waits gone). Kept off; useful once those limits fall.
    PCIe, and the light list's write-back gone with it; ~3 GiB of a 6 GiB card (1.6 GiB used now).
 2. Thread 1: binding by the engine's table layout (pass 1, 12, 14) instead of the generic SRT walk.
 3. Then multi-threaded recording.
+
+## 8. Materials and shaders from the game files (static, no run)
+
+Goal: know every draw's shader inputs before the game starts, so the precompiler is not limited to pipelines a
+previous run created (`docs/OFFLINE_SHADER_PRECOMPILATION.md` §6 item 3). Research tools in `E:\research\rea\q\`
+(`material_db.py`, `shader_structs.py`, `validate_material.py`, `predict_runtime.py`, `check_fs_runtime.py`); the
+game files are only read.
+
+**Engine (Ghidra).** `0x4468e0(X)` creates, for every pass of a program object X, the runtime material through the
+class table `DAT_00ce56b8[pass+0x20]` and calls `0x447190`, which builds the pass's texture/buffer API-slot tables;
+`0x448640` binds them per draw (descriptor = mesh instance +0x28 + i*8 dwords + 8); `0x445be0` binds the engine's
+global textures. `0x4468e0` also rewrites the PS struct's `DB_SHADER_CONTROL` (+0x30): bit 0x40 -> 0x60, 0x900 -> 0x920.
+
+**Package layout (KCAP).**
+- Program object X (found as the owner of a pass array, 22 518 in the game; the u64 at +0x18 is a per-program hash,
+  not a class): +0x2c ntex, +0x30 nbuf, +0x80 passes (stride 0xb8), +0x88 npass, +0xc0 buffer records (0x20: u64 name,
+  +8 API slot), +0xd0 texture records (0x10: u64 name, +0xb API slot), +0xe0 material texture ids, +0xf0 buffer ids.
+- Pass element E: DIC fixup at E+0x20 (the runtime pass class index; the class hash says which render pass), +0x30
+  fetch shader, +0x38 VS struct, +0x40 PS struct, +0x88/+0x90 buffer pairs {u8 stage, u8 id}, +0x98/+0xa0 texture
+  pairs. Stage 0 = VS, 3 = PS (512 377 of 512 382 entries agree with the shaders' own usage slots).
+- Material instance D (33 110): +0x20 -> X, +0x30 texture bindings (0x30 each, u64 texture id), +0x38 count = X's
+  ntex; binding i is the program's material texture i. Texture object: +0x28 T#, +0x48 u64 id (9 180 textures, all but
+  2 instance textures resolve).
+- Gnmx shader structs (2 325 VS/PS, one struct per footer hash, 0 conflicts): dword0 bits 24-31 = input usage slot
+  count; +0x08 PGM_LO (KNLI kind 4), HI, RSRC1, RSRC2; PS: +0x18 Z_FORMAT, COL_FORMAT, PS_INPUT_ENA, PS_INPUT_ADDR,
+  PS_IN_CONTROL, BARYC_CNTL, DB_SHADER_CONTROL, CB_SHADER_MASK, +0x38 input semantic count, +0x3c usage slots, then
+  u16 input semantics; VS: +0x18 VS_OUT_CONFIG, POS_FORMAT, PA_CL_VS_OUT_CNTL, +0x24 u8 input / u8 export semantic
+  counts, +0x28 usage slots, u32 input semantics, u16 export semantics (semantic, out index << 8); CS: +0x10 RSRC1,
+  RSRC2, +0x18 NUM_THREAD_X/Y/Z, then usage slots.
+- Usage slots {u8 type, u8 API slot, u8 start register, u8 flags}: start < 16 = user data register; type 27 at a
+  register = the extended user data pointer, a resource with start R >= 16 sits at EUD[R - 16].
+
+**Checked against the runs we already had (hold-out, never used to build the prediction).**
+- Material textures (binding log, 1 382 logged pass shaders): the logged format is among the instances' formats in
+  3 364 of 3 436 images (98 %), exactly the only one in 2 716; global textures: 64 of 74 names have one format.
+- Fragment runtime parameters of all 1 149 cached graphics pipelines (three scenes): PS_INPUT_ENA/ADDR, num_interp,
+  front_face_all_bits, Z/COL format, DB_SHADER_CONTROL (with `kDbShaderMask`) from the PS struct: 1 149 of 1 149.
+  SPI_PS_INPUT_CNTL from the pass's VS export / PS input semantics (out index; flat bit 10 -> bit 10; semantic bit 12
+  -> bit 5; no export -> 0x20 | default << 8): 1 091 of 1 149, and all 58 others are draws whose VS is not the PS's
+  pass partner (effects), i.e. every material pass pair is exact.
+- The rest of the runtime parameters (render targets, instancing, clip state) by pass class: for the new programs of a
+  scene (absent from the two other scenes' caches) the class's most frequent state is the actual one in 90 of 101,
+  31 of 31 and 46 of 49 new pass shaders, the remaining ones among 2-3 alternatives; misses are instancing step rates
+  (5) and render targets (5).
+- The new modules that are not pass shaders are all compute (26 / 7 / 105 layout modules): CS runtime parameters are
+  in its struct (RSRC1/2, threads); their resources are bound by engine code (effects, particles) - next.
+
+**So:** for material draws, a translation request (code, user data, runtime parameters, flattened user data with the
+predicted T# formats) can be built from the files alone; what still needs work is the vertex side (fetch shader at
+pass +0x30, V# formats of the meshes), constant buffer/sampler templates, and compute.
+
+### 8.1 The static predictor (`src\runtime\gpu\static\`, `--predict-shaders`)
+
+- `StaticDraws` (static_draws.cpp) reads every pack (21.3 GiB, 80 s, one thread): 22 518 programs, 138 900 passes,
+  33 110 instances, 32 866 geometries (distinct stream formats), 9 180 textures, 2 325 VS/PS, 109 fetch shaders.
+- `PredictModules` (static_predictor.cpp) builds, per pass, the request a draw would give the frontend: the program
+  (read with the frontend's own `ReadProgram`, so its identity is the runtime's), RuntimeParams (shader fields from
+  the structs, render state from the template's pass class), user data and a synthetic guest memory behind them
+  (extended user data, fetch shader, vertex buffer table = the geometry's V# array). Material T# from the instances,
+  named textures/buffers, the constant buffer and samplers from the template, a skinned variant (stream 0 as
+  32_32_32 float, stride 12: what skinned draws read). PS first; the VS starts where the PS's bindings end. The key is
+  made as `ShaderFrontend::Prepare` makes a layout's; the same key from the SRT walk over the synthetic memory is
+  checked (30 of ~128 000 differ). Modules go to the disk cache through `AddModule`, the first of a (program, runtime)
+  as the layout - a game start restores them like any other record; a miss costs only its record.
+- Off by default. `SecondSonPC.exe --gpu-backend sspc --predict-shaders tools\static_shaders\static_templates.txt`
+  (no game, before the guest address space: a device without presentation and the translator only) writes into
+  `[ShaderCache] dir\<game>\native\<generation>`; `SSPC_STATIC_SHADERS=<templates>` does it at a game start instead.
+  22 programs make the bridge's recompiler assert (`resource_discover_pass.cpp:257`, never met in a run): the process
+  ends; `tools\static_shaders\predict_loop.ps1` puts the unfinished ones on `logs\static_predict_skip.txt` and resumes.
+- One run: ~128 000 modules translated in 75 s (15 threads), 0 failures, 111 MiB of cache.
+
+Measured (hold-out: the template's render state built from the two other scenes' caches; logs\p414\m1\cache):
+
+| scene | layout modules of pass shaders: (program, RuntimeParams) predicted | keyed modules: exact key predicted |
+|---|---|---|
+| village (early) | 527 / 546 (96.5 %) | 164 / 218 (75 %); 169 with 64 variants and the skinned one |
+| beach | 398 / 412 (96.6 %) | 105 / 129 (81 %) (16 variants, before the skinned one) |
+| harbour (user1022) | 437 / 452 (96.7 %) | 112 / 148 (76 %) |
+
+(before: a module's exact key seen in other scenes ≤ 5 % - docs\OFFLINE_SHADER_PRECOMPILATION.md §3). The keyed
+misses: one image word (view type 2D / 2D array, or another format: instances beyond the 16 variants, named
+textures with more than one format) and skinned/instanced vertex formats. The named textures' and buffers' templates
+come from the binding log of earlier runs, not held out.
+
+Not yet: pipelines (PipelineDesc: the class's fixed-function state, bindings) - the precompiler still prepares only
+the manifest's; compute (8 049 CS, bound by engine code); a game run with the predicted cache (the system's commit
+limit was taken by other processes at the time).
