@@ -34,3 +34,17 @@ stage (REA §7 item 2, P5.3 native frontend extended to pass 28) - not started h
 
 - `SSPC_DIAG_SKIP_DEPTH_SIZE=<width>`: depth-only draws into a depth target of that width dropped before preparation.
 - `SSPC_DIAG_DRAW_HISTO_P` also takes a VS address (decimal) - pipeline numbers move between runs.
+
+## Per-draw cost of the atlas draws, and a relaxed stage memo (measured, rejected)
+
+Thread 1 per atlas draw (TSC ticks, temporary counters, ~1.4 M draws): ParallelCp::PrepareDraw 6 770 (~1.9 us) =
+the frontend's PrepareDraw 4 400 (VS stage 2 850 - a memo miss every time, PS stage 1 070, pipeline ~500) + the
+stage copies and write notes ~2 370.
+
+Tried: the stage memo (P4.7) taken also when the user data differs only in registers the preparation did not depend
+on (`UserDataUsed`), the executor writing every draw's own registers into the flattened user data. Correct
+(`SSPC_DIAG_STAGE_MEMO=verify`: 5.69 M hits prepared in full and compared, 0 different) but **0 relaxed hits** in
+the city: the registers the atlas draws differ in are the ones their SRT walk reads (the per-object table pointer).
+Removed. Cheaper atlas draws need their preparation without the per-draw SRT walk (binding by the engine's table
+layout) or without the per-record stage copy - both larger than this stage; GPU-4 (shared stage copies) and the
+frontend thread (NATIVE_CP.md) measured no gain before.
