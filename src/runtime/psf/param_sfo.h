@@ -50,6 +50,19 @@ public:
         return entries_;
     }
 
+    /// Adds a parameter or replaces its value (its format stays: false when `key` has another one). The reserved
+    /// length is the console's for the keys it knows (MAINTITLE 128, DETAIL 1024, ...), else the value's own, as
+    /// the oracle's writer (third_party/shadPS4/src/core/file_format/psf.cpp) - so the files stay alike.
+    bool SetString(const std::string& key, std::string_view value);
+    bool SetInteger(const std::string& key, u32 value);
+    bool SetBinary(const std::string& key, std::span<const u8> value);
+
+    /// The PSF image (version 1.1), laid out as the oracle's writer: index, keys, then each value 4-aligned and
+    /// padded to its reserved length.
+    std::vector<u8> Encode() const;
+    /// Encode() written to a host file (replaced); false: not written.
+    bool Save(const std::filesystem::path& file) const;
+
 private:
     const Entry* Find(std::string_view key) const;
 

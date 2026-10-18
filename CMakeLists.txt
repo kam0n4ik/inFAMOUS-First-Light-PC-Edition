@@ -256,6 +256,7 @@ set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${
 # (cmake --build <dir> --target sspc_engine_tests; tools/engine_tests/main.cpp [--bench]).
 add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     tools/engine_tests/main.cpp
+    src/runtime/psf/param_sfo.cpp
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp

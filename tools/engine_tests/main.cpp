@@ -3,6 +3,9 @@
 // System V entry points the game's PLT stubs have.
 //   sspc_engine_tests [--bench]   -> stdout, exit code = failures
 //     --bench   the queue's throughput with each wait policy (many tiny jobs, 5 workers + a waiting thread)
+#include <iterator>
+#include <fstream>
+#include <filesystem>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -17,6 +20,7 @@
 
 #include <windows.h>
 
+#include "runtime/psf/param_sfo.h"
 #include "engine/guest_hooks.h"
 #include "engine/guest_probe.h"
 #include "engine/job_system.h"
@@ -159,6 +163,55 @@ struct Batch {
         return reinterpret_cast<GuestBatch*>(storage.data());
     }
 };
+
+// The PSF writer: every param.sfo of the saves and the game decodes and encodes back to the same bytes, and an edit
+// reads back (runtime/psf/param_sfo.cpp). Read only: the files are never written.
+void TestParamSfo() {
+    std::printf("param.sfo\n");
+    namespace fs = std::filesystem;
+    int files = 0;
+    for (const char* root : {"E:/SecondSonPC/userdata/home", "E:/shdps4/CUSA00004/sce_sys"}) {
+        std::error_code ec;
+        if (!fs::exists(root, ec)) {
+            continue;
+        }
+        for (const auto& f : fs::recursive_directory_iterator(root, ec)) {
+            if (f.path().filename() != "param.sfo") {
+                continue;
+            }
+            std::ifstream in(f.path(), std::ios::binary);
+            const std::vector<u8> bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+            SecondSon::Psf::ParamSfo sfo;
+            std::string error;
+            CHECK(sfo.Parse(bytes, error));
+            // (the game's own file is Sony's layout - keys padded to 4: only the saves' files are the oracle's)
+            const bool save = f.path().string().find("savedata") != std::string::npos;
+            if (save) {
+                CHECK(sfo.Encode() == bytes);
+            } else {
+                SecondSon::Psf::ParamSfo again;
+                CHECK(again.Parse(sfo.Encode(), error) && again.Entries().size() == sfo.Entries().size());
+            }
+            std::printf("  %s: %s\n", f.path().string().c_str(),
+                        sfo.Encode() == bytes ? "same bytes" : "same entries, other layout");
+            ++files;
+        }
+    }
+    std::printf("  %d files round-tripped\n", files);
+    SecondSon::Psf::ParamSfo s;
+    CHECK(s.SetString("MAINTITLE", "inFAMOUS"));
+    CHECK(s.SetInteger("SAVEDATA_LIST_PARAM", 7));
+    const u8 blocks[8] = {0x60, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(s.SetBinary("SAVEDATA_BLOCKS", blocks));
+    CHECK(s.SetString("MAINTITLE", "Second Son"));
+    CHECK(!s.SetInteger("MAINTITLE", 1));
+    SecondSon::Psf::ParamSfo r;
+    std::string error;
+    CHECK(r.Parse(s.Encode(), error));
+    CHECK(r.GetString("MAINTITLE") == std::string("Second Son"));
+    CHECK(r.GetInteger("SAVEDATA_LIST_PARAM") == 7u);
+    CHECK(r.GetBinary("SAVEDATA_BLOCKS").has_value() && r.GetBinary("SAVEDATA_BLOCKS")->size() == 8);
+}
 
 void TestHash() {
     std::printf("hash\n");
@@ -876,6 +929,7 @@ void TestNativeState() {
 int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     TestHash();
+    TestParamSfo();
     TestOrder();
     TestIterators();
     TestWaitHelps();
