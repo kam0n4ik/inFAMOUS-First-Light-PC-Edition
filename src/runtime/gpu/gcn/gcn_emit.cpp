@@ -17,6 +17,7 @@ namespace {
 
 using spv::Op;
 
+constexpr u32 kLdsDwords = 8192;
 constexpr u32 kSccOperand = 253, kVccz = 251, kExecz = 252, kExecLo = 126, kExecHi = 127, kM0 = 124;
 
 struct Unsupported {
@@ -122,6 +123,8 @@ private:
     void EmitSmrd(const Inst& in, u32 index, std::string_view name);
     bool EmitBuffer(const Inst& in, u32 index, std::string_view name);
     bool EmitTbuffer(const Inst& in, u32 index, std::string_view name);
+    bool EmitDs(const Inst& in, std::string_view name);
+    Id gds_ = 0, lds_ = 0, t_ptr_wg_u32_ = 0;
     Id BufferAddress(const Inst& in, u32 buffer);              ///< MUBUF / MTBUF: the byte address in the binding
     Id ReadBits(u32 buffer, Id byte_addr, u32 bit, u32 width); ///< `width` (<= 32) bits at byte_addr * 8 + bit
     u32 cur_index_ = 0;
@@ -372,6 +375,16 @@ void Emitter::DeclareResources() {
     flat_ = ssbo(false, 0);
     for (u32 i = 0; i < res_.buffers.size(); ++i) {
         buffers_.push_back(ssbo(res_.buffers[i].written, 1 + i));
+    }
+    if (res_.uses_gds) {
+        gds_ = ssbo(true, 1 + static_cast<u32>(res_.buffers.size()));
+    }
+    if (res_.uses_lds) {
+        // the local data share: 32 KiB of dwords (the most a GCN workgroup gets)
+        t_ptr_wg_u32_ = b_.TypePointer(spv::StorageClass::Workgroup, t_u32_);
+        const Id arr = b_.TypeArray(t_u32_, b_.U32(kLdsDwords));
+        lds_ = b_.Variable(b_.TypePointer(spv::StorageClass::Workgroup, arr), spv::StorageClass::Workgroup);
+        interface_.push_back(lds_);
     }
     // PushData: float xoffset, yoffset, xscale, yscale; u8 buf_offsets[56] (as 14 dwords)
     const Id f4 = b_.TypeArray(t_f32_, b_.U32(4));
@@ -627,6 +640,123 @@ bool Emitter::EmitTbuffer(const Inst& in, u32 index, std::string_view name) {
     return true;
 }
 
+bool Emitter::EmitDs(const Inst& in, std::string_view name) {
+    const u32 off0 = in.w0 & 0xFF, off1 = (in.w0 >> 8) & 0xFF, off16 = off0 | (off1 << 8);
+    const bool gds = ((in.w0 >> 17) & 1) != 0;
+    const u32 addr_reg = kVgpr + (in.w1 & 0xFF), data0 = kVgpr + ((in.w1 >> 8) & 0xFF),
+              data1 = kVgpr + ((in.w1 >> 16) & 0xFF), vdst = kVgpr + ((in.w1 >> 24) & 0xFF);
+    const Id scope_sg = b_.U32(static_cast<u32>(spv::Scope::Subgroup));
+    if (name == "ds_append" || name == "ds_consume") {
+        // once per subgroup: +/- the active lanes, by the lowest one; all lanes get the value before (the v_mbcnt that
+        // follows gives each lane its place - the hardware does it once per wave)
+        const Id base = b_.Op(Op::OpBitFieldUExtract, t_u32_, {Get(kM0, in), b_.U32(16), b_.U32(16)});
+        const Id dw = b_.Op(Op::OpShiftRightLogical, t_u32_, {b_.Op(Op::OpIAdd, t_u32_, {base, b_.U32(off16)}), b_.U32(2)});
+        const Id all = b_.Op(Op::OpGroupNonUniformBallot, t_uvec4_, {scope_sg, b_.ConstantBool(true)});
+        const Id count = b_.Op(Op::OpGroupNonUniformBallotBitCount, t_u32_,
+                               {scope_sg, static_cast<u32>(spv::GroupOperation::Reduce), all});
+        const Id first = b_.Op(Op::OpGroupNonUniformElect, t_bool_, {scope_sg});
+        const Id slot = b_.LocalVariable(t_ptr_u32_, b_.U32(0));
+        const Id then = b_.NewId(), merge = b_.NewId();
+        b_.OpNoResult(Op::OpSelectionMerge, {merge, 0});
+        b_.OpNoResult(Op::OpBranchConditional, {first, then, merge});
+        b_.Label(then);
+        const Id ptr = b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {gds_, b_.U32(0), dw});
+        const Id old = b_.Op(name == "ds_append" ? Op::OpAtomicIAdd : Op::OpAtomicISub, t_u32_,
+                             {ptr, b_.U32(static_cast<u32>(spv::Scope::Device)), b_.U32(0), count});
+        b_.OpNoResult(Op::OpStore, {slot, old});
+        b_.OpNoResult(Op::OpBranch, {merge});
+        b_.Label(merge);
+        Set(vdst, b_.Op(Op::OpGroupNonUniformBroadcastFirst, t_u32_, {scope_sg, b_.Op(Op::OpLoad, t_u32_, {slot})}));
+        return true;
+    }
+    if (name == "ds_swizzle_b32") {
+        const Id lane = LaneId();
+        Id src_lane = 0;
+        if ((off16 & 0x8000) != 0) {
+            // quad permute: lane 4q + i reads lane 4q + offset[2i + 1:2i]
+            const Id i = b_.Op(Op::OpBitwiseAnd, t_u32_, {lane, b_.U32(3)});
+            const Id sel = b_.Op(Op::OpBitFieldUExtract, t_u32_,
+                                 {b_.U32(off16 & 0xFF), b_.Op(Op::OpShiftLeftLogical, t_u32_, {i, b_.U32(1)}), b_.U32(2)});
+            src_lane = b_.Op(Op::OpBitwiseOr, t_u32_, {b_.Op(Op::OpBitwiseAnd, t_u32_, {lane, b_.U32(~3u)}), sel});
+        } else {
+            // within groups of 32 lanes: ((lane & and) | or) ^ xor
+            const u32 and_m = off16 & 0x1F, or_m = (off16 >> 5) & 0x1F, xor_m = (off16 >> 10) & 0x1F;
+            const Id low = b_.Op(Op::OpBitwiseXor, t_u32_,
+                                 {b_.Op(Op::OpBitwiseOr, t_u32_, {b_.Op(Op::OpBitwiseAnd, t_u32_, {lane, b_.U32(and_m)}), b_.U32(or_m)}),
+                                  b_.U32(xor_m)});
+            src_lane = b_.Op(Op::OpBitwiseOr, t_u32_, {b_.Op(Op::OpBitwiseAnd, t_u32_, {lane, b_.U32(~31u)}), low});
+        }
+        Set(vdst, b_.Op(Op::OpGroupNonUniformShuffle, t_u32_, {scope_sg, Get(data0, in), src_lane}));
+        return true;
+    }
+    if (gds || lds_ == 0) {
+        return false; // (GDS accesses other than append / consume: not used by the game)
+    }
+    const auto at = [&](Id byte_addr) {
+        const Id dw = b_.Op(Op::OpShiftRightLogical, t_u32_, {byte_addr, b_.U32(2)});
+        return b_.Op(Op::OpAccessChain, t_ptr_wg_u32_, {lds_, b_.Op(Op::OpBitwiseAnd, t_u32_, {dw, b_.U32(kLdsDwords - 1)})});
+    };
+    const Id addr = Get(addr_reg, in);
+    const auto plus = [&](u32 bytes) { return bytes == 0 ? addr : b_.Op(Op::OpIAdd, t_u32_, {addr, b_.U32(bytes)}); };
+    const auto load = [&](u32 bytes) { return b_.Op(Op::OpLoad, t_u32_, {at(plus(bytes))}); };
+    const auto store = [&](u32 bytes, Id v) { b_.OpNoResult(Op::OpStore, {at(plus(bytes)), v}); };
+    if (name == "ds_write_b32") {
+        store(off16, Get(data0, in));
+    } else if (name == "ds_write_b64") {
+        store(off16, Get(data0, in));
+        store(off16 + 4, Get(data0 + 1, in));
+    } else if (name == "ds_write2_b32" || name == "ds_write2st64_b32") {
+        const u32 m = name == "ds_write2_b32" ? 4 : 256;
+        store(off0 * m, Get(data0, in));
+        store(off1 * m, Get(data1, in));
+    } else if (name == "ds_write2_b64" || name == "ds_write2st64_b64") {
+        const u32 m = name == "ds_write2_b64" ? 8 : 512;
+        store(off0 * m, Get(data0, in));
+        store(off0 * m + 4, Get(data0 + 1, in));
+        store(off1 * m, Get(data1, in));
+        store(off1 * m + 4, Get(data1 + 1, in));
+    } else if (name == "ds_read_b32") {
+        Set(vdst, load(off16));
+    } else if (name == "ds_read_b64") {
+        const Id a = load(off16), c = load(off16 + 4);
+        Set(vdst, a);
+        Set(vdst + 1, c);
+    } else if (name == "ds_read2_b32" || name == "ds_read2st64_b32") {
+        const u32 m = name == "ds_read2_b32" ? 4 : 256;
+        const Id a = load(off0 * m), c = load(off1 * m);
+        Set(vdst, a);
+        Set(vdst + 1, c);
+    } else if (name == "ds_read2_b64" || name == "ds_read2st64_b64") {
+        const u32 m = name == "ds_read2_b64" ? 8 : 512;
+        const Id a = load(off0 * m), a2 = load(off0 * m + 4), c = load(off1 * m), c2 = load(off1 * m + 4);
+        Set(vdst, a);
+        Set(vdst + 1, a2);
+        Set(vdst + 2, c);
+        Set(vdst + 3, c2);
+    } else {
+        static constexpr std::pair<std::string_view, Op> kAtomics[] = {
+            {"ds_add_u32", Op::OpAtomicIAdd},     {"ds_sub_u32", Op::OpAtomicISub},     {"ds_min_i32", Op::OpAtomicSMin},
+            {"ds_max_i32", Op::OpAtomicSMax},     {"ds_min_u32", Op::OpAtomicUMin},     {"ds_max_u32", Op::OpAtomicUMax},
+            {"ds_and_b32", Op::OpAtomicAnd},      {"ds_or_b32", Op::OpAtomicOr},        {"ds_xor_b32", Op::OpAtomicXor},
+            {"ds_add_rtn_u32", Op::OpAtomicIAdd}, {"ds_sub_rtn_u32", Op::OpAtomicISub}, {"ds_min_rtn_i32", Op::OpAtomicSMin},
+            {"ds_max_rtn_i32", Op::OpAtomicSMax}, {"ds_min_rtn_u32", Op::OpAtomicUMin}, {"ds_max_rtn_u32", Op::OpAtomicUMax},
+            {"ds_wrxchg_rtn_b32", Op::OpAtomicExchange},
+        };
+        for (const auto& [nm, op] : kAtomics) {
+            if (name == nm) {
+                const Id old = b_.Op(op, t_u32_, {at(plus(off16)), b_.U32(static_cast<u32>(spv::Scope::Workgroup)), b_.U32(0),
+                                                  Get(data0, in)});
+                if (name.find("_rtn_") != std::string_view::npos) {
+                    Set(vdst, old);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 Id Emitter::LaneId() {
     if (lane_id_ == 0) {
         lane_id_ = b_.Variable(b_.TypePointer(spv::StorageClass::Input, t_u32_), spv::StorageClass::Input);
@@ -704,6 +834,15 @@ void Emitter::Emit(const Inst& in) {
         }
         if (!options_.stub_memory) {
             throw Unsupported{fmt::format("{} (resource: {})", name, res_.error)};
+        }
+        EmitStub(in, name);
+        return;
+    case Format::Ds:
+        if (EmitDs(in, name)) {
+            return;
+        }
+        if (!options_.stub_memory) {
+            throw Unsupported{std::string(name)};
         }
         EmitStub(in, name);
         return;

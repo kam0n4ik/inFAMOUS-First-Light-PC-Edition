@@ -175,6 +175,13 @@ void Analysis::Step(State& s, u32 index, bool record) {
         }
         return;
     }
+    case Format::Ds:
+        if (((in.w0 >> 17) & 1) != 0 || name == "ds_append" || name == "ds_consume") {
+            out_.uses_gds = true;
+        } else if (name != "ds_swizzle_b32") {
+            out_.uses_lds = true;
+        }
+        return;
     case Format::Sop1:
         if (name == "s_mov_b32") {
             Write(s, o.dst[0], Value(s, o.src[0], in));

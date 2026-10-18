@@ -44,6 +44,8 @@ struct ResourceInfo {
     u32 flat_dwords = 16;       ///< 16 + what the walk copies
     std::vector<WalkLoad> walk; ///< in order (a later load may use an earlier one's dwords as its pointer)
     std::vector<BufferUse> buffers;
+    bool uses_gds = false;      ///< ds_append / ds_consume: the GDS buffer, at binding 1 + buffers.size()
+    bool uses_lds = false;      ///< the local data share (workgroup memory)
     std::vector<s32> buffer_of; ///< per instruction: its buffer (-1: none)
     std::vector<s32> load_of;   ///< per instruction (s_load_*): its walk load (-1: none)
     std::string error;          ///< a resource whose descriptor is not found (unknown SGPRs), and where
