@@ -49,7 +49,16 @@ const std::filesystem::path& RootDir() {
     return root;
 }
 
+const std::filesystem::path& LaunchDir() {
+    static const std::filesystem::path dir = [] {
+        std::error_code ec;
+        return std::filesystem::current_path(ec);
+    }();
+    return dir;
+}
+
 void PrepareBridgeWorkingDirectory() {
+    (void)LaunchDir(); // (kept before the change below)
     const auto work = RootDir() / "runtime" / "sspc";
     std::error_code ec;
     std::filesystem::create_directories(work / "user", ec);

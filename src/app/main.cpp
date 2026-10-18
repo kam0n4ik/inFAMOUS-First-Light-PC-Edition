@@ -365,7 +365,13 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--scan-game-shaders") {
             config->scan_game_shaders = true;
         } else if (arg == "--predict-shaders" && has_value) {
-            config->predict_shaders = std::filesystem::absolute(argv[++i]);
+            // a relative path: from where the user started the program, else from the install root (the process
+            // runs in <root>\runtime\sspc by now)
+            const std::filesystem::path t = argv[++i];
+            std::error_code ec;
+            config->predict_shaders = t.is_absolute()                                  ? t
+                                      : std::filesystem::exists(App::LaunchDir() / t, ec) ? App::LaunchDir() / t
+                                                                                         : App::RootDir() / t;
         } else {
             return Fail(std::string("unknown argument: ") + std::string(arg));
         }

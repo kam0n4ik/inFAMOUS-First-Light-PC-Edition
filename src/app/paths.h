@@ -14,4 +14,8 @@ const std::filesystem::path& RootDir();
 /// run before shadPS4's static initializers. Never falls back to %APPDATA%\shadPS4: aborts instead.
 void PrepareBridgeWorkingDirectory();
 
+/// The working directory the process was started in (before PrepareBridgeWorkingDirectory changed it): what a relative
+/// path on the command line means to the user.
+const std::filesystem::path& LaunchDir();
+
 } // namespace SecondSon::App
