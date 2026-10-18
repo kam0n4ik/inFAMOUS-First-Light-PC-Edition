@@ -19,21 +19,25 @@ constexpr Location kLocations[] = {
 
 struct KindInfo {
     u32 w, h;
-    u64 fnv; // FNV-1a 64 of the original texture data
+    u64 fnv;    // FNV-1a 64 of the original top level
+    u32 levels; // mip levels (each drawn again)
 };
 
 KindInfo Info(PictureKind k) {
     switch (k) {
-    case PictureKind::kSideways256: return {256, 256, 0x4a8b828796c1653cull};
-    case PictureKind::kSideways128: return {128, 128, 0x8819943153427b7aull};
-    case PictureKind::kRattle1024: return {1024, 256, 0x3dfcd14efee62109ull};
-    case PictureKind::kRattle512: return {512, 128, 0xb4420a042a9be869ull};
-    case PictureKind::kTouchPrint256: return {256, 256, 0xf2e47d05c6d25ba6ull};
-    case PictureKind::kDpad256: return {256, 256, 0xd6349daad5d0602eull};
-    case PictureKind::kDpadKarma256: return {256, 256, 0x4cd4970d746fdd34ull};
-    case PictureKind::kDpad64: return {64, 64, 0x226c536031f7fbddull};
+    case PictureKind::kSideways256: return {256, 256, 0x4a8b828796c1653cull, 9};
+    case PictureKind::kSideways128: return {128, 128, 0x8819943153427b7aull, 8};
+    case PictureKind::kRattle1024: return {1024, 256, 0x3dfcd14efee62109ull, 11};
+    case PictureKind::kRattle512: return {512, 128, 0xb4420a042a9be869ull, 10};
+    case PictureKind::kTouchPrint256: return {256, 256, 0xf2e47d05c6d25ba6ull, 9};
+    case PictureKind::kDpad256: return {256, 256, 0xd6349daad5d0602eull, 9};
+    case PictureKind::kDpadKarma256: return {256, 256, 0x4cd4970d746fdd34ull, 9};
+    case PictureKind::kDpad64: return {64, 64, 0x226c536031f7fbddull, 7};
+    case PictureKind::kDiscTriangle128: return {128, 128, 0x11b1d5b54a980384ull, 8};
+    case PictureKind::kDiscSquare128: return {128, 128, 0x606d90357f561093ull, 8};
+    case PictureKind::kDpadRed64: return {64, 64, 0xadc3c2015a999d34ull, 7};
     }
-    return {0, 0, 0};
+    return {0, 0, 0, 0};
 }
 
 // ---- BC3 in the console layout: 4x4 blocks of 16 bytes, 8x8 blocks a micro tile in Morton order, tiles row by row
@@ -422,11 +426,23 @@ bool DrawDpad(Image& im, const Input::Settings& layout) {
                        ? Rgb{std::min<int>(255, s[0] / hits * 5 / 4), std::min<int>(255, s[1] / hits * 5 / 4),
                              std::min<int>(255, s[2] / hits * 5 / 4)}
                        : Rgb{200, 200, 200};
+        // a white arm (the highlight of a coloured wheel) stays white
+        const Rgb mid = average(a.x, a.y, std::max(1.0f, 0.03f * W));
+        if (std::min({mid.r, mid.g, mid.b}) > 200) {
+            a.colour = {255, 255, 255};
+        }
     }
     // the disc's own colour between the arms
     const float q = 0.17f * W;
     const Rgb c1 = average(cx - q, cy - q, r), c2 = average(cx + q, cy + q, r);
     const Rgb disc{(c1.r + c2.r) / 2, (c1.g + c2.g) / 2, (c1.b + c2.b) / 2};
+    for (Arm& a : arms) { // (an arm the disc's own colour - a coloured wheel's plain arm - is a light grey key)
+        const int d = std::abs(a.colour.r - disc.r * 5 / 4) + std::abs(a.colour.g - disc.g * 5 / 4) +
+                      std::abs(a.colour.b - disc.b * 5 / 4);
+        if (d < 120 && !(a.colour.r == 255 && a.colour.g == 255 && a.colour.b == 255)) {
+            a.colour = {225, 225, 225};
+        }
+    }
     const float clear = 0.31f * W;
     for (u32 y = 0; y < im.h; ++y) {
         for (u32 x = 0; x < im.w; ++x) {
@@ -447,6 +463,89 @@ bool DrawDpad(Image& im, const Input::Settings& layout) {
         }
     }
     return true;
+}
+
+/// A button on a disc over a character (the subdue / melee prompts): the disc and its ring stay; the button's shape
+/// becomes the key bound to it, in the shape's own colour.
+bool DrawDisc(Image& im, const Input::Settings& layout, Input::Action action) {
+    const auto key = Bound(layout, action);
+    if (!key) {
+        return false;
+    }
+    const float W = static_cast<float>(im.w), cx = W / 2, cy = static_cast<float>(im.h) / 2;
+    const float inner = 0.30f * W;
+    long hi[3] = {}, nhi = 0, lo[3] = {}, nlo = 0;
+    for (u32 y = 0; y < im.h; ++y) {
+        for (u32 x = 0; x < im.w; ++x) {
+            const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            const u8* p = im.At(x, y);
+            if (p[3] < 128 || dx * dx + dy * dy > inner * inner) {
+                continue;
+            }
+            const bool sat = std::max({p[0], p[1], p[2]}) - std::min({p[0], p[1], p[2]}) > 60;
+            long* acc = sat ? hi : lo;
+            acc[0] += p[0];
+            acc[1] += p[1];
+            acc[2] += p[2];
+            ++(sat ? nhi : nlo);
+        }
+    }
+    if (nhi == 0 || nlo == 0) {
+        return false;
+    }
+    const Rgb colour{std::min<int>(255, int(hi[0] / nhi) * 5 / 4), std::min<int>(255, int(hi[1] / nhi) * 5 / 4),
+                     std::min<int>(255, int(hi[2] / nhi) * 5 / 4)};
+    const Rgb disc{int(lo[0] / nlo), int(lo[1] / nlo), int(lo[2] / nlo)};
+    for (u32 y = 0; y < im.h; ++y) {
+        for (u32 x = 0; x < im.w; ++x) {
+            const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            if (dx * dx + dy * dy <= inner * inner) {
+                u8* p = im.At(x, y);
+                p[0] = static_cast<u8>(disc.r);
+                p[1] = static_cast<u8>(disc.g);
+                p[2] = static_cast<u8>(disc.b);
+                p[3] = 255;
+            }
+        }
+    }
+    return DrawKeyAt(im, *key, static_cast<u32>(0.46f * W), static_cast<int>(cx), static_cast<int>(cy), colour);
+}
+
+/// Bytes of a level's blocks: padded to 8x8 blocks (the micro tile).
+u64 LevelBytes(u32 w, u32 h, u32 level) {
+    const u32 bw = ((std::max(1u, w >> level) + 3) / 4 + 7) / 8 * 8;
+    const u32 bh = ((std::max(1u, h >> level) + 3) / 4 + 7) / 8 * 8;
+    return u64{bw} * bh * 16;
+}
+
+/// The next level: 2x2 boxes averaged with premultiplied alpha.
+Image Half(const Image& a) {
+    Image b;
+    b.w = std::max(1u, a.w / 2);
+    b.h = std::max(1u, a.h / 2);
+    b.px.assign(size_t{b.w} * b.h * 4, 0);
+    for (u32 y = 0; y < b.h; ++y) {
+        for (u32 x = 0; x < b.w; ++x) {
+            u32 s[4] = {}, n = 0;
+            for (u32 dy = 0; dy < 2; ++dy) {
+                for (u32 dx = 0; dx < 2; ++dx) {
+                    const u32 X = std::min(a.w - 1, x * 2 + dx), Y = std::min(a.h - 1, y * 2 + dy);
+                    const u8* p = a.px.data() + (size_t{Y} * a.w + X) * 4;
+                    for (int c = 0; c < 3; ++c) {
+                        s[c] += u32{p[c]} * p[3];
+                    }
+                    s[3] += p[3];
+                    ++n;
+                }
+            }
+            u8* q = b.px.data() + (size_t{y} * b.w + x) * 4;
+            for (int c = 0; c < 3; ++c) {
+                q[c] = static_cast<u8>(s[3] == 0 ? 0 : s[c] / s[3]);
+            }
+            q[3] = static_cast<u8>(s[3] / n);
+        }
+    }
+    return b;
 }
 
 u64 Fnv(const u8* p, u64 n) {
@@ -471,11 +570,16 @@ std::vector<const Location*> InPack(std::string_view pack) {
 
 u64 Bytes(PictureKind kind) {
     const KindInfo k = Info(kind);
-    return u64{k.w} * k.h;
+    u64 n = 0;
+    for (u32 l = 0; l < k.levels; ++l) {
+        n += LevelBytes(k.w, k.h, l);
+    }
+    return n;
 }
 
 bool IsOriginal(PictureKind kind, const u8* data) {
-    return Fnv(data, Bytes(kind)) == Info(kind).fnv;
+    const KindInfo k = Info(kind);
+    return Fnv(data, u64{k.w} * k.h) == k.fnv;
 }
 
 void DecodeBc3(const u8* tiled, u32 w, u32 h, u8* rgba) {
@@ -532,14 +636,36 @@ std::vector<u8> Build(PictureKind kind, const u8* original, Input::PromptStyle s
     case PictureKind::kDpad256:
     case PictureKind::kDpadKarma256:
     case PictureKind::kDpad64:
+    case PictureKind::kDpadRed64:
         drawn = DrawDpad(im, layout);
+        break;
+    case PictureKind::kDiscTriangle128:
+        drawn = DrawDisc(im, layout, Input::Action::Triangle);
+        break;
+    case PictureKind::kDiscSquare128:
+        drawn = DrawDisc(im, layout, Input::Action::Square);
         break;
     }
     if (!drawn) {
         return out;
     }
-    FlipRows(im);
-    EncodeBc3(im.px.data(), k.w, k.h, out.data());
+    // every mip level from the drawn top level (the game samples the small ones on screen), each stored bottom-up in
+    // its padded block tiles
+    u64 at = 0;
+    Image level = std::move(im);
+    for (u32 l = 0; l < k.levels; ++l) {
+        if (l != 0) {
+            level = Half(level);
+        }
+        const u32 pw = ((level.w + 3) / 4 + 7) / 8 * 8 * 4, ph = ((level.h + 3) / 4 + 7) / 8 * 8 * 4;
+        std::vector<u8> padded(size_t{pw} * ph * 4, 0);
+        for (u32 y = 0; y < level.h; ++y) {
+            std::memcpy(padded.data() + size_t{y} * pw * 4, level.px.data() + size_t{level.h - 1 - y} * level.w * 4,
+                        size_t{level.w} * 4);
+        }
+        EncodeBc3(padded.data(), pw, ph, out.data() + at);
+        at += LevelBytes(k.w, k.h, l);
+    }
     return out;
 }
 

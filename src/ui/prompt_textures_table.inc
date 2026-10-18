@@ -125,3 +125,6 @@
 {"core_common.sprig.xpps", 0xd7bf3e4, PictureKind::kDpad256},
 {"core_common.sprig.xpps", 0xd7a8be4, PictureKind::kDpadKarma256},
 {"core_common.sprig.xpps", 0xfb010e4, PictureKind::kDpad64},
+{"core_common.sprig.xpps", 0xf7536e4, PictureKind::kDiscTriangle128},
+{"core_common.sprig.xpps", 0xf74cee4, PictureKind::kDiscSquare128},
+{"core_common.sprig.xpps", 0xfafc0e4, PictureKind::kDpadRed64},

@@ -23,6 +23,9 @@ enum class PictureKind : u8 {
     kDpad256,
     kDpadKarma256,
     kDpad64,
+    kDiscTriangle128,
+    kDiscSquare128,
+    kDpadRed64,
 };
 
 /// A picture in a pack: the bytes of its texture data at `offset` of the file named `pack` (the game's file name).
@@ -35,10 +38,10 @@ struct Location {
 /// The places of the pictures in a pack (`pack`: its file name, e.g. "a8.hires.xpps"); empty for most packs.
 std::vector<const Location*> InPack(std::string_view pack);
 
-/// The size of a picture's texture data (BC3: one byte per pixel).
+/// The size of a picture's texture data: its whole mip chain (BC3, each level's blocks padded to 8x8 blocks).
 u64 Bytes(PictureKind kind);
 
-/// True when `data` (Bytes(kind)) are the game's own bytes of that picture (version 01.07).
+/// True when `data` (Bytes(kind)) are the game's own bytes of that picture (version 01.07; the top level's hash).
 bool IsOriginal(PictureKind kind, const u8* data);
 
 /// The picture for `style`: the keyboard's drawn from `original` with the bindings of `layout`; any other style (or a

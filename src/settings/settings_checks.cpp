@@ -611,7 +611,10 @@ void PromptPictureChecks(const CheckFn& check, const fs::path& dir) {
                        {"core_common.sprig.xpps", T::PictureKind::kTouchPrint256, 256, 256, "touchprint"},
                        {"core_common.sprig.xpps", T::PictureKind::kDpad256, 256, 256, "dpad"},
                        {"core_common.sprig.xpps", T::PictureKind::kDpadKarma256, 256, 256, "dpad_karma"},
-                       {"core_common.sprig.xpps", T::PictureKind::kDpad64, 64, 64, "dpad64"}};
+                       {"core_common.sprig.xpps", T::PictureKind::kDpad64, 64, 64, "dpad64"},
+                       {"core_common.sprig.xpps", T::PictureKind::kDiscTriangle128, 128, 128, "disc_triangle"},
+                       {"core_common.sprig.xpps", T::PictureKind::kDiscSquare128, 128, 128, "disc_square"},
+                       {"core_common.sprig.xpps", T::PictureKind::kDpadRed64, 64, 64, "dpad_red64"}};
     for (const One& o : all) {
         const T::Location* at = nullptr;
         for (const auto* l : T::InPack(o.pack)) {
