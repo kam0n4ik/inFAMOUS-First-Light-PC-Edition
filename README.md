@@ -2,9 +2,9 @@
 
 **A Windows PC port project for inFAMOUS: Second Son.**
 
-An independent engineering project focused on running, understanding, and progressively rebuilding the game's runtime for Windows, with a custom Vulkan graphics backend and native system implementations.
+An independent engineering project that runs the original PlayStation 4 game on Windows on its own runtime: its own loader, kernel, memory, threading, system services, GPU command processor, Vulkan backend and — step by step — its own GCN shader translator.
 
-> **Status: In development.** The game launches and reaches gameplay. Core runtime components and graphics systems are being progressively replaced with custom implementations. Performance, compatibility, and long-session stability remain under active development.
+> **Status: in development, playable.** The game starts, loads saves and is played on the project's own runtime and Vulkan backend. Most PlayStation system services are native. What still comes from shadPS4 is listed exactly below; removing it is the current work.
 
 <p align="center">
   <img src="pc-edition-banner.png"
@@ -13,10 +13,13 @@ An independent engineering project focused on running, understanding, and progre
 </p>
 
 <p align="center">
-  <a href="#project-status">Status</a> ·
-  <a href="#features">Features</a> ·
+  <a href="#where-the-project-is">Status</a> ·
+  <a href="#what-is-new">What is new</a> ·
+  <a href="#graphics">Graphics</a> ·
+  <a href="#own-shader-translator">Shader translator</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#input-and-button-prompts">Input</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#installation">Installation</a> ·
   <a href="#known-issues">Known issues</a> ·
   <a href="#roadmap">Roadmap</a>
 </p>
@@ -25,419 +28,225 @@ An independent engineering project focused on running, understanding, and progre
 
 ## Overview
 
-*inFAMOUS: Second Son — PC Edition* is an independent project exploring a native Windows implementation of the runtime required to run the original PlayStation 4 game.
+The project began as a launcher on top of the shadPS4 emulator core and has been replacing it piece by piece. Today the game runs on SecondSonPC's own code for nearly everything that matters at run time; shadPS4 is still linked into the build and provides a shrinking set of functions (below).
 
-The project began with a working compatibility layer and has progressively evolved toward a custom runtime, custom graphics infrastructure, and native replacements for PlayStation system services.
+It is not a remake and not a source-code reconstruction: the original executable and assets are used unchanged. The project replaces the platform underneath them.
 
-The long-term objective is to reduce and ultimately eliminate mandatory dependencies on shadPS4, while preserving the original game's rendering, gameplay, and content.
+All numbers in this file were measured on the development machine (RTX 2060, Windows 10, 32 GB RAM) in fixed test scenes, unless stated otherwise.
 
-This is not a remake, a new game engine, or a reconstruction of the original source code. The project works with the original game's executable and assets while replacing and extending the platform-specific infrastructure around them.
+## Where the project is
 
-### Project goals
+### PlayStation functions the game imports
 
-- Run the original game on Windows.
-- Build a custom runtime for PlayStation 4 game code.
-- Maintain a custom Vulkan graphics backend.
-- Replace compatibility-layer system services with native Windows implementations.
-- Improve CPU-side command processing and frame-time consistency.
-- Preserve original game assets, gameplay logic, and visual quality.
-- Investigate the feasibility of binary recompilation for future stages.
+The game imports 417 system functions. Their owner in the current build (snapshot `docs/generated/CALLS.md`, 2026-10-18):
 
-## Project status
+| Owner | Functions | Called in a 2-minute gameplay run |
+|---|---:|---:|
+| **Native (SecondSonPC)** | **336** | 163 |
+| shadPS4 (bridge) | 61 | 8 |
+| shadPS4 common stub | 20 | 1 |
 
-| Component | Current status |
+The bridge functions the game actually calls: `sceAjmInitialize`, `sceAjmModuleRegister` (audio decoding), `sceCommonDialogInitialize`, `sceNetInit`, `sceNetPoolCreate`, `sceNetInetNtop`, `sceLibcHeapGetTraceInfo`, `fflush`; the common stub: `vprintf`.
+
+### Components
+
+| Component | State |
 |---|---|
-| Windows executable and custom loader | Implemented |
-| Original game code execution | Working |
-| Custom graphics backend | Implemented and under active development |
-| Vulkan rendering and resource management | Implemented; ongoing compatibility work |
-| Native kernel, threading and memory components | Enabled by default; regression testing ongoing |
-| Native exception handling and CPU patcher | Implemented; compatibility testing ongoing |
-| Offline network and system services | Partially replaced |
-| Native save-data implementation | Implemented; compatibility tested on copied saves |
-| Native audio output through WASAPI | Implemented; extended stability testing required |
-| Video decoding | In development |
-| ATRAC9 / Ajm audio decoding | Pending |
-| Complete removal of shadPS4 | In progress |
-| Custom GCN-to-SPIR-V translator | Future major milestone |
-| Binary recompilation into a Windows-native executable | Research phase, not yet implemented |
-| Multiplayer co-op | Research idea; no implementation claimed |
+| Executable, loader (SELF/ELF, relocations, TLS, NID table) | Own |
+| Kernel: threads, synchronization, time, event queues, virtual / direct memory | Own, on by default |
+| Exception handling, CPU patcher (TCB / FS patches) | Own, on by default |
+| File system, system / user services, PlayGo, app content | Own |
+| Save data (`param.sfo` byte-identical to the bridge's in tests) | Own |
+| Audio output (WASAPI) | Own |
+| Video decoding (`sceVideodec*`, cutscenes) | Own |
+| Offline network, NP, trophies, HTTP | Own (offline behaviour) |
+| Keyboard / mouse input, pad API | Own |
+| GPU: PM4 command processor | Own |
+| GPU: Vulkan backend (default `--gpu-backend sspc`) | Own |
+| Shader translation GCN → SPIR-V | Own for compute and vertex programs (opt-in), shadPS4's recompiler for the rest by default |
+| Ajm / ATRAC9 audio decoding | shadPS4 |
+| Common dialogs, a few network / libc functions | shadPS4 |
+| Build without `third_party/shadPS4` | Not yet |
 
-The status above describes the state reported during development. Each component may have additional limitations that are not yet documented here.
+## What is new
 
-## Features
+The main changes since the first public description:
 
-### Custom Windows runtime
+- **Own Vulkan backend is the default.** The game's GPU command buffers are processed by SecondSonPC's PM4 command processor and recorded into Vulkan by its own executor; the bridge renderer is only a fallback (`--gpu-backend bridge`).
+- **Own shader translator.** Every compute program met in the test scenes and all vertex programs except rect/quad lists are translated by SecondSonPC's GCN → SPIR-V translator in the opt-in mode (details below).
+- **Shader cache and preparation window.** Translated shaders and Vulkan pipelines are stored on disk; before the game starts, a preparation window predicts and builds the pipelines the game will need, from the game's own data files (no save scanning).
+- **Upscaling and frame generation.** DLSS Super Resolution, AMD FSR 3.1 Super Resolution and FSR 3.1 Frame Generation inside the game's frame.
+- **Frame pacing.** The emulated 59.94 Hz vblank was the cap of the 1 % lows; the presenter now paces freely with a frame-rate limit (default 60, up to unlimited). The game's clock was measured to be independent of FPS.
+- **Rendering fixes:** light glow through walls (real occlusion queries), flickering smoke (particle sort race), lighting colour channels.
+- **Button prompts follow the input device** — keyboard/mouse, Xbox or PlayStation.
+- **Native audio output (WASAPI), video decoding and save data.**
 
-The project includes a custom executable and runtime infrastructure designed to run the original game on Windows.
+## Graphics
 
-Current work includes:
+### Own command processor and Vulkan backend
 
-- Custom loading and initialization.
-- Native implementations of selected PlayStation kernel interfaces.
-- Custom thread and virtual-memory management.
-- Native exception handling.
-- A CPU patching system.
-- Progressive replacement of shadPS4 system services.
+- PM4 packets of the game's command buffers are decoded and executed by SecondSonPC (graphics and async compute queues).
+- Resources, descriptors, GPU memory import, synchronization, barriers by ranges, write-back of GPU results the game reads.
+- Two-thread mode: command processing and Vulkan recording on separate threads.
+- Vulkan Validation and Synchronization Validation were clean in the documented test scenes.
 
-The goal is to minimize compatibility overhead and gain direct control over the execution environment.
+### Rendering fixes
 
-### Custom Vulkan graphics backend
+| Problem | Cause | Fix |
+|---|---|---|
+| Vehicle-light glow visible through fences and walls | visibility queries always reported "fully visible" | real Vulkan occlusion queries, results given to the game's compute shader (`146a3bd`) |
+| Smoke flickering | the particle sort merged all widths in one dispatch; on PS4 that is one 64-lane wave, on PC two 32-lane subgroups raced | one dispatch per merge level with a barrier (`01a3edd`) |
+| Wrong lighting colours | colour target component swap was masked out | COMP_SWAP honoured |
 
-SecondSonPC has its own graphics backend for translating the game's GPU commands into Vulkan operations.
+### Shader cache, pipeline prediction
 
-Ongoing development covers:
+- Disk cache of translated SPIR-V with reflection, plus `VkPipelineCache` (`vulkan.bin`) with device/driver checks.
+- Static prediction: shader programs, descriptor layouts and pipeline states are derived from the game's pack files and engine structures. Hold-out accuracy for whole pipelines of render passes: 87–90 %; compute ~87 % of keys.
+- A preparation window builds them before the game starts (a repeat start takes ~2 s).
 
-- GPU command processing.
-- Graphics and compute pipelines.
-- Resource bindings and descriptors.
-- GPU memory management.
-- Synchronization and resource lifetime.
-- Shader pipeline caching and compilation.
-- CPU-side command preparation.
-- Rendering correctness and performance profiling.
+### Upscaling and frame generation
 
-The graphics backend is already operational, but the shader translation pipeline still depends on shadPS4 components.
+Native backend only. The upscaler replaces the game's own (PS4 Pro-style) scaling pass; the HUD is drawn afterwards at full resolution and never goes through the upscaler. Motion vectors, reversed depth and jitter are taken from the game's frame.
 
-### Lighting and occlusion
+| Mode (RTX 2060) | Village FPS / 1 % low | Beach FPS / 1 % low |
+|---|---|---|
+| Native | 35.4 / 25.8 | 41.6 / 28.0 |
+| DLSS Quality | 36.3 / 27.8 | 38.8 / 26.8 |
+| FSR Quality | 38.7 / 29.2 | 44.7 / 29.3 |
+| FSR Performance | 40.7 / 29.2 | 45.3 / 29.3 |
 
-A confirmed rendering defect involving vehicle-headlight glow passing through fences and other occluders was traced to incorrect occlusion-query results.
+FSR 3.1 Frame Generation: beach 43–53 game frames/s → 86–105 shown; the HUD is kept out of generated frames. DLSS Frame Generation is not implemented (needs RTX 40/50). Generated frames still need visual review.
 
-The original game uses visibility queries to determine how much of a light-glow proxy is visible. The previous implementation returned equivalent values for queries with and without depth testing, effectively forcing full visibility.
+## Own shader translator
 
-The fix introduces real Vulkan occlusion queries and makes their results available to the game's original compute shader.
+SecondSonPC's GCN → SPIR-V translator (`src/runtime/gpu/gcn/`): decoder, control-flow graph, structurization, resource analysis with its own SRT walk, and a SPIR-V emitter. It follows the bridge's binding and interface conventions, so its modules can be mixed with the bridge's in one pipeline, and decides per program: an instruction or shape it does not handle sends that program to the bridge's recompiler with the reason logged.
 
-**Implementation:** commit `146a3bd`.
+Enable it with the environment variable `SSPC_OWN_SHADERS` (or `play_rea_own.cmd` for compute):
 
-Reported validation results:
+| Value | Own translator for |
+|---|---|
+| `cs` | compute programs |
+| `cs,vs` | compute and vertex programs |
 
-- Headlight glow behind a fence was absent in 8 out of 8 tested frames after the fix.
-- Directly visible streetlights and selected environmental lights remained visible.
-- Vulkan Validation and Synchronization Validation reported no messages during the documented test.
+Results (2-minute gameplay run, no cache, synchronous pipeline builds):
 
-The tested scene did not include a vehicle with headlights directly visible to the camera, so further regression testing is required.
+| Stage | Own | Sent to the bridge | `spirv-val` |
+|---|---:|---:|---|
+| Compute | 132 translations | 0 | all valid |
+| Vertex | 284 translations | 6 (rect / quad lists) | all valid |
+| Pixel | — | all (in progress) | — |
 
-### Native audio output
+Offline, over all 10 301 GCN programs in the game's files: 7 820 SPIR-V modules emitted, 7 820 valid.
 
-The project now includes a Windows WASAPI audio-output implementation, allowing the game to output audio without the bridge's SDL audio implementation.
+Covered so far: scalar / vector ALU including 64-bit and double precision, wave64 semantics on 32-lane subgroups, buffer / typed buffer / formatted loads and stores, LDS and GDS, images (load, store, sampling with explicit LOD and texel offsets, cube and 1D views), the fetch shader and vertex attribute formats, position / parameter / clip-distance exports. The picture was checked in game against the bridge's translation.
 
-**Implementation:** commit `245d86d`.
+## Performance
 
-A compatibility fallback remains available through:
+The frame is currently limited by **CPU-side command processing and Vulkan recording** (~20–25 ms in heavy scenes, 6–10 thousand draws per frame), not by the GPU. Cutscenes with ~1 200 draws run at 60–90 FPS.
 
-`play_rea.cmd --bridge audio`
+Measured improvements (A/B, n = 3, before → after):
 
-Extended stability testing is still required following a previous crash associated with near-exhaustion of system commit memory. The cause has not been conclusively linked to audio.
+| Change | Beach | Harbour | Village |
+|---|---|---|---|
+| GPU optimizations (`3da31cf`) | 48.1 → 55.1 FPS | 42.6 → 49.9 FPS | 37.3 → 38.6 FPS |
+| Free frame pacing, 1 % low (`2f984a9`) | 29.4 → 48.8 | 29.4 → 46.8 | 29.3 → 35.3 |
 
-### Save-data compatibility
+Performance work is done by controlled A/B runs; rejected experiments are documented (`docs/GPU_OPTIMIZATION.md`, `docs/FRAMEBREAK.md`, `docs/LIGHTING_PROFILE.md`). No quality setting, light or shadow is reduced to gain FPS.
 
-The custom save-data implementation has loaded existing saves and completed automatic save operations using copied user save data.
+## Native audio, video and saves
 
-The `param.sfo` output was reported to match the bridge's output byte for byte in the tested scenario.
+- **Audio output** through WASAPI (`245d86d`); `--bridge audio` switches back to the bridge's output.
+- **Video decoding** (`sceVideodec*`) is native; cutscenes play.
+- **Save data**: existing saves load and autosaves are written; tests always run on copies of the user's saves.
 
-The original user saves were not modified during those tests.
+## Input and button prompts
 
-This is an important compatibility milestone, but it does not yet establish correctness for every save-data operation or every possible recovery scenario.
-
-### Input and controller support
-
-SecondSonPC includes custom keyboard and mouse input handling together with PC-oriented control settings.
-
-The goal is to provide a natural PC gameplay experience while preserving the original game's visual identity and compatibility with controller-based play.
-
-Current work in this area includes:
-
-- Custom keyboard and mouse input handling.
-- PC-specific control settings and key bindings.
-- Adaptation of contextual gameplay prompts for keyboard and mouse.
-- Preservation of the original PlayStation prompt artwork and overall visual style.
-- Development of controller-specific prompt variants for PlayStation and Xbox layouts.
-- Input-device-aware prompt switching based on the currently active control method.
-
-The intended behavior is to display the correct contextual prompts for the active input device. When the player switches between keyboard/mouse and a gamepad, the game should update the visible prompts accordingly without permanently replacing the original assets.
-
-### Input and controller support
-
-SecondSonPC includes custom keyboard and mouse input handling and PC-oriented control settings, bringing the original PlayStation 4 game closer to a native PC experience.
-
-The goal is to provide intuitive PC controls while preserving the original game's visual identity and compatibility with supported game controllers.
-
-Current implementation and development include:
-
-- Custom keyboard and mouse input handling.
-- PC-specific control settings and key bindings.
-- Adaptation of contextual gameplay prompts for keyboard and mouse.
-- Keyboard key representations integrated into the original prompt design.
-- Preservation of original PlayStation button icons for players using PlayStation controllers.
-- Support for different controller prompt layouts without permanently replacing the original game assets.
-- Development of automatic prompt selection based on the active input device.
-
-The intended behavior is to display the appropriate button prompts for the player's current input method. Keyboard and mouse prompts should be displayed during keyboard/mouse gameplay, while the original controller prompts remain available when using a supported gamepad.
-
-#### Keyboard and mouse prompt adaptation
-
-The original game features distinctive, textured button prompts that are integrated into its visual design. For the PC version, these prompts are being adapted to use keyboard keys while retaining the original artwork's colors, textures, and overall presentation.
-
-The examples below demonstrate the visual adaptation of gameplay prompts, including keyboard mappings such as `F`, `V`, `G`, `X`, and `TAB`.
+Keyboard and mouse are handled natively, with PC key bindings. The game draws every button prompt from one icon font; SecondSonPC redraws the physical-button cells for the active input device, so **all** prompts of the game — static and composite, in every language — switch between keyboard/mouse, Xbox and PlayStation without editing strings or replacing the original files on disk.
 
 <p align="center">
   <img src="prw1.png" alt="Keyboard and mouse prompt adaptations for inFAMOUS: Second Son PC Edition" width="900">
 </p>
 
-#### Controller and alternate prompt variants
-
-Controller support remains an important part of the PC version. Original PlayStation button icons are not permanently replaced, allowing the game to retain its original presentation when played with a PlayStation controller.
-
-Alternative prompt designs are also being explored for other supported input methods, including Xbox-style controller layouts and keyboard/mouse controls.
-
 <p align="center">
   <img src="prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
 </p>
 
-**Development status:** Custom keyboard and mouse input handling and PC control settings are implemented. Prompt adaptation and input-device-aware switching are being developed and require further in-game verification before they can be considered complete.
-## Performance and profiling
-
-Performance work focuses on identifying real bottlenecks rather than applying visual shortcuts.
-
-The project uses controlled experiments, instrumentation, and A/B comparisons to investigate:
-
-- CPU command-processing overhead.
-- Graphics and compute pipeline costs.
-- Shadow rendering.
-- GPU memory transfers.
-- Synchronization stalls.
-- Pipeline creation and caching.
-- Resource binding and command preparation.
-- Frame-time consistency.
-
-### Shadow rendering investigation
-
-Profiling of a city scene identified approximately 1,100 small shadow draw calls per frame associated with vehicle headlights and spotlights.
-
-The reported CPU command-processing cost was approximately 2.4 ms per frame for this work.
-
-An experiment that attempted to reuse shader preparation was reverted because the relevant draw calls required different object-specific data and did not benefit from the proposed cache.
-
-The findings are documented in `docs/LIGHTING_PROFILE.md`.
-
-The current approach is to preserve shadow quality and investigate architectural optimizations only when a measurable and correct improvement is plausible.
-
-### Performance reporting
-
-Performance figures should always identify the tested scene, build, graphics settings, measurement interval, and whether the system was under other CPU/GPU load.
-
-Historical measurements have been affected by concurrent builds and background workloads. They should not be treated as representative benchmarks for the current build without a controlled retest.
-
-No universal FPS target or hardware recommendation is claimed at this stage.
+The original PlayStation icons stay when a PlayStation controller is used.
 
 ## Architecture
 
-The project is being developed in several layers.
-
 ```text
-Original PS4 game
+Original PS4 game (eboot.bin + modules, unchanged)
         |
         v
-Custom loader and runtime
-        |
-        +-- Native kernel interfaces
-        +-- Threading and virtual memory
-        +-- Exception handling and CPU patching
-        +-- System service compatibility
-        +-- Save-data handling
-        +-- Audio and video subsystems
-        |
-        v
-Custom graphics command processor
-        |
-        +-- GPU command translation
-        +-- Resource and descriptor management
-        +-- Pipeline caching
-        +-- Vulkan synchronization
+SecondSonPC loader and runtime
+        +-- kernel: threads, sync, time, event queues
+        +-- virtual / direct memory, exception handling, CPU patcher
+        +-- file system, system / user services, PlayGo
+        +-- save data, WASAPI audio, video decoding
+        +-- offline network / NP / trophies
+        +-- [shadPS4 bridge: Ajm, common dialogs, a few net / libc functions]
         |
         v
-Vulkan graphics backend
+SecondSonPC GPU
+        +-- PM4 command processor (graphics + async compute)
+        +-- shader frontend: SRT walk, resource plans, specialization keys
+        +-- GCN -> SPIR-V: own translator (compute, vertex) / bridge recompiler (rest)
+        +-- shader + pipeline disk cache, static pipeline prediction
+        +-- Vulkan executor: descriptors, memory import, barriers, write-back
+        +-- presenter: frame pacing, DLSS / FSR upscaling, FSR frame generation
         |
         v
-Windows GPU driver
+Vulkan driver
 ```
-
-This is a conceptual overview, not a complete call graph. Some subsystems still use shadPS4 implementations, and the remaining dependencies are being audited.
-
-### Native system implementations
-
-The following components have been replaced or substantially implemented outside the bridge, according to current development reports:
-
-- Kernel, threading, memory management, exception handling, and CPU patching.
-- Selected offline networking and security-related services.
-- HTTP offline functions.
-- Trophy service compatibility.
-- Kernel event queues.
-- Save-data handling.
-- WASAPI audio output.
-
-The precise set of functions and their completeness should be tracked in the technical documentation and verified against the current build.
-
-### Remaining compatibility dependencies
-
-The current work includes replacing:
-
-- Video decoding interfaces (`sceVideodec*`).
-- Ajm / ATRAC9 decoding.
-- Remaining network and socket functions.
-- Save-data and system-message dialogs.
-- Small libc compatibility functions such as `fflush` and `vprintf`.
-
-After the system-service work, a major remaining task is the GCN-to-SPIR-V shader translator. The long-term objective is to remove mandatory shadPS4 dependencies from the build and runtime, not merely rename or wrap them.
-
-## Development history
-
-The project has progressed through several major stages.
-
-### Stage 1 — Initial Windows execution
-
-- Established a custom executable and launch workflow.
-- Reached playable game scenes.
-- Built the foundation for PC-specific controls and settings.
-- Began profiling CPU and GPU bottlenecks.
-
-### Stage 2 — Custom graphics infrastructure
-
-- Developed GPU command-processing components.
-- Integrated a Vulkan rendering path.
-- Added pipeline caching and shader-related instrumentation.
-- Investigated graphics correctness and GPU synchronization.
-
-### Stage 3 — Performance and rendering research
-
-- Profiled CPU command processing and GPU workloads.
-- Investigated shadow rendering and lighting costs.
-- Implemented real Vulkan occlusion queries for light-glow visibility.
-- Added controlled A/B experiments and documented unsuccessful optimization attempts.
-
-### Stage 4 — Native runtime replacement
-
-- Enabled custom kernel, threading, memory, exception, and CPU-patching components by default.
-- Replaced selected offline system services.
-- Implemented event-queue handling.
-- Added native save-data functionality.
-- Implemented WASAPI audio output.
-
-### Stage 5 — Current development
-
-- Replace remaining video, audio-decoding, networking, and dialog dependencies.
-- Validate long-session stability and memory behavior.
-- Finish controller-prompt improvements.
-- Continue reducing shadPS4 dependencies.
-- Investigate the feasibility of a custom shader translator and binary recompilation.
-
-## Installation
-
-**This project does not distribute the original game, game executable, game assets, console firmware, or copyrighted game content.**
-
-A legally obtained copy of the original game is required. Users are responsible for obtaining and preparing their own game files.
-
-The exact required game version, directory layout, and setup procedure must be documented against a tested public build before this section is considered complete.
-
-### Requirements
-
-- A supported 64-bit Windows installation.
-- A compatible graphics card and Vulkan driver.
-- The user's own supported game files.
-- Any runtime dependencies specified by the corresponding release.
-
-**Tested hardware and software configurations:** to be documented after reproducible compatibility testing.
-
-### Launching the game
-
-The current development workflow uses the project's launch scripts, including `play.cmd`.
-
-Launch script names and required arguments may change during development. Follow the instructions included with the specific build rather than assuming every development script is suitable for public distribution.
 
 ## Known issues
 
-The project is under active development. Known or unresolved areas include:
-
-- Performance varies significantly by scene and CPU-side workload.
-- Long-session stability and system-memory usage require additional testing.
-- The WASAPI implementation needs further validation after a memory-exhaustion crash.
-- Video decoding and ATRAC9 support are still being developed.
-- Some system services remain dependent on shadPS4.
-- The shader translation pipeline is not yet fully independent.
-- Controller prompts and other UI improvements require final integration and regression testing.
-- Lighting fixes have been validated in specific scenes but require broader testing.
-- No complete campaign compatibility guarantee is claimed.
+- FPS is bound by CPU command processing in dense scenes (foliage, city streets).
+- Pixel shaders, rect/quad-list vertex shaders and auxiliary tessellation stages still use the bridge's recompiler.
+- Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4; the build still needs `third_party/shadPS4`.
+- On a machine without a page file, total committed memory can reach the Windows limit in long sessions (32 GB RAM); fixed causes are documented in `docs/KNOWN_ISSUES.md`, long-session soak testing continues.
+- Frame generation has not been reviewed frame by frame; input latency with it is not measured.
+- No full-campaign compatibility guarantee.
 
 ## Roadmap
 
-### Phase 1 — Runtime and system services
+### Runtime and services
+- [x] Own loader, kernel, threads, memory, exceptions, CPU patcher
+- [x] File system, system services, save data, offline network / trophies
+- [x] WASAPI audio output, video decoding
+- [ ] Ajm / ATRAC9 decoding
+- [ ] Common dialogs, remaining network and libc functions
 
-- [x] Custom kernel, threading, memory, exception handling, and CPU patching enabled by default.
-- [x] Offline HTTP implementation.
-- [x] Selected offline network and trophy services.
-- [x] Kernel event queues.
-- [x] Save-data implementation and compatibility checks.
-- [x] Native WASAPI audio output.
-- [ ] Complete stability and memory regression testing.
-- [ ] Implement remaining networking and libc functions.
-- [ ] Complete system-message and save-data dialog support.
+### Graphics
+- [x] Own PM4 command processor and Vulkan backend (default)
+- [x] Occlusion queries, smoke and lighting fixes
+- [x] Shader / pipeline disk cache, static pipeline prediction, preparation window
+- [x] DLSS / FSR 3.1 upscaling, FSR 3.1 frame generation
+- [x] Free frame pacing
+- [ ] Faster command recording (the current FPS limit)
 
-### Phase 2 — Audio and video
+### Own shader translator
+- [x] Compute programs
+- [x] Vertex programs (except rect / quad lists)
+- [ ] Pixel programs: interpolation, colour / depth exports, implicit-LOD sampling
+- [ ] Rect / quad lists and auxiliary stages
+- [ ] Own translator by default
 
-- [x] Native audio-output foundation.
-- [ ] Implement and validate `sceVideodec*` using an independently linked FFmpeg dependency.
-- [ ] Implement Ajm / ATRAC9 decoding.
-- [ ] Validate cutscene playback and audio/video synchronization.
-- [ ] Test repeated playback and resource cleanup.
+### Independence
+- [ ] Remove the bridge (`src/bridge/shadps4`)
+- [ ] Build without `third_party/shadPS4`
+- [ ] Validate gameplay, saves, audio, video and graphics against a controlled baseline
 
-### Phase 3 — Graphics and performance
+## Installation
 
-- [x] Custom Vulkan graphics backend.
-- [x] Real Vulkan occlusion queries for light-glow visibility.
-- [x] Lighting and shadow performance profiling.
-- [ ] Reduce unnecessary CPU-side draw preparation.
-- [ ] Improve frame-time consistency.
-- [ ] Complete GPU synchronization and resource-lifetime regression tests.
-- [ ] Replace remaining shader translation dependencies.
+**This project does not distribute the original game, its executable, assets, firmware or any copyrighted content.** A legally obtained copy of the game is required; you prepare your own game files.
 
-### Phase 4 — Complete independence
-
-- [ ] Audit all runtime and build dependencies.
-- [ ] Replace remaining mandatory shadPS4 components.
-- [ ] Build and launch without the bridge.
-- [ ] Validate gameplay, saves, audio, video, and graphics.
-- [ ] Verify performance against a controlled baseline.
-
-### Phase 5 — Binary recompilation research
-
-After the runtime becomes independent, investigate whether parts of the original x86-64 game code can be translated into a Windows-compatible executable.
-
-Initial research will focus on individual functions and modules, correctness validation, ABI compatibility, and measurable performance.
-
-Full-game binary recompilation is a research objective, not a completed feature.
-
-### Future ideas
-
-- Expanded controller support and contextual prompts.
-- Further native Windows integration.
-- Research into cooperative multiplayer feasibility.
-
-These ideas are exploratory and are not currently promised features.
+Development builds are started with the scripts in the repository root (`play.cmd`, `play_native.cmd`, `play_rea.cmd`, `play_rea_own.cmd`). Their names and arguments change during development. Requirements: 64-bit Windows, a Vulkan 1.3 GPU and driver, the user's own game files. A tested public build and its setup procedure are not published yet.
 
 ## Contributing
 
-Technical contributions, reproducible bug reports, performance traces, and documentation improvements are welcome, subject to the project's contribution policy.
-
-Before submitting a performance optimization:
-
-1. Record a reproducible baseline.
-2. Change one variable at a time.
-3. Validate rendering correctness.
-4. Run the relevant Vulkan validation checks.
-5. Report average FPS, 1% lows, and frame-time percentiles when available.
-6. Document failed experiments to prevent repeated work.
-
-Do not submit game dumps, copyrighted game assets, or other proprietary game content.
+Reproducible bug reports, traces and documentation fixes are welcome. For performance changes: record a baseline, change one thing at a time, check rendering and Vulkan validation, report average FPS and 1 % lows, and document failed experiments. Do not submit game dumps or any proprietary game content.
 
 ## Legal notice
 
@@ -445,19 +254,16 @@ This is an independent, unofficial project and is not affiliated with, endorsed 
 
 inFAMOUS and inFAMOUS: Second Son are trademarks and/or copyrighted works of their respective owners.
 
-No original game content is intentionally distributed by this repository. Users must supply their own legally obtained game files.
+No original game content is distributed by this repository. Users must supply their own legally obtained game files.
 
-The licensing terms of third-party components remain applicable to those components. Consult the relevant license files for details.
+Third-party components, including the parts of shadPS4 still used during the migration, remain under their own licences.
 
 ## Acknowledgements
 
-- The authors and maintainers of the open-source tools used in the project.
-- The maintainers of Vulkan-related libraries and development tooling.
-- Researchers documenting PlayStation 4 hardware, graphics behavior, and executable formats.
-- Contributors who help reproduce bugs, analyze traces, and validate fixes.
+- The shadPS4 project, whose emulator core the port started from.
+- The authors and maintainers of the open-source tools and Vulkan libraries used here.
+- Researchers documenting PlayStation 4 hardware, GCN and executable formats.
 
 ## Disclaimer
 
-This project is experimental software. Features may be incomplete, compatibility may vary, and regressions may occur. Back up save data before testing any development build.
-
-**The goal is a technically independent Windows port that preserves the original game while replacing the platform-specific infrastructure required to run it.**
+Experimental software: features may be incomplete and regressions may occur. Back up your save data before testing a development build.
