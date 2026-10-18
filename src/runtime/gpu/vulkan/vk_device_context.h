@@ -60,6 +60,7 @@ struct DeviceCaps {
     bool markers = false;
     bool device_fault = false;      ///< VK_EXT_device_fault
     bool sparse_buffer = false;     ///< sparseBinding + sparseResidencyBuffer on the queue (the buffer cache)
+    bool occlusion_precise = false; ///< occlusionQueryPrecise: the guest's occlusion queries counted exactly
     bool checkpoints = false;       ///< VK_NV_device_diagnostic_checkpoints (diagnostics)
     bool buffer_markers = false;    ///< VK_AMD_buffer_marker (diagnostics)
     bool diagnostics_config = false; ///< VK_NV_device_diagnostics_config (diagnostics)

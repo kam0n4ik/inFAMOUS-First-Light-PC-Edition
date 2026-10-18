@@ -255,6 +255,7 @@ public:
     void Synchronize(u32 queue) override;
     bool WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) override;
     bool CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) override;
+    bool ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) override;
     bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                        u32 pattern) override;
     void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
@@ -883,6 +884,21 @@ private:
     const std::atomic<u64>* map_gen_ = nullptr; ///< P4.7 (SetMapGeneration)
     Diagnostics* diag_ = nullptr;
     VkQueryPool queries_ = VK_NULL_HANDLE; ///< two timestamps per batch slot
+    // The guest's occlusion queries (ZpassOnTimeline): each draw between a query's begin and end event is counted by a
+    // host occlusion query of its own; at the end event the counts are copied to the DB records the guest reads (the
+    // game's light glows: a proxy drawn with and without the depth test, visible part = the ratio).
+    static constexpr u32 kOccSlots = 4096;
+    struct GuestOcclusion {
+        bool open = false;
+        u64 begin = 0;     ///< the results' address (DB 0's begin count)
+        u32 max_slots = 0; ///< DBs of the mask: one draw's count per DB record
+        std::vector<u32> slots;
+    };
+    GuestOcclusion occ_;
+    VkQueryPool occ_pool_ = VK_NULL_HANDLE;
+    u32 occ_next_ = 0;
+    u64 occ_queries_ = 0, occ_draws_ = 0, occ_refused_ = 0, occ_abandoned_ = 0, occ_overflow_ = 0;
+    void OcclusionResetSlots(const std::vector<u32>& slots);
     u32 next_query_slot_ = 0;
     // SSPC-020 / P4.6 night: the GPU's time at each held clock fence's place (SSPC_DIAG_CLOCK=completion: the time the
     // completion was seen, the earlier behaviour)

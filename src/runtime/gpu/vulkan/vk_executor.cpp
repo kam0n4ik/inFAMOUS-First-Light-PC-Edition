@@ -304,6 +304,9 @@ Executor::~Executor() {
     if (queries_ != VK_NULL_HANDLE) {
         f.vkDestroyQueryPool(dev, queries_, nullptr);
     }
+    if (occ_pool_ != VK_NULL_HANDLE) {
+        f.vkDestroyQueryPool(dev, occ_pool_, nullptr);
+    }
     if (insp_pool_ != VK_NULL_HANDLE) {
         f.vkDestroyQueryPool(dev, insp_pool_, nullptr);
     }
@@ -2022,6 +2025,131 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
     images_.Invalidate(dst, bytes); // textures there are uploaded again (they read the video memory copy, after it)
     ++stats_.timeline_copies;
     stats_.timeline_copy_bytes += bytes;
+    return true;
+}
+
+void Executor::OcclusionResetSlots(const std::vector<u32>& slots) {
+    // outside rendering; vkCmdResetQueryPool orders itself after the earlier query commands on those queries
+    for (size_t i = 0; i < slots.size();) {
+        size_t j = i + 1;
+        while (j < slots.size() && slots[j] == slots[j - 1] + 1) {
+            ++j;
+        }
+        Fn().vkCmdResetQueryPool(cur_.cb, occ_pool_, slots[i], static_cast<u32>(j - i));
+        i = j;
+    }
+}
+
+bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb);
+    // SSPC_OCCLUSION=off: the earlier behaviour (every query reads as visible), for A/B
+    static const bool off = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("SSPC_OCCLUSION", v, sizeof(v)) > 0 && std::string_view(v) == "off";
+    }();
+    // 16-byte DB records {begin, end} for DBs 0..n-1 (the game: 8 or 16), in guest memory
+    const u32 dbs = static_cast<u32>(std::popcount(db_mask));
+    if (off || stride != 16 || dbs == 0 || dbs > 16 || db_mask != (1u << dbs) - 1u || (dst & 7) != 0 ||
+        dst >= (1ull << 40)) {
+        ++occ_refused_;
+        return false;
+    }
+    const bool end = occ_.open && dst == occ_.begin + 8;
+    if (!end) {
+        // the begin event: every DB record {begin 0, end 0}, both valid (bit 63); the end's low dword gets a count
+        std::array<u32, 64> block{};
+        for (u32 i = 0; i < dbs; ++i) {
+            block[i * 4 + 1] = 0x80000000u;
+            block[i * 4 + 3] = 0x80000000u;
+        }
+        if (!WriteOnTimeline(queue, seq, dst, block.data(), u64{dbs} * 16)) { // (it notes the work number)
+            ++occ_refused_;
+            return false;
+        }
+        EndRendering();
+        if (occ_pool_ == VK_NULL_HANDLE) {
+            const VkQueryPoolCreateInfo qi{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                           .queryType = VK_QUERY_TYPE_OCCLUSION,
+                                           .queryCount = kOccSlots};
+            if (Fn().vkCreateQueryPool(ctx_.Device(), &qi, nullptr, &occ_pool_) != VK_SUCCESS) {
+                occ_pool_ = VK_NULL_HANDLE;
+                SSPC_LOG(GPU, Error, "occlusion queries: no query pool - the guest's queries read as nothing drawn");
+            } else {
+                Fn().vkCmdResetQueryPool(cur_.cb, occ_pool_, 0, kOccSlots);
+                SSPC_LOG(GPU, Info, "occlusion queries: counted on the host GPU ({})",
+                         ctx_.Caps().occlusion_precise ? "precise sample counts"
+                                                       : "NOT precise - the device has no exact counts");
+            }
+        }
+        if (occ_.open) {
+            ++occ_abandoned_; // a begin without its end: its draws' queries are not read, only made reusable
+            OcclusionResetSlots(occ_.slots);
+        }
+        occ_.open = occ_pool_ != VK_NULL_HANDLE;
+        occ_.begin = dst;
+        occ_.max_slots = dbs;
+        occ_.slots.clear();
+        return true;
+    }
+    // the end event: the counts of the query's draws, one per DB record (the guest sums the DBs)
+    occ_.open = false;
+    ++occ_queries_;
+    if ((occ_queries_ & 0xFFFF) == 1) {
+        SSPC_LOG(GPU, Info, "occlusion queries: {} done, {} draws counted, {} refused, {} begun again before their end, "
+                            "{} draws over a query's DB records",
+                 occ_queries_, occ_draws_, occ_refused_, occ_abandoned_, occ_overflow_);
+    }
+    if (!Begin()) {
+        return false;
+    }
+    if (occ_.slots.empty()) {
+        Note(queue, seq); // nothing drawn: the begin event's zero counts are the result
+        ++commands_;
+        return true;
+    }
+    write_run_ = false;
+    EndRendering();
+    const auto ranges = [&] {
+        acc_reads_.clear();
+        acc_writes_.clear();
+        for (size_t k = 0; k < occ_.slots.size(); ++k) {
+            acc_writes_.push_back({dst + k * 16, dst + k * 16 + 4});
+        }
+    };
+    ranges();
+    if (NeedsBarrier(acc_reads_, acc_writes_, false)) {
+        GlobalBarrier(5);
+    }
+    std::array<std::pair<VkBuffer, u64>, 16> where{};
+    for (size_t k = 0; k < occ_.slots.size(); ++k) {
+        u64 avail = 0;
+        if (!GuestRange(dst + k * 16, 4, true, 4, where[k].first, where[k].second, avail) || avail < 4) {
+            ++occ_refused_;
+            OcclusionResetSlots(occ_.slots);
+            return false; // the processor writes its counts (after Synchronize)
+        }
+    }
+    Note(queue, seq);
+    ++commands_;
+    EndRendering(); // (the ranges' uploads ordered themselves)
+    if (LabelChanges(kLabelOther | 4)) {
+        Label(kLabelOther | 4, "T occlusion counts on the timeline");
+    }
+    InspMark(Inspector::kGpuTransfer);
+    for (size_t k = 0; k < occ_.slots.size(); ++k) {
+        Fn().vkCmdCopyQueryPoolResults(cur_.cb, occ_pool_, occ_.slots[k], 1, where[k].first, where[k].second, 4,
+                                       VK_QUERY_RESULT_WAIT_BIT);
+    }
+    OcclusionResetSlots(occ_.slots);
+    ranges();
+    NoteAccesses(acc_reads_, acc_writes_, false);
+    const u64 bytes = occ_.slots.size() * 16;
+    timeline_writes_.push_back({dst, dst + bytes, cur_.value});
+    ++tw_version_;
+    tw_lo_ = std::min(tw_lo_, dst);
+    tw_hi_ = std::max(tw_hi_, dst + bytes);
+    images_.Invalidate(dst, bytes);
+    ++stats_.timeline_copies;
     return true;
 }
 
@@ -3909,6 +4037,20 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         }
         e.images_count = static_cast<u32>(trace_.images.size()) - e.images_begin;
     }
+    // a draw inside a guest occlusion query (the game's glow proxies): its own host query, read at the query's end
+    u32 occ_slot = ~0u;
+    if (occ_.open && !diag_skip && rendering_) {
+        if (occ_.slots.size() < occ_.max_slots) {
+            occ_slot = occ_next_;
+            occ_next_ = (occ_next_ + 1) % kOccSlots;
+            occ_.slots.push_back(occ_slot);
+            ++occ_draws_;
+            f.vkCmdBeginQuery(cur_.cb, occ_pool_, occ_slot,
+                              ctx_.Caps().occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        } else {
+            ++occ_overflow_;
+        }
+    }
     if (diag_skip) {
         ++stats_.diag_skipped_draws;
     } else {
@@ -3943,6 +4085,9 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     } else {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
     }
+    }
+    if (occ_slot != ~0u) {
+        f.vkCmdEndQuery(cur_.cb, occ_pool_, occ_slot);
     }
     DiagEnd(cid);
     DiagCaptureDraw(prep.pipeline, color_img, true);

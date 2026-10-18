@@ -575,6 +575,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     if (!error.empty()) {
         return nullptr;
     }
+    caps.occlusion_precise = f2.features.occlusionQueryPrecise == VK_TRUE;
     // what the backend does not use and only costs
     // sparse buffers: the buffer cache's mirror of the guest's GPU address space (kept when the device has them)
     caps.sparse_buffer = f2.features.sparseBinding == VK_TRUE && f2.features.sparseResidencyBuffer == VK_TRUE &&

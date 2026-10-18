@@ -733,10 +733,23 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
                 return short_packet(3);
             }
             const u64 dst = (body[1] & ~7u) | (u64{body[2] & 0xFFFF} << 32);
+            const u32 zmask = type == 0x39 ? pipe_stat_mask_ : 0xFFu;
+            const u32 zstride = type == 0x39 ? pipe_stat_stride_ : 16u;
+            if (options_.mode == Mode::Isolated &&
+                options_.work->ZpassOnTimeline(q.id, q.work_seq + 1, dst, zmask, zstride)) {
+                ++q.work_seq;
+                ++stats_.timeline_writes;
+                if (zpass_writes_++ == 0) {
+                    SSPC_LOG(GPU, Info, "command processor: occlusion queries ({} at {:#x}, DBs {:#x}, stride {}): "
+                                        "counted on the host GPU",
+                             type == 0x39 ? "PIXEL_PIPE_STAT_DUMP" : "ZPASS_DONE", dst, zmask, zstride);
+                }
+                return StepStatus::Packet;
+            }
             zpass_count_ += 0x10000;
             const u64 value = zpass_count_ | (1ull << 63);
-            const u32 mask = type == 0x39 ? pipe_stat_mask_ : 0xFFu;
-            const u32 stride = type == 0x39 ? pipe_stat_stride_ : 16u;
+            const u32 mask = zmask;
+            const u32 stride = zstride;
             for (u32 db = 0; db < 16; ++db) {
                 if ((mask >> db & 1) == 0) {
                     continue;

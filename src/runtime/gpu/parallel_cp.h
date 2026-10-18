@@ -258,6 +258,7 @@ public:
     void Interrupt(u32 queue, Cp::FenceKind kind) override;
     void Synchronize(u32 queue) override;
     bool WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) override;
+    bool ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) override;
     bool CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) override;
     bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                        u32 pattern) override;

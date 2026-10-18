@@ -72,6 +72,9 @@ namespace SecondSon::Gpu::Vk {
     X(vkQueueBindSparse)                                                                                               \
     X(vkDestroyQueryPool)                                                                                              \
     X(vkCmdResetQueryPool)                                                                                             \
+    X(vkCmdBeginQuery)                                                                                                 \
+    X(vkCmdEndQuery)                                                                                                   \
+    X(vkCmdCopyQueryPoolResults)                                                                                       \
     X(vkCmdWriteTimestamp2)                                                                                            \
     X(vkGetQueryPoolResults)                                                                                           \
     X(vkCreateBuffer)                                                                                                  \

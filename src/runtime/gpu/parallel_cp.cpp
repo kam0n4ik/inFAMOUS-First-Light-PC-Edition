@@ -1380,6 +1380,17 @@ bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, 
     return ok;
 }
 
+bool ParallelCp::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    // after the draws queued before it (the query's own draw among them), as the executor records it
+    Drain(DrainReason::TimelineWrite);
+    const bool ok = exec_.ZpassOnTimeline(queue, seq, dst, db_mask, stride);
+    SnapshotTimeline();
+    if (ok && frontend_ != nullptr) {
+        AddGpuWrite(dst, dst + 16ull * stride, next_, exec_.RecordedValue());
+    }
+    return ok;
+}
+
 bool ParallelCp::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                                u32 pattern) {
     if (async_writes_ && started_ && !Idle()) {

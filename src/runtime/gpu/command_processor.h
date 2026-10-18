@@ -224,6 +224,14 @@ public:
     /// Isolated: a DMA_DATA memory-to-memory copy recorded on the GPU's timeline after the GPU work before it, instead
     /// of Synchronize + a CPU copy (P4.4). true: recorded - the processor copies nothing itself.
     virtual bool CopyOnTimeline(u32 /*queue*/, u64 /*seq*/, u64 /*src*/, u64 /*dst*/, u64 /*bytes*/) { return false; }
+    /// Isolated: an occlusion count event (EVENT_WRITE ZPASS_DONE / PIXEL_PIPE_STAT_DUMP): every DB of `db_mask` writes
+    /// its 64-bit pixel count (bit 63: valid) at `dst + DB * stride`. A query's begin event writes at its results'
+    /// address, its end event 8 bytes further. The executor counts the draws between the two on the host GPU and
+    /// writes the counts on the GPU's timeline (the game's shaders read them: light glows fade behind walls). true:
+    /// recorded - the processor writes nothing itself.
+    virtual bool ZpassOnTimeline(u32 /*queue*/, u64 /*seq*/, u64 /*dst*/, u32 /*db_mask*/, u32 /*stride*/) {
+        return false;
+    }
     /// Isolated: a DMA_DATA with GDS on one side recorded on the GPU's timeline (GDS is the executor's buffer, which the
     /// shaders bind and Options::gds maps): DataToGds fills `pattern`, MemoryToGds copies from `memory`, GdsToMemory to
     /// it; `gds_offset` in bytes. true: recorded - the processor touches neither side (P4.6).
