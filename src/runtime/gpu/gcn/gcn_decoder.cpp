@@ -137,8 +137,9 @@ std::string_view Mnemonic(Format f, u32 op) {
     return it != m.end() ? it->second : std::string_view{};
 }
 
-bool Decode(std::span<const u32> code, std::vector<Inst>& out, std::string& error) {
+bool Decode(std::span<const u32> code, std::vector<Inst>& out, std::string& error, bool to_end) {
     size_t i = 0;
+    bool ended = false; // (an s_endpgm was decoded)
     while (i < code.size()) {
         Inst in;
         in.offset = static_cast<u32>(i);
@@ -218,12 +219,18 @@ bool Decode(std::span<const u32> code, std::vector<Inst>& out, std::string& erro
                 wide = true;
                 break;
             default:
+                if (ended) {
+                    return true; // (data after the code)
+                }
                 error = fmt::format("dword {}: {:#010x} is no GCN encoding", i, w);
                 return false;
             }
         }
         in.dwords = static_cast<u8>(1 + (wide ? 1 : 0) + (lit ? 1 : 0));
         if (i + in.dwords > code.size()) {
+            if (ended) {
+                return true;
+            }
             error = fmt::format("dword {}: {} {} runs past the code ({} dwords)", i, FormatName(in.format), in.op,
                                 code.size());
             return false;
@@ -238,7 +245,10 @@ bool Decode(std::span<const u32> code, std::vector<Inst>& out, std::string& erro
         out.push_back(in);
         i += in.dwords;
         if (in.format == Format::Sopp && in.op == kSopEndpgm) {
-            break;
+            ended = true;
+            if (!to_end) {
+                break;
+            }
         }
     }
     return true;

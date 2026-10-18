@@ -10,6 +10,7 @@
 
 #include <fmt/format.h>
 
+#include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
 #include "runtime/gpu/shader/game_shader_index.h"
 
@@ -31,6 +32,9 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
     std::map<std::pair<u32, u32>, Count> ops; // (format, opcode)
     std::vector<std::string> failures;
     u64 programs = 0, decoded = 0, instructions = 0, without_end = 0, trailing = 0;
+    u64 cfg_failed = 0, blocks = 0, with_loops = 0, loops = 0, irreducible = 0, unreachable = 0, max_blocks = 0;
+    std::vector<std::string> cfg_failures, irreducible_programs;
+    Cfg cfg;
     std::vector<u32> code;
     std::vector<Inst> insts;
     std::map<u32, std::ifstream> files;
@@ -51,7 +55,7 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
         }
         insts.clear();
         std::string why;
-        if (!Decode(code, insts, why)) {
+        if (!Decode(code, insts, why, true)) {
             failures.push_back(fmt::format("{} @ {:#x}: {}", index.Packs()[loc.pack], loc.offset, why));
             continue;
         }
@@ -62,6 +66,21 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
             ++without_end;
         } else if (last.offset + last.dwords < code.size()) {
             ++trailing; // (data after s_endpgm: inline constants, padding)
+        }
+        std::string cfg_error;
+        if (!BuildCfg(insts, cfg, cfg_error)) {
+            ++cfg_failed;
+            cfg_failures.push_back(fmt::format("{} @ {:#x}: {}", index.Packs()[loc.pack], loc.offset, cfg_error));
+        } else {
+            blocks += cfg.blocks.size();
+            max_blocks = std::max<u64>(max_blocks, cfg.blocks.size());
+            with_loops += cfg.loops > 0 ? 1 : 0;
+            loops += cfg.loops;
+            unreachable += cfg.unreachable;
+            if (!cfg.Reducible()) {
+                ++irreducible;
+                irreducible_programs.push_back(fmt::format("{} @ {:#x}", index.Packs()[loc.pack], loc.offset));
+            }
         }
         std::map<std::pair<u32, u32>, bool> seen;
         for (const Inst& in : insts) {
@@ -90,6 +109,15 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
         text += fmt::format("{:<8} {:<34} {:>10} {:>10}\n", FormatName(f),
                             name.empty() ? fmt::format("UNKNOWN #{}", key.second) : std::string(name), c.programs,
                             c.uses);
+    }
+    text += fmt::format("\ncontrol flow: {} blocks (at most {} in one program); {} programs with loops ({} loops); {} "
+                        "irreducible programs; {} unreachable blocks; {} graphs not built\n",
+                        blocks, max_blocks, with_loops, loops, irreducible, unreachable, cfg_failed);
+    for (const auto& s : cfg_failures) {
+        text += "  not built: " + s + "\n";
+    }
+    for (const auto& s : irreducible_programs) {
+        text += "  irreducible: " + s + "\n";
     }
     text += fmt::format("\nunknown opcodes: {}\ndecode failures: {}\n", unknown, failures.size());
     for (const auto& s : failures) {

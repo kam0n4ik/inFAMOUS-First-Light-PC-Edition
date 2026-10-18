@@ -1,7 +1,7 @@
-GCN inventory of the game's programs (SecondSonPC decoder): 10301 programs, 10301 decoded, 5353834 instructions; 0 without s_endpgm, 195 with data after it; 270 distinct opcodes
+GCN inventory of the game's programs (SecondSonPC decoder): 10301 programs, 10301 decoded, 5354419 instructions; 0 without s_endpgm, 0 with data after it; 270 distinct opcodes
 
 format   opcode                               programs       uses
-SOPP     s_endpgm                                10301      10301
+SOPP     s_endpgm                                10301      10496
 SOP1     s_mov_b32                               10301      55933
 SOPP     s_waitcnt                               10296     435993
 VOP1     v_mov_b32                               10241     321592
@@ -26,7 +26,7 @@ SMRD     s_load_dwordx4                           7427     117760
 VOP1     v_rsq_f32                                7245      19889
 VOP3     v_med3_f32                               7204       8676
 SMRD     s_buffer_load_dwordx4                    7060      32119
-SOP1     s_mov_b64                                6992      53555
+SOP1     s_mov_b64                                6992      53750
 VOP2     v_madak_f32                              6987      53177
 VOP1     v_cvt_i32_f32                            6690      30562
 VOP1     v_rcp_f32                                6662      24294
@@ -86,7 +86,7 @@ MUBUF    buffer_load_dwordx2                      2750      21398
 VOP2     v_subrev_f32                             2676      11432
 VOP3     v_addc_u32                               2299     102850
 VOP2     v_addc_u32                               2263      18021
-EXP      exp                                      2257      10445
+EXP      exp                                      2257      10640
 VOP3     v_cmp_gt_f32                             2252      34921
 VOP3     v_cmp_le_i32                             2076      72039
 VOP3     v_add_f32                                2063       5390
@@ -271,6 +271,8 @@ VOP1     v_cvt_f32_f64                               1          2
 VOP1     v_cvt_f64_f32                               1          5
 DS       ds_read2_b64                                1          1
 SOP2     s_min_i32                                   1          1
+
+control flow: 159467 blocks (at most 92 in one program); 4449 programs with loops (9773 loops); 0 irreducible programs; 0 unreachable blocks; 0 graphs not built
 
 unknown opcodes: 2
 decode failures: 0

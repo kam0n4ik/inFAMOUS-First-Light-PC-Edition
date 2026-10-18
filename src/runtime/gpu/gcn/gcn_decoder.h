@@ -70,8 +70,10 @@ Operands GetOperands(const Inst& in);
 /// The mnemonic of (format, opcode), or "" when the table has none (an opcode SecondSonPC does not know).
 std::string_view Mnemonic(Format f, u32 op);
 
-/// The program's instructions up to and including its s_endpgm (or the end of `code`). false: an encoding that is
-/// not GCN's, or an instruction running past `code`; `error` says which (instructions decoded so far are kept).
-bool Decode(std::span<const u32> code, std::vector<Inst>& out, std::string& error);
+/// The program's instructions up to and including its first s_endpgm (or the end of `code`). With `to_end`, on to
+/// the end of `code`: code after the first s_endpgm (an early exit's target) is decoded too, and the first word that
+/// is no GCN instruction after an s_endpgm ends it quietly (data: inline constants, padding). false: an encoding that
+/// is not GCN's before any s_endpgm, or an instruction running past `code`; `error` says which.
+bool Decode(std::span<const u32> code, std::vector<Inst>& out, std::string& error, bool to_end = false);
 
 } // namespace SecondSon::Gpu::Gcn
