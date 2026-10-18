@@ -135,6 +135,7 @@ add_library(sspc_runtime STATIC
     src/runtime/memory/virtual_memory.cpp
     src/runtime/memory/vma_map.cpp
     src/runtime/net/net_util.cpp
+    src/runtime/np/np_manager.cpp
     src/runtime/pad/pad.cpp
     src/runtime/playgo/playgo.cpp
     src/runtime/psf/param_sfo.cpp

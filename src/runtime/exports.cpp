@@ -36,6 +36,9 @@ std::span<const Export> AppContentExports(); // runtime/app_content/app_content.
 namespace Net {
 std::span<const Export> NetUtilExports(); // runtime/net/net_util.cpp
 }
+namespace Np {
+std::span<const Export> NpManagerExports(); // runtime/np/np_manager.cpp
+}
 namespace Libc {
 std::span<const Export> LibcMemExports(); // runtime/libc/libc_mem.cpp
 }
@@ -85,7 +88,7 @@ std::vector<Export> Collect() {
                              Kernel::DirectMemoryExports(), Kernel::ProcessExports(), Kernel::Threads::ThreadExports(),
                              Kernel::Signals::SignalExports(), Kernel::GuestErrno::Exports(),
                              Kernel::MemoryApi::Exports(), Kernel::Clock::Exports(),
-                             Net::NetUtilExports(), Libc::LibcMemExports(), Gpu::Gnm::GnmExports(), Gpu::VideoOut::Exports(),
+                             Net::NetUtilExports(), Np::NpManagerExports(), Libc::LibcMemExports(), Gpu::Gnm::GnmExports(), Gpu::VideoOut::Exports(),
                              std::span<const Export>(kFilesystemObservers)}) {
         all.insert(all.end(), group.begin(), group.end());
     }
