@@ -121,6 +121,9 @@ private:
     bool BufferKnown(s32 buffer) const;
     void EmitSmrd(const Inst& in, u32 index, std::string_view name);
     bool EmitBuffer(const Inst& in, u32 index, std::string_view name);
+    bool EmitTbuffer(const Inst& in, u32 index, std::string_view name);
+    Id BufferAddress(const Inst& in, u32 buffer);              ///< MUBUF / MTBUF: the byte address in the binding
+    Id ReadBits(u32 buffer, Id byte_addr, u32 bit, u32 width); ///< `width` (<= 32) bits at byte_addr * 8 + bit
     u32 cur_index_ = 0;
     std::vector<Id> interface_; ///< the entry point's interface (every global variable used: SPIR-V 1.4+)
     Id LaneId();
@@ -506,6 +509,124 @@ bool Emitter::EmitBuffer(const Inst& in, u32 index, std::string_view name) {
     return true;
 }
 
+Id Emitter::BufferAddress(const Inst& in, u32 buffer) {
+    const bool offen = ((in.w0 >> 12) & 1) != 0, idxen = ((in.w0 >> 13) & 1) != 0;
+    const u32 vaddr = kVgpr + (in.w1 & 0xFF);
+    Id addr = b_.Op(Op::OpIAdd, t_u32_, {Get((in.w1 >> 24) & 0xFF, in), b_.U32(in.w0 & 0xFFF)});
+    if (idxen) {
+        const Id stride = b_.Op(Op::OpBitFieldUExtract, t_u32_, {SharpDword(buffer, 1), b_.U32(16), b_.U32(14)});
+        addr = b_.Op(Op::OpIAdd, t_u32_, {addr, b_.Op(Op::OpIMul, t_u32_, {Get(vaddr, in), stride})});
+    }
+    if (offen) {
+        addr = b_.Op(Op::OpIAdd, t_u32_, {addr, Get(idxen ? vaddr + 1 : vaddr, in)});
+    }
+    return b_.Op(Op::OpIAdd, t_u32_, {addr, BufOffset(buffer)});
+}
+
+Id Emitter::ReadBits(u32 buffer, Id byte_addr, u32 bit, u32 width) {
+    // bits [s, s + width) of (word[i] | word[i + 1] << 32): i = addr / 4 + (bit / 32), s = (addr % 4) * 8 + bit % 32
+    const auto load = [&](Id i) {
+        return b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {buffers_[buffer], b_.U32(0), i})});
+    };
+    const Id bitpos = b_.Op(Op::OpIAdd, t_u32_,
+                            {b_.Op(Op::OpShiftLeftLogical, t_u32_, {b_.Op(Op::OpBitwiseAnd, t_u32_, {byte_addr, b_.U32(3)}), b_.U32(3)}),
+                             b_.U32(bit)});
+    const Id idx = b_.Op(Op::OpIAdd, t_u32_, {b_.Op(Op::OpShiftRightLogical, t_u32_, {byte_addr, b_.U32(2)}),
+                                             b_.Op(Op::OpShiftRightLogical, t_u32_, {bitpos, b_.U32(5)})});
+    const Id shift = b_.Op(Op::OpBitwiseAnd, t_u32_, {bitpos, b_.U32(31)});
+    const Id lo = load(idx);
+    const Id hi = load(b_.Op(Op::OpIAdd, t_u32_, {idx, b_.U32(1)}));
+    const Id joined = b_.Op(Op::OpBitwiseOr, t_u32_,
+                            {b_.Op(Op::OpShiftRightLogical, t_u32_, {lo, shift}),
+                             b_.Op(Op::OpShiftLeftLogical, t_u32_, {hi, b_.Op(Op::OpISub, t_u32_, {b_.U32(32), shift})})});
+    // (a shift by 32 is undefined: within one dword the field is lo's)
+    const Id inside = b_.Op(Op::OpULessThanEqual, t_bool_, {b_.Op(Op::OpIAdd, t_u32_, {shift, b_.U32(width)}), b_.U32(32)});
+    if (width == 32) {
+        return Select(t_u32_, b_.Op(Op::OpIEqual, t_bool_, {shift, b_.U32(0)}), lo, joined);
+    }
+    const Id simple = b_.Op(Op::OpBitFieldUExtract, t_u32_, {lo, shift, b_.U32(width)});
+    const Id spanned = b_.Op(Op::OpBitFieldUExtract, t_u32_, {joined, b_.U32(0), b_.U32(width)});
+    return Select(t_u32_, inside, simple, spanned);
+}
+
+bool Emitter::EmitTbuffer(const Inst& in, u32 index, std::string_view name) {
+    if (!name.starts_with("tbuffer_load_format_") || ((in.w0 >> 15) & 1) != 0) {
+        return false; // (stores: not used by the game; addr64)
+    }
+    struct Fmt {
+        u32 comps;
+        std::array<u8, 4> bits;
+    };
+    // the data formats (dfmt): components and their widths, from bit 0
+    static constexpr Fmt kFmt[15] = {
+        {0, {0, 0, 0, 0}},     {1, {8, 0, 0, 0}},    {1, {16, 0, 0, 0}},   {2, {8, 8, 0, 0}},
+        {1, {32, 0, 0, 0}},    {2, {16, 16, 0, 0}},  {3, {10, 11, 11, 0}}, {3, {11, 11, 10, 0}},
+        {4, {10, 10, 10, 2}},  {4, {2, 10, 10, 10}}, {4, {8, 8, 8, 8}},    {2, {32, 32, 0, 0}},
+        {4, {16, 16, 16, 16}}, {3, {32, 32, 32, 0}}, {4, {32, 32, 32, 32}},
+    };
+    const u32 dfmt = (in.w0 >> 19) & 0xF, nfmt = (in.w0 >> 23) & 7;
+    if (dfmt == 0 || dfmt > 14 || dfmt == 6 || dfmt == 7 || nfmt == 6) {
+        return false; // (invalid / packed floats / the reserved number format)
+    }
+    const Fmt& f = kFmt[dfmt];
+    for (u32 c = 0; c < f.comps; ++c) {
+        if (nfmt == 7 && f.bits[c] != 16 && f.bits[c] != 32) {
+            return false; // (floats of other widths)
+        }
+    }
+    const u32 n = name.ends_with("xyzw") ? 4 : name.ends_with("xyz") ? 3 : name.ends_with("xy") ? 2 : 1;
+    const u32 buffer = static_cast<u32>(res_.buffer_of[index]);
+    const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    const Id addr = BufferAddress(in, buffer);
+    const bool int_format = nfmt == 4 || nfmt == 5;
+    u32 bit = 0;
+    for (u32 c = 0; c < n; ++c) {
+        if (c >= f.comps) {
+            // missing components: 0, 0, 0 and 1 (1.0 or 1 by the number format)
+            Set(vdata + c, c == 3 ? (int_format ? b_.U32(1) : b_.U32(0x3F800000u)) : b_.U32(0));
+            continue;
+        }
+        const u32 w = f.bits[c];
+        const Id raw = ReadBits(buffer, addr, bit, w);
+        bit += w;
+        const auto sext = [&]() {
+            return w == 32 ? Bit(t_i32_, raw) : b_.Op(Op::OpBitFieldSExtract, t_i32_, {Bit(t_i32_, raw), b_.U32(0), b_.U32(w)});
+        };
+        const float max_u = static_cast<float>(w == 32 ? 4294967295.0 : static_cast<double>((1ull << w) - 1));
+        const float max_s = static_cast<float>((1ull << (w - 1)) - 1);
+        Id v = raw;
+        switch (nfmt) {
+        case 0: // unorm
+            v = Bit(t_u32_, b_.Op(Op::OpFMul, t_f32_, {b_.Op(Op::OpConvertUToF, t_f32_, {raw}), b_.F32(1.0f / max_u)}));
+            break;
+        case 1: // snorm
+            v = Bit(t_u32_, Glsl(GLSLstd450FMax, t_f32_,
+                                 {b_.Op(Op::OpFMul, t_f32_, {b_.Op(Op::OpConvertSToF, t_f32_, {sext()}), b_.F32(1.0f / max_s)}),
+                                  b_.F32(-1.0f)}));
+            break;
+        case 2: // uscaled
+            v = Bit(t_u32_, b_.Op(Op::OpConvertUToF, t_f32_, {raw}));
+            break;
+        case 3: // sscaled
+            v = Bit(t_u32_, b_.Op(Op::OpConvertSToF, t_f32_, {sext()}));
+            break;
+        case 5: // sint
+            v = Bit(t_u32_, sext());
+            break;
+        case 7: // float
+            if (w == 16) {
+                v = Bit(t_u32_, b_.Op(Op::OpCompositeExtract, t_f32_,
+                                      {Glsl(GLSLstd450UnpackHalf2x16, b_.TypeVector(t_f32_, 2), {raw}), 0}));
+            }
+            break;
+        default: // uint
+            break;
+        }
+        Set(vdata + c, v);
+    }
+    return true;
+}
+
 Id Emitter::LaneId() {
     if (lane_id_ == 0) {
         lane_id_ = b_.Variable(b_.TypePointer(spv::StorageClass::Input, t_u32_), spv::StorageClass::Input);
@@ -583,6 +704,16 @@ void Emitter::Emit(const Inst& in) {
         }
         if (!options_.stub_memory) {
             throw Unsupported{fmt::format("{} (resource: {})", name, res_.error)};
+        }
+        EmitStub(in, name);
+        return;
+    case Format::Mtbuf:
+        if (res_.buffer_of[cur_index_] >= 0 && BufferKnown(res_.buffer_of[cur_index_]) &&
+            EmitTbuffer(in, cur_index_, name)) {
+            return;
+        }
+        if (!options_.stub_memory) {
+            throw Unsupported{std::string(name)};
         }
         EmitStub(in, name);
         return;

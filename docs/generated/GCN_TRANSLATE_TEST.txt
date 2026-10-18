@@ -1,31 +1,58 @@
-SecondSonPC's own GCN translator on the game's programs: 10301 programs, 4309 emitted (41.8 %), 4308 valid (spirv-val, vulkan1.3; 41.8 %), 67211230 words
+SecondSonPC's own GCN translator on the game's programs: 10301 programs, 6147 emitted (59.7 %), 6146 valid (spirv-val, vulkan1.3; 59.7 %), 130079130 words
 
 stopped at (programs, first example):
-    3509  tbuffer_load_format_xyzw                 art/cache/a1.xpps@3a4a94
     1888  v_interp_p1_f32                          art/cache/a1.xpps@3d3694
+    1265  ds_append                                art/cache/a1.xpps@3a4a94
      282  s_swappc_b64                             art/cache/a1.xpps@3bb294
-      69  image_sample_lz                          art/cache/all_shaders.xpps@64128
-      58  ds_append                                art/cache/a8.xpps@1343d48
+     202  buffer_atomic_add                        art/cache/a25.xpps@109aa8c
+     115  ds_write_b32                             art/cache/angel_demon.xpps@177f298
+      82  image_sample_lz                          art/cache/all_shaders.xpps@64128
       38  image_load_mip                           art/cache/a11.xpps@1021fac
-      35  ds_write_b32                             art/cache/concrete_knight.xpps@ea93e8
-      12  exp                                      art/cache/a1.xpps@40cb94
+      36  exp                                      art/cache/a1.xpps@40cb94
+      13  buffer_load_dword                        art/cache/angel_demon.xpps@1880698
        9  image_sample                             art/cache/a25.xpps@10af78c
+       8  s_buffer_load_dwordx4 (resource: dword 457: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/tv_boss.xpps@1330ac8
+       6  buffer_load_dwordx4                      art/cache/concrete_rook.xpps@fc8c64
        5  buffer_load_format_xyzw                  art/cache/all_shaders.xpps@59b28
        5  s_buffer_load_dwordx4 (resource: dword 1331: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b23.xpps@ea5fb0
-       4  buffer_load_format_xyz                   art/cache/all_shaders.xpps@71328
+       4  buffer_load_dwordx2                      art/cache/angel_demon.xpps@17bd498
        4  v_interp_mov_f32                         art/cache/a1.xpps@3ddf94
-       3  s_buffer_load_dwordx16 (resource: dword 352: s_buffer_load_dwordx16 - the V# in s[32:35] is not found) art/cache/angel_demon.xpps@185f898
+       4  buffer_load_format_xyz                   art/cache/all_shaders.xpps@71328
+       3  buffer_load_dwordx3                      art/cache/concrete_bishop.xpps@df262c
+       3  s_load_dwordx4 (resource: dword 354: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/c56.xpps@142bb40
+       3  s_buffer_load_dwordx4 (resource: dword 1383: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_knight.xpps@edeae8
+       3  s_buffer_load_dwordx4 (resource: dword 1341: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@17f1398
+       3  s_buffer_load_dwordx4 (resource: dword 478: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104d3ae4
        3  image_load                               art/cache/all_shaders.xpps@85018
+       3  s_buffer_load_dwordx4 (resource: dword 487: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104cabe4
+       3  s_buffer_load_dwordx4 (resource: dword 516: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104b8de4
+       3  s_buffer_load_dwordx16 (resource: dword 352: s_buffer_load_dwordx16 - the V# in s[32:35] is not found) art/cache/angel_demon.xpps@185f898
+       2  s_buffer_load_dwordx4 (resource: dword 1168: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@10217be4
+       2  s_buffer_load_dwordx4 (resource: dword 1320: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_knight.xpps@ea34e8
+       2  s_buffer_load_dwordx4 (resource: dword 1297: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fb9c5e4
        2  image_get_resinfo                        art/cache/all_shaders.xpps@67b28
        2  s_buffer_load_dwordx4 (resource: dword 1299: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_cb.sprig.xpps@840ed8
-       2  s_buffer_load_dwordx4 (resource: dword 1297: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fb9c5e4
-       2  s_buffer_load_dwordx4 (resource: dword 1320: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_knight.xpps@ea34e8
-       2  s_buffer_load_dwordx4 (resource: dword 1329: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b10.xpps@13e32b4
+       2  s_buffer_load_dwordx4 (resource: dword 1335: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@a0540e4
        2  s_buffer_load_dwordx4 (resource: dword 149: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1060c4e4
+       2  s_buffer_load_dwordx4 (resource: dword 1434: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@619fedc
+       2  s_buffer_load_dwordx4 (resource: dword 1420: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_bishop.xpps@e2b92c
+       2  s_buffer_load_dwordx4 (resource: dword 1329: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b10.xpps@13e32b4
+       2  s_buffer_load_dwordx4 (resource: dword 417: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@105803e4
+       2  s_buffer_load_dwordx4 (resource: dword 431: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104d7be4
+       2  s_buffer_load_dwordx4 (resource: dword 446: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/tv_boss.xpps@13382c8
+       2  s_buffer_load_dwordx4 (resource: dword 1551: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd70ee4
+       2  s_buffer_load_dwordx4 (resource: dword 481: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104cc5e4
+       2  s_load_dwordx4 (resource: dword 235: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@1076a2e4
        2  s_buffer_load_dwordx4 (resource: dword 58: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a587e4
        2  s_buffer_load_dwordx4 (resource: dword 879: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_bishop.xpps@e7272c
        2  s_buffer_load_dwordx4 (resource: dword 945: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@183c598
+       2  s_load_dwordx4 (resource: dword 444: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/a25.xpps@10a128c
+       2  s_load_dwordx4 (resource: dword 446: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_seaport.sprig.xpps@634d6dc
        2  v_div_scale_f32                          art/cache/all_shaders.xpps@57c28
+       1  s_buffer_load_dwordx4 (resource: dword 109: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10982ae4
+       1  s_buffer_load_dwordx4 (resource: dword 111: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1011b7e4
+       1  s_buffer_load_dwordx4 (resource: dword 112: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/laser_boss.xpps@17dfe5c
+       1  s_buffer_load_dwordx4 (resource: dword 113: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@108843e4
        1  s_buffer_load_dwordx4 (resource: dword 114: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/msn_lb.sprig.xpps@8532b4
        1  s_buffer_load_dwordx4 (resource: dword 115: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1086e3e4
        1  s_buffer_load_dwordx4 (resource: dword 116: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1058c3e4
@@ -42,38 +69,103 @@ stopped at (programs, first example):
        1  s_buffer_load_dwordx4 (resource: dword 1315: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@100792e4
        1  s_buffer_load_dwordx4 (resource: dword 1316: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff3a5e4
        1  s_buffer_load_dwordx4 (resource: dword 1317: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@618ebdc
-       1  buffer_load_format_x                     art/cache/all_shaders.xpps@7fb18
        1  s_buffer_load_dwordx4 (resource: dword 1323: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd491e4
        1  s_buffer_load_dwordx4 (resource: dword 1326: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@6156bdc
        1  s_buffer_load_dwordx4 (resource: dword 1327: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@6178cdc
        1  s_buffer_load_dwordx4 (resource: dword 1328: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fdf42e4
+       1  s_buffer_load_dwordx4 (resource: dword 1336: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@1007c8e4
+       1  s_buffer_load_dwordx4 (resource: dword 1345: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc612e4
+       1  s_buffer_load_dwordx4 (resource: dword 1348: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/c11.xpps@eabf50
+       1  s_buffer_load_dwordx4 (resource: dword 1349: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff875e4
+       1  s_buffer_load_dwordx4 (resource: dword 1378: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fecf6e4
+       1  s_buffer_load_dwordx4 (resource: dword 1392: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fde34e4
+       1  s_buffer_load_dwordx4 (resource: dword 1404: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff699e4
+       1  s_buffer_load_dwordx4 (resource: dword 1407: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff52de4
+       1  s_buffer_load_dwordx4 (resource: dword 1433: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_at.sprig.xpps@665390
+       1  s_buffer_load_dwordx4 (resource: dword 148: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/msn_cb.sprig.xpps@883cd8
+       1  s_buffer_load_dwordx4 (resource: dword 1510: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/celia.xpps@c0af40
+       1  s_buffer_load_dwordx4 (resource: dword 1511: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@17fb998
+       1  s_buffer_load_dwordx4 (resource: dword 1537: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fe2e1e4
+       1  s_buffer_load_dwordx4 (resource: dword 1539: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ff6b5e4
+       1  s_buffer_load_dwordx4 (resource: dword 1615: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd0b1e4
+       1  s_buffer_load_dwordx4 (resource: dword 1623: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/b92.xpps@b2f9d8
+       1  s_buffer_load_dwordx4 (resource: dword 1624: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_bishop.xpps@e29b2c
+       1  s_buffer_load_dwordx4 (resource: dword 1631: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_sam.sprig.xpps@8df04c
+       1  s_buffer_load_dwordx4 (resource: dword 1684: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@17cfc98
+       1  s_buffer_load_dwordx4 (resource: dword 1691: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/concrete_rook.xpps@f69e64
+       1  s_buffer_load_dwordx4 (resource: dword 1717: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc69ae4
+       1  s_buffer_load_dwordx4 (resource: dword 1744: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd415e4
+       1  s_buffer_load_dwordx4 (resource: dword 174: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@106b07e4
+       1  s_buffer_load_dwordx4 (resource: dword 1769: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fcff1e4
+       1  s_buffer_load_dwordx4 (resource: dword 1801: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@17bf798
+       1  s_buffer_load_dwordx4 (resource: dword 1807: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fbd7ce4
+       1  s_buffer_load_dwordx4 (resource: dword 1819: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc5f0e4
+       1  s_buffer_load_dwordx4 (resource: dword 1829: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fbe9be4
+       1  s_buffer_load_dwordx4 (resource: dword 1847: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc1e3e4
+       1  s_buffer_load_dwordx4 (resource: dword 1958: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@17afe98
+       1  s_buffer_load_dwordx4 (resource: dword 1959: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/augustine.xpps@15f96b4
+       1  s_buffer_load_dwordx4 (resource: dword 2009: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fbc14e4
+       1  s_buffer_load_dwordx4 (resource: dword 2042: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fbc80e4
+       1  s_buffer_load_dwordx4 (resource: dword 2143: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fb628e4
+       1  s_buffer_load_dwordx4 (resource: dword 233: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/angel_demon.xpps@187b998
+       1  s_buffer_load_dwordx4 (resource: dword 235: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/tv_boss.xpps@13506c8
+       1  s_buffer_load_dwordx4 (resource: dword 245: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_cbc.sprig.xpps@103b28
+       1  s_buffer_load_dwordx4 (resource: dword 2783: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fa179e4
+       1  s_buffer_load_dwordx4 (resource: dword 2788: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fa1dde4
+       1  s_buffer_load_dwordx4 (resource: dword 282: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/concrete_knight.xpps@f9a0e8
+       1  s_buffer_load_dwordx4 (resource: dword 298: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@1063a5e4
+       1  s_buffer_load_dwordx4 (resource: dword 305: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104c43e4
+       1  s_buffer_load_dwordx4 (resource: dword 3448: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@1770e98
+       1  s_buffer_load_dwordx4 (resource: dword 34: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@109143e4
+       1  buffer_load_format_x                     art/cache/all_shaders.xpps@7fb18
+       1  s_buffer_load_dwordx4 (resource: dword 422: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_seaport.sprig.xpps@635a4dc
        1  buffer_store_format_x                    art/cache/all_shaders.xpps@77318
        1  ds_write_b64                             art/cache/all_shaders.xpps@4ff28
-       1  s_buffer_load_dwordx4 (resource: dword 1335: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fce31e4
-       1  s_buffer_load_dwordx4 (resource: dword 1345: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc612e4
-       1  buffer_load_dwordx4                      art/cache/core_common.sprig.xpps@1036f6e4
-       1  s_buffer_load_dwordx4 (resource: dword 153: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fbaede4
-       1  s_buffer_load_dwordx4 (resource: dword 159: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1062bfe4
-       1  s_buffer_load_dwordx4 (resource: dword 2143: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fb628e4
-       1  image_sample_c_lz                        art/cache/all_shaders.xpps@65f28
-       1  s_buffer_load_dwordx4 (resource: dword 34: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@109143e4
        1  s_buffer_load_dwordx4 (resource: dword 454: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@103c91e4
-       1  s_buffer_load_dwordx4 (resource: dword 506: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_seaport.sprig.xpps@61508dc
-       1  s_buffer_load_dwordx4 (resource: dword 52: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a5dfe4
-       1  s_buffer_load_dwordx4 (resource: dword 577: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104937e4
+       1  s_buffer_load_dwordx4 (resource: dword 456: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@1049ede4
+       1  image_sample_c_lz                        art/cache/all_shaders.xpps@65f28
+       1  s_buffer_load_dwordx4 (resource: dword 461: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104e17e4
+       1  s_buffer_load_dwordx4 (resource: dword 1547: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fdd44e4
        1  image_store                              art/cache/all_shaders.xpps@65828
+       1  s_buffer_load_dwordx4 (resource: dword 159: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1062bfe4
+       1  s_buffer_load_dwordx4 (resource: dword 497: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@1047a7e4
+       1  s_buffer_load_dwordx4 (resource: dword 506: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_seaport.sprig.xpps@61508dc
+       1  s_buffer_load_dwordx4 (resource: dword 1605: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fc99fe4
+       1  s_buffer_load_dwordx4 (resource: dword 1005: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@102586e4
+       1  s_buffer_load_dwordx4 (resource: dword 528: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@10491de4
+       1  s_buffer_load_dwordx4 (resource: dword 52: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a5dfe4
+       1  s_buffer_load_dwordx4 (resource: dword 575: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fc387e4
+       1  s_buffer_load_dwordx4 (resource: dword 577: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104937e4
+       1  s_buffer_load_dwordx4 (resource: dword 101: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/msn_cbc.sprig.xpps@104f28
+       1  s_buffer_load_dwordx4 (resource: dword 601: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@10462de4
+       1  s_buffer_load_dwordx4 (resource: dword 619: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@103950e4
        1  s_buffer_load_dwordx4 (resource: dword 65: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10a513e4
        1  s_buffer_load_dwordx4 (resource: dword 662: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@1852f98
-       1  s_buffer_load_dwordx4 (resource: dword 245: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_cbc.sprig.xpps@103b28
-       1  s_buffer_load_dwordx4 (resource: dword 101: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/msn_cbc.sprig.xpps@104f28
-       1  s_buffer_load_dwordx4 (resource: dword 105: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fa0b0e4
-       1  s_load_dwordx4 (resource: dword 219: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@10884be4
-       1  s_buffer_load_dwordx4 (resource: dword 109: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@10982ae4
-       1  s_buffer_load_dwordx4 (resource: dword 111: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@1011b7e4
-       1  v_cvt_f64_i32                            art/cache/all_shaders.xpps@6cd28
-       1  s_buffer_load_dwordx4 (resource: dword 112: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/laser_boss.xpps@17dfe5c
-       1  s_buffer_load_dwordx4 (resource: dword 113: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@108843e4
        1  s_buffer_load_dwordx4 (resource: dword 71: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/tv_boss.xpps@1355fc8
+       1  s_buffer_load_dwordx4 (resource: dword 1020: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@102f81e4
+       1  s_buffer_load_dwordx4 (resource: dword 931: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@101831e4
+       1  s_buffer_load_dwordx4 (resource: dword 105: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fa0b0e4
+       1  s_buffer_load_dwordx4 (resource: dword 1559: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/msn_smi.sprig.xpps@1397210
+       1  s_buffer_load_dwordx8 (resource: dword 750: s_buffer_load_dwordx8 - the V# in s[28:31] is not found) art/cache/augustine.xpps@161b6b4
+       1  s_load_dwordx4 (resource: dword 219: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@10884be4
+       1  s_buffer_load_dwordx4 (resource: dword 518: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@104745e4
+       1  s_load_dwordx4 (resource: dword 264: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/laser_boss.xpps@17cae5c
+       1  s_load_dwordx4 (resource: dword 275: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@106dabe4
+       1  s_load_dwordx4 (resource: dword 297: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/msn_lb.sprig.xpps@8288b4
+       1  s_load_dwordx4 (resource: dword 298: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/msn_lb.sprig.xpps@8291b4
+       1  s_load_dwordx4 (resource: dword 321: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@10580fe4
+       1  s_load_dwordx4 (resource: dword 322: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/angel_demon.xpps@1886998
+       1  s_buffer_load_dwordx4 (resource: dword 1607: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@fd1e7e4
+       1  s_load_dwordx4 (resource: dword 363: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@10617fe4
+       1  s_load_dwordx4 (resource: dword 441: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_seaport.sprig.xpps@6357fdc
+       1  s_buffer_load_dwordx4 (resource: dword 1066: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@10238ce4
+       1  s_buffer_load_dwordx4 (resource: dword 1087: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@1027e1e4
+       1  s_load_dwordx4 (resource: dword 449: s_load_dwordx4 - its pointer s[12:13] is not in the user data) art/cache/core_common.sprig.xpps@104681e4
+       1  s_buffer_load_dwordx4 (resource: dword 1542: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@ffd61e4
+       1  v_cvt_f64_i32                            art/cache/all_shaders.xpps@6cd28
+       1  s_buffer_load_dwordx4 (resource: dword 1093: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/angel_demon.xpps@1831b98
+       1  s_buffer_load_dwordx4 (resource: dword 153: s_buffer_load_dwordx4 - the V# in s[16:19] is not found) art/cache/core_common.sprig.xpps@fbaede4
+       1  s_buffer_load_dwordx4 (resource: dword 948: s_buffer_load_dwordx4 - the V# in s[4:7] is not found) art/cache/core_common.sprig.xpps@10192be4
 
 invalid modules: 1 kinds (each kind's first module: C:\Users\kamon\AppData\Local\Temp\sspc_gcn_translate\invalid_<n>.spv)
        1  error: line ###: Header block '##[%##]' is contained in the loop construct headed by '##[%##]', but its merge block '##[
