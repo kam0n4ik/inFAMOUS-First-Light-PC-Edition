@@ -100,6 +100,7 @@ struct EmitOptions {
         u32 kind = 0;          ///< the output's type: 0 float, 1 uint, 2 sint (the target's number class, remapped)
         u32 conversion = 0;    ///< as VertexInput's, in the write direction
         std::array<u8, 4> map{0, 1, 2, 3}; ///< output component i = the exported component map[i] (CB COMP_SWAP)
+        bool self_scale = false; ///< a MIN/MAX blend with SRC/DST colour factors: RGB squared (the bridge's emulation)
     };
     struct FragmentOptions {
         u32 input_addr = 0, input_ena = 0; ///< SPI_PS_INPUT_ADDR / ENA
@@ -107,7 +108,12 @@ struct EmitOptions {
         u32 num_inputs = 0;
         std::array<FragmentInput, 32> inputs{};
         std::array<ColorTarget, 8> targets{};
-        u32 mrtz_mask = 0; ///< bit 0 depth, 1 stencil, 2 sample mask (DB_SHADER_CONTROL)
+        u32 mrtz_mask = 0; ///< bit 0 depth, 1 stencil, 2 sample mask (DB_SHADER_CONTROL, SPI_SHADER_Z_FORMAT)
+        bool early_tests = false; ///< DEPTH_BEFORE_SHADER: EarlyFragmentTests
+        /// the bridge's needs_manual_interpolation (NVIDIA): the inputs are per-vertex (PerVertexKHR), the I/J VGPRs
+        /// BaryCoordKHR's y/z, v_interp_p1/p2 the hardware's P0 + I * (P1 - P0) + J * (P2 - P0) - exact for an input
+        /// constant over the primitive (an index), which the device's interpolation is not
+        bool manual_interpolation = false;
     };
     bool fragment = false;
     FragmentOptions fs;

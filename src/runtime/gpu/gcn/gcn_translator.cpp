@@ -166,7 +166,9 @@ public:
     GS::TranslationResult Translate(const GS::TranslationRequest& req) override {
         const bool cs = req.hw == GS::HwStage::Cs && req.sw == GS::SwStage::Compute && (stages_ & 1) != 0;
         const bool vs = req.hw == GS::HwStage::Vs && req.sw == GS::SwStage::Vertex && (stages_ & 2) != 0;
-        if ((cs || vs) && Wanted(req.footer_hash)) {
+        const bool ps = req.hw == GS::HwStage::Ps && req.sw == GS::SwStage::Fragment && (stages_ & 4) != 0;
+        const char* stage = cs ? "compute" : (vs ? "vertex" : "fragment");
+        if ((cs || vs || ps) && Wanted(req.footer_hash)) {
             GS::TranslationResult res;
             std::string why;
             u32 walk_loads = 0;
@@ -182,6 +184,13 @@ public:
                              req.footer_hash, req.address, req.code.size(), res.spirv.size(),
                              res.reflection.buffers.size(), res.reflection.flatbuf_dwords, walk_loads,
                              req.runtime.threads[0], req.runtime.threads[1], req.runtime.threads[2], n);
+                } else if (ps) {
+                    SSPC_LOG(GPU, Info,
+                             "own GCN translator: fragment {:016x} at {:#x} ({} dwords) translated - {} SPIR-V words, {} "
+                             "buffers, {} images, MRT mask {:#x}{}, flat {} dwords, walk {} loads [{} own so far]",
+                             req.footer_hash, req.address, req.code.size(), res.spirv.size(),
+                             res.reflection.buffers.size(), res.reflection.images.size(), res.reflection.mrt_mask,
+                             res.reflection.has_discard ? ", discards" : "", res.reflection.flatbuf_dwords, walk_loads, n);
                 } else {
                     SSPC_LOG(GPU, Info,
                              "own GCN translator: vertex {:016x} at {:#x} ({} dwords) translated - {} SPIR-V words, {} "
@@ -193,8 +202,7 @@ public:
                 return res;
             }
             if (const u32 n = ++declined_; n <= 400) {
-                SSPC_LOG(GPU, Info, "own GCN translator: {} {:016x} to the bridge's ({})", cs ? "compute" : "vertex",
-                         req.footer_hash, why);
+                SSPC_LOG(GPU, Info, "own GCN translator: {} {:016x} to the bridge's ({})", stage, req.footer_hash, why);
             }
         }
         return fallback_->Translate(req);
@@ -370,6 +378,134 @@ private:
         return true;
     }
 
+    /// A fragment program's parameters (the bridge's ToRuntime: the inputs' SPI_PS_INPUT_CNTL, the colour targets'
+    /// export format, number class, conversion and COMP_SWAP, the depth export's mask).
+    static bool PrepareFragment(const GS::TranslationRequest& req, EmitOptions::FragmentOptions& fs, std::string& why) {
+        const GS::RuntimeParams& p = req.runtime;
+        const GS::DeviceProfile& prof = *req.profile;
+        if (p.dual_source != 0) {
+            why = "dual-source blending";
+            return false;
+        }
+        const bool ls = (p.stages_en & 3) != 0, gs = ((p.stages_en >> 5) & 1) != 0;
+        if (((p.ps_vs_out_cntl != 0 && !ls) || (p.ps_ucp_enable != 0 && !gs)) && prof.needs_clip_distance_emulation) {
+            why = "clip distances emulated on this device";
+            return false;
+        }
+        fs.input_addr = p.ps_input_addr;
+        fs.input_ena = p.ps_input_ena;
+        fs.front_face_all_bits = p.front_face_all_bits != 0;
+        fs.manual_interpolation = prof.needs_manual_interpolation;
+        fs.num_inputs = std::min<u32>(p.num_interp, 32);
+        for (u32 i = 0; i < fs.num_inputs; ++i) {
+            const u32 c = p.ps_input_cntl[i];
+            fs.inputs[i] = {.location = c & 0x1F,
+                            .flat = ((c >> 10) & 1) != 0,
+                            .is_default = ((c >> 5) & 1) != 0,
+                            .default_value = (c >> 8) & 3};
+        }
+        // MRTZ: DB_SHADER_CONTROL's exports, then SPI_SHADER_Z_FORMAT's components (MaskFromExportFormat)
+        const u32 d = p.db_shader_control;
+        const u32 stencil = ((d >> 2) & 1) | ((d >> 1) & 1);
+        u32 mrtz = (d & 1) | (stencil << 1) | (((d >> 8) & 1) << 2) | (((d >> 7) & 1) << 3);
+        switch (p.z_format) {
+        case 0: mrtz = 0; break;
+        case 1: mrtz &= 1; break;
+        case 2: mrtz &= 3; break;
+        case 3: mrtz &= 9; break;
+        case 9: break;
+        default:
+            if (mrtz != 0) {
+                why = fmt::format("SPI_SHADER_Z_FORMAT {}", p.z_format);
+                return false;
+            }
+        }
+        fs.mrtz_mask = mrtz;
+        fs.early_tests = ((d >> 12) & 1) != 0;
+        // colour targets (CB_COLORn_INFO: FORMAT 2-6, NUMBER_TYPE 8-10, COMP_SWAP 11-12)
+        static constexpr u8 kComponents[23] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0, 3, 4, 4, 4, 2, 2, 2};
+        // the bridge's mrt_swizzles[swap][components - 1]: CompSwizzle per output component (0 zero, 4-7 r-a)
+        static constexpr u8 kSwizzle[4][4][4] = {
+            {{4, 0, 0, 0}, {4, 5, 0, 0}, {4, 5, 6, 0}, {4, 5, 6, 7}},
+            {{5, 0, 0, 0}, {4, 7, 0, 0}, {4, 5, 7, 0}, {6, 5, 4, 7}},
+            {{6, 0, 0, 0}, {5, 4, 0, 0}, {6, 5, 4, 0}, {7, 6, 5, 4}},
+            {{7, 0, 0, 0}, {7, 4, 0, 0}, {7, 5, 4, 0}, {7, 4, 5, 6}},
+        };
+        for (u32 cb = 0; cb < 8; ++cb) {
+            const GS::ColorTargetParams& t = p.targets[cb];
+            if (t.bound == 0) {
+                continue; // (no export: the bridge's empty colour buffer)
+            }
+            EmitOptions::ColorTarget& ct = fs.targets[cb];
+            const u32 dfmt = (t.info >> 2) & 0x1F, nt = (t.info >> 8) & 7, swap = (t.info >> 11) & 3;
+            const u32 nfmt = nt == 6 ? 9 : nt; // (the CB's 6 is sRGB)
+            const bool f32 = dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14;
+            u32 cls = nfmt;
+            switch (nfmt) {
+            case 0:
+                cls = f32 ? 4 : 0;
+                ct.conversion = f32 ? 6 : 0;
+                break;
+            case 2:
+                cls = 4;
+                ct.conversion = 1;
+                break;
+            case 3:
+                cls = 5;
+                ct.conversion = 2;
+                break;
+            case 7:
+                cls = dfmt == 1 ? 4 : 7;
+                break;
+            case 10:
+                cls = 0;
+                ct.conversion = 3;
+                break;
+            default:
+                break;
+            }
+            ct.kind = cls == 4 ? 1 : (cls == 5 ? 2 : 0);
+            ct.export_format = (p.col_format >> (cb * 4)) & 0xF;
+            ct.self_scale = t.min_max_self != 0;
+            const u32 n = dfmt < 23 ? kComponents[dfmt] : 0;
+            if (n == 0) {
+                why = fmt::format("MRT{} of data format {}", cb, dfmt);
+                return false;
+            }
+            std::array<u8, 4> s{};
+            for (u32 c = 0; c < 4; ++c) {
+                s[c] = kSwizzle[swap][n - 1][c];
+            }
+            std::array<u8, 4> r = s; // RemapSwizzle
+            switch (dfmt) {
+            case 17:
+            case 7:
+            case 16:
+                r = {s[2], s[1], s[0], s[3]};
+                break;
+            case 8:
+                r = {s[3], s[2], s[1], s[0]};
+                break;
+            case 19:
+                r = {s[1], s[2], s[3], s[0]};
+                break;
+            case 1:
+            case 2:
+            case 4:
+                for (u8& c : r) {
+                    c = c == 7 ? 4 : c;
+                }
+                break;
+            default:
+                break;
+            }
+            for (u32 c = 0; c < 4; ++c) {
+                ct.map[c] = static_cast<u8>(r[c] >= 4 ? r[c] - 4 : c); // (CompMapping::Map)
+            }
+        }
+        return true;
+    }
+
     static bool TryOwn(const GS::TranslationRequest& req, GS::TranslationResult& res, std::string& why,
                        u32& walk_loads) {
         if (req.code.empty() || req.profile == nullptr) {
@@ -377,7 +513,8 @@ private:
             return false;
         }
         const bool vertex = req.hw == GS::HwStage::Vs;
-        if (!vertex && !(req.start == GS::BindingStart{})) {
+        const bool fragment = req.hw == GS::HwStage::Ps;
+        if (!vertex && !fragment && !(req.start == GS::BindingStart{})) {
             why = "its bindings do not start at 0";
             return false;
         }
@@ -444,6 +581,11 @@ private:
             if (!PrepareVertex(req, insts, eo.vs, fetch, res, why)) {
                 return false;
             }
+        } else if (fragment) {
+            eo.fragment = true;
+            if (!PrepareFragment(req, eo.fs, why)) {
+                return false;
+            }
         } else {
             eo.compute = true;
             eo.threads = req.runtime.threads;
@@ -457,7 +599,7 @@ private:
             // SSPC_OWN_SHADERS_DUMP=<footer hashes>: the program, its buffers' V#s as the translation saw them, the SPIR-V
             // (a program not translated too: its code and why)
             std::string text = fmt::format("{} {:016x} at {:#x}, rsrc2 {:#x}, group {}x{}x{}{}\n",
-                                           vertex ? "vertex" : "compute", req.footer_hash,
+                                           vertex ? "vertex" : (fragment ? "fragment" : "compute"), req.footer_hash,
                                            req.address, rsrc2, eo.threads[0], eo.threads[1], eo.threads[2],
                                            r.ok ? "" : " - not translated: " + r.error);
             for (u32 b = 0; b < ri.buffers.size(); ++b) {
@@ -481,7 +623,7 @@ private:
                 text += fmt::format("{:5} {:<28} {:08x} {:08x}{}{}\n", in.offset, Mnemonic(in.format, in.op), in.w0, in.w1,
                                     in.literal ? fmt::format(" lit {:08x}", in.lit) : "", regs);
             }
-            const std::string base = fmt::format("logs/own_{}_{:016x}", vertex ? "vs" : "cs", req.footer_hash);
+            const std::string base = fmt::format("logs/own_{}_{:016x}", vertex ? "vs" : (fragment ? "ps" : "cs"), req.footer_hash);
             std::ofstream(base + ".txt", std::ios::binary) << text;
             std::ofstream(base + ".spv", std::ios::binary)
                 .write(reinterpret_cast<const char*>(r.spirv.data()), static_cast<std::streamsize>(r.spirv.size() * 4));
@@ -501,6 +643,8 @@ private:
         if (fetch.present) {
             refl.fetch = std::move(fetch);
         }
+        refl.mrt_mask = r.mrt_mask;
+        refl.has_discard = r.has_discard;
         // the bridge's order (the executor's game fixes, e.g. the particle sort's split, know the buffers by it): the
         // V#s, the flattened user data, GDS
         for (const BufferUse& b : ri.buffers) {
@@ -553,8 +697,8 @@ void InstallOwnTranslatorIfEnabled() {
     }
     static OwnTranslator own(fallback, stages);
     GS::InstallShaderTranslator(&own);
-    SSPC_LOG(GPU, Info, "own GCN translator: enabled for{}{} programs (SSPC_OWN_SHADERS={}), {} for the rest",
-             (stages & 1) != 0 ? " compute" : "", (stages & 2) != 0 ? " vertex" : "", std::getenv("SSPC_OWN_SHADERS"),
+    SSPC_LOG(GPU, Info, "own GCN translator: enabled for{}{}{} programs (SSPC_OWN_SHADERS={}), {} for the rest",
+             (stages & 1) != 0 ? " compute" : "", (stages & 2) != 0 ? " vertex" : "", (stages & 4) != 0 ? " fragment" : "", std::getenv("SSPC_OWN_SHADERS"),
              fallback->Name());
 }
 

@@ -152,7 +152,14 @@ private:
         u32 coords = 0;     ///< the address's coordinates (s, t, r / the slice)
         u32 kind = 0;    ///< 0 float, 1 uint, 2 sint
         u32 dst_sel = 0; ///< DST_SEL (the shader applies it to a storage image)
+        bool cube = false;  ///< a cube (a 2D array of faces): sampling coordinates are AMD's cube coordinates
+        bool srgb = false;  ///< (its number format, remapped, is sRGB: no degamma)
+        /// a sampled image's read conversion (the bridge's MapNumberConversion): 0 none, 1 uscaled, 2 sscaled,
+        /// 3 ubnorm, 4 snorm_nz 8-bit, 5 snorm_nz 16-bit, 6 unorm 32-bit, 7 sRGB to linear (BC6)
+        u32 conversion = 0;
     };
+    std::vector<u32> sampler_flags_; ///< per sampler: bit 0 FORCE_UNNORMALIZED, 1 FORCE_DEGAMMA, 0x80000000 unknown
+    Id GammaToLinear(Id c);
     std::vector<ImageDecl> images_;
     std::vector<Id> samplers_;
     void DeclareImages(u32 first_binding);
@@ -181,6 +188,15 @@ private:
     Id position_ = 0, point_size_ = 0, clip_dist_ = 0, cull_dist_ = 0;
     std::array<Id, 32> params_{};
     std::vector<Id> vinputs_;
+    // the fragment stage (EmitOptions::fragment)
+    void InitFragment(); ///< the input VGPRs, the inputs' interpolation (from the program's v_interp), their variables
+    void EmitInterp(const Inst& in);
+    void EmitFragmentExport(const Inst& in);
+    Id frag_coord_ = 0, front_face_ = 0, frag_depth_ = 0, t_ptr_in_f32_ = 0;
+    std::array<Id, 32> finputs_{}; ///< per input slot (v_interp's ATTR): its variable
+    std::array<Id, 8> mrt_{};      ///< per MRT: its output variable
+    u8 mrt_mask_ = 0;
+    bool has_discard_ = false;
     std::unordered_map<u32, Id> regs_; ///< register code -> its function variable
 };
 
@@ -876,6 +892,47 @@ void Emitter::DeclareImages(u32 binding) {
         if (dw1 && dw3 && (type == 8 || type == 9 || type == 10 || type_array || cube)) {
             const u32 nfmt = (*dw1 >> 26) & 0xF;
             d.kind = nfmt == 4 ? 1 : nfmt == 5 ? 2 : 0;
+            if (!use.written) {
+                // a sampled image: the number class the bridge declares it with (RemapNumberFormat) and the read
+                // conversion (MapNumberConversion) - the runtime's view has the remapped format
+                const u32 dfmt = (*dw1 >> 20) & 0x3F;
+                const bool f32 = dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14;
+                u32 cls = nfmt;
+                switch (nfmt) {
+                case 0:
+                    cls = f32 ? 4 : 0;
+                    d.conversion = f32 ? 6 : 0;
+                    break;
+                case 2:
+                    cls = 4;
+                    d.conversion = 1;
+                    break;
+                case 3:
+                    cls = 5;
+                    d.conversion = 2;
+                    break;
+                case 6:
+                    cls = 5;
+                    d.conversion = (dfmt == 1 || dfmt == 3 || dfmt == 10) ? 4 : ((dfmt == 2 || dfmt == 5 || dfmt == 12) ? 5 : 99);
+                    break;
+                case 7:
+                    cls = dfmt == 1 ? 4 : 7;
+                    break;
+                case 9:
+                    cls = (dfmt == 38 || dfmt == 39 || dfmt == 40) ? 0 : 9;
+                    d.conversion = dfmt == 40 ? 7 : 0;
+                    break;
+                case 10:
+                    cls = 0;
+                    d.conversion = 3;
+                    break;
+                default:
+                    break;
+                }
+                d.kind = cls == 4 ? 1 : cls == 5 ? 2 : 0;
+                d.srgb = cls == 9;
+            }
+            d.cube = cube;
             d.scalar = d.kind == 1 ? t_u32_ : d.kind == 2 ? t_i32_ : t_f32_;
             d.texel = b_.TypeVector(d.scalar, 4);
             d.storage = use.written;
@@ -911,6 +968,8 @@ void Emitter::DeclareImages(u32 binding) {
         images_.push_back(d);
     }
     for (size_t i = 0; i < res_.samplers.size(); ++i) {
+        const auto s0 = FlatValue(res_.samplers[i].sharp[0]);
+        sampler_flags_.push_back(s0 ? (((*s0 >> 15) & 1) | (((*s0 >> 20) & 1) << 1)) : 0x80000000u);
         const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::UniformConstant, b_.TypeSampler()),
                                  spv::StorageClass::UniformConstant);
         b_.Decorate(v, spv::Decoration::DescriptorSet, {0});
@@ -969,10 +1028,52 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         return b_.Op(Op::OpCompositeConstruct, b_.TypeVector(ty, static_cast<u32>(c.size())),
                      std::span<const u32>(c.data(), c.size()));
     };
+    bool degamma = false; // (set by sampling: the sampler's FORCE_DEGAMMA on a non-sRGB image)
     const auto results = [&](Id texel, bool swizzle) {
+        // a sampled image's texel as the bridge reads it: its format's number conversion, the sampler's degamma
+        u32 kind = im.kind;
+        Id scalar = im.scalar;
+        if (!im.storage && (im.conversion != 0 || degamma)) {
+            if (im.conversion == 99) {
+                throw Unsupported{"an image of number format SNORM_NZ in an unknown data format"};
+            }
+            std::array<Id, 4> f{};
+            for (u32 c = 0; c < 4; ++c) {
+                const Id x = b_.Op(Op::OpCompositeExtract, im.scalar, {texel, c});
+                switch (im.conversion) {
+                case 0: f[c] = x; break;
+                case 1: f[c] = b_.Op(Op::OpConvertUToF, t_f32_, {x}); break;
+                case 2: f[c] = b_.Op(Op::OpConvertSToF, t_f32_, {x}); break;
+                case 3: f[c] = b_.Op(Op::OpFSub, t_f32_, {b_.Op(Op::OpFMul, t_f32_, {x, b_.F32(2.0f)}), b_.F32(1.0f)}); break;
+                case 4:
+                case 5: {
+                    const Id odd = b_.Op(Op::OpIAdd, t_i32_, {b_.Op(Op::OpIMul, t_i32_, {x, b_.Constant(t_i32_, 2)}),
+                                                              b_.Constant(t_i32_, 1)});
+                    f[c] = b_.Op(Op::OpFDiv, t_f32_, {b_.Op(Op::OpConvertSToF, t_f32_, {odd}),
+                                                      b_.F32(im.conversion == 4 ? 255.0f : 65535.0f)});
+                    break;
+                }
+                case 6:
+                    f[c] = b_.Op(Op::OpFDiv, t_f32_, {b_.Op(Op::OpConvertUToF, t_f32_, {x}), b_.F32(4294967295.0f)});
+                    break;
+                case 7: f[c] = GammaToLinear(x); break;
+                default: break;
+                }
+            }
+            if (degamma) {
+                // (the bridge: the raw texel's RGB to linear, in place of the conversion)
+                for (u32 c = 0; c < 3; ++c) {
+                    f[c] = GammaToLinear(b_.Op(Op::OpCompositeExtract, im.scalar, {texel, c}));
+                }
+                f[3] = b_.Op(Op::OpCompositeExtract, im.scalar, {texel, 3});
+            }
+            texel = b_.Op(Op::OpCompositeConstruct, b_.TypeVector(t_f32_, 4), std::span<const u32>(f.data(), 4));
+            kind = 0;
+            scalar = t_f32_;
+        }
         // the components dmask selects, packed into consecutive VGPRs (a storage image's DST_SEL by the shader)
         u32 k = 0;
-        const Id one = im.kind == 0 ? b_.U32(0x3F800000u) : b_.U32(1);
+        const Id one = kind == 0 ? b_.U32(0x3F800000u) : b_.U32(1);
         for (u32 c = 0; c < 4; ++c) {
             if (((dmask >> c) & 1) == 0) {
                 continue;
@@ -980,8 +1081,8 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
             const u32 sel = swizzle ? (im.dst_sel >> (3 * c)) & 7 : 4 + c;
             Id v = sel == 1 ? one : b_.U32(0);
             if (sel >= 4) {
-                const Id comp = b_.Op(Op::OpCompositeExtract, im.scalar, {texel, sel - 4});
-                v = im.kind == 1 ? comp : Bit(t_u32_, comp);
+                const Id comp = b_.Op(Op::OpCompositeExtract, scalar, {texel, sel - 4});
+                v = kind == 1 ? comp : Bit(t_u32_, comp);
             }
             Set(vdata + k++, v);
         }
@@ -1027,20 +1128,121 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         b_.OpNoResult(Op::OpImageWrite, {image, coords(true), texel});
         return true;
     }
-    if (name == "image_sample_lz" || name == "image_sample_l" || name == "image_sample_lz_o" || name == "image_sample_l_o") {
+    if (name.starts_with("image_sample")) {
+        // the modifiers (c compare, d / cd derivatives, cl LOD clamp, l LOD, b bias, lz LOD 0, o offset) and the
+        // address they lay out (Sea Islands ISA 8.2.4): [offset] [bias] [z-compare] [derivatives] coordinates [LOD /
+        // clamp]
+        bool cmp = false, deriv = false, clamp = false, lod_given = false, bias = false, lz = false;
+        for (std::string_view rest = name.substr(12); !rest.empty();) {
+            rest.remove_prefix(1); // ('_')
+            const size_t u = rest.find('_');
+            const std::string_view t = rest.substr(0, u);
+            cmp = cmp || t == "c";
+            deriv = deriv || t == "d" || t == "cd";
+            clamp = clamp || t == "cl";
+            lod_given = lod_given || t == "l";
+            bias = bias || t == "b";
+            lz = lz || t == "lz";
+            rest = u == std::string_view::npos ? std::string_view{} : rest.substr(u);
+        }
+        if (cmp) {
+            return Decline(" (a depth compare)");
+        }
+        if (deriv) {
+            return Decline(" (explicit derivatives)");
+        }
         const s32 si = res_.sampler_of[index];
-        if (si < 0 || im.storage || unorm) {
-            return Decline(unorm ? " (unnormalized coordinates)" : " (no sampler / a storage image)");
+        if (si < 0 || im.storage) {
+            return Decline(" (no sampler / a storage image)");
+        }
+        const u32 sflags = sampler_flags_[si];
+        if ((sflags & 0x80000000u) != 0) {
+            return Decline(" (the S# not at the translation)");
+        }
+        const bool unnormalized = unorm || (sflags & 1) != 0;
+        degamma = (sflags & 2) != 0 && !im.srgb; // (the runtime's key holds FORCE_DEGAMMA / FORCE_UNNORMALIZED)
+        if (unnormalized && im.cube) {
+            return Decline(" (unnormalized coordinates on a cube)");
+        }
+        // the coordinates from `first`: AMD's cube coordinates ([1, 2], the face) to the 2D array of faces, unnormalized
+        // ones divided by the level 0 size (the bridge's)
+        const auto sample_coords = [&](u32 first) {
+            const u32 qn = im.coords + (im.one_d ? 1 : 0);
+            Id size = 0;
+            if (unnormalized) {
+                b_.Capability(spv::Capability::ImageQuery);
+                size = b_.Op(Op::OpImageQuerySizeLod, b_.TypeVector(t_i32_, qn), {image, b_.Constant(t_i32_, 0)});
+            }
+            std::vector<u32> c;
+            for (u32 k = 0; k < im.coords; ++k) {
+                const bool layer = im.arrayed && k == im.coords - 1;
+                Id v = GetF(first + k, in);
+                if (im.cube && k < 2) {
+                    v = b_.Op(Op::OpFSub, t_f32_, {v, b_.F32(1.0f)});
+                } else if (im.cube && k == 2) {
+                    const Id fl = Glsl(GLSLstd450Floor, t_f32_, {b_.Op(Op::OpFDiv, t_f32_, {v, b_.F32(8.0f)})});
+                    v = Glsl(GLSLstd450Fma, t_f32_, {fl, b_.F32(-2.0f), v});
+                } else if (unnormalized && !layer) {
+                    const Id extent = b_.Op(Op::OpConvertSToF, t_f32_, {b_.Op(Op::OpCompositeExtract, t_i32_, {size, k})});
+                    v = b_.Op(Op::OpFDiv, t_f32_, {v, extent});
+                }
+                c.push_back(v);
+                if (im.one_d && k == 0) {
+                    c.push_back(b_.F32(0.0f));
+                }
+            }
+            return c.size() == 1 ? c[0]
+                                 : b_.Op(Op::OpCompositeConstruct, b_.TypeVector(t_f32_, static_cast<u32>(c.size())),
+                                         std::span<const u32>(c.data(), c.size()));
+        };
+        const bool implicit = !lod_given && !lz;
+        if (implicit && !options_.fragment) {
+            return Decline(" (an implicit LOD outside a fragment program)");
+        }
+        if (implicit && has_offset) {
+            return Decline(" (a texel offset with an implicit LOD)");
+        }
+        if (clamp && !implicit) {
+            return Decline(" (a LOD clamp with an explicit LOD)");
         }
         const Id sampler = b_.Op(Op::OpLoad, b_.TypeSampler(), {samplers_[si]});
         const Id sampled = b_.Op(Op::OpSampledImage, b_.TypeSampledImage(im.type), {image, sampler});
-        const Id lod = name.starts_with("image_sample_l_") || name == "image_sample_l" ? GetF(vaddr + im.coords, in)
-                                                                                         : b_.F32(0.0f);
+        if (implicit) {
+            // the coordinates after [offset] [bias]; the LOD clamp after them (a minimum LOD)
+            const u32 first = vaddr + (bias ? 1 : 0);
+            std::vector<u32> ops{sampled, sample_coords(first)};
+            u32 mask = 0;
+            if (bias) {
+                mask |= static_cast<u32>(spv::ImageOperandsMask::Bias);
+            }
+            if (clamp) {
+                b_.Capability(spv::Capability::MinLod);
+                mask |= static_cast<u32>(spv::ImageOperandsMask::MinLod);
+            }
+            if (mask != 0) {
+                ops.push_back(mask);
+                if (bias) {
+                    ops.push_back(GetF(vaddr, in));
+                }
+                if (clamp) {
+                    ops.push_back(GetF(first + im.coords, in));
+                }
+            }
+            results(b_.Op(Op::OpImageSampleImplicitLod, im.texel, std::span<const u32>(ops.data(), ops.size())), false);
+            return true;
+        }
+        if (bias) {
+            return Decline(" (a bias with an explicit LOD)");
+        }
+        const Id lod = lod_given ? GetF(vaddr + im.coords, in) : b_.F32(0.0f);
         if (!has_offset) {
             results(b_.Op(Op::OpImageSampleExplicitLod, im.texel,
-                          {sampled, coords(false), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+                          {sampled, sample_coords(vaddr), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
                     false);
             return true;
+        }
+        if (im.cube || unnormalized) {
+            return Decline(" (a texel offset on a cube / unnormalized coordinates)");
         }
         // the texel offset: 6-bit signed fields at bits 0, 8, 16 of one VGPR (x, y[, z]). Vulkan allows a dynamic
         // Offset only on gathers: the coordinates move by offset / the level's size instead (what the offset means)
@@ -1410,6 +1612,419 @@ void Emitter::EmitExport(const Inst& in) {
     throw Unsupported{fmt::format("exp to target {} (a vertex program)", target)};
 }
 
+void Emitter::InitFragment() {
+    const EmitOptions::FragmentOptions& fs = options_.fs;
+    t_vec4_ = b_.TypeVector(t_f32_, 4);
+    t_ptr_in_f32_ = b_.TypePointer(spv::StorageClass::Input, t_f32_);
+    // the barycentrics' VGPRs as SPI_PS_INPUT_ADDR lays them out: their interpolation (0 perspective sample, 1 center,
+    // 2 centroid, 3 pull model, 4 linear sample, 5 center, 6 centroid; 0xFF none)
+    std::array<u8, 256> bary{};
+    bary.fill(0xFF);
+    static constexpr u32 kRegs[8] = {2, 2, 2, 3, 2, 2, 2, 1};
+    std::array<s32, 8> bary_first{};
+    bary_first.fill(-1);
+    u32 v = 0;
+    for (u32 k = 0; k < 8; ++k) {
+        if (((fs.input_addr >> k) & 1) != 0) {
+            bary_first[k] = static_cast<s32>(v);
+            for (u32 i = 0; i < kRegs[k]; ++i) {
+                bary[v++] = k < 7 ? static_cast<u8>(k) : 0xFF;
+            }
+        }
+    }
+    // each input's interpolation from the v_interp_p2 that reads it (the I/J registers it is given)
+    std::array<s32, 32> mode{};
+    mode.fill(-1); // -1 unused, 0-6 as bary, 7 flat
+    for (const Inst& in : insts_) {
+        if (in.format != Format::Vintrp) {
+            continue;
+        }
+        const u32 op = (in.w0 >> 16) & 3, attr = (in.w0 >> 10) & 0x3F, vsrc = in.w0 & 0xFF;
+        if (attr >= fs.num_inputs) {
+            throw Unsupported{fmt::format("v_interp of input {} (SPI_PS_IN_CONTROL.NUM_INTERP {})", attr, fs.num_inputs)};
+        }
+        const EmitOptions::FragmentInput& fi = fs.inputs[attr];
+        if (fi.is_default || op == 0) {
+            continue;
+        }
+        s32 m = 0;
+        if (op == 1) {
+            if (fi.flat) {
+                throw Unsupported{fmt::format("v_interp_p2_f32 of the flat input {}", attr)};
+            }
+            m = bary[vsrc];
+            if (m == 0xFF || m == 3) {
+                throw Unsupported{fmt::format("v_interp_p2_f32 with J in v{} (not a barycentric of SPI_PS_INPUT_ADDR "
+                                              "{:#x}, or the pull model)", vsrc, fs.input_addr)};
+            }
+        } else if (op == 2) {
+            if (!fi.flat || vsrc != 2) {
+                throw Unsupported{fmt::format("v_interp_mov_f32 P{} of the {} input {}", vsrc == 2 ? "0" : "10/20",
+                                              fi.flat ? "flat" : "interpolated", attr)};
+            }
+            m = 7;
+        } else {
+            throw Unsupported{"v_interp op 3"};
+        }
+        if (mode[attr] >= 0 && mode[attr] != m) {
+            throw Unsupported{fmt::format("input {} interpolated two ways ({} and {})", attr, mode[attr], m)};
+        }
+        mode[attr] = m;
+    }
+    // their variables: a vec4 at SPI_PS_INPUT_CNTL_i.OFFSET (inputs at one location share it if interpolated alike);
+    // manual interpolation: the vec4s of the primitive's three vertices (PerVertexKHR)
+    const bool manual = fs.manual_interpolation;
+    bool barycentric = false; // (SPV_KHR_fragment_shader_barycentric declared)
+    std::array<Id, 32> at_location{};
+    std::array<s32, 32> location_mode{};
+    for (u32 a = 0; a < 32; ++a) {
+        if (mode[a] < 0) {
+            continue;
+        }
+        const u32 loc = fs.inputs[a].location;
+        if (at_location[loc] != 0) {
+            if (!manual && location_mode[loc] != mode[a]) {
+                throw Unsupported{fmt::format("location {} read with two interpolations", loc)};
+            }
+            finputs_[a] = at_location[loc];
+            continue;
+        }
+        const Id type = manual ? b_.TypeArray(t_vec4_, b_.U32(3)) : t_vec4_;
+        const Id var = b_.Variable(b_.TypePointer(spv::StorageClass::Input, type), spv::StorageClass::Input);
+        b_.Decorate(var, spv::Decoration::Location, {loc});
+        const s32 m = mode[a];
+        if (manual) {
+            if (!barycentric) {
+                b_.Extension("SPV_KHR_fragment_shader_barycentric");
+                b_.Capability(spv::Capability::FragmentBarycentricKHR);
+                barycentric = true;
+            }
+            b_.Decorate(var, spv::Decoration::PerVertexKHR);
+        } else if (m == 7) {
+            b_.Decorate(var, spv::Decoration::Flat);
+        } else {
+            if (m >= 4) {
+                b_.Decorate(var, spv::Decoration::NoPerspective);
+            }
+            if (m == 2 || m == 6) {
+                b_.Decorate(var, spv::Decoration::Centroid);
+            } else if (m == 0 || m == 4) {
+                b_.Capability(spv::Capability::SampleRateShading);
+                b_.Decorate(var, spv::Decoration::Sample);
+            }
+        }
+        interface_.push_back(var);
+        finputs_[a] = var;
+        at_location[loc] = var;
+        location_mode[loc] = m;
+    }
+    // the VGPRs after the barycentrics (left 0 unless the interpolation is manual: v_interp_p2 does not read them
+    // otherwise): the position, the front face
+    const auto builtin_in = [&](spv::BuiltIn builtin, Id type) {
+        const Id var = b_.Variable(b_.TypePointer(spv::StorageClass::Input, type), spv::StorageClass::Input);
+        b_.Decorate(var, spv::Decoration::BuiltIn, {static_cast<u32>(builtin)});
+        interface_.push_back(var);
+        return var;
+    };
+    Id sample_id = 0;
+    const auto load_sample_id = [&] {
+        if (sample_id == 0) {
+            b_.Capability(spv::Capability::SampleRateShading);
+            sample_id = builtin_in(spv::BuiltIn::SampleId, t_u32_);
+            b_.Decorate(sample_id, spv::Decoration::Flat);
+        }
+        return b_.Op(Op::OpLoad, t_u32_, {sample_id});
+    };
+    // manual interpolation: the barycentrics' I/J are BaryCoordKHR's y/z (the weights of P1/P2), at the sample or the
+    // centroid as the barycentric is (the bridge's BaryCoordSmooth*/NoPersp*); the pull model is not translated
+    if (barycentric) {
+        const Id t_vec3 = b_.TypeVector(t_f32_, 3);
+        Id persp = 0, linear = 0;
+        for (u32 k = 0; k < 7; ++k) {
+            if (bary_first[k] < 0 || k == 3) {
+                continue;
+            }
+            Id& var = k < 3 ? persp : linear;
+            if (var == 0) {
+                var = builtin_in(k < 3 ? spv::BuiltIn::BaryCoordKHR : spv::BuiltIn::BaryCoordNoPerspKHR, t_vec3);
+            }
+            Id ij = 0;
+            if (k == 0 || k == 4) {
+                b_.Capability(spv::Capability::InterpolationFunction);
+                ij = Glsl(GLSLstd450InterpolateAtSample, t_vec3, {var, load_sample_id()});
+            } else if (k == 2 || k == 6) {
+                b_.Capability(spv::Capability::InterpolationFunction);
+                ij = Glsl(GLSLstd450InterpolateAtCentroid, t_vec3, {var});
+            } else {
+                ij = b_.Op(Op::OpLoad, t_vec3, {var});
+            }
+            const u32 first = kVgpr + static_cast<u32>(bary_first[k]);
+            SetF(first, b_.Op(Op::OpCompositeExtract, t_f32_, {ij, 1}));
+            SetF(first + 1, b_.Op(Op::OpCompositeExtract, t_f32_, {ij, 2}));
+        }
+    }
+    for (u32 k = 8; k < 16; ++k) {
+        if (((fs.input_addr >> k) & 1) == 0) {
+            continue;
+        }
+        const bool ena = ((fs.input_ena >> k) & 1) != 0;
+        Id value = b_.U32(0);
+        if (ena && k <= 11) {
+            if (frag_coord_ == 0) {
+                frag_coord_ = builtin_in(spv::BuiltIn::FragCoord, t_vec4_);
+            }
+            Id c = b_.Op(Op::OpLoad, t_f32_, {b_.Op(Op::OpAccessChain, t_ptr_in_f32_, {frag_coord_, b_.U32(k - 8)})});
+            if (k == 11) {
+                c = b_.Op(Op::OpFDiv, t_f32_, {b_.F32(1.0f), c}); // (POS_W_FLOAT is 1 / w)
+            }
+            value = Bit(t_u32_, c);
+        } else if (ena && k == 12) {
+            front_face_ = builtin_in(spv::BuiltIn::FrontFacing, t_bool_);
+            const Id ff = b_.Op(Op::OpLoad, t_bool_, {front_face_});
+            value = fs.front_face_all_bits ? Select(t_u32_, ff, b_.U32(1), b_.U32(0))
+                                           : Select(t_u32_, ff, b_.U32(std::bit_cast<u32>(1.0f)),
+                                                    b_.U32(std::bit_cast<u32>(-1.0f)));
+        } else if (ena && k == 13) {
+            // ANCILLARY: the sample index (bits 8-11), the render target index (16-26). As the bridge
+            // (LowerPackedAncillary): only bit-field extracts of it are known - each gives its built-in
+            const u32 reg = kVgpr + v;
+            bool sample = false, layer = false;
+            for (const Inst& in : insts_) {
+                const Operands o = GetOperands(in);
+                for (u32 s = 0; s < o.num_src; ++s) {
+                    if (o.src[s] != reg) {
+                        continue;
+                    }
+                    const auto off = ConstOperand(o.src[1], in), bits = ConstOperand(o.src[2], in);
+                    if (Mnemonic(in.format, in.op) != "v_bfe_u32" || s != 0 || !off || !bits) {
+                        throw Unsupported{"the ancillary VGPR read other than by v_bfe_u32 of constant fields"};
+                    }
+                    if (*off >= 8 && *off + *bits <= 12) {
+                        sample = true;
+                    } else if (*off >= 16 && *off + *bits <= 27) {
+                        layer = true;
+                    } else {
+                        throw Unsupported{fmt::format("the ancillary VGPR's bits {}..{}", *off, *off + *bits)};
+                    }
+                }
+            }
+            value = b_.U32(0);
+            if (sample) {
+                value = b_.Op(Op::OpShiftLeftLogical, t_u32_, {load_sample_id(), b_.U32(8)});
+            }
+            if (layer) {
+                b_.Capability(spv::Capability::Geometry);
+                const Id var = builtin_in(spv::BuiltIn::Layer, t_u32_);
+                b_.Decorate(var, spv::Decoration::Flat);
+                value = b_.Op(Op::OpBitwiseOr, t_u32_,
+                              {value, b_.Op(Op::OpShiftLeftLogical, t_u32_, {b_.Op(Op::OpLoad, t_u32_, {var}), b_.U32(16)})});
+            }
+        } else if (ena) {
+            throw Unsupported{fmt::format("fragment input VGPR {} (SPI_PS_INPUT_ENA bit {})",
+                                          k == 13 ? "ancillary" : (k == 14 ? "sample coverage" : "fixed-point position"), k)};
+        }
+        Set(kVgpr + v++, value);
+    }
+}
+
+void Emitter::EmitInterp(const Inst& in) {
+    const u32 op = (in.w0 >> 16) & 3, chan = (in.w0 >> 8) & 3, attr = (in.w0 >> 10) & 0x3F;
+    const u32 vdst = kVgpr + ((in.w0 >> 18) & 0xFF);
+    const bool manual = options_.fs.manual_interpolation;
+    if (op == 0 && !manual) {
+        return; // (p1: the interpolation is the input's - p2 reads it whole)
+    }
+    const EmitOptions::FragmentInput& fi = options_.fs.inputs[attr];
+    if (fi.is_default) {
+        if (op == 0) {
+            return;
+        }
+        static constexpr float kDefault[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 0}, {1, 1, 1, 1}};
+        Set(vdst, b_.U32(std::bit_cast<u32>(kDefault[fi.default_value & 3][chan])));
+        return;
+    }
+    if (manual) {
+        // p1: P0 + I * (P1 - P0); p2: VDST + J * (P2 - P0); mov (InitFragment: P0 of a flat input only): P0
+        const auto vertex = [&](u32 k) {
+            return b_.Op(Op::OpLoad, t_f32_, {b_.Op(Op::OpAccessChain, t_ptr_in_f32_, {finputs_[attr], b_.U32(k), b_.U32(chan)})});
+        };
+        const Id p0 = vertex(0);
+        if (op == 2) {
+            SetF(vdst, p0);
+            return;
+        }
+        const Id w = Bit(t_f32_, Get(kVgpr + (in.w0 & 0xFF), in));
+        const Id d = b_.Op(Op::OpFSub, t_f32_, {vertex(op == 0 ? 1 : 2), p0});
+        const Id base = op == 0 ? p0 : Bit(t_f32_, Get(vdst, in));
+        SetF(vdst, Glsl(GLSLstd450Fma, t_f32_, {d, w, base}));
+        return;
+    }
+    const Id v = b_.Op(Op::OpLoad, t_f32_, {b_.Op(Op::OpAccessChain, t_ptr_in_f32_, {finputs_[attr], b_.U32(chan)})});
+    Set(vdst, Bit(t_u32_, v));
+}
+
+void Emitter::EmitFragmentExport(const Inst& in) {
+    const u32 en = in.w0 & 0xF, target = (in.w0 >> 4) & 0x3F;
+    const bool compr = ((in.w0 >> 10) & 1) != 0, vm = ((in.w0 >> 12) & 1) != 0;
+    const auto vsrc = [&](u32 c) { return Get(kVgpr + ((in.w1 >> (8 * c)) & 0xFF), in); };
+    const auto if_exec = [&](auto&& body) {
+        if (!writes_exec_) {
+            body();
+            return;
+        }
+        const Id run = b_.NewId(), after = b_.NewId();
+        const Id e = Exec();
+        b_.OpNoResult(Op::OpSelectionMerge, {after, 0});
+        b_.OpNoResult(Op::OpBranchConditional, {e, run, after});
+        b_.Label(run);
+        body();
+        b_.OpNoResult(Op::OpBranch, {after});
+        b_.Label(after);
+    };
+    if (vm) {
+        // the valid mask: the lanes EXEC does not hold are discarded (demoted: they still run as helpers)
+        has_discard_ = true;
+        b_.Capability(spv::Capability::DemoteToHelperInvocation);
+        if (writes_exec_) {
+            const Id kill = b_.NewId(), after = b_.NewId();
+            const Id e = Exec();
+            b_.OpNoResult(Op::OpSelectionMerge, {after, 0});
+            b_.OpNoResult(Op::OpBranchConditional, {e, after, kill});
+            b_.Label(kill);
+            b_.OpNoResult(Op::OpDemoteToHelperInvocation, {});
+            b_.OpNoResult(Op::OpBranch, {after});
+            b_.Label(after);
+        }
+    }
+    if (target < 8) {
+        mrt_mask_ |= static_cast<u8>(1u << target);
+        const EmitOptions::ColorTarget& t = options_.fs.targets[target];
+        if (t.export_format == 0 || en == 0) {
+            return;
+        }
+        std::array<Id, 4> comp{}; // the exported components as register bits (0: not exported)
+        if (compr) {
+            for (u32 half = 0; half < 2; ++half) {
+                if (((en >> (2 * half)) & 1) == 0) {
+                    continue;
+                }
+                const Id x = vsrc(half);
+                const Id v2 = b_.TypeVector(t_f32_, 2);
+                switch (t.export_format) {
+                case 4:
+                case 5:
+                case 6: {
+                    const GLSLstd450 f = t.export_format == 4 ? GLSLstd450UnpackHalf2x16
+                                                              : (t.export_format == 5 ? GLSLstd450UnpackUnorm2x16
+                                                                                      : GLSLstd450UnpackSnorm2x16);
+                    const Id p = Glsl(f, v2, {x});
+                    comp[2 * half] = Bit(t_u32_, b_.Op(Op::OpCompositeExtract, t_f32_, {p, 0}));
+                    comp[2 * half + 1] = Bit(t_u32_, b_.Op(Op::OpCompositeExtract, t_f32_, {p, 1}));
+                    break;
+                }
+                case 7:
+                    comp[2 * half] = b_.Op(Op::OpBitwiseAnd, t_u32_, {x, b_.U32(0xFFFF)});
+                    comp[2 * half + 1] = b_.Op(Op::OpShiftRightLogical, t_u32_, {x, b_.U32(16)});
+                    break;
+                case 8:
+                    comp[2 * half] = Bit(t_u32_, b_.Op(Op::OpBitFieldSExtract, t_i32_, {Bit(t_i32_, x), b_.U32(0), b_.U32(16)}));
+                    comp[2 * half + 1] =
+                        Bit(t_u32_, b_.Op(Op::OpBitFieldSExtract, t_i32_, {Bit(t_i32_, x), b_.U32(16), b_.U32(16)}));
+                    break;
+                default:
+                    throw Unsupported{fmt::format("a compressed export to MRT{} of format {}", target, t.export_format)};
+                }
+            }
+        } else {
+            u32 mask = 0;
+            switch (t.export_format) {
+            case 1: mask = en & 1; break; // R_32
+            case 2: mask = en & 3; break; // GR_32
+            case 3: mask = en & 9; break; // AR_32
+            case 9: mask = en; break;     // ABGR_32
+            default:
+                throw Unsupported{fmt::format("an uncompressed export to MRT{} of format {}", target, t.export_format)};
+            }
+            for (u32 c = 0; c < 4; ++c) {
+                if (((mask >> c) & 1) != 0) {
+                    comp[c] = vsrc(c);
+                }
+            }
+        }
+        // the target's output: a vec4 of its number class at location n
+        const Id scalar = t.kind == 0 ? t_f32_ : (t.kind == 1 ? t_u32_ : t_i32_);
+        if (mrt_[target] == 0) {
+            const Id type = b_.TypeVector(scalar, 4);
+            const Id zero = t.kind == 0 ? b_.F32(0.0f) : b_.Constant(scalar, 0);
+            const std::array<Id, 4> zeros{zero, zero, zero, zero};
+            mrt_[target] = b_.Variable(b_.TypePointer(spv::StorageClass::Output, type), spv::StorageClass::Output,
+                                       b_.ConstantComposite(type, zeros));
+            b_.Decorate(mrt_[target], spv::Decoration::Location, {target});
+            interface_.push_back(mrt_[target]);
+        }
+        if_exec([&] {
+            const Id ptr = b_.TypePointer(spv::StorageClass::Output, scalar);
+            for (u32 i = 0; i < 4; ++i) {
+                const Id bits = comp[t.map[i]];
+                if (bits == 0) {
+                    continue;
+                }
+                Id v = 0;
+                const Id f = Bit(t_f32_, bits);
+                switch (t.conversion) {
+                case 0:
+                    v = scalar == t_u32_ ? bits : Bit(scalar, bits);
+                    break;
+                case 1:
+                    v = b_.Op(Op::OpConvertFToU, t_u32_, {f});
+                    break;
+                case 2:
+                    v = b_.Op(Op::OpConvertFToS, t_i32_, {f});
+                    break;
+                case 3:
+                    v = b_.Op(Op::OpFMul, t_f32_, {b_.Op(Op::OpFAdd, t_f32_, {f, b_.F32(1.0f)}), b_.F32(0.5f)});
+                    break;
+                case 6:
+                    v = b_.Op(Op::OpConvertFToU, t_u32_,
+                              {b_.Op(Op::OpFMul, t_f32_, {Glsl(GLSLstd450FClamp, t_f32_, {f, b_.F32(0.0f), b_.F32(1.0f)}),
+                                                          b_.F32(4294967295.0f)})});
+                    break;
+                default:
+                    throw Unsupported{fmt::format("MRT{} write conversion {}", target, t.conversion)};
+                }
+                if (t.self_scale && i < 3 && scalar == t_f32_) {
+                    v = b_.Op(Op::OpFMul, t_f32_, {v, v}); // (min/max(src * src, dst * dst))
+                }
+                b_.OpNoResult(Op::OpStore, {b_.Op(Op::OpAccessChain, ptr, {mrt_[target], b_.U32(i)}), v});
+            }
+        });
+        return;
+    }
+    if (target == 8) {
+        // MRTZ: depth (x); stencil (y) and the sample mask (z) are not translated yet
+        if (compr) {
+            throw Unsupported{"a compressed MRTZ export"};
+        }
+        const u32 mask = en & options_.fs.mrtz_mask;
+        if ((mask & ~1u) != 0) {
+            throw Unsupported{fmt::format("an MRTZ export of stencil / sample mask (mask {:#x})", mask)};
+        }
+        if ((mask & 1) != 0) {
+            if (frag_depth_ == 0) {
+                frag_depth_ = b_.Variable(b_.TypePointer(spv::StorageClass::Output, t_f32_), spv::StorageClass::Output);
+                b_.Decorate(frag_depth_, spv::Decoration::BuiltIn, {static_cast<u32>(spv::BuiltIn::FragDepth)});
+                interface_.push_back(frag_depth_);
+            }
+            if_exec([&] { b_.OpNoResult(Op::OpStore, {frag_depth_, Bit(t_f32_, vsrc(0))}); });
+        }
+        return;
+    }
+    if (target == 9) {
+        return; // NULL: only its valid mask
+    }
+    throw Unsupported{fmt::format("exp to target {} (a fragment program)", target)};
+}
+
 void Emitter::VertexEpilogue() {
     const EmitOptions::VertexOptions& vs = options_.vs;
     if (!vs.depth_minus_one_to_one && !vs.clip_space) {
@@ -1532,6 +2147,15 @@ Id Emitter::LaneId() {
     return b_.Op(Op::OpLoad, t_u32_, {lane_id_});
 }
 
+Id Emitter::GammaToLinear(Id c) {
+    // the bridge's ApplyGammaToLinear: c > 0.04045 ? ((c + 0.055) / 1.055)^2.4 : c / 12.92
+    const Id a = Glsl(GLSLstd450Pow, t_f32_,
+                      {b_.Op(Op::OpFMul, t_f32_, {b_.Op(Op::OpFAdd, t_f32_, {c, b_.F32(0.055f)}), b_.F32(1.0f / 1.055f)}),
+                       b_.F32(2.4f)});
+    const Id l = b_.Op(Op::OpFMul, t_f32_, {c, b_.F32(1.0f / 12.92f)});
+    return Select(t_f32_, b_.Op(Op::OpFOrdGreaterThan, t_bool_, {c, b_.F32(0.04045f)}), a, l);
+}
+
 Id Emitter::Glsl(GLSLstd450 f, Id type, std::initializer_list<u32> args) {
     std::vector<u32> ops{glsl_, static_cast<u32>(f)};
     ops.insert(ops.end(), args.begin(), args.end());
@@ -1555,7 +2179,7 @@ bool Emitter::IsVector(const Inst& in) const {
     case Format::Mtbuf:
     case Format::Mimg:
     case Format::Exp:
-        return true;
+        return !options_.fragment; // (a fragment export tests EXEC itself)
     default:
         return false;
     }
@@ -1634,6 +2258,20 @@ void Emitter::Emit(const Inst& in) {
     case Format::Exp:
         if (options_.vertex) {
             EmitExport(in);
+            return;
+        }
+        if (options_.fragment) {
+            EmitFragmentExport(in);
+            return;
+        }
+        if (options_.stub_memory) {
+            EmitStub(in, name);
+            return;
+        }
+        throw Unsupported{std::string(name)};
+    case Format::Vintrp:
+        if (options_.fragment) {
+            EmitInterp(in);
             return;
         }
         if (options_.stub_memory) {
@@ -2509,6 +3147,9 @@ EmitResult Emitter::Run() {
         if (options_.vertex) {
             InitVertex();
         }
+        if (options_.fragment) {
+            InitFragment();
+        }
         b_.OpNoResult(Op::OpBranch, {labels_[0]});
         for (const u32 x : Rpo()) {
             const Node& nd = nodes_[x];
@@ -2590,11 +3231,23 @@ EmitResult Emitter::Run() {
         b_.EndFunction();
         if (options_.vertex) {
             b_.EntryPoint(spv::ExecutionModel::Vertex, fn, "main", interface_);
+        } else if (options_.fragment) {
+            b_.EntryPoint(spv::ExecutionModel::Fragment, fn, "main", interface_);
+            b_.ExecutionMode(fn, spv::ExecutionMode::OriginUpperLeft);
+            if (frag_depth_ != 0) {
+                b_.ExecutionMode(fn, spv::ExecutionMode::DepthReplacing);
+            }
+            if (options_.fs.early_tests) {
+                if (frag_depth_ != 0) {
+                    throw Unsupported{"DEPTH_BEFORE_SHADER with a depth export"};
+                }
+                b_.ExecutionMode(fn, spv::ExecutionMode::EarlyFragmentTests);
+            }
         } else {
             b_.EntryPoint(spv::ExecutionModel::GLCompute, fn, "main", interface_);
         }
-        if (options_.vertex) {
-            // (no execution mode)
+        if (options_.vertex || options_.fragment) {
+            // (no group size)
         } else if (options_.compute) {
             b_.ExecutionMode(fn, spv::ExecutionMode::LocalSize,
                              {std::max(options_.threads[0], 1u), std::max(options_.threads[1], 1u),
@@ -2604,6 +3257,8 @@ EmitResult Emitter::Run() {
         }
         res.spirv = b_.Assemble();
         res.resources = res_;
+        res.mrt_mask = mrt_mask_;
+        res.has_discard = has_discard_;
         res.ok = true;
     } catch (const Unsupported& u) {
         res.unsupported = u.what;
