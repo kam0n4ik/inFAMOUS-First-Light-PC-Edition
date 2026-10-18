@@ -237,5 +237,34 @@ Measured (hold-out: the joint states built from the two other scenes' caches; `c
 The misses are mostly a stage: a keyed PS whose material texture format was not among the variants (as in §8.1),
 then the joint state beyond the three most frequent.
 
-Not yet: compute (8 049 CS, bound by engine code); a game run with the predicted cache (the on-demand creations'
-driver feedback would show the hits in the game itself).
+### 8.3 Compute shaders
+
+The packs hold 8 049 compute shaders as Gnmx CsShader structs (a kind-4 link to a program of footer type 4: RSRC1/2 at
++0x10, COMPUTE_NUM_THREAD_X/Y/Z at +0x18, input usage slots at +0x28). Their RuntimeParams are exactly what
+`BuildComputeRuntime` makes of a dispatch's registers (233 / 233 cached modules). Their descriptors are bound by the
+engine's code, so:
+
+- The descriptors of a slot come from earlier dispatches (`csig`/`cslot` template lines, `tools\static_shaders\
+  cs_table.py`, from the caches' flattened user data - `cs_flat.py`): by the struct's whole slot list and start
+  register, else by (usage type, api slot, flags); the template sharp carries every V# bit the key reads (stride,
+  swizzle, formats, element size, index stride, ADD_TID, MTYPE - an arbitrary sharp of a coarser form lost MTYPE:
+  113 -> 288 below).
+- A RW buffer's stride (the particle structs: 48-176 bytes, different in nearly every new program) follows from the
+  code: the largest offset + size of the MUBUF/MTBUF accesses with IDXEN through that V# (in the user data SGPRs or
+  loaded from the extended user data), rounded up to 16 when an access moves 16 bytes or more or an offset is not
+  16-aligned (`BufferStrides`, `gcn_buf.py`; 1 350 of 1 582 slots of three scenes' dispatches). Read-only buffers keep
+  the template's (the engine gives many of them stride 0 although the code indexes them).
+
+Hold-out on the descriptors (new CS programs of a scene, templates from the other two; `cs_holdout.py`): every slot
+right for 18 / 26 (village), 6 / 7 (beach), 102 / 105 (harbour) - from 7, 4, 23 by the templates alone. In the
+translation: the first module of all 8 049 programs, (program, RuntimeParams) of every CS layout module of the three
+scenes (26 / 26, 7 / 7, 105 / 105 new ones). The key a layout gets in the game (the live cache of this generation,
+its keys computed by `SSPC_STATIC_KEYS=<dir>` -> `compare_keys.py`; not a hold-out): CS 288 / 353 (82 %), PS 370 / 466
+(79 %), VS 163 / 214 (76 %). Not predicted: the second and later key of a program (121 keyed CS modules there).
+
+With compute: ~300 000 modules in 3 min, 13 550 pipelines (8 049 compute) compiled into `vulkan.bin` (181 MiB) in
+36-120 s, 0.2-0.3 ms each from it afterwards. `SSPC_STATIC_COMPUTE=0`: graphics only.
+
+Not yet: a game run with the predicted cache (the on-demand creations' driver feedback would show the hits in the
+game itself); more than one key per CS program; the material textures' streaming placeholders (a 1x1 1D T# of the
+texture's format while it streams in: 158 of 682 logged material modules had one).
