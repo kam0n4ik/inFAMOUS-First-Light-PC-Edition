@@ -273,6 +273,39 @@ DS       ds_read2_b64                                1          1
 SOP2     s_min_i32                                   1          1
 
 control flow: 159467 blocks (at most 92 in one program); 4449 programs with loops (9773 loops); 0 irreducible programs; 0 unreachable blocks; 0 graphs not built
+structure: 10269 programs as SPIR-V needs them; 77358 selections; to rewrite: 0 loops with several latches, 0 loops exiting to several blocks, 33 selections left before their merge; 15499 selections sharing their merge (given one of their own)
+  shape: art/cache/a1.xpps @ 0x3da094: branch at block 1: its region is left before merge -2
+  shape: art/cache/a1.xpps @ 0x3edb94: branch at block 1: its region is left before merge -2
+  shape: art/cache/a10.xpps @ 0x59ee70: branch at block 1: its region is left before merge -2
+  shape: art/cache/a10.xpps @ 0x59f970: branch at block 1: its region is left before merge -2
+  shape: art/cache/a11.xpps @ 0x101afac: branch at block 1: its region is left before merge -2
+  shape: art/cache/a11.xpps @ 0x101d7ac: branch at block 1: its region is left before merge -2
+  shape: art/cache/a11.xpps @ 0x10217ac: branch at block 1: its region is left before merge -2
+  shape: art/cache/a11.xpps @ 0x10223ac: branch at block 1: its region is left before merge -2
+  shape: art/cache/a11.xpps @ 0x1048aac: branch at block 1: its region is left before merge -2
+  shape: art/cache/a12.xpps @ 0xe5f904: branch at block 1: its region is left before merge -2
+  shape: art/cache/a16.xpps @ 0x75f598: branch at block 1: its region is left before merge -2
+  shape: art/cache/a19.xpps @ 0x10bce1c: branch at block 1: its region is left before merge -2
+  shape: art/cache/a19.xpps @ 0x10c0f1c: branch at block 1: its region is left before merge -2
+  shape: art/cache/a24.xpps @ 0x7be0c0: branch at block 1: its region is left before merge -2
+  shape: art/cache/a4.xpps @ 0x10d0f14: branch at block 1: its region is left before merge -2
+  shape: art/cache/all_shaders.xpps @ 0x68228: branch at block 15: its region is left before merge -2
+  shape: art/cache/all_shaders.xpps @ 0x69028: branch at block 15: its region is left before merge -2
+  shape: art/cache/augustine.xpps @ 0x1853fb4: branch at block 1: its region is left before merge -2
+  shape: art/cache/augustine.xpps @ 0x18732b4: branch at block 1: its region is left before merge -2
+  shape: art/cache/b1.xpps @ 0xcc28b4: branch at block 1: its region is left before merge -2
+  shape: art/cache/b10.xpps @ 0x1568db4: branch at block 1: its region is left before merge -2
+  shape: art/cache/c50.xpps @ 0x133ed44: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x109e8ae4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x109f99e4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a007e4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a14ce4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a35ee4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a4dbe4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a697e4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a6b3e4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_common.sprig.xpps @ 0x10a793e4: branch at block 1: its region is left before merge -2
+  shape: art/cache/core_seaport.sprig.xpps @ 0x658d2dc: branch at block 1: its region is left before merge -2
 
 unknown opcodes: 2
 decode failures: 0

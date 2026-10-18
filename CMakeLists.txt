@@ -123,6 +123,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/gcn/gcn_cfg.cpp
     src/runtime/gpu/gcn/gcn_decoder.cpp
     src/runtime/gpu/gcn/gcn_inventory.cpp
+    src/runtime/gpu/gcn/gcn_structure.cpp
     src/runtime/kernel/event_queues.cpp
     src/runtime/kernel/guest_errno.cpp
     src/runtime/kernel/kernel_memory.cpp

@@ -4,6 +4,7 @@
 #include "runtime/gpu/gcn/gcn_inventory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <vector>
@@ -12,6 +13,7 @@
 
 #include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
+#include "runtime/gpu/gcn/gcn_structure.h"
 #include "runtime/gpu/shader/game_shader_index.h"
 
 namespace SecondSon::Gpu::Gcn {
@@ -33,7 +35,9 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
     std::vector<std::string> failures;
     u64 programs = 0, decoded = 0, instructions = 0, without_end = 0, trailing = 0;
     u64 cfg_failed = 0, blocks = 0, with_loops = 0, loops = 0, irreducible = 0, unreachable = 0, max_blocks = 0;
-    std::vector<std::string> cfg_failures, irreducible_programs;
+    std::vector<std::string> cfg_failures, irreducible_programs, shape_examples;
+    std::string dump_text;
+    u64 simple = 0, multi_latch = 0, multi_exit = 0, escaping = 0, selections = 0, shared = 0;
     Cfg cfg;
     std::vector<u32> code;
     std::vector<Inst> insts;
@@ -80,6 +84,37 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
             if (!cfg.Reducible()) {
                 ++irreducible;
                 irreducible_programs.push_back(fmt::format("{} @ {:#x}", index.Packs()[loc.pack], loc.offset));
+            } else {
+                const Structure st = AnalyzeStructure(cfg);
+                // SSPC_GCN_DUMP=<pack>@<hex offset>: that program's blocks, edges and instructions in the report
+                if (const char* dump = std::getenv("SSPC_GCN_DUMP");
+                    dump != nullptr && fmt::format("{}@{:x}", index.Packs()[loc.pack], loc.offset) == dump) {
+                    for (u32 k = 0; k < cfg.blocks.size(); ++k) {
+                        const Block& bk = cfg.blocks[k];
+                        dump_text += fmt::format("block {} [{}..{}] idom {} ipdom {} loop {} -> {} {} {}{}\n", k, bk.first,
+                                                 bk.last, cfg.idom[k], st.ipdom[k], st.loop_of[k], bk.taken,
+                                                 CondName(bk.cond), bk.next, bk.exit ? " EXIT" : "");
+                        for (u32 i = bk.first; i <= bk.last; ++i) {
+                            dump_text += fmt::format("    {:5} {}\n", insts[i].offset,
+                                                     Mnemonic(insts[i].format, insts[i].op));
+                        }
+                    }
+                    for (const auto& note : st.notes) {
+                        dump_text += "  note: " + note + "\n";
+                    }
+                }
+                simple += st.Simple() ? 1 : 0;
+                multi_latch += st.multi_latch_loops;
+                multi_exit += st.multi_exit_loops;
+                escaping += st.escaping_selections;
+                shared += st.shared_merges;
+                for (const s32 m : st.selection_merge) {
+                    selections += m != -1 ? 1 : 0;
+                }
+                if (!st.Simple() && shape_examples.size() < 40) {
+                    shape_examples.push_back(fmt::format("{} @ {:#x}: {}", index.Packs()[loc.pack], loc.offset,
+                                                         st.notes.empty() ? "" : st.notes.front()));
+                }
             }
         }
         std::map<std::pair<u32, u32>, bool> seen;
@@ -113,6 +148,13 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
     text += fmt::format("\ncontrol flow: {} blocks (at most {} in one program); {} programs with loops ({} loops); {} "
                         "irreducible programs; {} unreachable blocks; {} graphs not built\n",
                         blocks, max_blocks, with_loops, loops, irreducible, unreachable, cfg_failed);
+    text += fmt::format("structure: {} programs as SPIR-V needs them; {} selections; to rewrite: {} loops with "
+                        "several latches, {} loops exiting to several blocks, {} selections left before their merge; {} "
+                        "selections sharing their merge (given one of their own)\n",
+                        simple, selections, multi_latch, multi_exit, escaping, shared);
+    for (const auto& s : shape_examples) {
+        text += "  shape: " + s + "\n";
+    }
     for (const auto& s : cfg_failures) {
         text += "  not built: " + s + "\n";
     }
@@ -120,6 +162,7 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
         text += "  irreducible: " + s + "\n";
     }
     text += fmt::format("\nunknown opcodes: {}\ndecode failures: {}\n", unknown, failures.size());
+    text += dump_text;
     for (const auto& s : failures) {
         text += "  " + s + "\n";
     }
