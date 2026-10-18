@@ -98,8 +98,18 @@ bool RunInventory(const std::filesystem::path& game_dir, const std::filesystem::
                                                  bk.last, cfg.idom[k], st.ipdom[k], st.loop_of[k], bk.taken,
                                                  CondName(bk.cond), bk.next, bk.exit ? " EXIT" : "");
                         for (u32 i = bk.first; i <= bk.last; ++i) {
-                            dump_text += fmt::format("    {:5} {}\n", insts[i].offset,
-                                                     Mnemonic(insts[i].format, insts[i].op));
+                            const Operands ops = GetOperands(insts[i]);
+                            std::string regs;
+                            for (u32 k = 0; k < ops.num_dst; ++k) {
+                                regs += fmt::format(" d{}", ops.dst[k]);
+                            }
+                            for (u32 k = 0; k < ops.num_src; ++k) {
+                                regs += fmt::format(" s{}", ops.src[k]);
+                            }
+                            dump_text += fmt::format("    {:5} {:<28} {:08x} {:08x}{}{}\n", insts[i].offset,
+                                                     Mnemonic(insts[i].format, insts[i].op), insts[i].w0, insts[i].w1,
+                                                     insts[i].literal ? fmt::format(" lit {:08x}", insts[i].lit) : "",
+                                                     regs);
                         }
                     }
                     for (const auto& note : st.notes) {

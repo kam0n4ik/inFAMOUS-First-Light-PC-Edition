@@ -27,7 +27,8 @@ struct EmitResult {
     std::string error;       ///< the first instruction not handled ("unsupported: <mnemonic>") or a structure problem
     std::string unsupported; ///< its mnemonic alone (empty: none)
     std::vector<u32> spirv;
-    /// the resources (bindings: 0 the flattened user data, then buffers[i] at 1 + i; push constants: PushData)
+    /// the resources (bindings: buffers[i] at i, the flattened user data at buffers.size(), GDS after it; push
+    /// constants: PushData, buf_offsets[i] for buffers[i])
     ResourceInfo resources;
 };
 
@@ -47,6 +48,10 @@ struct EmitOptions {
     /// lane numbering - v_mbcnt of a constant mask (a lane's index in the wave) - uses LocalInvocationIndex & 63 in a
     /// compute program; v_readlane / v_writelane of a constant lane beyond the subgroup are not translated.
     u32 subgroup_size = 64;
+    /// the flattened user data at the translation (the user data, then the SRT walk's copies): the V#s' fields the
+    /// module is specialized on (the runtime's key holds them) - buffer_*_format's DATA/NUM_FORMAT and DST_SEL.
+    /// Empty: those instructions are not translated.
+    std::span<const u32> flat;
 };
 
 EmitResult EmitProgram(std::span<const Inst> insts, const Cfg& cfg, const Structure& st,

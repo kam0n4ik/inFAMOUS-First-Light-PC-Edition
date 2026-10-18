@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -151,6 +152,37 @@ private:
         const Structure st = AnalyzeStructure(cfg);
         EmitOptions eo;
         eo.user_sgprs = (rsrc2 >> 1) & 0x1F;
+        // the flattened user data the translation sees (as the bridge's: the walk over the request's memory), before
+        // the emission (formatted buffers are specialized on their V#'s format; the runtime's key holds it)
+        ResourceInfo pre;
+        AnalyzeResources(insts, cfg, eo.user_sgprs, pre); // (an unknown V# fails in the emission, at its instruction)
+        std::vector<u8> walker;
+        if (!BuildSrtWalker(pre, walker, why)) {
+            return false;
+        }
+        res.flatbuf.assign(pre.flat_dwords, 0);
+        std::copy(req.user_data.begin(), req.user_data.end(), res.flatbuf.begin());
+        if (!req.flatbuf.empty()) {
+            if (req.flatbuf.size() != pre.flat_dwords) {
+                why = fmt::format("the given flattened user data has {} dwords, the translation's {}", req.flatbuf.size(),
+                                  pre.flat_dwords);
+                return false;
+            }
+            res.flatbuf.assign(req.flatbuf.begin(), req.flatbuf.end());
+        } else if (!walker.empty()) {
+            if (req.memory == nullptr) {
+                why = "no guest memory for the SRT walk";
+                return false;
+            }
+            GS::SrtProgram walk;
+            GS::SrtProgram::RunStats stats;
+            if (!walk.Compile(walker, why) ||
+                !walk.Run(std::span<const u32, 16>(req.user_data), res.flatbuf, *req.memory, stats, why)) {
+                why = "the SRT walk: " + why;
+                return false;
+            }
+        }
+        eo.flat = res.flatbuf;
         eo.compute = true;
         eo.threads = req.runtime.threads;
         eo.rsrc2 = rsrc2;
@@ -162,16 +194,50 @@ private:
         }
         const ResourceInfo& ri = r.resources;
         GS::ShaderReflection& refl = res.reflection;
-        if (!BuildSrtWalker(ri, refl.srt_walker, why)) {
+        if (HashList("SSPC_OWN_SHADERS_DUMP").contains(req.footer_hash)) {
+            // SSPC_OWN_SHADERS_DUMP=<footer hashes>: the program, its buffers' V#s as the translation saw them, the SPIR-V
+            std::string text = fmt::format("compute {:016x} at {:#x}, rsrc2 {:#x}, group {}x{}x{}\n", req.footer_hash,
+                                           req.address, rsrc2, eo.threads[0], eo.threads[1], eo.threads[2]);
+            for (u32 b = 0; b < ri.buffers.size(); ++b) {
+                text += fmt::format("buffer {} (binding {}){}:", b, b + 1, ri.buffers[b].written ? " written" : "");
+                for (const ScalarValue& v : ri.buffers[b].sharp) {
+                    const bool flat = v.kind == ScalarValue::Kind::Flat;
+                    text += fmt::format(" {}{}={:08x}", flat ? "flat" : "const", v.value,
+                                        flat && v.value < res.flatbuf.size() ? res.flatbuf[v.value] : v.value);
+                }
+                text += "\n";
+            }
+            for (const Inst& in : insts) {
+                const Operands ops = GetOperands(in);
+                std::string regs;
+                for (u32 k = 0; k < ops.num_dst; ++k) {
+                    regs += fmt::format(" d{}", ops.dst[k]);
+                }
+                for (u32 k = 0; k < ops.num_src; ++k) {
+                    regs += fmt::format(" s{}", ops.src[k]);
+                }
+                text += fmt::format("{:5} {:<28} {:08x} {:08x}{}{}\n", in.offset, Mnemonic(in.format, in.op), in.w0, in.w1,
+                                    in.literal ? fmt::format(" lit {:08x}", in.lit) : "", regs);
+            }
+            const std::string base = fmt::format("logs/own_cs_{:016x}", req.footer_hash);
+            std::ofstream(base + ".txt", std::ios::binary) << text;
+            std::ofstream(base + ".spv", std::ios::binary)
+                .write(reinterpret_cast<const char*>(r.spirv.data()), static_cast<std::streamsize>(r.spirv.size() * 4));
+        }
+        if (!(ri.walk == pre.walk) || ri.flat_dwords != pre.flat_dwords) {
+            why = "the emission's resources differ from the analysis'";
             return false;
         }
+        refl.srt_walker = std::move(walker);
         refl.hw = req.hw;
         refl.sw = req.sw;
         refl.footer_hash = req.footer_hash;
-        refl.buffers.push_back({.kind = GS::BufferKind::Flatbuf}); // binding 0
+        // the bridge's order (the executor's game fixes, e.g. the particle sort's split, know the buffers by it): the
+        // V#s, the flattened user data, GDS
         for (const BufferUse& b : ri.buffers) {
             refl.buffers.push_back({.sharp = Location(b), .kind = GS::BufferKind::Guest, .is_written = b.written});
         }
+        refl.buffers.push_back({.kind = GS::BufferKind::Flatbuf});
         if (ri.uses_gds) {
             refl.buffers.push_back({.kind = GS::BufferKind::GdsBuffer, .is_written = true});
         }
@@ -182,29 +248,6 @@ private:
         refl.start = req.start;
         const u32 n = static_cast<u32>(refl.buffers.size());
         refl.end = {req.start.unified + n, req.start.buffer + n};
-        // the flattened user data the translation sees (as the bridge's: the walk over the request's memory)
-        res.flatbuf.assign(ri.flat_dwords, 0);
-        std::copy(req.user_data.begin(), req.user_data.end(), res.flatbuf.begin());
-        if (!req.flatbuf.empty()) {
-            if (req.flatbuf.size() != ri.flat_dwords) {
-                why = fmt::format("the given flattened user data has {} dwords, the translation's {}", req.flatbuf.size(),
-                                  ri.flat_dwords);
-                return false;
-            }
-            res.flatbuf.assign(req.flatbuf.begin(), req.flatbuf.end());
-        } else if (!refl.srt_walker.empty()) {
-            if (req.memory == nullptr) {
-                why = "no guest memory for the SRT walk";
-                return false;
-            }
-            GS::SrtProgram walk;
-            GS::SrtProgram::RunStats stats;
-            if (!walk.Compile(refl.srt_walker, why) ||
-                !walk.Run(std::span<const u32, 16>(req.user_data), res.flatbuf, *req.memory, stats, why)) {
-                why = "the SRT walk: " + why;
-                return false;
-            }
-        }
         walk_loads = static_cast<u32>(ri.walk.size());
         res.spirv = std::move(r.spirv);
         return true;

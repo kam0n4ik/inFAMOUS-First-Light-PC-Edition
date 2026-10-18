@@ -237,11 +237,15 @@ void Analysis::Step(State& s, u32 index, bool record) {
     case Format::Vop2:
     case Format::Vop3:
     case Format::Vopc: {
-        // what a vector instruction writes into SGPRs (readlane, compares, carries) is data
+        // what a vector instruction writes into SGPRs (readlane, compares, carries) is data: one SGPR for
+        // v_readlane / v_readfirstlane, a pair (a lane mask) for the others
+        const bool one_sgpr = name == "v_readlane_b32" || name == "v_readfirstlane_b32";
         for (u32 i = 0; i < o.num_dst; ++i) {
             if (o.dst[i] < kVgpr) {
                 Write(s, o.dst[i], {});
-                Write(s, o.dst[i] + 1, {});
+                if (!one_sgpr) {
+                    Write(s, o.dst[i] + 1, {});
+                }
             }
         }
         const bool carry = name == "v_add_i32" || name == "v_sub_i32" || name == "v_subrev_i32" ||

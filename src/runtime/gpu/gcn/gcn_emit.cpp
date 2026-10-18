@@ -113,17 +113,21 @@ private:
     Id lane_id_ = 0;            ///< SubgroupLocalInvocationId (on first use)
     // resources
     ResourceInfo res_;
-    Id flat_ = 0, push_ = 0;  ///< the flattened user data (binding 0), PushData
-    std::vector<Id> buffers_; ///< binding 1 + i
+    Id flat_ = 0, push_ = 0;  ///< the flattened user data (binding buffers.size()), PushData
+    std::vector<Id> buffers_; ///< binding i
     Id t_ptr_sb_u32_ = 0, t_ptr_pc_u32_ = 0;
     void DeclareResources();
     Id FlatDword(Id index);   ///< flat[index]
-    Id BufOffset(u32 buffer); ///< buf_offsets[1 + buffer] (bytes the descriptor's start was moved down)
+    Id BufOffset(u32 buffer); ///< buf_offsets[buffer] (bytes the descriptor's start was moved down)
     Id SharpDword(u32 buffer, u32 dword);
     bool BufferKnown(s32 buffer) const;
     void EmitSmrd(const Inst& in, u32 index, std::string_view name);
     bool EmitBuffer(const Inst& in, u32 index, std::string_view name);
     bool EmitTbuffer(const Inst& in, u32 index, std::string_view name);
+    /// a typed load of `n` components: the data / number format and DST_SEL (3 bits per component: 0 zero, 1 one,
+    /// 4-7 the format's x-w) given
+    bool EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt, u32 dst_sel);
+    bool EmitFormattedBuffer(const Inst& in, u32 index, std::string_view name); ///< buffer_*_format: the V#'s format
     bool EmitDs(const Inst& in, std::string_view name);
     Id gds_ = 0, lds_ = 0, t_ptr_wg_u32_ = 0;
     Id BufferAddress(const Inst& in, u32 buffer);              ///< MUBUF / MTBUF: the byte address in the binding
@@ -378,10 +382,11 @@ void Emitter::DeclareResources() {
         return v;
     };
     t_ptr_sb_u32_ = b_.TypePointer(spv::StorageClass::StorageBuffer, t_u32_);
-    flat_ = ssbo(false, 0);
     for (u32 i = 0; i < res_.buffers.size(); ++i) {
-        buffers_.push_back(ssbo(res_.buffers[i].written, 1 + i));
+        buffers_.push_back(ssbo(res_.buffers[i].written, i));
     }
+    // the bridge's order (the executor's game fixes know the buffers by it): the V#s, the flattened user data, GDS
+    flat_ = ssbo(false, static_cast<u32>(res_.buffers.size()));
     if (res_.uses_gds) {
         gds_ = ssbo(true, 1 + static_cast<u32>(res_.buffers.size()));
     }
@@ -412,7 +417,7 @@ Id Emitter::FlatDword(Id index) {
 }
 
 Id Emitter::BufOffset(u32 buffer) {
-    const u32 k = 1 + buffer; // (the flattened user data is binding 0)
+    const u32 k = buffer; // (the V#s are the first bindings)
     const Id word =
         b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_pc_u32_, {push_, b_.U32(1), b_.U32(k / 4)})});
     return b_.Op(Op::OpBitFieldUExtract, t_u32_, {word, b_.U32((k % 4) * 8), b_.U32(8)});
@@ -572,6 +577,63 @@ bool Emitter::EmitTbuffer(const Inst& in, u32 index, std::string_view name) {
     if (!name.starts_with("tbuffer_load_format_") || ((in.w0 >> 15) & 1) != 0) {
         return false; // (stores: not used by the game; addr64)
     }
+    const u32 n = name.ends_with("xyzw") ? 4 : name.ends_with("xyz") ? 3 : name.ends_with("xy") ? 2 : 1;
+    // the instruction's format, the components in order (the bridge: no DST_SEL for typed instructions)
+    return EmitTypedLoad(in, index, n, (in.w0 >> 19) & 0xF, (in.w0 >> 23) & 7, 4 | 5 << 3 | 6 << 6 | 7 << 9);
+}
+
+bool Emitter::EmitFormattedBuffer(const Inst& in, u32 index, std::string_view name) {
+    if (((in.w0 >> 15) & 1) != 0 || ((in.w0 >> 16) & 1) != 0) {
+        return false; // addr64 / lds
+    }
+    const u32 buffer = static_cast<u32>(res_.buffer_of[index]);
+    const ScalarValue& w3 = res_.buffers[buffer].sharp[3];
+    u32 dw3 = 0;
+    if (w3.kind == ScalarValue::Kind::Const) {
+        dw3 = w3.value;
+    } else if (w3.kind == ScalarValue::Kind::Flat && w3.value < options_.flat.size()) {
+        dw3 = options_.flat[w3.value];
+    } else {
+        return false; // (no flattened user data at the translation)
+    }
+    const u32 dfmt = (dw3 >> 15) & 0xF, nfmt = (dw3 >> 12) & 7, dst_sel = dw3 & 0xFFF;
+    const u32 n = name.ends_with("xyzw") ? 4 : name.ends_with("xyz") ? 3 : name.ends_with("xy") ? 2 : 1;
+    if (name.starts_with("buffer_load_format_")) {
+        return EmitTypedLoad(in, index, n, dfmt, nfmt, dst_sel);
+    }
+    // stores: formats of 32-bit integer / float components in order (a narrower component would be a read-modify-write
+    // of a dword other lanes may write too); a null V# stores nothing
+    if (dfmt == 0) {
+        return true;
+    }
+    const bool dwords = dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14;
+    const u32 comps = dfmt == 4 ? 1 : dfmt == 11 ? 2 : dfmt == 13 ? 3 : 4;
+    if (!dwords || (nfmt != 4 && nfmt != 5 && nfmt != 7)) {
+        return false;
+    }
+    for (u32 c = 0; c < std::min(n, comps); ++c) {
+        if (((dst_sel >> (3 * c)) & 7) != 4 + c) {
+            return false; // (a swizzled store)
+        }
+    }
+    const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    const Id first = b_.Op(Op::OpShiftRightLogical, t_u32_, {BufferAddress(in, buffer), b_.U32(2)});
+    for (u32 c = 0; c < std::min(n, comps); ++c) {
+        const Id idx = c == 0 ? first : b_.Op(Op::OpIAdd, t_u32_, {first, b_.U32(c)});
+        b_.OpNoResult(Op::OpStore, {b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {buffers_[buffer], b_.U32(0), idx}),
+                                    Get(vdata + c, in)});
+    }
+    return true;
+}
+
+bool Emitter::EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt, u32 dst_sel) {
+    const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    if (dfmt == 0) {
+        for (u32 c = 0; c < n; ++c) {
+            Set(vdata + c, b_.U32(0)); // a null V#: zeros (as the bridge)
+        }
+        return true;
+    }
     struct Fmt {
         u32 comps;
         std::array<u8, 4> bits;
@@ -583,8 +645,7 @@ bool Emitter::EmitTbuffer(const Inst& in, u32 index, std::string_view name) {
         {4, {10, 10, 10, 2}},  {4, {2, 10, 10, 10}}, {4, {8, 8, 8, 8}},    {2, {32, 32, 0, 0}},
         {4, {16, 16, 16, 16}}, {3, {32, 32, 32, 0}}, {4, {32, 32, 32, 32}},
     };
-    const u32 dfmt = (in.w0 >> 19) & 0xF, nfmt = (in.w0 >> 23) & 7;
-    if (dfmt == 0 || dfmt > 14 || dfmt == 6 || dfmt == 7 || nfmt == 6) {
+    if (dfmt > 14 || dfmt == 6 || dfmt == 7 || nfmt == 6) {
         return false; // (invalid / packed floats / the reserved number format)
     }
     const Fmt& f = kFmt[dfmt];
@@ -593,16 +654,27 @@ bool Emitter::EmitTbuffer(const Inst& in, u32 index, std::string_view name) {
             return false; // (floats of other widths)
         }
     }
-    const u32 n = name.ends_with("xyzw") ? 4 : name.ends_with("xyz") ? 3 : name.ends_with("xy") ? 2 : 1;
     const u32 buffer = static_cast<u32>(res_.buffer_of[index]);
-    const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
     const Id addr = BufferAddress(in, buffer);
     const bool int_format = nfmt == 4 || nfmt == 5;
-    u32 bit = 0;
+    const Id one = int_format ? b_.U32(1) : b_.U32(0x3F800000u);
+    // the components DST_SEL picks
+    u32 needed = 0;
     for (u32 c = 0; c < n; ++c) {
+        if (const u32 sel = (dst_sel >> (3 * c)) & 7; sel >= 4) {
+            needed |= 1u << (sel - 4);
+        }
+    }
+    std::array<Id, 4> comp{};
+    u32 bit = 0;
+    for (u32 c = 0; c < 4; ++c) {
         if (c >= f.comps) {
             // missing components: 0, 0, 0 and 1 (1.0 or 1 by the number format)
-            Set(vdata + c, c == 3 ? (int_format ? b_.U32(1) : b_.U32(0x3F800000u)) : b_.U32(0));
+            comp[c] = c == 3 ? one : b_.U32(0);
+            continue;
+        }
+        if (((needed >> c) & 1) == 0) {
+            bit += f.bits[c];
             continue;
         }
         const u32 w = f.bits[c];
@@ -641,7 +713,11 @@ bool Emitter::EmitTbuffer(const Inst& in, u32 index, std::string_view name) {
         default: // uint
             break;
         }
-        Set(vdata + c, v);
+        comp[c] = v;
+    }
+    for (u32 c = 0; c < n; ++c) {
+        const u32 sel = (dst_sel >> (3 * c)) & 7;
+        Set(vdata + c, sel >= 4 ? comp[sel - 4] : sel == 1 ? one : b_.U32(0));
     }
     return true;
 }
@@ -920,7 +996,9 @@ void Emitter::Emit(const Inst& in) {
         return;
     case Format::Mubuf:
         if (res_.buffer_of[cur_index_] >= 0 && BufferKnown(res_.buffer_of[cur_index_]) &&
-            EmitBuffer(in, cur_index_, name)) {
+            (name.starts_with("buffer_load_format_") || name.starts_with("buffer_store_format_")
+                 ? EmitFormattedBuffer(in, cur_index_, name)
+                 : EmitBuffer(in, cur_index_, name))) {
             return;
         }
         if (!options_.stub_memory) {
