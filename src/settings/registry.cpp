@@ -714,6 +714,17 @@ void Build(Registry& r) {
         .requires_on = "shaders.precompile",
     });
     v.push_back(Desc{
+        .id = "shaders.predictAll", .table = "ShaderCache", .key = "predictAll", .category = Category::Shaders,
+        .type = Type::Bool, .apply = Apply::Restart, .en = "Compile all the game's shaders before it starts",
+        .ru = "Компилировать все шейдеры игры до запуска",
+        .help_en = "Before the game starts, a console window compiles the shaders found in the game's files and shows "
+                   "the progress (a few minutes once; afterwards a second). Takes effect after a restart.",
+        .help_ru = "Перед запуском игры окно консоли компилирует шейдеры, найденные в файлах игры, и показывает "
+                   "прогресс (один раз — несколько минут, потом — секунда). Вступает в силу после перезапуска.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.shader_predict; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.shader_predict = std::get<bool>(x); },
+    });
+    v.push_back(Desc{
         .id = "shaders.maxSize", .table = "ShaderCache", .key = "maxSizeMiB", .category = Category::Shaders,
         .type = Type::Int, .apply = Apply::Restart, .min = 256, .max = 16384, .ui_min = 256, .ui_max = 8192,
         .step = 256, .unit = "MiB", .en = "Shader cache size", .ru = "Размер кэша шейдеров",

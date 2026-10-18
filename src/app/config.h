@@ -137,6 +137,9 @@ struct Config {
     bool scan_game_shaders = false;          // --scan-game-shaders: index the game's GCN programs and exit (P4.14)
     std::filesystem::path predict_shaders;   // --predict-shaders <templates>: material draws' modules from the packs
                                              //   into the shader cache, no game (docs/REA_ENGINE_REVERSE.md §8)
+    bool predict_if_needed = false;          // --if-needed: with --predict-shaders, only when the cache's stamp is not
+                                             //   this predictor's and these templates' (the start's console window)
+    bool prepare_shaders = true;             // --no-shader-prepare: no --predict-shaders console before the game
 };
 
 /// Parses <root>\SecondSonPC.toml. On failure returns nullopt and fills `errors`.

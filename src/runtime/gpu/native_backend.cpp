@@ -11,12 +11,14 @@
 #include <filesystem>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 
 #include <fmt/format.h>
+#include <xxhash.h>
 
 #include "base/lifecycle.h"
 #include "base/log.h"
@@ -2571,7 +2573,8 @@ namespace {
 /// cache file keeps what the driver compiled), then a sample of them created again (what the game's creation of one
 /// costs after this).
 std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProfile& profile, GS::ShaderDiskCache& disk,
-                                    const std::vector<GS::PipelineDesc>& descs, u32 threads) {
+                                    const std::vector<GS::PipelineDesc>& descs, u32 threads,
+                                    Static::PredictProgress* prog) {
     Vk::PipelineCacheFile pcache(ctx, disk);
     if (!pcache.Load()) {
         return "predicted pipelines: " + pcache.LoadNote() + " - not built";
@@ -2593,6 +2596,9 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
                 std::vector<u32> vs, ps;
                 for (size_t i; (i = next.fetch_add(1)) < count;) {
                     const GS::PipelineDesc& d = descs[i];
+                    if (progress && prog != nullptr) {
+                        prog->done.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (!disk.LoadSpirv(d.vs, vs) || (d.has_ps && !disk.LoadSpirv(d.ps, ps))) {
                         n.missing.fetch_add(1, std::memory_order_relaxed);
                         continue;
@@ -2651,6 +2657,9 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
     };
     const auto t0 = std::chrono::steady_clock::now();
     Count first;
+    if (prog != nullptr) {
+        prog->Begin(Static::PredictProgress::Pipelines, descs.size());
+    }
     run(descs.size(), first, true);
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     Count again;
@@ -2727,8 +2736,8 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
                 for (const u32 w : key.words) {
                     kw += fmt::format("{:x},", w);
                 }
-                out << fmt::format("{:016x}{:016x}\t{}\t{}\t{}\t{}\n", id.hash.lo, id.hash.hi, id.length,
-                                   static_cast<u32>(id.stage), dm.layout ? 1 : 0, kw);
+                out << fmt::format("{:016x}{:016x}\t{}\t{}\t{}\t{}\t{}\n", id.hash.lo, id.hash.hi, id.length,
+                                   static_cast<u32>(id.stage), dm.layout ? 1 : 0, kw, st.record);
                 ++n;
             }
         }
@@ -2736,7 +2745,32 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
                               (o.logs_dir / "cache_module_keys.tsv").string());
         return true;
     }
+    // the stamp of a finished preparation: this cache generation, the templates' content, the predictor's version
+    // (kPredictorVersion: raised with every change of what it predicts). if_needed: a matching stamp and the driver's
+    // cache file - nothing to do
+    constexpr u32 kPredictorVersion = 2;
+    const std::filesystem::path stamp_file = root / gen / "static_predict.stamp";
+    std::string stamp;
+    {
+        std::ifstream tf(o.templates, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
+        stamp = fmt::format("{} {:016x} {}", gen, XXH3_64bits(text.data(), text.size()), kPredictorVersion);
+    }
+    if (o.if_needed) {
+        std::ifstream sf(stamp_file, std::ios::binary);
+        const std::string old((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
+        std::error_code ec;
+        if (old == stamp && std::filesystem::is_regular_file(root / gen / "vulkan.bin", ec)) {
+            if (o.up_to_date != nullptr) {
+                *o.up_to_date = true;
+            }
+            summary = fmt::format("shaders already prepared ({})", (root / gen).string());
+            disk.Close();
+            return true;
+        }
+    }
     Static::PredictOptions po;
+    po.progress = o.progress;
     po.threads = o.threads;
     if (!o.logs_dir.empty()) {
         po.report = o.logs_dir / "static_predict_modules.tsv";
@@ -2806,7 +2840,10 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
         return true;
     }
     if (ok && !descs.empty()) {
-        summary += "\n" + BuildPredictedPipelines(*ctx, profile, disk, descs, o.threads);
+        summary += "\n" + BuildPredictedPipelines(*ctx, profile, disk, descs, o.threads, o.progress);
+    }
+    if (ok) {
+        std::ofstream(stamp_file, std::ios::trunc) << stamp;
     }
     disk.Close();
     summary += fmt::format("\n-> {}", (root / gen).string());

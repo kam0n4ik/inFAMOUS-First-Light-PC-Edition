@@ -504,13 +504,20 @@ bool Translate(Context& c, const Request& r, GS::BindingStart& end) {
 }
 
 /// Runs `n` jobs on `threads` threads.
-void Parallel(u32 threads, size_t n, const std::function<void(size_t)>& fn) {
+void Parallel(u32 threads, size_t n, const std::function<void(size_t)>& fn, PredictProgress* progress = nullptr,
+              int phase = PredictProgress::Idle) {
+    if (progress != nullptr) {
+        progress->Begin(phase, n);
+    }
     std::atomic<size_t> next{0};
     std::vector<std::thread> pool;
     for (u32 t = 0; t < threads; ++t) {
         pool.emplace_back([&] {
             for (size_t i; (i = next.fetch_add(1)) < n;) {
                 fn(i);
+                if (progress != nullptr) {
+                    progress->done.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         });
     }
@@ -612,7 +619,16 @@ std::unordered_map<u32, u32> BufferStrides(const StaticShader& sh) {
 
 /// A compute shader's user data: each resource slot's sharp from the template (by its slot list and register, else by
 /// the slot), a RW buffer's stride from its code; the extended user data at kEudAddr.
-void FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& strides_from_code) {
+/// The engine's placeholder for a read-only buffer it has nothing for yet (NUM_RECORDS 0, stride 15: the particle
+/// systems' "previous state" before their first update); later dispatches of the same program bind the real buffer.
+bool IsPlaceholderBuffer(const std::vector<u32>& w) {
+    return w.size() == 4 && w[2] == 0 && w[3] == 0x1800C004u;
+}
+
+/// `filled`: the placeholders' later form instead - a read-only buffer of the stride the code implies (its raw[3]
+/// as the engine's real read-only buffers have it). Returns whether the shader has a placeholder at all.
+bool FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& strides_from_code, bool filled) {
+    bool placeholder = false;
     const StaticTemplates& t = c.templates;
     u64 sig = 0xCBF29CE484222325ull;
     for (const u32 w : cs.slots) {
@@ -652,11 +668,20 @@ void FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& 
                 ++strides_from_code;
             }
         }
+        if (!image && IsPlaceholderBuffer(w)) {
+            placeholder = true;
+            if (filled) {
+                const auto s = strides.find(reg);
+                const u32 stride = s != strides.end() ? s->second & 0x3FFFu : 0;
+                w = {0x10000000u, 0x2u | (stride << 16), 0x100000u, 0x20027204u};
+            }
+        }
         if (w[0] == 0 && w[1] == 0) {
             w[0] = 0x1000; // (a base of 0 would read as no descriptor)
         }
         ud.Put(reg, w.data(), static_cast<u32>(n));
     }
+    return placeholder;
 }
 
 /// Every compute shader of the packs: its runtime parameters from its struct (as BuildComputeRuntime makes them from a
@@ -678,17 +703,30 @@ void PredictCompute(Context& c, const PredictOptions& options, u32 threads, std:
         for (u32 i = 0; i < 3; ++i) {
             r.runtime.threads[i] = cs.regs[i] & 0xFFFF;
         }
-        FillComputeUserData(c, cs, r.ud, from_code);
+        Request later = r;
+        const bool placeholder = FillComputeUserData(c, cs, r.ud, from_code, false);
         const u64 h = RequestHash(r);
         hashes.push_back(h);
         if (requested.insert(h).second) {
             reqs.push_back(std::move(r));
         }
+        if (placeholder) { // the same program's later dispatches: the real buffers in the placeholders' place
+            u64 unused = 0;
+            FillComputeUserData(c, cs, later.ud, unused, true);
+            const u64 lh = RequestHash(later);
+            hashes.push_back(lh);
+            if (requested.insert(lh).second) {
+                reqs.push_back(std::move(later));
+            }
+        }
     }
-    Parallel(threads, reqs.size(), [&](size_t i) {
-        GS::BindingStart end;
-        Translate(c, reqs[i], end);
-    });
+    Parallel(
+        threads, reqs.size(),
+        [&](size_t i) {
+            GS::BindingStart end;
+            Translate(c, reqs[i], end);
+        },
+        options.progress, PredictProgress::ComputeShaders);
     stats.compute_shaders = c.draws.Computes().size();
     stats.compute_requests = reqs.size();
     stats.compute_strides_from_code = from_code;
@@ -814,10 +852,13 @@ void PredictPipelines(Context& c, const PredictOptions& options, u32 threads,
             }
         }
     }
-    Parallel(threads, ps_new.size(), [&](size_t i) {
-        GS::BindingStart end;
-        Translate(c, ps_new[i], end);
-    });
+    Parallel(
+        threads, ps_new.size(),
+        [&](size_t i) {
+            GS::BindingStart end;
+            Translate(c, ps_new[i], end);
+        },
+        options.progress, PredictProgress::PipelineShaders);
     // the VS where a draw's PS ends
     std::vector<Request> vs_new;
     for (Job& j : jobs) {
@@ -844,10 +885,13 @@ void PredictPipelines(Context& c, const PredictOptions& options, u32 threads,
             vs_new.push_back(std::move(r));
         }
     }
-    Parallel(threads, vs_new.size(), [&](size_t i) {
-        GS::BindingStart end;
-        Translate(c, vs_new[i], end);
-    });
+    Parallel(
+        threads, vs_new.size(),
+        [&](size_t i) {
+            GS::BindingStart end;
+            Translate(c, vs_new[i], end);
+        },
+        options.progress, PredictProgress::PipelineShaders);
     stats.requests += ps_new.size() + vs_new.size();
 
     std::ofstream report;
@@ -1034,7 +1078,15 @@ bool RunPrediction(const std::filesystem::path& game_dir, const std::filesystem:
     }
     StaticDraws draws;
     StaticScanStats ss;
-    if (!draws.Scan(game_dir, ss, error)) {
+    if (options.progress != nullptr) {
+        options.progress->Begin(PredictProgress::Scan, 0);
+    }
+    const auto scanned = [](void* ctx, u64 done, u64 total) {
+        auto* pr = static_cast<PredictProgress*>(ctx);
+        pr->total.store(total);
+        pr->done.store(done);
+    };
+    if (!draws.Scan(game_dir, ss, error, options.progress != nullptr ? +scanned : nullptr, options.progress)) {
         summary = error;
         return false;
     }
@@ -1228,7 +1280,9 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
     }
     std::vector<GS::BindingStart> ps_end(ps_reqs.size());
     std::vector<u8> ps_ok(ps_reqs.size(), 0);
-    Parallel(threads, ps_reqs.size(), [&](size_t i) { ps_ok[i] = Translate(c, ps_reqs[i], ps_end[i]) ? 1 : 0; });
+    Parallel(
+        threads, ps_reqs.size(), [&](size_t i) { ps_ok[i] = Translate(c, ps_reqs[i], ps_end[i]) ? 1 : 0; },
+        options.progress, PredictProgress::PixelShaders);
     // where a pass's VS starts: the ends of its PS translations
     std::unordered_map<u64, GS::BindingStart> end_by_hash;
     for (size_t i = 0; i < ps_reqs.size(); ++i) {
@@ -1292,10 +1346,13 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
             }
         }
     }
-    Parallel(threads, vs_reqs.size(), [&](size_t i) {
-        GS::BindingStart end;
-        Translate(c, vs_reqs[i], end);
-    });
+    Parallel(
+        threads, vs_reqs.size(),
+        [&](size_t i) {
+            GS::BindingStart end;
+            Translate(c, vs_reqs[i], end);
+        },
+        options.progress, PredictProgress::VertexShaders);
     stats.requests = ps_reqs.size() + vs_reqs.size();
 
     if (options.compute) {

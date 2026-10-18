@@ -71,6 +71,8 @@
 //                              [ShaderCache] dir\<game>\native\game_programs.idx and exits (P4.14)
 //     --predict-shaders <t>    the material draws' VS/PS modules predicted from the packs (templates <t>) and
 //                              translated into the native shader cache, no game (docs\REA_ENGINE_REVERSE.md §8)
+//     --if-needed              with --predict-shaders: nothing when the cache was prepared so already (its stamp)
+//     --no-shader-prepare      no shader preparation window before the game ([ShaderCache] predictAll)
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
 //   PC settings (docs/PC_SETTINGS_IMPLEMENTATION.md): the in-game menu (F1) saves changes to
@@ -82,6 +84,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <string>
@@ -113,6 +116,46 @@ int Fail(const std::string& message) {
     std::fprintf(stderr, "SecondSonPC: %s\n", message.c_str());
     MessageBoxA(nullptr, message.c_str(), "SecondSonPC", MB_ICONERROR | MB_OK);
     return 1;
+}
+
+std::wstring QuoteArg(const std::wstring& s) {
+    return L"\"" + s + L"\"";
+}
+
+/// Every shader of the game's packs compiled before it starts (docs/REA_ENGINE_REVERSE.md §8): this program again with
+/// --predict-shaders --if-needed in a console window of its own that shows the progress; the game waits for it (a
+/// second when the cache was prepared already). A failure only costs the preparation: the game starts as before.
+void PrepareShaders(const SecondSon::App::Config& config) {
+    using namespace SecondSon;
+    const auto templates = App::RootDir() / "tools" / "static_shaders" / "static_templates.txt";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(templates, ec)) {
+        SSPC_LOG(App, Warning, "shader preparation: no {} - skipped", templates.string());
+        return;
+    }
+    std::wstring exe(MAX_PATH, L'\0');
+    exe.resize(GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size())));
+    std::wstring cmd = QuoteArg(exe) + L" --gpu-backend sspc --predict-shaders " + QuoteArg(templates.wstring()) +
+                       L" --if-needed --shader-cache " + QuoteArg(config.shader_cache_dir.wstring());
+    if (config.gpu_device >= 0) {
+        cmd += L" --gpu-device " + std::to_wstring(config.gpu_device);
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
+                        App::RootDir().wstring().c_str(), &si, &pi)) {
+        SSPC_LOG(App, Warning, "shader preparation: the process did not start (error {})", GetLastError());
+        return;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    SSPC_LOG(App, Info, "shader preparation: exit code {} after {:.1f} s", code,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 } // namespace
@@ -364,6 +407,10 @@ int main(int argc, char* argv[]) {
             config->clear_shader_cache = true;
         } else if (arg == "--scan-game-shaders") {
             config->scan_game_shaders = true;
+        } else if (arg == "--if-needed") {
+            config->predict_if_needed = true;
+        } else if (arg == "--no-shader-prepare") {
+            config->prepare_shaders = false;
         } else if (arg == "--predict-shaders" && has_value) {
             // a relative path: from where the user started the program, else from the install root (the process
             // runs in <root>\runtime\sspc by now)
@@ -584,6 +631,13 @@ int main(int argc, char* argv[]) {
         SSPC_LOG(App, Info, "{}", text);
         std::printf("%s", text.c_str());
         return 0;
+    }
+    // the game itself (not a test, a probe or an offline mode, not an automated run): its shaders first
+    if (config->prepare_shaders && config->pc.shader_predict && config->predict_shaders.empty() &&
+        config->gpu_backend == App::Config::GpuBackend::Sspc && config->shader_cache && !config->selftest &&
+        !config->fault_test && !config->gpu_probe && config->gpu_replay.empty() && config->gpu_shader_verify.empty() &&
+        !config->patch_race_test && !gpu_stability_test && config->test_presses.empty()) {
+        PrepareShaders(*config);
     }
     Base::StartVramLog(vram_log_seconds);
     const bool own_loader = config->loader == App::Config::LoaderBackend::Sspc;

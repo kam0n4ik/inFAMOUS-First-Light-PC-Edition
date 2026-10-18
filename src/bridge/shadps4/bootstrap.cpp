@@ -24,6 +24,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -83,6 +84,7 @@
 #include "runtime/gpu/cp_shadow.h"
 #include "runtime/gpu/frame_pacing.h"
 #include "runtime/gpu/native_backend.h"
+#include "runtime/gpu/static/static_predictor.h"
 #include "runtime/gpu/pm4_stats.h"
 #include "runtime/gpu/shader/shader_capture.h"
 #include "bridge/shadps4/shader_bridge_hooks.h"
@@ -1231,9 +1233,76 @@ int RunPredictShaders(const App::Config& cfg, const std::string& game) {
     po.cache_max_mib = cfg.pc.shader_cache_max_mib;
     po.threads = cfg.pc.shader_precompile_threads;
     po.logs_dir = cfg.logs_dir;
+    po.if_needed = cfg.predict_if_needed;
+    bool up_to_date = false;
+    po.up_to_date = &up_to_date;
+    // the console shows where it is: a line per phase, rewritten in place five times a second
+    Gpu::Static::PredictProgress progress;
+    po.progress = &progress;
+    SetConsoleTitleW(L"SecondSonPC — подготовка шейдеров");
+    std::printf("SecondSonPC: подготовка шейдеров игры (все шейдеры из файлов игры компилируются до её запуска)\n");
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<bool> stop{false};
+    std::thread printer([&] {
+        static constexpr const char* kPhase[] = {"запуск",
+                                                 "чтение файлов игры",
+                                                 "пиксельные шейдеры",
+                                                 "вершинные шейдеры",
+                                                 "вычислительные шейдеры",
+                                                 "шейдеры конвейеров",
+                                                 "компиляция конвейеров драйвером",
+                                                 "готово"};
+        int shown = -1;
+        for (u32 tick = 0; !stop.load(); ++tick) {
+            const int phase = progress.phase.load();
+            const u64 done = progress.done.load(), total = progress.total.load();
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (phase != shown && shown > 0) {
+                std::printf("\n"); // the finished phase's line stays
+            }
+            shown = phase;
+            // the phase's name padded to 34 characters (UTF-8: a Cyrillic letter is two bytes)
+            std::string name = kPhase[std::clamp(phase, 0, 7)];
+            size_t chars = 0;
+            for (const char ch : name) {
+                chars += (static_cast<u8>(ch) & 0xC0) != 0x80 ? 1 : 0;
+            }
+            name.append(chars < 34 ? 34 - chars : 0, ' ');
+            if (total == 0) {
+                static constexpr char kSpin[] = {'|', '/', '-', '\\'};
+                std::printf("\r  %s %c   %6.0f с          ", name.c_str(), kSpin[tick % 4], s);
+            } else {
+                const double f = static_cast<double>(std::min(done, total)) / static_cast<double>(total);
+                char bar[31];
+                const int fill = static_cast<int>(f * 30.0);
+                for (int i = 0; i < 30; ++i) {
+                    bar[i] = i < fill ? '#' : '.';
+                }
+                bar[30] = '\0';
+                std::printf("\r  %s [%s] %5.1f%%  %llu / %llu   %6.0f с   ", name.c_str(), bar, f * 100.0,
+                            static_cast<unsigned long long>(done), static_cast<unsigned long long>(total), s);
+            }
+            std::fflush(stdout);
+            Sleep(200);
+        }
+    });
     std::string summary;
     const bool ok = Gpu::Native::PredictShaders(po, summary);
-    std::printf("SecondSonPC: %s\n", summary.c_str());
+    stop.store(true);
+    printer.join();
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (up_to_date) {
+        std::printf("\r%-110s\rSecondSonPC: все шейдеры уже скомпилированы - запуск игры\n", "");
+    } else {
+        std::printf("\n\nSecondSonPC: %s\n\n", summary.c_str());
+        std::printf(ok ? "SecondSonPC: шейдеры скомпилированы за %.0f с - запуск игры\n"
+                       : "SecondSonPC: подготовка шейдеров не удалась (%.0f с) - игра запустится как раньше\n",
+                    s);
+    }
+    std::fflush(stdout);
+    if (cfg.predict_if_needed) {
+        Sleep(up_to_date ? 700 : 3000); // (the window of the start: readable before it closes)
+    }
     return ok ? 0 : 1;
 }
 

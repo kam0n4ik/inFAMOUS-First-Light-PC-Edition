@@ -50,6 +50,8 @@ struct PcSettings {
     // [ShaderCache] (P4.14): the native backend's persistent shader cache (enabled/dir are older keys of the table)
     bool shader_precompile = true;          // the pipelines known from earlier runs prepared before the game starts
     bool shader_precompile_progress = true; // the progress panel while they are (Esc skips the wait)
+    bool shader_predict = true;             // every shader of the game's packs compiled before it starts (a console
+                                            // window with the progress; once per templates/predictor/driver)
     u32 shader_cache_max_mib = 2048;        // the shader cache file's size limit
     u32 shader_precompile_threads = 0;      // 0: automatic (half the logical processors, at most 6)
 };

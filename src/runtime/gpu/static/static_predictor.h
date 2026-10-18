@@ -18,6 +18,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -70,7 +71,20 @@ struct StaticTemplates {
     bool Load(const std::filesystem::path& file, std::string& error);
 };
 
+/// What a run is doing, for a progress display that polls it from another thread.
+struct PredictProgress {
+    enum Phase : int { Idle, Scan, PixelShaders, VertexShaders, ComputeShaders, PipelineShaders, Pipelines, Done };
+    std::atomic<int> phase{Idle};
+    std::atomic<u64> done{0}, total{0}; ///< total 0: not counted
+    void Begin(int p, u64 n) {
+        done.store(0);
+        total.store(n);
+        phase.store(p);
+    }
+};
+
 struct PredictOptions {
+    PredictProgress* progress = nullptr; ///< updated as the run goes (nullptr: none)
     u32 threads = 0;                ///< 0: hardware threads - 1
     u32 max_state_variants = 3;     ///< per (role, class[, COL_FORMAT])
     u32 max_material_variants = 16; ///< distinct material texture formats per program

@@ -12,6 +12,10 @@
 
 #include "base/abi.h"
 
+namespace SecondSon::Gpu::Static {
+struct PredictProgress;
+}
+
 namespace SecondSon::Gpu::Native {
 
 struct Options {
@@ -72,6 +76,10 @@ struct PredictShadersOptions {
     std::string game = "CUSA00004";
     u32 cache_max_mib = 2048;
     u32 threads = 0;
+    Static::PredictProgress* progress = nullptr; ///< the run's phase and counts, for a progress display
+    /// only when the cache was not prepared by this predictor from these templates yet (its stamp file); else nothing
+    bool if_needed = false;
+    bool* up_to_date = nullptr; ///< (if_needed) set when nothing had to be done
 };
 bool PredictShaders(const PredictShadersOptions& options, std::string& summary);
 
