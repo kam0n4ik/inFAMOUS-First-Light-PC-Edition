@@ -95,6 +95,7 @@
 #include <windows.h>
 
 #include "app/config.h"
+#include "runtime/gpu/gcn/gcn_inventory.h"
 #include "app/paths.h"
 #include "base/crash.h"
 #include "base/lifecycle.h"
@@ -194,7 +195,7 @@ int main(int argc, char* argv[]) {
         } else if (a == "--no-user-settings" || a == "--press" || a == "--selftest" || a == "--fault-test" ||
                    a == "--patch-race-test" || a == "--gpu-stability-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
                    a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache" ||
-                   a == "--scan-game-shaders" || a == "--predict-shaders") {
+                   a == "--scan-game-shaders" || a == "--predict-shaders" || a == "--gcn-inventory") {
             user_settings = false;
         }
     }
@@ -412,6 +413,8 @@ int main(int argc, char* argv[]) {
             config->shader_cache = false;
         } else if (arg == "--clear-shader-cache") {
             config->clear_shader_cache = true;
+        } else if (arg == "--gcn-inventory") {
+            config->gcn_inventory = true;
         } else if (arg == "--scan-game-shaders") {
             config->scan_game_shaders = true;
         } else if (arg == "--if-needed") {
@@ -615,6 +618,16 @@ int main(int argc, char* argv[]) {
                  config->shader_cache_dir.string());
         std::printf("SecondSonPC: %llu shader cache generation(s) removed from %s\n",
                     static_cast<unsigned long long>(removed), config->shader_cache_dir.string().c_str());
+        return 0;
+    }
+    if (config->gcn_inventory) {
+        // Phase 4, own translator: what SecondSonPC's GCN decoder makes of every program of the game (read only)
+        std::string error;
+        const auto report = App::RootDir() / "logs" / "gcn_inventory.txt";
+        if (!Gpu::Gcn::RunInventory(config->game_dir, config->shader_cache_dir, report, error)) {
+            return Fail("--gcn-inventory: " + error);
+        }
+        std::printf("SecondSonPC: GCN inventory -> %s\n", report.string().c_str());
         return 0;
     }
     if (config->scan_game_shaders) {
