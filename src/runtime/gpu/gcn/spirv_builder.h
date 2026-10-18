@@ -48,6 +48,9 @@ public:
     Id TypeRuntimeArray(Id element);
     Id TypeStruct(std::span<const Id> members);
     Id TypePointer(spv::StorageClass storage, Id type);
+    Id TypeImage(Id sampled_type, spv::Dim dim, u32 depth, u32 arrayed, u32 ms, u32 sampled, spv::ImageFormat format);
+    Id TypeSampler();
+    Id TypeSampledImage(Id image_type);
     Id TypeFunction(Id result, std::span<const Id> params = {});
 
     // ---- constants (deduplicated)

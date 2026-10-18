@@ -111,6 +111,10 @@ private:
     bool writes_exec_ = false;
 
     Id t_void_ = 0, t_bool_ = 0, t_u32_ = 0, t_i32_ = 0, t_f32_ = 0, t_uvec4_ = 0, t_ptr_u32_ = 0, t_ptr_bool_ = 0;
+    Id t_f64_ = 0, t_uvec2_ = 0; ///< (on first use: Float64)
+    void Float64();
+    Id GetF64(u32 code, const Inst& in, u32 i);  ///< a 64-bit float source (a register pair, or a constant); VOP3 abs/neg
+    void SetF64(const Inst& in, u32 code, Id v); ///< a 64-bit float result into a register pair; VOP3 omod/clamp
     Id glsl_ = 0;
     Id exec_ = 0, scc_ = 0;
     Id lane_id_ = 0;            ///< SubgroupLocalInvocationId (on first use)
@@ -132,6 +136,28 @@ private:
     bool EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt, u32 dst_sel);
     bool EmitFormattedBuffer(const Inst& in, u32 index, std::string_view name); ///< buffer_*_format: the V#'s format
     bool EmitDs(const Inst& in, std::string_view name);
+    std::string decline_; ///< why the last memory instruction was not translated (in its Unsupported)
+    bool Decline(std::string why) {
+        decline_ = std::move(why);
+        return false;
+    }
+    /// An image as declared: its T#'s type and number format read at the translation (the module is specialized on
+    /// them: the runtime's key holds its view type, data and number format).
+    struct ImageDecl {
+        bool ok = false;
+        bool null = false; ///< a T# of no image type (a null descriptor bound): loads 0, stores nothing
+        Id var = 0, type = 0, texel = 0, scalar = 0; ///< texel: vec4 of the sampled type (scalar)
+        bool storage = false, arrayed = false;
+        bool one_d = false; ///< a 1D image: a 2D view of one row (the bridge's and the runtime's), y = 0 inserted
+        u32 coords = 0;     ///< the address's coordinates (s, t, r / the slice)
+        u32 kind = 0;    ///< 0 float, 1 uint, 2 sint
+        u32 dst_sel = 0; ///< DST_SEL (the shader applies it to a storage image)
+    };
+    std::vector<ImageDecl> images_;
+    std::vector<Id> samplers_;
+    void DeclareImages(u32 first_binding);
+    bool EmitImage(const Inst& in, u32 index, std::string_view name);
+    std::optional<u32> FlatValue(const ScalarValue& v) const;
     Id gds_ = 0, lds_ = 0, t_ptr_wg_u32_ = 0;
     Id BufferAddress(const Inst& in, u32 buffer);              ///< MUBUF / MTBUF: the byte address in the binding
     Id ReadBits(u32 buffer, Id byte_addr, u32 bit, u32 width); ///< `width` (<= 32) bits at byte_addr * 8 + bit
@@ -412,6 +438,7 @@ void Emitter::DeclareResources() {
         lds_ = b_.Variable(b_.TypePointer(spv::StorageClass::Workgroup, arr), spv::StorageClass::Workgroup);
         interface_.push_back(lds_);
     }
+    DeclareImages(static_cast<u32>(res_.buffers.size()) + 1 + (res_.uses_gds ? 1 : 0));
     // PushData: float xoffset, yoffset, xscale, yscale; u8 buf_offsets[56] (as 14 dwords)
     const Id f4 = b_.TypeArray(t_f32_, b_.U32(4));
     b_.Decorate(f4, spv::Decoration::ArrayStride, {4});
@@ -622,13 +649,50 @@ bool Emitter::EmitFormattedBuffer(const Inst& in, u32 index, std::string_view na
         return true;
     }
     const bool dwords = dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14;
+    if (!dwords && (dfmt == 1 || dfmt == 2 || dfmt == 3 || dfmt == 5) && (nfmt == 0 || nfmt == 4 || nfmt == 5 || nfmt == 7) &&
+        !(nfmt == 7 && (dfmt == 1 || dfmt == 3))) {
+        // 8 / 16-bit components: each its bits of a dword, cleared and set by two atomics (lanes writing the other
+        // parts of the same dword do not disturb them)
+        const u32 w = (dfmt == 1 || dfmt == 3) ? 8 : 16, ncomp = (dfmt == 3 || dfmt == 5) ? 2 : 1;
+        const u32 mask = (1u << w) - 1;
+        const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+        const Id addr = BufferAddress(in, buffer);
+        const Id scope = b_.U32(static_cast<u32>(spv::Scope::Device));
+        for (u32 c = 0; c < std::min(n, ncomp); ++c) {
+            if (((dst_sel >> (3 * c)) & 7) != 4 + c) {
+                return Decline(fmt::format(" (a swizzled store: DST_SEL {:#x})", dst_sel));
+            }
+            const Id v = Get(vdata + c, in);
+            Id raw = v;
+            if (nfmt == 7) {
+                const Id v2 = b_.Op(Op::OpCompositeConstruct, b_.TypeVector(t_f32_, 2), {Bit(t_f32_, v), b_.F32(0.0f)});
+                raw = Glsl(GLSLstd450PackHalf2x16, t_u32_, {v2});
+            } else if (nfmt == 0) {
+                const Id clamped = Glsl(GLSLstd450NClamp, t_f32_, {Bit(t_f32_, v), b_.F32(0.0f), b_.F32(1.0f)});
+                raw = b_.Op(Op::OpConvertFToU, t_u32_,
+                            {Glsl(GLSLstd450RoundEven, t_f32_, {b_.Op(Op::OpFMul, t_f32_, {clamped, b_.F32(static_cast<float>(mask))})})});
+            }
+            raw = b_.Op(Op::OpBitwiseAnd, t_u32_, {raw, b_.U32(mask)});
+            const Id bitpos = b_.Op(Op::OpIAdd, t_u32_,
+                                    {b_.Op(Op::OpShiftLeftLogical, t_u32_, {b_.Op(Op::OpBitwiseAnd, t_u32_, {addr, b_.U32(3)}), b_.U32(3)}),
+                                     b_.U32(c * w)});
+            const Id idx = b_.Op(Op::OpIAdd, t_u32_, {b_.Op(Op::OpShiftRightLogical, t_u32_, {addr, b_.U32(2)}),
+                                                     b_.Op(Op::OpShiftRightLogical, t_u32_, {bitpos, b_.U32(5)})});
+            const Id shift = b_.Op(Op::OpBitwiseAnd, t_u32_, {bitpos, b_.U32(31)});
+            const Id ptr = b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {buffers_[buffer], b_.U32(0), idx});
+            const Id keep = b_.Op(Op::OpNot, t_u32_, {b_.Op(Op::OpShiftLeftLogical, t_u32_, {b_.U32(mask), shift})});
+            b_.Op(Op::OpAtomicAnd, t_u32_, {ptr, scope, b_.U32(0), keep});
+            b_.Op(Op::OpAtomicOr, t_u32_, {ptr, scope, b_.U32(0), b_.Op(Op::OpShiftLeftLogical, t_u32_, {raw, shift})});
+        }
+        return true;
+    }
     const u32 comps = dfmt == 4 ? 1 : dfmt == 11 ? 2 : dfmt == 13 ? 3 : 4;
     if (!dwords || (nfmt != 4 && nfmt != 5 && nfmt != 7)) {
-        return false;
+        return Decline(fmt::format(" (a store of dfmt {} nfmt {})", dfmt, nfmt));
     }
     for (u32 c = 0; c < std::min(n, comps); ++c) {
         if (((dst_sel >> (3 * c)) & 7) != 4 + c) {
-            return false; // (a swizzled store)
+            return Decline(fmt::format(" (a swizzled store: DST_SEL {:#x})", dst_sel));
         }
     }
     const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
@@ -660,13 +724,13 @@ bool Emitter::EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt
         {4, {10, 10, 10, 2}},  {4, {2, 10, 10, 10}}, {4, {8, 8, 8, 8}},    {2, {32, 32, 0, 0}},
         {4, {16, 16, 16, 16}}, {3, {32, 32, 32, 0}}, {4, {32, 32, 32, 32}},
     };
-    if (dfmt > 14 || dfmt == 6 || dfmt == 7 || nfmt == 6) {
-        return false; // (invalid / packed floats / the reserved number format)
+    if (dfmt > 14 || dfmt == 6 || dfmt == 7) {
+        return Decline(fmt::format(" (dfmt {} nfmt {})", dfmt, nfmt)); // (invalid / packed floats / reserved)
     }
     const Fmt& f = kFmt[dfmt];
     for (u32 c = 0; c < f.comps; ++c) {
         if (nfmt == 7 && f.bits[c] != 16 && f.bits[c] != 32) {
-            return false; // (floats of other widths)
+            return Decline(fmt::format(" (dfmt {} nfmt {}: floats of {} bits)", dfmt, nfmt, f.bits[c]));
         }
     }
     const u32 buffer = static_cast<u32>(res_.buffer_of[index]);
@@ -719,6 +783,13 @@ bool Emitter::EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt
         case 5: // sint
             v = Bit(t_u32_, sext());
             break;
+        case 6: // snorm_nz: (2s + 1) / (2^w - 1) (the bridge's)
+            v = Bit(t_u32_, b_.Op(Op::OpFMul, t_f32_,
+                                  {b_.Op(Op::OpConvertSToF, t_f32_,
+                                         {b_.Op(Op::OpIAdd, t_i32_, {b_.Op(Op::OpIMul, t_i32_, {sext(), b_.Constant(t_i32_, 2)}),
+                                                                     b_.Constant(t_i32_, 1)})}),
+                                   b_.F32(1.0f / max_u)}));
+            break;
         case 7: // float
             if (w == 16) {
                 v = Bit(t_u32_, b_.Op(Op::OpCompositeExtract, t_f32_,
@@ -735,6 +806,191 @@ bool Emitter::EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt
         Set(vdata + c, sel >= 4 ? comp[sel - 4] : sel == 1 ? one : b_.U32(0));
     }
     return true;
+}
+
+std::optional<u32> Emitter::FlatValue(const ScalarValue& v) const {
+    if (v.kind == ScalarValue::Kind::Const) {
+        return v.value;
+    }
+    if (v.kind == ScalarValue::Kind::Flat && v.value < options_.flat.size()) {
+        return options_.flat[v.value];
+    }
+    return std::nullopt;
+}
+
+void Emitter::DeclareImages(u32 binding) {
+    for (const ImageUse& use : res_.images) {
+        ImageDecl d;
+        const auto dw1 = FlatValue(use.sharp[1]), dw3 = FlatValue(use.sharp[3]);
+        const u32 type = dw3 ? (*dw3 >> 28) : 0;
+        // a cube: a 2D array of its faces, the face the third coordinate (the bridge's type; the runtime binds its view
+        // so)
+        const bool cube = type == 11;
+        const bool type_array = type == 12 || type == 13;
+        if (dw1 && dw3 && (type == 8 || type == 9 || type == 10 || type_array || cube)) {
+            const u32 nfmt = (*dw1 >> 26) & 0xF;
+            d.kind = nfmt == 4 ? 1 : nfmt == 5 ? 2 : 0;
+            d.scalar = d.kind == 1 ? t_u32_ : d.kind == 2 ? t_i32_ : t_f32_;
+            d.texel = b_.TypeVector(d.scalar, 4);
+            d.storage = use.written;
+            // (the runtime's view: an array type without DA is a single layer)
+            d.arrayed = cube || (use.array && type_array);
+            d.dst_sel = *dw3 & 0xFFF;
+            d.one_d = type == 8 || type == 12;
+            const spv::Dim dim = type == 10 ? spv::Dim::Dim3D : spv::Dim::Dim2D;
+            d.coords = (d.one_d ? 1 : dim == spv::Dim::Dim2D ? 2 : 3) + (d.arrayed ? 1 : 0);
+            if (d.storage) {
+                b_.Capability(spv::Capability::StorageImageReadWithoutFormat);
+                b_.Capability(spv::Capability::StorageImageWriteWithoutFormat);
+            }
+            d.type = b_.TypeImage(d.scalar, dim, 0, d.arrayed ? 1 : 0, 0, d.storage ? 2 : 1, spv::ImageFormat::Unknown);
+            d.ok = true;
+        } else {
+            d.null = dw1 && dw3 && type < 8; // (the hardware reads zeros, drops writes; a real T# is another key)
+            d.ok = d.null;
+            // (an unknown T#, a cube or a multisampled image: the instructions on it are not translated; the binding
+            // is declared all the same)
+            d.scalar = t_f32_;
+            d.texel = b_.TypeVector(t_f32_, 4);
+            d.type = b_.TypeImage(t_f32_, spv::Dim::Dim2D, 0, 0, 0, use.written ? 2 : 1, spv::ImageFormat::Unknown);
+            if (use.written) {
+                b_.Capability(spv::Capability::StorageImageReadWithoutFormat);
+                b_.Capability(spv::Capability::StorageImageWriteWithoutFormat);
+            }
+        }
+        d.var = b_.Variable(b_.TypePointer(spv::StorageClass::UniformConstant, d.type), spv::StorageClass::UniformConstant);
+        b_.Decorate(d.var, spv::Decoration::DescriptorSet, {0});
+        b_.Decorate(d.var, spv::Decoration::Binding, {binding++});
+        interface_.push_back(d.var);
+        images_.push_back(d);
+    }
+    for (size_t i = 0; i < res_.samplers.size(); ++i) {
+        const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::UniformConstant, b_.TypeSampler()),
+                                 spv::StorageClass::UniformConstant);
+        b_.Decorate(v, spv::Decoration::DescriptorSet, {0});
+        b_.Decorate(v, spv::Decoration::Binding, {binding++});
+        interface_.push_back(v);
+        samplers_.push_back(v);
+    }
+}
+
+bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
+    const s32 ii = res_.image_of[index];
+    if (ii < 0 || !images_[ii].ok) {
+        if (ii >= 0) {
+            const auto dw3 = FlatValue(res_.images[ii].sharp[3]);
+            return Decline(dw3 ? fmt::format(" (T# type {})", *dw3 >> 28) : std::string(" (T# not at the translation)"));
+        }
+        return false;
+    }
+    const ImageDecl& im = images_[ii];
+    const u32 dmask = (in.w0 >> 8) & 0xF;
+    if (im.null) {
+        if (name.starts_with("image_load") || name.starts_with("image_sample") || name.starts_with("image_gather")) {
+            const u32 vd = kVgpr + ((in.w1 >> 8) & 0xFF);
+            for (u32 c = 0, k = 0; c < 4; ++c) {
+                if (((dmask >> c) & 1) != 0) {
+                    Set(vd + k++, b_.U32(0));
+                }
+            }
+            return true;
+        }
+        return name == "image_store";
+    }
+    const bool unorm = ((in.w0 >> 12) & 1) != 0, tfe = ((in.w0 >> 16) & 1) != 0, lwe = ((in.w0 >> 17) & 1) != 0;
+    if (tfe || lwe) {
+        return false;
+    }
+    const u32 vaddr = kVgpr + (in.w1 & 0xFF), vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    const Id image = b_.Op(Op::OpLoad, im.type, {im.var});
+    // the coordinates: integer (loads, stores) or float (sampling), one or a vector
+    const auto coords = [&](bool integer) {
+        const Id ty = integer ? t_i32_ : t_f32_;
+        std::vector<u32> c;
+        for (u32 k = 0; k < im.coords; ++k) {
+            c.push_back(Bit(ty, Get(vaddr + k, in)));
+            if (im.one_d && k == 0) {
+                c.push_back(integer ? b_.Constant(t_i32_, 0) : b_.F32(0.0f)); // (the row of a 1D image)
+            }
+        }
+        if (c.size() == 1) {
+            return c[0];
+        }
+        return b_.Op(Op::OpCompositeConstruct, b_.TypeVector(ty, static_cast<u32>(c.size())),
+                     std::span<const u32>(c.data(), c.size()));
+    };
+    const auto results = [&](Id texel, bool swizzle) {
+        // the components dmask selects, packed into consecutive VGPRs (a storage image's DST_SEL by the shader)
+        u32 k = 0;
+        const Id one = im.kind == 0 ? b_.U32(0x3F800000u) : b_.U32(1);
+        for (u32 c = 0; c < 4; ++c) {
+            if (((dmask >> c) & 1) == 0) {
+                continue;
+            }
+            const u32 sel = swizzle ? (im.dst_sel >> (3 * c)) & 7 : 4 + c;
+            Id v = sel == 1 ? one : b_.U32(0);
+            if (sel >= 4) {
+                const Id comp = b_.Op(Op::OpCompositeExtract, im.scalar, {texel, sel - 4});
+                v = im.kind == 1 ? comp : Bit(t_u32_, comp);
+            }
+            Set(vdata + k++, v);
+        }
+    };
+    const bool identity = im.dst_sel == (4 | 5 << 3 | 6 << 6 | 7 << 9);
+    if (name == "image_load" || name == "image_load_mip") {
+        const bool mip = name == "image_load_mip";
+        if (im.storage) {
+            if (mip) {
+                return Decline(" (a storage image's mip level)"); // (bound one by one, not yet)
+            }
+            results(b_.Op(Op::OpImageRead, im.texel, {image, coords(true)}), true);
+            return true;
+        }
+        const Id lod = mip ? Bit(t_i32_, Get(vaddr + im.coords, in)) : b_.Constant(t_i32_, 0);
+        results(b_.Op(Op::OpImageFetch, im.texel,
+                      {image, coords(true), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+                false);
+        return true;
+    }
+    if (name == "image_store") {
+        if (!im.storage) {
+            return Decline(" (a store to a sampled image)");
+        }
+        // the shader's component j goes to the image's channel DST_SEL[j] - 4 (the inverse of the view's swizzle)
+        std::array<u32, 4> c{};
+        std::array<bool, 4> set{};
+        u32 k = 0;
+        for (u32 j = 0; j < 4; ++j) {
+            const Id v = ((dmask >> j) & 1) != 0 ? Get(vdata + k++, in) : b_.U32(0);
+            const u32 sel = identity ? 4 + j : (im.dst_sel >> (3 * j)) & 7;
+            if (sel >= 4 && !set[sel - 4]) {
+                c[sel - 4] = im.kind == 1 ? v : Bit(im.scalar, v);
+                set[sel - 4] = true;
+            }
+        }
+        for (u32 j = 0; j < 4; ++j) {
+            if (!set[j]) {
+                c[j] = im.kind == 1 ? b_.U32(0) : Bit(im.scalar, b_.U32(0));
+            }
+        }
+        const Id texel = b_.Op(Op::OpCompositeConstruct, im.texel, std::span<const u32>(c.data(), 4));
+        b_.OpNoResult(Op::OpImageWrite, {image, coords(true), texel});
+        return true;
+    }
+    if (name == "image_sample_lz" || name == "image_sample_l") {
+        const s32 si = res_.sampler_of[index];
+        if (si < 0 || im.storage || unorm) {
+            return Decline(unorm ? " (unnormalized coordinates)" : " (no sampler / a storage image)");
+        }
+        const Id sampler = b_.Op(Op::OpLoad, b_.TypeSampler(), {samplers_[si]});
+        const Id sampled = b_.Op(Op::OpSampledImage, b_.TypeSampledImage(im.type), {image, sampler});
+        const Id lod = name == "image_sample_l" ? GetF(vaddr + im.coords, in) : b_.F32(0.0f);
+        results(b_.Op(Op::OpImageSampleExplicitLod, im.texel,
+                      {sampled, coords(false), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+                false);
+        return true;
+    }
+    return false;
 }
 
 bool Emitter::EmitDs(const Inst& in, std::string_view name) {
@@ -864,8 +1120,9 @@ void Emitter::InitCompute() {
     };
     const u32 rsrc2 = options_.rsrc2;
     const Id tid = input(spv::BuiltIn::LocalInvocationId, uvec3);
-    const u32 tid_count = (rsrc2 >> 11) & 3; // TIDIG_COMP_CNT: v0 x, v1 y, v2 z
-    for (u32 c = 0; c <= std::min<u32>(tid_count, 2); ++c) {
+    // v0-v2 the thread's x, y, z in the group: all three (the runtime's rsrc2 is Rsrc2TranslationMask's - no
+    // TIDIG_COMP_CNT - and a program reads only those it was given)
+    for (u32 c = 0; c < 3; ++c) {
         Set(kVgpr + c, b_.Op(Op::OpCompositeExtract, t_u32_, {tid, c}));
     }
     u32 sgpr = (rsrc2 >> 1) & 0x1F; // after the user data
@@ -875,14 +1132,74 @@ void Emitter::InitCompute() {
             Set(sgpr++, b_.Op(Op::OpCompositeExtract, t_u32_, {group, c}));
         }
     }
-    if (((rsrc2 >> 10) & 1) != 0) {
-        // TG_SIZE: the wave's index in the group (bits 0-5), the group's waves (bits 6-11)
+    {
+        // TG_SIZE after the group ids: the wave's index in the group (bits 0-5), the group's waves (bits 6-11) -
+        // always (TG_SIZE_EN is not in the runtime's rsrc2; a program not given it does not read that register)
         const u32 threads = std::max(options_.threads[0], 1u) * std::max(options_.threads[1], 1u) *
                             std::max(options_.threads[2], 1u);
         const u32 waves = (threads + 63) / 64;
         const Id wave = b_.Op(Op::OpShiftRightLogical, t_u32_, {LocalIndex(), b_.U32(6)});
         Set(sgpr++, b_.Op(Op::OpBitwiseOr, t_u32_, {wave, b_.U32(waves << 6)}));
     }
+}
+
+void Emitter::Float64() {
+    if (t_f64_ == 0) {
+        b_.Capability(spv::Capability::Float64);
+        t_f64_ = b_.TypeFloat(64);
+        t_uvec2_ = b_.TypeVector(t_u32_, 2);
+    }
+}
+
+Id Emitter::GetF64(u32 code, const Inst& in, u32 i) {
+    Float64();
+    Id v = 0;
+    if (code <= 107 || code == kM0 || code >= kVgpr) {
+        v = b_.Op(Op::OpBitcast, t_f64_,
+                  {b_.Op(Op::OpCompositeConstruct, t_uvec2_, {Get(code, in), Get(code + 1, in)})});
+    } else if (code >= 240 && code <= 247) {
+        static constexpr double kF[8] = {0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0};
+        const u64 bits = std::bit_cast<u64>(kF[code - 240]);
+        v = b_.Op(Op::OpBitcast, t_f64_,
+                  {b_.Op(Op::OpCompositeConstruct, t_uvec2_, {b_.U32(static_cast<u32>(bits)), b_.U32(static_cast<u32>(bits >> 32))})});
+    } else if (code == kLiteralOperand) {
+        // a 64-bit float literal: its high 32 bits
+        v = b_.Op(Op::OpBitcast, t_f64_, {b_.Op(Op::OpCompositeConstruct, t_uvec2_, {b_.U32(0), b_.U32(in.lit)})});
+    } else if (const auto c = ConstOperand(code, in)) {
+        v = b_.Op(Op::OpConvertSToF, t_f64_, {b_.Constant(t_i32_, static_cast<u32>(*c))}); // (an integer constant)
+    } else {
+        throw Unsupported{fmt::format("a 64-bit float source of code {}", code)};
+    }
+    if (in.format == Format::Vop3) {
+        if ((in.w0 >> (8 + i)) & 1) {
+            v = Glsl(GLSLstd450FAbs, t_f64_, {v});
+        }
+        if ((in.w1 >> (29 + i)) & 1) {
+            v = b_.Op(Op::OpFNegate, t_f64_, {v});
+        }
+    }
+    return v;
+}
+
+void Emitter::SetF64(const Inst& in, u32 code, Id v) {
+    if (in.format == Format::Vop3) {
+        static constexpr double kOmod[4] = {1.0, 2.0, 4.0, 0.5};
+        const u32 omod = (in.w1 >> 27) & 3;
+        if (omod != 0) {
+            const u64 bits = std::bit_cast<u64>(kOmod[omod]);
+            const Id k = b_.Op(Op::OpBitcast, t_f64_,
+                               {b_.Op(Op::OpCompositeConstruct, t_uvec2_, {b_.U32(static_cast<u32>(bits)), b_.U32(static_cast<u32>(bits >> 32))})});
+            v = b_.Op(Op::OpFMul, t_f64_, {v, k});
+        }
+        if ((in.w0 >> 11) & 1) {
+            const Id zero = b_.Op(Op::OpConvertSToF, t_f64_, {b_.Constant(t_i32_, 0)});
+            const Id one = b_.Op(Op::OpConvertSToF, t_f64_, {b_.Constant(t_i32_, 1)});
+            v = Glsl(GLSLstd450NClamp, t_f64_, {v, zero, one});
+        }
+    }
+    const Id pair = b_.Op(Op::OpBitcast, t_uvec2_, {v});
+    Set(code, b_.Op(Op::OpCompositeExtract, t_u32_, {pair, 0}));
+    Set(code + 1, b_.Op(Op::OpCompositeExtract, t_u32_, {pair, 1}));
 }
 
 Id Emitter::LocalIndex() {
@@ -990,12 +1307,21 @@ void Emitter::Emit(const Inst& in) {
         }
         EmitStub(in, name);
         return;
+    case Format::Mimg:
+        if (EmitImage(in, cur_index_, name)) {
+            return;
+        }
+        if (!options_.stub_memory) {
+            throw Unsupported{std::string(name) + decline_};
+        }
+        EmitStub(in, name);
+        return;
     case Format::Ds:
         if (EmitDs(in, name)) {
             return;
         }
         if (!options_.stub_memory) {
-            throw Unsupported{std::string(name)};
+            throw Unsupported{std::string(name) + decline_};
         }
         EmitStub(in, name);
         return;
@@ -1005,7 +1331,7 @@ void Emitter::Emit(const Inst& in) {
             return;
         }
         if (!options_.stub_memory) {
-            throw Unsupported{std::string(name)};
+            throw Unsupported{std::string(name) + decline_};
         }
         EmitStub(in, name);
         return;
@@ -1017,7 +1343,7 @@ void Emitter::Emit(const Inst& in) {
             return;
         }
         if (!options_.stub_memory) {
-            throw Unsupported{std::string(name)};
+            throw Unsupported{std::string(name) + decline_};
         }
         EmitStub(in, name);
         return;
@@ -1798,6 +2124,36 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         const Id a = s ? si(0) : u(0), c = s ? si(1) : u(1), e = s ? si(2) : u(2);
         const Id r = Glsl(mx, ty, {Glsl(mn, ty, {a, c}), Glsl(mn, ty, {Glsl(mx, ty, {a, c}), e})});
         Set(d, s ? Bit(t_u32_, r) : r);
+    } else if (name.find("_f64") != std::string_view::npos) {
+        // 64-bit floats (register pairs)
+        const auto f64 = [&](u32 i) { return GetF64(o.src[i], in, i); };
+        if (name == "v_cvt_f64_i32") {
+            Float64();
+            SetF64(in, d, b_.Op(Op::OpConvertSToF, t_f64_, {si(0)}));
+        } else if (name == "v_cvt_f64_u32") {
+            Float64();
+            SetF64(in, d, b_.Op(Op::OpConvertUToF, t_f64_, {u(0)}));
+        } else if (name == "v_cvt_f64_f32") {
+            Float64();
+            SetF64(in, d, b_.Op(Op::OpFConvert, t_f64_, {f(0)}));
+        } else if (name == "v_cvt_f32_f64") {
+            VDstF(in, d, b_.Op(Op::OpFConvert, t_f32_, {f64(0)}));
+        } else if (name == "v_add_f64") {
+            SetF64(in, d, b_.Op(Op::OpFAdd, t_f64_, {f64(0), f64(1)}));
+        } else if (name == "v_mul_f64") {
+            SetF64(in, d, b_.Op(Op::OpFMul, t_f64_, {f64(0), f64(1)}));
+        } else if (name == "v_fma_f64") {
+            SetF64(in, d, Glsl(GLSLstd450Fma, t_f64_, {f64(0), f64(1), f64(2)}));
+        } else if (name == "v_min_f64" || name == "v_max_f64") {
+            SetF64(in, d, Glsl(name == "v_min_f64" ? GLSLstd450NMin : GLSLstd450NMax, t_f64_, {f64(0), f64(1)}));
+        } else if (name == "v_rcp_f64") {
+            const Id x = f64(0);
+            SetF64(in, d, b_.Op(Op::OpFDiv, t_f64_, {b_.Op(Op::OpConvertSToF, t_f64_, {b_.Constant(t_i32_, 1)}), x}));
+        } else if (name == "v_sqrt_f64") {
+            SetF64(in, d, Glsl(GLSLstd450Sqrt, t_f64_, {f64(0)}));
+        } else {
+            throw Unsupported{std::string(name)};
+        }
     } else if (name == "v_readfirstlane_b32") {
         Set(d, b_.Op(Op::OpGroupNonUniformBroadcastFirst, t_u32_, {b_.U32(static_cast<u32>(spv::Scope::Subgroup)), u(0)}));
     } else {

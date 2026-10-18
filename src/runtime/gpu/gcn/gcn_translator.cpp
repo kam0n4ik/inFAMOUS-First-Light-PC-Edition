@@ -46,29 +46,32 @@ std::unordered_set<u64> HashList(const char* env) {
     return out;
 }
 
-GS::SharpLocation Location(const BufferUse& b) {
+/// Where a descriptor of `n` dwords is in the flattened user data (consecutive: one load; else per dword).
+GS::SharpLocation Location(std::span<const ScalarValue> sharp, u32 n) {
     GS::SharpLocation loc;
-    loc.dwords = 4;
+    loc.dwords = static_cast<u8>(n);
     bool consecutive = true;
-    for (u32 i = 0; i < 4; ++i) {
-        consecutive =
-            consecutive && b.sharp[i].kind == ScalarValue::Kind::Flat && b.sharp[i].value == b.sharp[0].value + i;
+    for (u32 i = 0; i < n; ++i) {
+        consecutive = consecutive && sharp[i].kind == ScalarValue::Kind::Flat && sharp[i].value == sharp[0].value + i;
     }
     if (consecutive) {
         loc.summary = GS::SharpLocation::Summary::SingleLoad;
-        loc.offsets[0] = static_cast<u16>(b.sharp[0].value);
+        loc.offsets[0] = static_cast<u16>(sharp[0].value);
         return loc;
     }
     loc.summary = GS::SharpLocation::Summary::MultiLoad;
-    for (u32 i = 0; i < 4; ++i) {
-        if (b.sharp[i].kind == ScalarValue::Kind::Flat) {
+    for (u32 i = 0; i < n; ++i) {
+        if (sharp[i].kind == ScalarValue::Kind::Flat) {
             loc.load_mask |= static_cast<u8>(1u << i);
-            loc.offsets[i] = static_cast<u16>(b.sharp[i].value);
+            loc.offsets[i] = static_cast<u16>(sharp[i].value);
         } else {
-            loc.immediates[i] = b.sharp[i].value;
+            loc.immediates[i] = sharp[i].value;
         }
     }
     return loc;
+}
+GS::SharpLocation Location(const BufferUse& b) {
+    return Location(b.sharp, 4);
 }
 
 class OwnTranslator final : public GS::ShaderTranslator {
@@ -188,16 +191,14 @@ private:
         eo.rsrc2 = rsrc2;
         eo.subgroup_size = subgroup;
         EmitResult r = EmitProgram(insts, cfg, st, eo);
-        if (!r.ok) {
-            why = r.error;
-            return false;
-        }
-        const ResourceInfo& ri = r.resources;
+        const ResourceInfo& ri = r.ok ? r.resources : pre;
         GS::ShaderReflection& refl = res.reflection;
         if (HashList("SSPC_OWN_SHADERS_DUMP").contains(req.footer_hash)) {
             // SSPC_OWN_SHADERS_DUMP=<footer hashes>: the program, its buffers' V#s as the translation saw them, the SPIR-V
-            std::string text = fmt::format("compute {:016x} at {:#x}, rsrc2 {:#x}, group {}x{}x{}\n", req.footer_hash,
-                                           req.address, rsrc2, eo.threads[0], eo.threads[1], eo.threads[2]);
+            // (a program not translated too: its code and why)
+            std::string text = fmt::format("compute {:016x} at {:#x}, rsrc2 {:#x}, group {}x{}x{}{}\n", req.footer_hash,
+                                           req.address, rsrc2, eo.threads[0], eo.threads[1], eo.threads[2],
+                                           r.ok ? "" : " - not translated: " + r.error);
             for (u32 b = 0; b < ri.buffers.size(); ++b) {
                 text += fmt::format("buffer {} (binding {}){}:", b, b + 1, ri.buffers[b].written ? " written" : "");
                 for (const ScalarValue& v : ri.buffers[b].sharp) {
@@ -224,6 +225,10 @@ private:
             std::ofstream(base + ".spv", std::ios::binary)
                 .write(reinterpret_cast<const char*>(r.spirv.data()), static_cast<std::streamsize>(r.spirv.size() * 4));
         }
+        if (!r.ok) {
+            why = r.error;
+            return false;
+        }
         if (!(ri.walk == pre.walk) || ri.flat_dwords != pre.flat_dwords) {
             why = "the emission's resources differ from the analysis'";
             return false;
@@ -241,13 +246,24 @@ private:
         if (ri.uses_gds) {
             refl.buffers.push_back({.kind = GS::BufferKind::GdsBuffer, .is_written = true});
         }
+        for (const ImageUse& im : ri.images) {
+            refl.images.push_back({.sharp = Location(im.sharp, im.r128 ? 4 : 8),
+                                   .is_array = im.array,
+                                   .is_written = im.written,
+                                   .is_r128 = im.r128});
+        }
+        for (const SamplerUse& s : ri.samplers) {
+            refl.samplers.push_back({.sharp = Location(s.sharp, 4)});
+        }
+        refl.has_storage_images = std::ranges::any_of(ri.images, [](const ImageUse& im) { return im.written; });
         refl.flatbuf_dwords = ri.flat_dwords;
         refl.user_data_used = static_cast<u16>((1u << std::min<u32>(eo.user_sgprs, 16)) - 1);
         refl.uses_shared = ri.uses_lds;
         refl.uses_lane_id = true;
         refl.start = req.start;
         const u32 n = static_cast<u32>(refl.buffers.size());
-        refl.end = {req.start.unified + n, req.start.buffer + n};
+        const u32 unified = n + static_cast<u32>(refl.images.size() + refl.samplers.size());
+        refl.end = {req.start.unified + unified, req.start.buffer + n};
         walk_loads = static_cast<u32>(ri.walk.size());
         res.spirv = std::move(r.spirv);
         return true;

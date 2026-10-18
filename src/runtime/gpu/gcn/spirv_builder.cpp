@@ -137,6 +137,17 @@ Id SpirvBuilder::TypeStruct(std::span<const Id> members) {
     Append(globals_, spv::Op::OpTypeStruct, w);
     return id;
 }
+Id SpirvBuilder::TypeImage(Id sampled_type, spv::Dim dim, u32 depth, u32 arrayed, u32 ms, u32 sampled,
+                             spv::ImageFormat format) {
+    return Dedup(spv::Op::OpTypeImage, {sampled_type, static_cast<u32>(dim), depth, arrayed, ms, sampled,
+                                        static_cast<u32>(format)});
+}
+Id SpirvBuilder::TypeSampler() {
+    return Dedup(spv::Op::OpTypeSampler, {});
+}
+Id SpirvBuilder::TypeSampledImage(Id image_type) {
+    return Dedup(spv::Op::OpTypeSampledImage, {image_type});
+}
 Id SpirvBuilder::TypePointer(spv::StorageClass storage, Id type) {
     return Dedup(spv::Op::OpTypePointer, {static_cast<u32>(storage), type});
 }

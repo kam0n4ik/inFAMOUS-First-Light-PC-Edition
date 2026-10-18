@@ -69,6 +69,7 @@ public:
 
 private:
     s32 Buffer(const State& s, u32 first_sgpr, bool written, u32 index, bool record);
+    void Image(const State& s, u32 index, bool record);
 
     std::span<const Inst> insts_;
     ResourceInfo& out_;
@@ -92,6 +93,71 @@ s32 Analysis::Buffer(const State& s, u32 first, bool written, u32 index, bool re
     use.written = written;
     out_.buffers.push_back(use);
     return static_cast<s32>(out_.buffers.size() - 1);
+}
+
+void Analysis::Image(const State& s, u32 index, bool record) {
+    const Inst& in = insts_[index];
+    const std::string_view name = Mnemonic(in.format, in.op);
+    const Operands o = GetOperands(in);
+    const auto sgpr = [&](u32 r) { return r < kRegs ? s[r] : ScalarValue{}; };
+    const auto unknown = [&](const char* what, u32 first, u32 n) {
+        if (record && out_.error.empty()) {
+            out_.error = fmt::format("dword {}: {} - the {} in s[{}:{}] is not found", in.offset, name, what, first,
+                                     first + n - 1);
+        }
+    };
+    ImageUse use;
+    use.r128 = ((in.w0 >> 15) & 1) != 0;
+    use.array = ((in.w0 >> 14) & 1) != 0;
+    use.written = name.starts_with("image_store") || name.starts_with("image_atomic");
+    use.sampled = name.starts_with("image_sample") || name.starts_with("image_gather");
+    const u32 t = o.src[2], n = use.r128 ? 4 : 8;
+    for (u32 i = 0; i < n; ++i) {
+        use.sharp[i] = sgpr(t + i);
+        if (use.sharp[i].kind == ScalarValue::Kind::Unknown) {
+            unknown("T#", t, n);
+        }
+    }
+    s32 found = -1;
+    for (u32 k = 0; k < out_.images.size(); ++k) {
+        if (out_.images[k].sharp == use.sharp && out_.images[k].r128 == use.r128) {
+            out_.images[k].written = out_.images[k].written || use.written;
+            out_.images[k].array = out_.images[k].array || use.array;
+            out_.images[k].sampled = out_.images[k].sampled || use.sampled;
+            found = static_cast<s32>(k);
+        }
+    }
+    if (found < 0) {
+        out_.images.push_back(use);
+        found = static_cast<s32>(out_.images.size() - 1);
+    }
+    if (record) {
+        out_.image_of[index] = found;
+    }
+    if (!name.starts_with("image_sample") && !name.starts_with("image_gather")) {
+        return;
+    }
+    SamplerUse sampler;
+    const u32 sr = o.src[3];
+    for (u32 i = 0; i < 4; ++i) {
+        sampler.sharp[i] = sgpr(sr + i);
+        if (sampler.sharp[i].kind == ScalarValue::Kind::Unknown) {
+            unknown("S#", sr, 4);
+        }
+    }
+    s32 sfound = -1;
+    for (u32 k = 0; k < out_.samplers.size(); ++k) {
+        if (out_.samplers[k].sharp == sampler.sharp) {
+            sfound = static_cast<s32>(k);
+        }
+    }
+    if (sfound < 0) {
+        out_.samplers.push_back(sampler);
+        sfound = static_cast<s32>(out_.samplers.size() - 1);
+    }
+    if (record) {
+        out_.sampler_of[index] = sfound;
+    }
 }
 
 void Analysis::Step(State& s, u32 index, bool record) {
@@ -175,6 +241,9 @@ void Analysis::Step(State& s, u32 index, bool record) {
         }
         return;
     }
+    case Format::Mimg:
+        Image(s, index, record);
+        return; // (writes VGPRs only)
     case Format::Ds:
         if (((in.w0 >> 17) & 1) != 0 || name == "ds_append" || name == "ds_consume") {
             out_.uses_gds = true;
@@ -334,6 +403,8 @@ bool AnalyzeResources(std::span<const Inst> insts, const Cfg& cfg, u32 user_sgpr
     out = {};
     out.buffer_of.assign(insts.size(), -1);
     out.load_of.assign(insts.size(), -1);
+    out.image_of.assign(insts.size(), -1);
+    out.sampler_of.assign(insts.size(), -1);
     const u32 n = static_cast<u32>(cfg.blocks.size());
     std::vector<State> entry(n);
     std::vector<u8> reached(n, 0);
@@ -380,6 +451,8 @@ bool AnalyzeResources(std::span<const Inst> insts, const Cfg& cfg, u32 user_sgpr
     }
     // the final pass: each instruction's resource with the states of the fixed point
     out.buffers.clear();
+    out.images.clear();
+    out.samplers.clear();
     for (const u32 b : cfg.rpo) {
         State s = entry[b];
         for (u32 i = cfg.blocks[b].first; i <= cfg.blocks[b].last; ++i) {

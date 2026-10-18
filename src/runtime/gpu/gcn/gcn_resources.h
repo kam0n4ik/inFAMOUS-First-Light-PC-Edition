@@ -34,6 +34,20 @@ struct WalkLoad {
     bool operator==(const WalkLoad&) const = default;
 };
 
+/// An image the program reads or writes (MIMG): its T# dwords (8, or 4 with R128).
+struct ImageUse {
+    std::array<ScalarValue, 8> sharp{};
+    bool r128 = false;
+    bool written = false; ///< image_store / an atomic: a storage image
+    bool array = false;   ///< the instructions' DA (an array view of an array type)
+    bool sampled = false; ///< image_sample / image_gather on it
+};
+
+/// A sampler (S#: 4 dwords).
+struct SamplerUse {
+    std::array<ScalarValue, 4> sharp{};
+};
+
 /// A buffer the program reads or writes: its V# dwords.
 struct BufferUse {
     std::array<ScalarValue, 4> sharp{};
@@ -48,6 +62,10 @@ struct ResourceInfo {
     bool uses_lds = false;      ///< the local data share (workgroup memory)
     std::vector<s32> buffer_of; ///< per instruction: its buffer (-1: none)
     std::vector<s32> load_of;   ///< per instruction (s_load_*): its walk load (-1: none)
+    std::vector<ImageUse> images;     ///< bindings after the buffers (the flattened user data and GDS among them)
+    std::vector<SamplerUse> samplers; ///< ... after the images
+    std::vector<s32> image_of;        ///< per instruction (MIMG): its image (-1: none)
+    std::vector<s32> sampler_of;      ///< per instruction (sampling MIMG): its sampler (-1: none)
     std::string error;          ///< a resource whose descriptor is not found (unknown SGPRs), and where
 };
 
