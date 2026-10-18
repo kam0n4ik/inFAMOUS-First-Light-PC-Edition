@@ -286,7 +286,7 @@ memory.
 
 The game starts with every predicted shader compiled: with `[ShaderCache] predictAll = true` (the default; the F1
 menu's "Compile all the game's shaders before it starts"; `--no-shader-prepare` for one run) SecondSonPC.exe starts
-itself with `--predict-shaders <root>	ools\static_shaders\static_templates.txt --if-needed` in a console window of
+itself with `--predict-shaders <root>\tools\static_shaders\static_templates.txt --if-needed` in a console window of
 its own and waits for it. The window shows each phase with a progress bar (the packs read, the PS / VS / CS modules,
 the pipelines' stages, the driver's compilation). A stamp in the cache generation (`static_predict.stamp`: the
 generation, the templates' XXH3, the predictor's version - `kPredictorVersion`, raised whenever what it predicts
