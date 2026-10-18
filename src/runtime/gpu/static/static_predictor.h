@@ -19,17 +19,21 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "base/abi.h"
+#include "runtime/gpu/shader/pipeline_state.h"
 #include "runtime/gpu/static/static_draws.h"
 
 namespace SecondSon::Gpu::Shader {
 class ShaderTranslator;
 class ShaderDiskCache;
 struct DeviceProfile;
+struct Module;
+struct ResourceBindingPlan;
 } // namespace SecondSon::Gpu::Shader
 
 namespace SecondSon::Gpu::Static {
@@ -47,6 +51,17 @@ struct StaticTemplates {
         std::vector<u8> runtime; ///< RuntimeParams bytes, the shader's own fields zero
     };
     std::vector<State> states; ///< most frequent first within a (role, class, COL_FORMAT)
+    /// A draw's joint render state (E:\research\rea\q\pipe_table.py): the PS's and the VS's RuntimeParams (the
+    /// shaders' own fields zero) and the pipeline's fixed-function state (no module ids, CB_SHADER_MASK, fragment
+    /// exports or export formats: the PS struct and its translation give them).
+    struct Pipe {
+        u64 cls = 0;
+        u32 col_format = 0;
+        u32 count = 0;
+        std::vector<u8> ps_runtime, vs_runtime;
+        Gpu::Shader::GraphicsPipelineState state;
+    };
+    std::vector<Pipe> pipes; ///< most frequent first within a (class, COL_FORMAT)
     bool Load(const std::filesystem::path& file, std::string& error);
 };
 
@@ -55,7 +70,16 @@ struct PredictOptions {
     u32 max_state_variants = 3;     ///< per (role, class[, COL_FORMAT])
     u32 max_material_variants = 16; ///< distinct material texture formats per program
     u32 max_vertex_variants = 16;   ///< distinct vertex stream formats per program
-    std::filesystem::path report;   ///< TSV of the predicted modules (empty: none)
+    u32 max_pipe_variants = 3;      ///< joint render states per (class, COL_FORMAT) the pipelines are predicted for
+    u32 max_draw_variants = 16;     ///< distinct (material, vertex) format pairs per program the pipelines are made of
+    std::filesystem::path report;   ///< TSV of the predicted modules (empty: none); the pipelines' next to it
+    /// A predicted graphics pipeline: the state (module ids zero) and its stages as a draw prepares them (the modules'
+    /// SPIR-V hash and runtime parameters set, their binding plans). Called on the calling thread, once per distinct
+    /// (stages, state); nullptr: no pipelines are predicted.
+    std::function<void(const Gpu::Shader::GraphicsPipelineState& state, const Gpu::Shader::Module& vs,
+                       const Gpu::Shader::ResourceBindingPlan& vs_plan, const Gpu::Shader::Module& ps,
+                       const Gpu::Shader::ResourceBindingPlan& ps_plan)>
+        pipeline;
 };
 
 struct PredictStats {
@@ -65,6 +89,10 @@ struct PredictStats {
     u64 resumed = 0;  ///< already in the cache (an earlier, interrupted run): read, not translated
     u64 skipped = 0;  ///< programs on the skip list
     u64 walk_key_mismatches = 0; ///< the key from the SRT walk over the synthetic memory differs from the translation's
+    u64 pipelines = 0;           ///< (stages, state) handed to options.pipeline
+    u64 pipeline_draws = 0;      ///< (pass, joint state, material/vertex pair) tried
+    u64 pipeline_no_state = 0;   ///< passes whose (class, COL_FORMAT) has no joint state
+    u64 pipeline_no_module = 0;  ///< draws a stage of which did not translate
     double ms = 0.0;
     std::string first_error;
 };

@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -2564,6 +2565,114 @@ std::string Report() {
     return g_backend != nullptr ? g_backend->Report() : std::string("the native backend is not running\n");
 }
 
+namespace {
+
+/// --predict-shaders: the predicted pipelines created once through the driver's pipeline cache and destroyed again (the
+/// cache file keeps what the driver compiled), then a sample of them created again (what the game's creation of one
+/// costs after this).
+std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProfile& profile, GS::ShaderDiskCache& disk,
+                                    const std::vector<GS::PipelineDesc>& descs, u32 threads) {
+    Vk::PipelineCacheFile pcache(ctx, disk);
+    if (!pcache.Load()) {
+        return "predicted pipelines: " + pcache.LoadNote() + " - not built";
+    }
+    Vk::PipelineFactory factory(ctx, profile);
+    factory.SetPersistence(pcache.Handle(), nullptr);
+    const u32 workers = threads != 0 ? threads : std::max(1u, std::thread::hardware_concurrency() - 1);
+    struct Count {
+        std::atomic<u64> built{0}, failed{0}, hits{0}, missing{0}, ns{0};
+    };
+    std::string first_error;
+    std::mutex error_mutex;
+    const auto run = [&](size_t count, Count& n, bool progress) {
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        for (u32 t = 0; t < workers; ++t) {
+            pool.emplace_back([&] {
+                const VkDevice dev = factory.Device();
+                std::vector<u32> vs, ps;
+                for (size_t i; (i = next.fetch_add(1)) < count;) {
+                    const GS::PipelineDesc& d = descs[i];
+                    if (!disk.LoadSpirv(d.vs, vs) || (d.has_ps && !disk.LoadSpirv(d.ps, ps))) {
+                        n.missing.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    VkShaderModule vm = VK_NULL_HANDLE, pm = VK_NULL_HANDLE;
+                    const auto make = [dev](const std::vector<u32>& code, VkShaderModule& out) {
+                        const VkShaderModuleCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                                          .pNext = nullptr,
+                                                          .flags = 0,
+                                                          .codeSize = code.size() * 4,
+                                                          .pCode = code.data()};
+                        return Vk::Fn().vkCreateShaderModule(dev, &ci, nullptr, &out) == VK_SUCCESS;
+                    };
+                    std::string error;
+                    bool ok = make(vs, vm) && (!d.has_ps || make(ps, pm));
+                    if (ok) {
+                        Vk::PipelineObjects obj;
+                        u32 flags = 0;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        ok = factory.Build(d, vm, pm, obj, flags, error);
+                        n.ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now() - t0).count()),
+                                       std::memory_order_relaxed);
+                        if (ok) {
+                            factory.Destroy(obj);
+                            n.hits.fetch_add((flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0,
+                                             std::memory_order_relaxed);
+                        }
+                    } else {
+                        error = "a shader module was refused";
+                    }
+                    if (vm != VK_NULL_HANDLE) {
+                        Vk::Fn().vkDestroyShaderModule(dev, vm, nullptr);
+                    }
+                    if (pm != VK_NULL_HANDLE) {
+                        Vk::Fn().vkDestroyShaderModule(dev, pm, nullptr);
+                    }
+                    if (!ok) {
+                        n.failed.fetch_add(1, std::memory_order_relaxed);
+                        std::scoped_lock lock{error_mutex};
+                        if (first_error.empty()) {
+                            first_error = error;
+                        }
+                        continue;
+                    }
+                    const u64 b = n.built.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (progress && b % 2000 == 0) {
+                        SSPC_LOG(GPU, Info, "predicted pipelines: {} of {} built", b, count);
+                    }
+                }
+            });
+        }
+        for (auto& t : pool) {
+            t.join();
+        }
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    Count first;
+    run(descs.size(), first, true);
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    Count again;
+    const size_t sample = std::min<size_t>(descs.size(), 1024);
+    run(sample, again, false);
+    const bool saved = pcache.Save();
+    return fmt::format(
+        "predicted pipelines: {} described, built {} in {:.1f} s ({:.2f} ms each on {} threads; already in the driver's "
+        "cache {}), failed {} (SPIR-V missing {}){}; created again from the cache: {} of {}, {:.2f} ms each (hits {}); "
+        "the driver's cache {}",
+        descs.size(), first.built.load(), wall,
+        static_cast<double>(first.ns.load()) / 1e6 / static_cast<double>(std::max<u64>(first.built.load(), 1)), workers,
+        first.hits.load(), first.failed.load(), first.missing.load(),
+        first_error.empty() ? std::string() : " - first failure: " + first_error, again.built.load(), sample,
+        static_cast<double>(again.ns.load()) / 1e6 / static_cast<double>(std::max<u64>(again.built.load(), 1)),
+        again.hits.load(),
+        saved ? fmt::format("saved ({:.1f} MiB)", static_cast<double>(pcache.SavedBytes()) / (1 << 20))
+              : std::string("NOT saved"));
+}
+
+} // namespace
+
 bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     Vk::ContextOptions co;
     co.device_index = o.device_index;
@@ -2591,7 +2700,36 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     if (!o.logs_dir.empty()) {
         po.report = o.logs_dir / "static_predict_modules.tsv";
     }
+    const auto env_on = [](const char* name, bool def) {
+        char v[4] = {};
+        const DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+        return n == 0 || n >= sizeof(v) ? def : v[0] == '1';
+    };
+    // the pipelines of the predicted draws (the template's joint states): described as the executor describes a draw's,
+    // created once here through the driver's pipeline cache (vulkan.bin: the game's creation of the same pipeline is a
+    // cache hit); SSPC_STATIC_PIPELINES=0: modules only. SSPC_STATIC_MANIFEST=1 also adds them to the manifest (the
+    // start-up precompiler then builds every one of them at each start)
+    std::vector<GS::PipelineDesc> descs;
+    std::unordered_set<u64> desc_seen;
+    const bool manifest = env_on("SSPC_STATIC_MANIFEST", false);
+    if (env_on("SSPC_STATIC_PIPELINES", true)) {
+        po.pipeline = [&](const GS::GraphicsPipelineState& state, const GS::Module& vs, const GS::ResourceBindingPlan& vsp,
+                          const GS::Module& ps, const GS::ResourceBindingPlan& psp) {
+            GS::PipelineDesc d = Vk::PipelineFactory::DescribeGraphics(state, &vs, vsp, &ps, &psp);
+            const u64 h = d.Hash();
+            if (!desc_seen.insert(h).second) {
+                return;
+            }
+            if (manifest) {
+                disk.AddPipeline(d, h, 0);
+            }
+            descs.push_back(std::move(d));
+        };
+    }
     const bool ok = Static::RunPrediction(o.game_dir, o.templates, *translator, profile, &disk, po, summary);
+    if (ok && !descs.empty()) {
+        summary += "\n" + BuildPredictedPipelines(*ctx, profile, disk, descs, o.threads);
+    }
     disk.Close();
     summary += fmt::format("\n-> {}", (root / gen).string());
     SSPC_LOG(GPU, Info, "{}", summary);

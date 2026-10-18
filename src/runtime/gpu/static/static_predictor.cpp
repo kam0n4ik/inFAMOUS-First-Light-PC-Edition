@@ -151,9 +151,44 @@ u32 PsInputCntl(u16 input, const std::vector<u16>& exports) {
     return v & GS::kPsInputCntlMask;
 }
 
+/// A PS's RuntimeParams: the render state's (`rt`, the shader's own fields zero) with the PS struct's and its pass VS's
+/// fields (ps_ucp_enable: the caller's).
+void PsRuntime(GS::RuntimeParams& rt, const StaticShader& ps, const StaticShader* vs) {
+    rt.hw = GS::HwStage::Ps;
+    rt.sw = GS::SwStage::Fragment;
+    rt.rsrc1 = ps.rsrc1 & GS::Rsrc1TranslationMask(GS::HwStage::Ps);
+    rt.rsrc2 = ps.rsrc2 & GS::Rsrc2TranslationMask(GS::HwStage::Ps);
+    rt.z_format = ps.regs[0] & 0xF;
+    rt.col_format = ps.regs[1];
+    rt.ps_input_ena = ps.regs[2] & 0xFFFF;
+    rt.ps_input_addr = ps.regs[3] & 0xFFFF;
+    rt.num_interp = ps.regs[4] & 0x3F;
+    rt.front_face_all_bits = (ps.regs[5] >> 24) & 1;
+    rt.db_shader_control = EngineDbShaderControl(ps.regs[6]) & GS::kDbShaderMask;
+    if ((rt.ps_input_ena & rt.ps_input_addr & (1u << 14)) == 0) {
+        rt.aa_samples_log2 = 0;
+    }
+    rt.ps_vs_out_cntl = vs != nullptr ? vs->regs[2] & 0xFF : 0;
+    rt.ps_input_cntl = {};
+    static const std::vector<u16> no_exports;
+    for (u32 i = 0; i < rt.num_interp && i < ps.ps_inputs.size() && i < 32; ++i) {
+        rt.ps_input_cntl[i] = PsInputCntl(ps.ps_inputs[i], vs != nullptr ? vs->vs_exports : no_exports);
+    }
+}
+
+/// A VS's RuntimeParams: the render state's with the VS struct's fields.
+void VsRuntime(GS::RuntimeParams& rt, const StaticShader& vs) {
+    rt.hw = GS::HwStage::Vs;
+    rt.sw = GS::SwStage::Vertex;
+    rt.rsrc1 = vs.rsrc1 & GS::Rsrc1TranslationMask(GS::HwStage::Vs);
+    rt.rsrc2 = vs.rsrc2 & GS::Rsrc2TranslationMask(GS::HwStage::Vs);
+    rt.vs_out_cntl = vs.regs[2] & 0x3FFFFFFu;
+}
+
 struct Variant {
     std::vector<const std::array<u32, 8>*> material; ///< per material texture (nullptr: not found)
     const std::vector<std::array<u32, 4>>* streams = nullptr;
+    s32 skin = -1; ///< a vertex variant: its skinned form's index (-1: none)
 };
 
 /// One translation to make.
@@ -184,6 +219,37 @@ struct Context {
     std::atomic<u64> translated{0}, failed{0}, added{0}, layout_count{0}, walk_mismatch{0};
     std::atomic<u64> unknown_textures{0}, unknown_buffers{0};
     std::string first_error;
+    /// What a request gave (options.pipeline set: the pipelines are made of them), by request hash.
+    struct Outcome {
+        GS::ProgramIdentity id;
+        GS::SpirvHash spirv;
+        GS::RuntimeParams runtime;
+        GS::BindingStart start, end;
+        GS::SpecializationKey key;
+        GS::ResourceBindingPlan plan;
+        u32 mrt_mask = 0;
+    };
+    bool keep_outcomes = false;
+    std::unordered_map<u64, Outcome> outcomes;
+    void Keep(u64 hash, const GS::ProgramIdentity& id, const GS::SpirvHash& spirv, const GS::RuntimeParams& runtime,
+              const GS::BindingStart& start, const GS::BindingStart& end, const GS::SpecializationKey& key,
+              GS::ResourceBindingPlan& plan, u32 mrt) {
+        if (!keep_outcomes) {
+            return;
+        }
+        Outcome o;
+        o.id = id;
+        o.spirv = spirv;
+        o.runtime = runtime;
+        o.start = start;
+        o.end = end;
+        o.key = key;
+        plan.flat.clear(); // (the bindings are what a pipeline needs of it)
+        o.plan = std::move(plan);
+        o.mrt_mask = mrt;
+        std::scoped_lock lock{mutex};
+        outcomes.insert_or_assign(hash, std::move(o));
+    }
 };
 
 u64 RequestHash(const Request& r) {
@@ -331,6 +397,7 @@ bool Translate(Context& c, const Request& r, GS::BindingStart& end) {
                                 GS::VertexSource{nullptr, dm.result.vertex_sharps}, dp);
             end = GS::EndOf(r.start, dp);
             c.resumed.fetch_add(1, std::memory_order_relaxed);
+            c.Keep(RequestHash(r), id, dm.spirv_hash, r.runtime, r.start, end, dm.key, dp, dr.mrt_mask);
             return true;
         }
     }
@@ -408,6 +475,7 @@ bool Translate(Context& c, const Request& r, GS::BindingStart& end) {
     m.start = r.start;
     m.user_data = r.ud.regs;
     m.spirv_hash = GS::HashSpirv(result.spirv);
+    c.Keep(RequestHash(r), prog.id, m.spirv_hash, r.runtime, r.start, end, key, plan, refl.mrt_mask);
     m.result = std::move(result);
     const u64 lh = XXH3_64bits(&prog.id, sizeof(prog.id.hash) + sizeof(prog.id.length)) ^
                    XXH3_64bits(&r.runtime, sizeof(r.runtime)) * 0x9E3779B97F4A7C15ull ^ static_cast<u64>(hw);
@@ -448,6 +516,206 @@ void Parallel(u32 threads, size_t n, const std::function<void(size_t)>& fn) {
     }
     for (auto& t : pool) {
         t.join();
+    }
+}
+
+std::string KeyText(const GS::SpecializationKey& key) {
+    std::string s;
+    for (const u32 w : key.words) {
+        s += fmt::format("{:x},", w);
+    }
+    return s;
+}
+
+/// The material draws' pipelines (docs/REA_ENGINE_REVERSE.md §8.2): for every pass, every joint render state of its
+/// (class, COL_FORMAT) and every (material, vertex) format pair its program's geometry has, the PS and the VS such a
+/// draw binds (translated now unless done) and the pipeline's state; options.pipeline gets each distinct one.
+void PredictPipelines(Context& c, const PredictOptions& options, u32 threads,
+                      const std::vector<std::vector<Variant>>& materials,
+                      const std::vector<std::vector<Variant>>& vertices, const std::vector<s32>& inst_mat,
+                      const std::vector<s32>& geo_vert, const std::vector<s32>& geo_skin,
+                      std::unordered_set<u64>& requested, PredictStats& stats) {
+    const StaticDraws& draws = c.draws;
+    std::map<std::pair<u64, u32>, std::vector<const StaticTemplates::Pipe*>> combos;
+    for (const StaticTemplates::Pipe& p : c.templates.pipes) {
+        auto& v = combos[{p.cls, p.col_format}];
+        if (v.size() < options.max_pipe_variants) {
+            v.push_back(&p);
+        }
+    }
+    // a program's draws: the (material variant, vertex variant) pairs of its geometry (-1: none)
+    const size_t nprog = draws.Programs().size();
+    std::vector<std::vector<std::pair<s32, s32>>> pairs(nprog);
+    const auto add = [&](u32 prog, s32 m, s32 v) {
+        auto& p = pairs[prog];
+        if (p.size() < options.max_draw_variants && std::ranges::find(p, std::pair{m, v}) == p.end()) {
+            p.emplace_back(m, v);
+        }
+    };
+    std::vector<u8> drawn(draws.Instances().size(), 0);
+    for (u32 gi = 0; gi < draws.Geometries().size(); ++gi) {
+        const u32 ii = draws.Geometries()[gi].instance;
+        drawn[ii] = 1;
+        if (inst_mat[ii] < 0 || geo_vert[gi] < 0) {
+            continue; // (over the variant limits)
+        }
+        const u32 prog = draws.Instances()[ii].program;
+        add(prog, inst_mat[ii], geo_vert[gi]);
+        if (geo_skin[gi] >= 0) {
+            add(prog, inst_mat[ii], geo_skin[gi]);
+        }
+    }
+    for (u32 ii = 0; ii < draws.Instances().size(); ++ii) {
+        if (drawn[ii] == 0 && inst_mat[ii] >= 0) {
+            add(draws.Instances()[ii].program, inst_mat[ii], -1);
+        }
+    }
+    for (auto& p : pairs) {
+        if (p.empty()) {
+            p.emplace_back(-1, -1); // (a program no instance names: drawn by the engine's code)
+        }
+    }
+    struct Job {
+        u32 prog = 0, pass = 0;
+        const StaticTemplates::Pipe* pipe = nullptr;
+        s32 m = -1, v = -1;
+        u64 ps = 0, vs = 0; ///< request hashes
+    };
+    std::vector<Job> jobs;
+    const Variant empty;
+    const auto& passes = draws.Passes();
+    const auto& shaders = draws.Shaders();
+    std::vector<Request> ps_new;
+    for (u32 pi = 0; pi < nprog; ++pi) {
+        const StaticProgram& prog = draws.Programs()[pi];
+        for (u32 k = 0; k < prog.passes; ++k) {
+            const StaticPass& pass = passes[prog.first_pass + k];
+            if (pass.ps == 0 || pass.vs == 0) {
+                continue;
+            }
+            const StaticShader& ps = shaders[pass.ps - 1];
+            const StaticShader& vs = shaders[pass.vs - 1];
+            const auto it = combos.find({pass.cls, ps.regs[1]});
+            if (it == combos.end()) {
+                ++stats.pipeline_no_state;
+                continue;
+            }
+            for (const StaticTemplates::Pipe* pipe : it->second) {
+                GS::RuntimeParams vrt, rt;
+                std::memcpy(&vrt, pipe->vs_runtime.data(), sizeof(vrt));
+                std::memcpy(&rt, pipe->ps_runtime.data(), sizeof(rt));
+                PsRuntime(rt, ps, &vs);
+                rt.ps_ucp_enable = vrt.clip_cntl & 0x3F;
+                for (const auto& [m, v] : pairs[pi]) {
+                    ++stats.pipeline_draws;
+                    Request r;
+                    r.shader = &ps;
+                    r.runtime = rt;
+                    FillUserData(c, ps, pass, kStagePs, m >= 0 ? materials[pi][m] : empty, r.ud);
+                    Job j{pi, prog.first_pass + k, pipe, m, v, RequestHash(r), 0};
+                    if (requested.insert(j.ps).second) {
+                        ps_new.push_back(std::move(r));
+                    }
+                    jobs.push_back(j);
+                }
+            }
+        }
+    }
+    Parallel(threads, ps_new.size(), [&](size_t i) {
+        GS::BindingStart end;
+        Translate(c, ps_new[i], end);
+    });
+    // the VS where a draw's PS ends
+    std::vector<Request> vs_new;
+    for (Job& j : jobs) {
+        const auto o = c.outcomes.find(j.ps);
+        if (o == c.outcomes.end()) {
+            continue;
+        }
+        const StaticPass& pass = passes[j.pass];
+        const StaticShader& vs = shaders[pass.vs - 1];
+        GS::RuntimeParams vrt;
+        std::memcpy(&vrt, j.pipe->vs_runtime.data(), sizeof(vrt));
+        VsRuntime(vrt, vs);
+        Variant v = j.m >= 0 ? materials[j.prog][j.m] : empty;
+        v.streams = j.v >= 0 ? vertices[j.prog][j.v].streams : nullptr;
+        Request r;
+        r.shader = &vs;
+        r.runtime = vrt;
+        r.start = o->second.end;
+        r.fetch = pass.fetch != 0 ? &draws.Fetches()[pass.fetch - 1] : nullptr;
+        r.streams = v.streams;
+        FillUserData(c, vs, pass, kStageVs, v, r.ud);
+        j.vs = RequestHash(r);
+        if (requested.insert(j.vs).second) {
+            vs_new.push_back(std::move(r));
+        }
+    }
+    Parallel(threads, vs_new.size(), [&](size_t i) {
+        GS::BindingStart end;
+        Translate(c, vs_new[i], end);
+    });
+    stats.requests += ps_new.size() + vs_new.size();
+
+    std::ofstream report;
+    if (!options.report.empty()) {
+        report.open(options.report.parent_path() / "static_predict_pipelines.tsv", std::ios::trunc);
+    }
+    std::unordered_set<u64> made;
+    for (const Job& j : jobs) {
+        const auto po = c.outcomes.find(j.ps);
+        const auto vo = j.vs != 0 ? c.outcomes.find(j.vs) : c.outcomes.end();
+        if (po == c.outcomes.end() || vo == c.outcomes.end()) {
+            ++stats.pipeline_no_module;
+            continue;
+        }
+        const StaticShader& ps = shaders[passes[j.pass].ps - 1];
+        // the state's shader-own fields as a draw's registers give them (pipe_shaderfields.py: exact on every pass
+        // pipeline of three scenes): CB_SHADER_MASK from the PS struct, the fragment exports from its translation,
+        // each bound target's export format from its COL_FORMAT
+        GS::GraphicsPipelineState st = j.pipe->state;
+        st.vs_module = 0;
+        st.ps_module = 0;
+        st.cb_shader_mask = ps.regs[7];
+        st.mrt_mask = po->second.mrt_mask & 0xFF;
+        for (u32 cb = 0; cb < 8; ++cb) {
+            GS::ColorTargetState& t = st.targets[cb];
+            if (t.info == 0) {
+                continue;
+            }
+            if (((st.mrt_mask >> cb) & 1) == 0) {
+                t = {};
+                continue;
+            }
+            t.export_format = (ps.regs[1] >> (cb * 4)) & 0xF;
+        }
+        const u64 key[2] = {j.vs, j.ps};
+        if (!made.insert(XXH3_64bits_withSeed(&st, sizeof(st), XXH3_64bits(key, sizeof(key)))).second) {
+            continue;
+        }
+        const Context::Outcome& p = po->second;
+        const Context::Outcome& v = vo->second;
+        GS::Module vm, pm;
+        vm.spirv_hash = v.spirv;
+        vm.runtime = v.runtime;
+        vm.start = v.start;
+        vm.key = v.key;
+        pm.spirv_hash = p.spirv;
+        pm.runtime = p.runtime;
+        pm.start = p.start;
+        pm.key = p.key;
+        options.pipeline(st, vm, v.plan, pm, p.plan);
+        ++stats.pipelines;
+        if (report.is_open()) {
+            std::string sh;
+            const auto* sb = reinterpret_cast<const u8*>(&st);
+            for (size_t i = 0; i < sizeof(st); ++i) {
+                sh += fmt::format("{:02x}", sb[i]);
+            }
+            report << fmt::format("{:016x}{:016x}\t{}\t{}\t{:016x}{:016x}\t{}\t{}\t{}\n", v.id.hash.lo, v.id.hash.hi,
+                                  v.id.length, KeyText(v.key), p.id.hash.lo, p.id.hash.hi, p.id.length, KeyText(p.key),
+                                  sh);
+        }
     }
 }
 
@@ -508,6 +776,32 @@ bool StaticTemplates::Load(const std::filesystem::path& file, std::string& error
                 ok = s.runtime.size() == sizeof(GS::RuntimeParams);
                 states.push_back(std::move(s));
             }
+        } else if (kind == "pipe") {
+            u64 cls = 0, col = 0;
+            u32 count = 0;
+            std::string hex[3];
+            ok = ParseHex(ls, cls) && ParseHex(ls, col) && static_cast<bool>(ls >> count >> hex[0] >> hex[1] >> hex[2]);
+            std::vector<u8> bytes[3];
+            for (int k = 0; ok && k < 3; ++k) {
+                ok = hex[k].size() % 2 == 0;
+                for (size_t i = 0; ok && i + 1 < hex[k].size(); i += 2) {
+                    u32 b = 0;
+                    ok = std::from_chars(hex[k].data() + i, hex[k].data() + i + 2, b, 16).ec == std::errc{};
+                    bytes[k].push_back(static_cast<u8>(b));
+                }
+            }
+            ok = ok && bytes[0].size() == sizeof(GS::RuntimeParams) && bytes[1].size() == sizeof(GS::RuntimeParams) &&
+                 bytes[2].size() == sizeof(GS::GraphicsPipelineState);
+            if (ok) {
+                Pipe p;
+                p.cls = cls;
+                p.col_format = static_cast<u32>(col);
+                p.count = count;
+                p.ps_runtime = std::move(bytes[0]);
+                p.vs_runtime = std::move(bytes[1]);
+                std::memcpy(&p.state, bytes[2].data(), sizeof(p.state));
+                pipes.push_back(std::move(p));
+            }
         } else if (!kind.empty() && kind[0] != '#') {
             ok = false;
         }
@@ -541,12 +835,17 @@ bool RunPrediction(const std::filesystem::path& game_dir, const std::filesystem:
         "{}, textures {}, shaders {}, fetch shaders {}; instance textures not found {}\n"
         "static shader prediction: {} requests ({} duplicates) in {:.1f} s - translated {}, failed {}, added {} ({} "
         "layouts); passes {} (no state {}, no instance {}); named textures unknown {}, buffers unknown {}; SRT-walk "
-        "key mismatches {}; resumed {}, skipped {}{}",
+        "key mismatches {}; resumed {}, skipped {}{}{}",
         ss.packs, static_cast<double>(ss.bytes) / (1ull << 30), ss.ms / 1000.0, ss.programs, ss.passes, ss.instances,
         ss.geometries, ss.textures, ss.shaders, ss.fetches, ss.instance_textures_missing, ps.requests,
         ps.duplicate_requests, ps.ms / 1000.0, ps.translated, ps.failed, ps.added, ps.layouts, ps.passes,
         ps.passes_no_state, ps.passes_no_instance, ps.named_textures_unknown, ps.named_buffers_unknown,
-        ps.walk_key_mismatches, ps.resumed, ps.skipped, ps.first_error.empty() ? "" : "; first failure: " + ps.first_error);
+        ps.walk_key_mismatches, ps.resumed, ps.skipped, ps.first_error.empty() ? "" : "; first failure: " + ps.first_error,
+        options.pipeline ? fmt::format("\nstatic shader prediction: pipelines {} of {} draws tried (passes without a joint "
+                                       "state {}, draws a stage of which did not translate {}; {} joint states)",
+                                       ps.pipelines, ps.pipeline_draws, ps.pipeline_no_state, ps.pipeline_no_module,
+                                       templates.pipes.size())
+                         : std::string());
     return true;
 }
 
@@ -556,6 +855,7 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
     const auto t0 = std::chrono::steady_clock::now();
     stats = {};
     Context c(draws, templates, translator, profile, disk);
+    c.keep_outcomes = static_cast<bool>(options.pipeline);
     if (!options.report.empty()) {
         c.report.open(options.report, std::ios::app); // (a resumed run adds to an interrupted one's)
         if (const char* t = std::getenv("SSPC_STATIC_TRACE"); t != nullptr && t[0] == '1') {
@@ -590,9 +890,13 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
     const size_t nprog = draws.Programs().size();
     std::vector<std::vector<Variant>> materials(nprog), vertices(nprog);
     std::deque<std::vector<std::array<u32, 4>>> skinned; // the skinned variants' streams (stable addresses)
+    // which variant an instance's material / a geometry's streams (and its skinned form) are (-1: over the limit)
+    std::vector<s32> inst_mat(draws.Instances().size(), -1);
+    std::vector<s32> geo_vert(draws.Geometries().size(), -1), geo_skin(draws.Geometries().size(), -1);
     {
-        std::vector<std::unordered_set<u64>> seen_m(nprog), seen_v(nprog);
-        for (const StaticInstance& in : draws.Instances()) {
+        std::vector<std::unordered_map<u64, s32>> seen_m(nprog), seen_v(nprog);
+        for (u32 ii = 0; ii < draws.Instances().size(); ++ii) {
+            const StaticInstance& in = draws.Instances()[ii];
             Variant v;
             u64 h = 0;
             for (const u32 t : in.textures) {
@@ -603,18 +907,28 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
                                     tex != nullptr ? (*tex)[5] : 0};
                 h = XXH3_64bits_withSeed(sig, sizeof(sig), h);
             }
-            if (materials[in.program].size() < options.max_material_variants && seen_m[in.program].insert(h).second) {
+            if (const auto it = seen_m[in.program].find(h); it != seen_m[in.program].end()) {
+                inst_mat[ii] = it->second;
+            } else if (materials[in.program].size() < options.max_material_variants) {
+                inst_mat[ii] = static_cast<s32>(materials[in.program].size());
+                seen_m[in.program].emplace(h, inst_mat[ii]);
                 materials[in.program].push_back(std::move(v));
             }
         }
-        for (const StaticGeometry& g : draws.Geometries()) {
+        for (u32 gi = 0; gi < draws.Geometries().size(); ++gi) {
+            const StaticGeometry& g = draws.Geometries()[gi];
             const u32 prog = draws.Instances()[g.instance].program;
             u64 h = 0;
             for (const auto& s : g.streams) {
                 const u32 sig[2] = {(s[1] >> 16) & 0x3FFF, s[3] & 0x7FFFF};
                 h = XXH3_64bits_withSeed(sig, sizeof(sig), h);
             }
-            if (vertices[prog].size() < options.max_vertex_variants && seen_v[prog].insert(h).second) {
+            if (const auto it = seen_v[prog].find(h); it != seen_v[prog].end()) {
+                geo_vert[gi] = it->second;
+                geo_skin[gi] = vertices[prog][it->second].skin;
+            } else if (vertices[prog].size() < options.max_vertex_variants) {
+                geo_vert[gi] = static_cast<s32>(vertices[prog].size());
+                seen_v[prog].emplace(h, geo_vert[gi]);
                 Variant v;
                 v.streams = &g.streams;
                 vertices[prog].push_back(std::move(v));
@@ -628,6 +942,8 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
                     sk[0] = pos;
                     Variant sv;
                     sv.streams = &sk;
+                    geo_skin[gi] = static_cast<s32>(vertices[prog].size());
+                    vertices[prog][geo_vert[gi]].skin = geo_skin[gi];
                     vertices[prog].push_back(std::move(sv));
                 }
             }
@@ -670,29 +986,10 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
             }
             const auto& mats = materials[pi].empty() ? none : materials[pi];
             stats.passes_no_instance += materials[pi].empty() ? 1 : 0;
-            const std::vector<u16> no_exports;
             for (const auto* s : st->second) {
                 GS::RuntimeParams rt;
                 std::memcpy(&rt, s->runtime.data(), sizeof(rt));
-                rt.hw = GS::HwStage::Ps;
-                rt.sw = GS::SwStage::Fragment;
-                rt.rsrc1 = ps.rsrc1 & GS::Rsrc1TranslationMask(GS::HwStage::Ps);
-                rt.rsrc2 = ps.rsrc2 & GS::Rsrc2TranslationMask(GS::HwStage::Ps);
-                rt.z_format = ps.regs[0] & 0xF;
-                rt.col_format = ps.regs[1];
-                rt.ps_input_ena = ps.regs[2] & 0xFFFF;
-                rt.ps_input_addr = ps.regs[3] & 0xFFFF;
-                rt.num_interp = ps.regs[4] & 0x3F;
-                rt.front_face_all_bits = (ps.regs[5] >> 24) & 1;
-                rt.db_shader_control = EngineDbShaderControl(ps.regs[6]) & GS::kDbShaderMask;
-                if ((rt.ps_input_ena & rt.ps_input_addr & (1u << 14)) == 0) {
-                    rt.aa_samples_log2 = 0;
-                }
-                rt.ps_vs_out_cntl = vs != nullptr ? vs->regs[2] & 0xFF : 0;
-                rt.ps_input_cntl = {};
-                for (u32 i = 0; i < rt.num_interp && i < ps.ps_inputs.size() && i < 32; ++i) {
-                    rt.ps_input_cntl[i] = PsInputCntl(ps.ps_inputs[i], vs != nullptr ? vs->vs_exports : no_exports);
-                }
+                PsRuntime(rt, ps, vs);
                 const std::vector<u32> ucps = clips.empty() ? std::vector<u32>{rt.ps_ucp_enable} : clips;
                 for (const u32 ucp : ucps) {
                     rt.ps_ucp_enable = ucp;
@@ -756,11 +1053,7 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
             for (const auto* s : st->second) {
                 GS::RuntimeParams rt;
                 std::memcpy(&rt, s->runtime.data(), sizeof(rt));
-                rt.hw = GS::HwStage::Vs;
-                rt.sw = GS::SwStage::Vertex;
-                rt.rsrc1 = vs.rsrc1 & GS::Rsrc1TranslationMask(GS::HwStage::Vs);
-                rt.rsrc2 = vs.rsrc2 & GS::Rsrc2TranslationMask(GS::HwStage::Vs);
-                rt.vs_out_cntl = vs.regs[2] & 0x3FFFFFFu;
+                VsRuntime(rt, vs);
                 for (const GS::BindingStart& start : vs_starts[pass_index]) {
                     for (const Variant& vv : verts) {
                         // a VS reads material textures rarely; the first material variant stands for them
@@ -787,8 +1080,12 @@ bool PredictModules(const StaticDraws& draws, const StaticTemplates& templates, 
         GS::BindingStart end;
         Translate(c, vs_reqs[i], end);
     });
-
     stats.requests = ps_reqs.size() + vs_reqs.size();
+
+    if (options.pipeline) {
+        PredictPipelines(c, options, threads, materials, vertices, inst_mat, geo_vert, geo_skin, requested, stats);
+    }
+
     stats.translated = c.translated;
     stats.failed = c.failed;
     stats.added = c.added;
