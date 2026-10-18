@@ -1230,6 +1230,7 @@ GameMetadata ReadGameMetadataShad(Core::FileSys::MntPoints& mnt) {
 /// and translated into the native backend's shader cache, before any guest memory or game code exists.
 int RunPredictShaders(const App::Config& cfg, const std::string& game) {
     InstallShaderTranslatorAdapter();
+    Gpu::Gcn::InstallOwnTranslatorIfEnabled(); // SSPC_OWN_SHADERS=cs: the compute modules prepared by the own translator
     Gpu::Native::PredictShadersOptions po;
     po.device_index = cfg.gpu_device;
     po.game_dir = cfg.game_dir;

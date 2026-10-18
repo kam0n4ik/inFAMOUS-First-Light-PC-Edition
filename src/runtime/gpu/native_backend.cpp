@@ -2700,7 +2700,10 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     }
     GS::DeviceProfile profile;
     ctx->QueryProfile(profile);
-    const auto root = GS::NativeCacheRoot(o.shader_cache_dir, o.game);
+    // SSPC_OWN_SHADERS (play_rea_own.cmd): the own translator's cache, as the game opens it (StartShaderCache)
+    const auto root = std::getenv("SSPC_OWN_SHADERS") != nullptr
+                          ? GS::NativeCacheRoot(o.shader_cache_dir, o.game).parent_path() / "native_own"
+                          : GS::NativeCacheRoot(o.shader_cache_dir, o.game);
     const std::string gen = GS::ShaderCacheGeneration(profile);
     GS::ShaderDiskCache disk;
     if (!disk.Open({.dir = root / gen, .generation = gen, .max_bytes = u64{o.cache_max_mib} << 20}, error)) {

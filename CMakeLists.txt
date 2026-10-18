@@ -220,6 +220,7 @@ foreach(_f IN LISTS _sspc_own_inputs)
 endforeach()
 string(SHA256 _sspc_own_full "${_sspc_own_acc}")
 string(SUBSTRING "${_sspc_own_full}" 0 16 SSPC_OWN_TRANSLATOR_GENERATION)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_sspc_own_inputs})
 file(WRITE ${CMAKE_BINARY_DIR}/bin/own_translator_generation.txt "${SSPC_OWN_TRANSLATOR_GENERATION}
 ")
 

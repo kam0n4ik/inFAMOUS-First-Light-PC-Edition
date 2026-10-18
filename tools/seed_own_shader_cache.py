@@ -2,7 +2,8 @@
 
 cache\\shaders\\<game>\\native\\<gen>\\shaders.pack -> ...\\native_own\\<gen>\\shaders.pack, every record but the compute
 modules ('M' of stage Cs: the own translator makes those) and the compute pipelines ('L' compute: their stages are
-those modules); vulkan.bin (the driver's pipeline cache) and the static prediction stamp as they are. The graphics
+those modules); vulkan.bin (the driver's pipeline cache) as it is, not the static prediction's stamp (the preparation
+window then runs once for this cache: the compute modules by the own translator before the game). The graphics
 modules and pipelines are the bridge's in both caches, so the own run starts with them prepared (no draws skipped
 while they build). A generation already seeded is left as it is unless --force or the own translator changed
 (build\\bin\\own_translator_generation.txt, written by CMake: its modules from an earlier translator are dropped).
@@ -49,9 +50,13 @@ def seed(src_dir, dst_dir):
             out.write(payload)
             kept += 1
     os.replace(tmp, os.path.join(dst_dir, 'shaders.pack'))
-    for name in ('vulkan.bin', 'static_predict.stamp'):
-        if os.path.exists(os.path.join(src_dir, name)):
-            shutil.copyfile(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+    shutil.copyfile(os.path.join(src_dir, 'vulkan.bin'), os.path.join(dst_dir, 'vulkan.bin')) if os.path.exists(
+        os.path.join(src_dir, 'vulkan.bin')) else None
+    # not the static prediction's stamp: the preparation window runs once for this cache, its compute modules
+    # translated by the own translator and their pipelines created before the game (no translation while playing)
+    stamp = os.path.join(dst_dir, 'static_predict.stamp')
+    if os.path.exists(stamp):
+        os.remove(stamp)
     return kept, dropped_modules, dropped_pipelines
 
 

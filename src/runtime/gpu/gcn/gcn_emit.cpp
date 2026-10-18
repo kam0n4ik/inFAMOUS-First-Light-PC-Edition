@@ -62,6 +62,9 @@ private:
     }
     Id LaneBit(Id lo, Id hi);
     std::pair<Id, Id> Ballot(Id cond);
+    /// a 64-bit source operand: EXEC as its lanes, a register pair, or a constant sign-extended to 64 bits (not the
+    /// operand code after it: 128 + 1 is the constant 1)
+    std::pair<Id, Id> Src64(u32 code, const Inst& in);
     Id Exec() {
         return b_.Op(Op::OpLoad, t_bool_, {exec_});
     }
@@ -346,6 +349,18 @@ void Emitter::Set(u32 code, Id value) {
 Id Emitter::LaneBit(Id lo, Id hi) {
     const Id v = b_.Op(Op::OpCompositeConstruct, t_uvec4_, {lo, hi, b_.U32(0), b_.U32(0)});
     return b_.Op(Op::OpGroupNonUniformInverseBallot, t_bool_, {b_.U32(static_cast<u32>(spv::Scope::Subgroup)), v});
+}
+
+std::pair<Id, Id> Emitter::Src64(u32 c, const Inst& in) {
+    if (c == kExecLo) {
+        return Ballot(Exec());
+    }
+    if (c <= 107 || c == kM0 || c >= kVgpr) {
+        return {Get(c, in), Get(c + 1, in)};
+    }
+    const Id lo = Get(c, in); // a constant: sign-extended to 64 bits
+    const Id neg = b_.Op(Op::OpSLessThan, t_bool_, {Bit(t_i32_, lo), b_.Constant(t_i32_, 0)});
+    return {lo, Select(t_u32_, neg, b_.U32(~0u), b_.U32(0))};
 }
 
 std::pair<Id, Id> Emitter::Ballot(Id cond) {
@@ -1062,18 +1077,7 @@ void Emitter::EmitStub(const Inst& in, std::string_view name) {
 void Emitter::EmitScalar(const Inst& in, std::string_view name) {
     const Operands o = GetOperands(in);
     const auto src = [&](u32 i) { return Get(o.src[i], in); };
-    const auto src64 = [&](u32 i) {
-        const u32 c = o.src[i];
-        if (c == kExecLo) {
-            return Ballot(Exec());
-        }
-        if (c <= 107 || c == kM0) {
-            return std::pair{Get(c, in), Get(c + 1, in)};
-        }
-        const Id lo = Get(c, in); // a constant: sign-extended to 64 bits
-        const Id neg = b_.Op(Op::OpSLessThan, t_bool_, {Bit(t_i32_, lo), b_.Constant(t_i32_, 0)});
-        return std::pair{lo, Select(t_u32_, neg, b_.U32(~0u), b_.U32(0))};
-    };
+    const auto src64 = [&](u32 i) { return Src64(o.src[i], in); };
     const auto set64 = [&](u32 code, std::pair<Id, Id> v) {
         if (code == kExecLo) {
             b_.OpNoResult(Op::OpStore, {exec_, LaneBit(v.first, v.second)});
@@ -1511,8 +1515,8 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         Set(code + 1, hi);
     };
     const auto carry_in = [&]() {
-        const u32 c = in.format == Format::Vop3 ? o.src[2] : kVccLo;
-        return LaneBit(Get(c, in), Get(c + 1, in));
+        const auto [lo, hi] = Src64(in.format == Format::Vop3 ? o.src[2] : kVccLo, in);
+        return LaneBit(lo, hi);
     };
     const Id lit = in.literal ? Bit(t_f32_, b_.U32(in.lit)) : 0;
     if (name == "v_mov_b32") {
@@ -1596,7 +1600,8 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         const u32 m = in.format == Format::Vop3 ? o.src[2] : kVccLo; // VOP2: VCC; VOP3: the pair in src2
         const Id a = in.format == Format::Vop3 ? Bit(t_u32_, f(0)) : u(0);
         const Id c = in.format == Format::Vop3 ? Bit(t_u32_, f(1)) : u(1);
-        Set(d, Select(t_u32_, LaneBit(Get(m, in), Get(m + 1, in)), c, a));
+        const auto [mlo, mhi] = Src64(m, in);
+        Set(d, Select(t_u32_, LaneBit(mlo, mhi), c, a));
     } else if (name == "v_cvt_f32_i32") {
         VDstF(in, d, b_.Op(Op::OpConvertSToF, t_f32_, {si(0)}));
     } else if (name == "v_cvt_f32_u32") {
@@ -1747,7 +1752,7 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         const Id prod = b_.Op(Op::OpUMulExtended, pair, {u(0), u(1)});
         const Id plo = b_.Op(Op::OpCompositeExtract, t_u32_, {prod, 0});
         const Id phi = b_.Op(Op::OpCompositeExtract, t_u32_, {prod, 1});
-        const Id clo = u(2), chi = Get(o.src[2] + 1, in);
+        const auto [clo, chi] = Src64(o.src[2], in); // (an inline 0 is 0:0, not 0:1)
         const Id rlo = b_.Op(Op::OpIAdd, t_u32_, {plo, clo});
         const Id c0 = SelBool(b_.Op(Op::OpULessThan, t_bool_, {rlo, plo}));
         const Id h1 = b_.Op(Op::OpIAdd, t_u32_, {phi, chi});
