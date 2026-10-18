@@ -2783,6 +2783,28 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
         };
     }
     const bool ok = Static::RunPrediction(o.game_dir, o.templates, *translator, profile, &disk, po, summary);
+    // SSPC_STATIC_SCORE_LAST=<n>: the cache's last n pipeline records (those a game run created on demand after an
+    // earlier prediction) against this prediction's descriptions, byte for byte; nothing is built (a copy of the cache)
+    if (char sv[16] = {}; ok && GetEnvironmentVariableA("SSPC_STATIC_SCORE_LAST", sv, sizeof(sv)) > 0) {
+        const size_t last = std::strtoull(sv, nullptr, 10);
+        const std::vector<GS::PipelineDesc> all = disk.Pipelines();
+        std::unordered_multimap<u64, size_t> by_hash;
+        for (size_t i = 0; i < descs.size(); ++i) {
+            by_hash.emplace(descs[i].Hash(), i);
+        }
+        u64 n[2] = {}, hit[2] = {};
+        for (size_t i = all.size() > last ? all.size() - last : 0; i < all.size(); ++i) {
+            const GS::PipelineDesc& d = all[i];
+            const auto [b, e] = by_hash.equal_range(d.Hash());
+            const bool found = std::any_of(b, e, [&](const auto& kv) { return descs[kv.second] == d; });
+            ++n[d.compute ? 1 : 0];
+            hit[d.compute ? 1 : 0] += found ? 1 : 0;
+        }
+        summary += fmt::format("\nSSPC_STATIC_SCORE_LAST: graphics {} of {} predicted exactly, compute {} of {}",
+                               hit[0], n[0], hit[1], n[1]);
+        disk.Close();
+        return true;
+    }
     if (ok && !descs.empty()) {
         summary += "\n" + BuildPredictedPipelines(*ctx, profile, disk, descs, o.threads);
     }

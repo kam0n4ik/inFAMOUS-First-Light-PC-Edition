@@ -265,6 +265,22 @@ its keys computed by `SSPC_STATIC_KEYS=<dir>` -> `compare_keys.py`; not a hold-o
 With compute: ~300 000 modules in 3 min, 13 550 pipelines (8 049 compute) compiled into `vulkan.bin` (181 MiB) in
 36-120 s, 0.2-0.3 ms each from it afterwards. `SSPC_STATIC_COMPUTE=0`: graphics only.
 
-Not yet: a game run with the predicted cache (the on-demand creations' driver feedback would show the hits in the
-game itself); more than one key per CS program; the material textures' streaming placeholders (a 1x1 1D T# of the
+### 8.4 A game run with the predicted cache (2026-10-18, hand play, 11.7 min)
+
+`--predict-shaders` into the live cache (297 636 modules, 13 555 pipelines into `vulkan.bin`, 6 min), then
+`play_unlimited.cmd`. At the start: the cache read in 234 ms (470 MiB), `vulkan.bin` 186 MiB loaded; the offline index:
+the cache had 10 213 of the game's 10 301 programs (99.1 %). During the run (the records the game appended):
+
+- translated anew: 1 023 modules - 8 first modules of a program (5 PS, 3 VS), the rest a program's second or later
+  key (678 CS, 258 PS, 79 VS); 2 programs new to the cache;
+- pipelines created on demand: 2 452 (the start-up manifest had 992); byte for byte one of the prediction's
+  descriptions (`SSPC_STATIC_SCORE_LAST=<n>` on a copy of the cache): graphics 531 / 700 (76 %), compute 1 063 /
+  1 752 (61 %) - those were created from `vulkan.bin` instead of compiled.
+
+The run ended in the game's movie decoder thread (an execute of 0x0 while the powers menu opened and closed its
+`powerk_*.bsf` movies at each key press), with the system's commit at its limit at some moment (peak 32 654 of
+32 655 MiB, no page file); no shader work on that thread. The predicted cache adds its `vulkan.bin` to the driver's
+memory.
+
+Not yet: more than one key per CS program (the largest remainder); the material textures' streaming placeholders (a 1x1 1D T# of the
 texture's format while it streams in: 158 of 682 logged material modules had one).
