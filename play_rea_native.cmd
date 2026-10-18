@@ -1,5 +1,6 @@
 @echo off
-rem play_rea.cmd with every Phase 2-3 native subsystem of SecondSonPC instead of the shadPS4 bridge
-rem (kernel, threads, memory, exceptions, CPU patcher, errno, clock, exit) - before they become the default
+rem Since 2026-10-18 play_rea.cmd itself runs on SecondSonPC's own kernel, threads, memory, exceptions, CPU patcher,
+rem errno, clock and exit (the default with the own loader); this file is kept for old shortcuts.
+rem The bridge's instead: play_rea.cmd --legacy-bridge-kernel
 cd /d "%~dp0"
-call "%~dp0play_rea.cmd" --native cpu --native exceptions --native threads --native memory --memory-commit on-demand --native errno --native clock --native kernel-memory --native exit %*
+call "%~dp0play_rea.cmd" %*

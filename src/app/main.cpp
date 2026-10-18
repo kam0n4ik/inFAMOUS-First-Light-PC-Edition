@@ -52,6 +52,8 @@
 //                              bridge's default keyboard layout) pushed into the window's event
 //                              queue <sec> seconds after the window opens; no window focus needed
 //     --bridge <group>         sends a NATIVE group back to BRIDGE (fs, system, ...)
+//     --legacy-bridge-kernel   the bridge's kernel/threads/memory/exceptions/CPU patcher/errno/clock/exit
+//                              instead of SecondSonPC's (the default with --loader sspc since 2026-10-18)
 //     --native <group>         enables an EXPERIMENTAL group, BRIDGE by default (kernel-dmem: direct
 //                              memory, P2.3.1; memory: SecondSonPC's memory manager instead of the
 //                              bridge's, P2.3.4; threads: SecondSonPC's guest thread manager, P2.4;
@@ -205,6 +207,8 @@ int main(int argc, char* argv[]) {
     }
     bool stock_bootstrap = false;
     bool gpu_stability_test = false;
+    bool legacy_bridge_kernel = false; // --legacy-bridge-kernel: the bridge's kernel groups, not SecondSonPC's
+    bool memory_commit_given = false;
     u32 vram_log_seconds = 0; // --vram-log <seconds>: video memory budget/usage samples (SSPC-001)
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -244,6 +248,8 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--bridge" && has_value) {
             config->bridged_groups.emplace_back(argv[++i]);
+        } else if (arg == "--legacy-bridge-kernel") {
+            legacy_bridge_kernel = true;
         } else if (arg == "--native" && has_value) {
             config->native_groups.emplace_back(argv[++i]); // experimental groups only
         } else if (arg == "--memory-commit" && has_value) {
@@ -252,6 +258,7 @@ int main(int argc, char* argv[]) {
                 return Fail("--memory-commit must be upfront|on-demand");
             }
             config->memory_commit_on_demand = mode == "on-demand";
+            memory_commit_given = true;
         } else if (arg == "--cpu-emulate" && has_value) {
             if (std::string_view(argv[++i]) != "sse4a") {
                 return Fail("--cpu-emulate: only sse4a");
@@ -424,6 +431,31 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Since 2026-10-18 the game runs on SecondSonPC's own kernel, threads, memory, exceptions, CPU patcher, errno,
+    // clock and exit (Phase 2/3 of docs/AUDIT.md, measured equal to the bridge's in game): on by default with the
+    // own loader; `--bridge <group>` gives one back to the bridge, --legacy-bridge-kernel all of them. Not for the
+    // self-tests, which compare one group at a time.
+    if (config->loader == App::Config::LoaderBackend::Sspc && !config->selftest && !legacy_bridge_kernel) {
+        const auto listed = [](const std::vector<std::string>& v, std::string_view g) {
+            return std::find(v.begin(), v.end(), g) != v.end();
+        };
+        const bool dmem = listed(config->native_groups, "kernel-dmem");
+        for (const char* g : {"cpu", "exceptions", "threads", "memory", "errno", "clock", "kernel-memory", "exit"}) {
+            const std::string_view group = g;
+            if (listed(config->native_groups, group) || listed(config->bridged_groups, group) ||
+                (group == "cpu" && (listed(config->native_groups, "fs-patch") ||
+                                    listed(config->bridged_groups, "fs-patch"))) ||
+                (group == "exceptions" && config->fault_test) ||
+                ((group == "memory" || group == "kernel-memory") && dmem) ||
+                (group == "kernel-memory" && listed(config->bridged_groups, "memory"))) {
+                continue;
+            }
+            config->native_groups.emplace_back(g);
+        }
+        if (!memory_commit_given && listed(config->native_groups, "memory")) {
+            config->memory_commit_on_demand = true;
+        }
+    }
     if (config->selftest && config->loader != App::Config::LoaderBackend::Sspc) {
         return Fail("--selftest compares SecondSonPC's subsystems with shadPS4's; it needs --loader sspc");
     }
