@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
@@ -1925,7 +1926,10 @@ void Backend::StartShaderCache(const Options& o) {
                             "--no-shader-cache): shaders translated and pipelines created as they are met");
         return;
     }
-    const auto root = o.shader_cache_dir / o.game / "native";
+    // SSPC_OWN_SHADERS (SecondSonPC's own GCN translator, play_rea_own.cmd): a cache of its own - a module's key does
+    // not name its translator, so the bridge's modules and the own translator's must never meet in one
+    const bool own_shaders = std::getenv("SSPC_OWN_SHADERS") != nullptr;
+    const auto root = o.shader_cache_dir / o.game / (own_shaders ? "native_own" : "native");
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     ApplyClearRequests(o.shader_cache_dir, root);
