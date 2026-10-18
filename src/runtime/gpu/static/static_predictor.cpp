@@ -617,17 +617,24 @@ std::unordered_map<u32, u32> BufferStrides(const StaticShader& sh) {
     return out;
 }
 
-/// A compute shader's user data: each resource slot's sharp from the template (by its slot list and register, else by
-/// the slot), a RW buffer's stride from its code; the extended user data at kEudAddr.
 /// The engine's placeholder for a read-only buffer it has nothing for yet (NUM_RECORDS 0, stride 15: the particle
 /// systems' "previous state" before their first update); later dispatches of the same program bind the real buffer.
 bool IsPlaceholderBuffer(const std::vector<u32>& w) {
     return w.size() == 4 && w[2] == 0 && w[3] == 0x1800C004u;
 }
 
-/// `filled`: the placeholders' later form instead - a read-only buffer of the stride the code implies (its raw[3]
-/// as the engine's real read-only buffers have it). Returns whether the shader has a placeholder at all.
-bool FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& strides_from_code, bool filled) {
+/// The descriptor variants a compute shader's dispatches are predicted with.
+enum class CsForm {
+    Template, ///< each slot's sharp as the template has it
+    Filled,   ///< the placeholders' later form: a read-only buffer of the stride the code implies
+    Code,     ///< and every read-only buffer the code indexes a raw one of that stride (the template's may be another
+              ///< system's binding of the same slot)
+};
+
+/// A compute shader's user data: each resource slot's sharp from the template (by its slot list and register, else by
+/// the slot), a RW buffer's stride from its code, the read-only buffers as `form` says; the extended user data at
+/// kEudAddr. Returns whether the shader has a placeholder at all.
+bool FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& strides_from_code, CsForm form) {
     bool placeholder = false;
     const StaticTemplates& t = c.templates;
     u64 sig = 0xCBF29CE484222325ull;
@@ -668,13 +675,13 @@ bool FillComputeUserData(Context& c, const StaticShader& cs, UserData& ud, u64& 
                 ++strides_from_code;
             }
         }
-        if (!image && IsPlaceholderBuffer(w)) {
-            placeholder = true;
-            if (filled) {
-                const auto s = strides.find(reg);
-                const u32 stride = s != strides.end() ? s->second & 0x3FFFu : 0;
-                w = {0x10000000u, 0x2u | (stride << 16), 0x100000u, 0x20027204u};
-            }
+        const bool held = !image && IsPlaceholderBuffer(w);
+        placeholder |= held;
+        const auto code = strides.find(reg);
+        if ((held && form != CsForm::Template) ||
+            (form == CsForm::Code && type == kResource && !image && code != strides.end())) {
+            const u32 stride = code != strides.end() ? code->second & 0x3FFFu : 0;
+            w = {0x10000000u, 0x2u | (stride << 16), 0x100000u, 0x20027204u};
         }
         if (w[0] == 0 && w[1] == 0) {
             w[0] = 0x1000; // (a base of 0 would read as no descriptor)
@@ -703,20 +710,18 @@ void PredictCompute(Context& c, const PredictOptions& options, u32 threads, std:
         for (u32 i = 0; i < 3; ++i) {
             r.runtime.threads[i] = cs.regs[i] & 0xFFFF;
         }
-        Request later = r;
-        const bool placeholder = FillComputeUserData(c, cs, r.ud, from_code, false);
-        const u64 h = RequestHash(r);
-        hashes.push_back(h);
-        if (requested.insert(h).second) {
-            reqs.push_back(std::move(r));
-        }
-        if (placeholder) { // the same program's later dispatches: the real buffers in the placeholders' place
+        // the template's form, the placeholders' later one (the same program's later dispatches) and the code's
+        for (const CsForm form : {CsForm::Template, CsForm::Filled, CsForm::Code}) {
+            Request v = r;
             u64 unused = 0;
-            FillComputeUserData(c, cs, later.ud, unused, true);
-            const u64 lh = RequestHash(later);
-            hashes.push_back(lh);
-            if (requested.insert(lh).second) {
-                reqs.push_back(std::move(later));
+            const bool placeholder = FillComputeUserData(c, cs, v.ud, form == CsForm::Template ? from_code : unused, form);
+            if (form == CsForm::Filled && !placeholder) {
+                continue;
+            }
+            const u64 h = RequestHash(v);
+            hashes.push_back(h);
+            if (requested.insert(h).second) {
+                reqs.push_back(std::move(v));
             }
         }
     }

@@ -282,5 +282,30 @@ The run ended in the game's movie decoder thread (an execute of 0x0 while the po
 32 655 MiB, no page file); no shader work on that thread. The predicted cache adds its `vulkan.bin` to the driver's
 memory.
 
-Not yet: more than one key per CS program (the largest remainder); the material textures' streaming placeholders (a 1x1 1D T# of the
+### 8.5 Before the game starts; the game run's misses
+
+The game starts with every predicted shader compiled: with `[ShaderCache] predictAll = true` (the default; the F1
+menu's "Compile all the game's shaders before it starts"; `--no-shader-prepare` for one run) SecondSonPC.exe starts
+itself with `--predict-shaders <root>	ools\static_shaders\static_templates.txt --if-needed` in a console window of
+its own and waits for it. The window shows each phase with a progress bar (the packs read, the PS / VS / CS modules,
+the pipelines' stages, the driver's compilation). A stamp in the cache generation (`static_predict.stamp`: the
+generation, the templates' XXH3, the predictor's version - `kPredictorVersion`, raised whenever what it predicts
+changes) makes a later start's window take ~2 s; a new predictor, new templates or a new driver prepares again
+(~80-160 s, the modules already in the cache are read, not translated).
+
+The game run of 8.4 against later predictors (`SSPC_STATIC_SCORE_LAST`, now also the graphics misses by cause;
+`SSPC_STATIC_KEYS` dumps the record number, so a run's own modules are the last ones):
+
+- 581 of the 678 CS modules the game translated had one buffer more in their key than the prediction: a read-only
+  buffer the engine binds as a placeholder (NUM_RECORDS 0, stride 15, raw[3] 0x1800C004) until a particle system's
+  first update, then the real one (raw, of the stride its code indexes it with). Predicting that later form too:
+  compute pipelines 1 063 -> 1 518 of 1 752; every read-only buffer the code indexes as a raw one of that stride
+  (a third form): 1 528. The rest: other systems' buffers in the same slots (typed vs raw), RW strides larger than
+  the code's accesses (176 for 80), storage image formats.
+- Graphics 531 of 700: 158 of the 169 misses are a module (the VS's 68, the PS's 65, both 25), 11 the state. The
+  modules differ in engine-bound resources the packs do not have (named textures unknown 2 887, named buffers 5 096:
+  null in the prediction, real in the game) and in material texture formats (UNORM/SRGB, BC variants); the
+  per-program variant limits do not matter (64 instead of 16: 532).
+
+Not yet: the engine's named textures and buffers in more templates (the largest graphics remainder); the material textures' streaming placeholders (a 1x1 1D T# of the
 texture's format while it streams in: 158 of 682 logged material modules had one).

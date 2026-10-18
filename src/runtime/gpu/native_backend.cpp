@@ -2748,7 +2748,7 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     // the stamp of a finished preparation: this cache generation, the templates' content, the predictor's version
     // (kPredictorVersion: raised with every change of what it predicts). if_needed: a matching stamp and the driver's
     // cache file - nothing to do
-    constexpr u32 kPredictorVersion = 2;
+    constexpr u32 kPredictorVersion = 3;
     const std::filesystem::path stamp_file = root / gen / "static_predict.stamp";
     std::string stamp;
     {
@@ -2772,6 +2772,15 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     Static::PredictOptions po;
     po.progress = o.progress;
     po.threads = o.threads;
+    // SSPC_STATIC_VARIANTS=<materials>,<vertex>,<draw pairs>,<joint states>: the per-program limits (research)
+    if (char vv[64] = {}; GetEnvironmentVariableA("SSPC_STATIC_VARIANTS", vv, sizeof(vv)) > 0) {
+        u32 l[4] = {po.max_material_variants, po.max_vertex_variants, po.max_draw_variants, po.max_pipe_variants};
+        std::sscanf(vv, "%u,%u,%u,%u", &l[0], &l[1], &l[2], &l[3]);
+        po.max_material_variants = l[0];
+        po.max_vertex_variants = l[1];
+        po.max_draw_variants = l[2];
+        po.max_pipe_variants = l[3];
+    }
     if (!o.logs_dir.empty()) {
         po.report = o.logs_dir / "static_predict_modules.tsv";
     }
@@ -2826,16 +2835,33 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
         for (size_t i = 0; i < descs.size(); ++i) {
             by_hash.emplace(descs[i].Hash(), i);
         }
-        u64 n[2] = {}, hit[2] = {};
+        // a miss's stages: which of them a predicted pipeline has (the module missed) and, with both, whether a
+        // predicted pipeline has that pair (else the state or the bindings differ)
+        const auto sh = [](const GS::SpirvHash& h) { return h.lo ^ (h.hi * 0x9E3779B97F4A7C15ull); };
+        std::unordered_set<u64> vs_known, ps_known, pair_known;
+        for (const GS::PipelineDesc& d : descs) {
+            vs_known.insert(sh(d.vs));
+            if (d.has_ps) {
+                ps_known.insert(sh(d.ps));
+            }
+            pair_known.insert(sh(d.vs) * 31 + (d.has_ps ? sh(d.ps) : 0));
+        }
+        u64 n[2] = {}, hit[2] = {}, why[5] = {};
         for (size_t i = all.size() > last ? all.size() - last : 0; i < all.size(); ++i) {
             const GS::PipelineDesc& d = all[i];
             const auto [b, e] = by_hash.equal_range(d.Hash());
             const bool found = std::any_of(b, e, [&](const auto& kv) { return descs[kv.second] == d; });
             ++n[d.compute ? 1 : 0];
             hit[d.compute ? 1 : 0] += found ? 1 : 0;
+            if (!found && !d.compute) {
+                const bool v = vs_known.contains(sh(d.vs)), p = !d.has_ps || ps_known.contains(sh(d.ps));
+                ++why[!v && !p ? 0 : !v ? 1 : !p ? 2 : pair_known.contains(sh(d.vs) * 31 + (d.has_ps ? sh(d.ps) : 0)) ? 4 : 3];
+            }
         }
-        summary += fmt::format("\nSSPC_STATIC_SCORE_LAST: graphics {} of {} predicted exactly, compute {} of {}",
-                               hit[0], n[0], hit[1], n[1]);
+        summary += fmt::format("\nSSPC_STATIC_SCORE_LAST: graphics {} of {} predicted exactly, compute {} of {}; graphics "
+                               "misses: both stages' modules unknown {}, the VS's {}, the PS's {}, both known but not "
+                               "together {}, the pair known (state or bindings differ) {}",
+                               hit[0], n[0], hit[1], n[1], why[0], why[1], why[2], why[3], why[4]);
         disk.Close();
         return true;
     }
