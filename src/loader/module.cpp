@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "base/log.h"
+#include "engine/guest_hooks.h"
 #include "loader/eh_frame.h"
 #include "loader/host.h"
 #include "loader/image_file.h"
@@ -275,6 +276,10 @@ bool Module::Map(Host& host, const ImageFile& file, u32& max_tls_index, std::str
     SSPC_LOG(Loader, Info, "{}: entry {:#x}", name, base_ + entry_);
 
     if (static_patching) {
+        // the code as the file has it, for the engine's checks of the functions it hooks (before it is rewritten)
+        for (const auto& [address, size] : executable_segments) {
+            Engine::AddPristineCode(address, reinterpret_cast<const void*>(address), size);
+        }
         StaticPatchSummary total;
         for (const auto& [address, size] : executable_segments) {
             const auto r = host.StaticPatch(address, size, function_starts, functions);

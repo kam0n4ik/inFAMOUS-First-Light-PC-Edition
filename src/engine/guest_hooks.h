@@ -30,7 +30,12 @@ void SetGuestImage(u64 base, u64 size);
 u64 GuestImageBase();
 u64 GuestImageEnd();
 
-/// True when the loaded function at base + f.rva hashes to f.fnv1a64; otherwise `error` says which.
+/// The code of an executable segment as the file has it, before the static CPU patcher rewrote instructions in it
+/// (the loader, --native cpu): verifications hash this copy, not the patched memory.
+void AddPristineCode(u64 address, const void* data, u64 size);
+
+/// True when the loaded function at base + f.rva hashes to f.fnv1a64 (its pristine bytes when the static patcher
+/// changed it; then its first 16 bytes - where a hook's jump goes - must be unpatched); otherwise `error` says which.
 bool VerifyGuestFunction(u64 module_base, const GuestFunction& f, std::string& error);
 
 /// Overwrites the first 14 bytes at `at` with `jmp qword [rip+0]; dq target`. Call before any thread can run the

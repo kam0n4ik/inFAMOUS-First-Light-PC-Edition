@@ -1,6 +1,8 @@
 // SecondSonPC — replacing functions of the game's own code with native ones (see guest_hooks.h).
 #include "engine/guest_hooks.h"
 
+#include <algorithm>
+#include <vector>
 #include <atomic>
 #include <cstring>
 
@@ -37,8 +39,37 @@ u64 HashBytes(const void* data, size_t size) {
     return h;
 }
 
+namespace {
+struct Pristine {
+    u64 address;
+    std::vector<u8> bytes;
+};
+std::vector<Pristine> g_pristine; // (written by the loader before any guest thread; read-only afterwards)
+} // namespace
+
+void AddPristineCode(u64 address, const void* data, u64 size) {
+    g_pristine.push_back({address, std::vector<u8>(static_cast<const u8*>(data), static_cast<const u8*>(data) + size)});
+}
+
 bool VerifyGuestFunction(u64 module_base, const GuestFunction& f, std::string& error) {
     const u64 at = module_base + f.rva;
+    for (const Pristine& p : g_pristine) {
+        if (at < p.address || at + f.size > p.address + p.bytes.size()) {
+            continue;
+        }
+        const u8* code = p.bytes.data() + (at - p.address);
+        if (std::memcmp(code, reinterpret_cast<const void*>(at), std::min<u32>(16, f.size)) != 0) {
+            error = fmt::format("eboot+{:#x}: its entry was rewritten by the static CPU patcher", f.rva);
+            return false;
+        }
+        const u64 h = HashBytes(code, f.size);
+        if (h != f.fnv1a64) {
+            error = fmt::format("eboot+{:#x} ({} bytes): hash {:#018x}, expected {:#018x} (another game version)",
+                                f.rva, f.size, h, f.fnv1a64);
+            return false;
+        }
+        return true;
+    }
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
         reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize < at + f.size) {
