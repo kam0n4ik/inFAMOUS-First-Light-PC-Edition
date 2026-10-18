@@ -195,6 +195,47 @@ misses: one image word (view type 2D / 2D array, or another format: instances be
 textures with more than one format) and skinned/instanced vertex formats. The named textures' and buffers' templates
 come from the binding log of earlier runs, not held out.
 
-Not yet: pipelines (PipelineDesc: the class's fixed-function state, bindings) - the precompiler still prepares only
-the manifest's; compute (8 049 CS, bound by engine code); a game run with the predicted cache (the system's commit
-limit was taken by other processes at the time).
+### 8.2 Pipelines of the predicted draws
+
+What a draw's pipeline is beyond its two modules is its GraphicsPipelineState (targets, blending, depth, topology).
+Measured on the pass pipelines of three scenes' caches (`tools\static_shaders\pipe_state.py`, `pipe_joint.py`,
+`pipe_shaderfields.py`):
+
+- The state without its shader-own fields is a function of (pass class, the PS's COL_FORMAT) for most draws: the
+  other scenes' most frequent state is the scene's in 88 %, one of the three most frequent in 97 %. Taken jointly
+  with the PS's and the VS's render state (one draw: PS RuntimeParams, VS RuntimeParams, pipeline state) the three
+  most frequent joint states of a key cover 94 %, five 96.5 % (65-71 keys, 145-162 joint states).
+- The shader-own fields follow the PS struct exactly (1 149 / 1 149 pipelines): CB_SHADER_MASK = the struct's,
+  the fragment exports = the non-zero nibbles of its COL_FORMAT (= its translation's `mrt_mask`), a bound target's
+  export format = its COL_FORMAT nibble.
+
+`PredictPipelines` (static_predictor.cpp, after the module phase): per pass, per joint state of its (class,
+COL_FORMAT) (template lines `pipe`, `pipe_table.py`; at most 3), per (material, vertex) format pair its program's
+geometry actually has (the geometry's own instance - at most 16, the skinned form too), the PS and the VS such a draw
+binds (the VS starting where that PS's bindings end; translated unless done) and the state with the shader-own fields
+filled. `--predict-shaders` describes each as the executor does (`PipelineFactory::DescribeGraphics`: SPIR-V, state,
+fragment runtime, bindings) and creates each distinct one once through the driver's pipeline cache, destroying it
+again: `vulkan.bin` then holds what the driver compiled, and the game's creation of that pipeline is a cache hit.
+`SSPC_STATIC_PIPELINES=0`: modules only; `SSPC_STATIC_MANIFEST=1`: the descriptions also go into the manifest (the
+start-up precompiler then builds them at every start - off: they are created on demand, from the cache).
+
+One run (hold-out templates): ~490 000 draws tried, 216 000-256 000 (stages, state) combinations, **5 500 distinct
+pipelines** (most variants differ only in descriptor formats the SPIR-V does not depend on); ~290 000 modules in
+155 s; the pipelines built in 19 s cold (37 ms each, 11 threads; 4 s with the driver's own shader cache warm),
+created again from `vulkan.bin` in **0.24-0.29 ms** each (1 024 / 1 024 cache hits). Cache: 146 MiB modules, 50 MiB
+`vulkan.bin`.
+
+Measured (hold-out: the joint states built from the two other scenes' caches; `compare_pipes.py`, stages matched by
+(program, key) - layout records by their RuntimeParams - so another cache generation compares):
+
+| scene | pass pipelines: stages + state predicted | state differs | not first visited elsewhere: exact |
+|---|---|---|---|
+| village (early) | 410 / 470 (87.2 %) | 14 | 129 / 155 (83 %) |
+| beach | 292 / 326 (89.6 %) | 9 | 62 / 66 |
+| harbour (user1022) | 309 / 353 (87.5 %) | 7 | 52 / 61 |
+
+The misses are mostly a stage: a keyed PS whose material texture format was not among the variants (as in §8.1),
+then the joint state beyond the three most frequent.
+
+Not yet: compute (8 049 CS, bound by engine code); a game run with the predicted cache (the on-demand creations'
+driver feedback would show the hits in the game itself).

@@ -20,6 +20,11 @@ Dependencies: Python 3.13 (`py -I -X utf8`), the KCAP reader `E:\SecondSonPC-reb
 | `predict_loop.ps1` | runs `--predict-shaders` until it completes (a recompiler assertion: skip list + resume) |
 | `compare_predict.py` | the prediction report against scenes' caches (layout / keyed hits) |
 | `keyed_miss.py` | why a keyed module was missed (the differing key words) |
+| `pipe_state.py` | pipeline state by (pass class, COL_FORMAT) against the caches (hold-out) |
+| `pipe_joint.py` | joint (PS state, VS state, pipeline state) per key: top-K hold-out coverage |
+| `pipe_shaderfields.py` | the state's shader-own fields against the PS structs (run in E:\research\rea) |
+| `pipe_table.py` | joint states -> `pipe` template lines (appended) |
+| `compare_pipes.py` | the predicted pipelines (`logs\static_predict_pipelines.tsv`) against scenes' caches |
 
 `static_templates.txt`: the template file made from the binding log `bindings_v1.jsonl` and the caches of three
 scenes (`logs\p414\m1\cache`): `tex`/`rbuf`/`cb`/`smp`/`state` lines (formats in `static_predictor.cpp`,
@@ -31,9 +36,11 @@ Make it again:
 py -I -X utf8 material_db.py out\material_db.json E:\shdps4\CUSA00004
 py -I -X utf8 templates.py out\material_db.json out\pack_shaders.json out\bindings_v1.jsonl static_templates.txt
 py -I -X utf8 state_table.py out\material_db.json static_templates.txt <scene shaders.pack>...
+py -I -X utf8 pipe_table.py out\material_db.json static_templates.txt <scene shaders.pack>...
 ```
 
-Run it into the normal shader cache (then a game start finds the modules):
+Run it into the normal shader cache (then a game start finds the modules, and the pipelines are compiled into
+`vulkan.bin` - docs\REA_ENGINE_REVERSE.md §8.2):
 
 ```
 build\bin\SecondSonPC.exe --gpu-backend sspc --predict-shaders tools\static_shaders\static_templates.txt
