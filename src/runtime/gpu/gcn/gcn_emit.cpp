@@ -901,7 +901,11 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
     if (tfe || lwe) {
         return false;
     }
-    const u32 vaddr = kVgpr + (in.w1 & 0xFF), vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    const u32 vdata = kVgpr + ((in.w1 >> 8) & 0xFF);
+    // the address: [offset] then the coordinates (then the LOD)
+    const bool has_offset = name.ends_with("_o");
+    const u32 offset_reg = kVgpr + (in.w1 & 0xFF);
+    const u32 vaddr = offset_reg + (has_offset ? 1 : 0);
     const Id image = b_.Op(Op::OpLoad, im.type, {im.var});
     // the coordinates: integer (loads, stores) or float (sampling), one or a vector
     const auto coords = [&](bool integer) {
@@ -977,16 +981,46 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         b_.OpNoResult(Op::OpImageWrite, {image, coords(true), texel});
         return true;
     }
-    if (name == "image_sample_lz" || name == "image_sample_l") {
+    if (name == "image_sample_lz" || name == "image_sample_l" || name == "image_sample_lz_o" || name == "image_sample_l_o") {
         const s32 si = res_.sampler_of[index];
         if (si < 0 || im.storage || unorm) {
             return Decline(unorm ? " (unnormalized coordinates)" : " (no sampler / a storage image)");
         }
         const Id sampler = b_.Op(Op::OpLoad, b_.TypeSampler(), {samplers_[si]});
         const Id sampled = b_.Op(Op::OpSampledImage, b_.TypeSampledImage(im.type), {image, sampler});
-        const Id lod = name == "image_sample_l" ? GetF(vaddr + im.coords, in) : b_.F32(0.0f);
+        const Id lod = name.starts_with("image_sample_l_") || name == "image_sample_l" ? GetF(vaddr + im.coords, in)
+                                                                                         : b_.F32(0.0f);
+        if (!has_offset) {
+            results(b_.Op(Op::OpImageSampleExplicitLod, im.texel,
+                          {sampled, coords(false), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+                    false);
+            return true;
+        }
+        // the texel offset: 6-bit signed fields at bits 0, 8, 16 of one VGPR (x, y[, z]). Vulkan allows a dynamic
+        // Offset only on gathers: the coordinates move by offset / the level's size instead (what the offset means)
+        b_.Capability(spv::Capability::ImageQuery);
+        const Id packed = Get(offset_reg, in);
+        const u32 dims = im.coords - (im.arrayed ? 1 : 0) + (im.one_d ? 1 : 0); // (the SPIR-V image's dimensions)
+        const u32 qn = dims + (im.arrayed ? 1 : 0);
+        const Id lod_i = b_.Op(Op::OpConvertFToS, t_i32_, {lod});
+        const Id size = b_.Op(Op::OpImageQuerySizeLod, b_.TypeVector(t_i32_, qn), {image, lod_i});
+        std::vector<u32> c;
+        u32 reg = 0;
+        for (u32 k = 0; k < qn; ++k) {
+            const bool layer = im.arrayed && k == qn - 1;
+            const bool row = im.one_d && k == 1;
+            Id v = row ? b_.F32(0.0f) : GetF(vaddr + reg++, in);
+            if (!layer && !row) {
+                const Id off = b_.Op(Op::OpConvertSToF, t_f32_,
+                                     {b_.Op(Op::OpBitFieldSExtract, t_i32_, {Bit(t_i32_, packed), b_.U32(8 * (im.one_d ? 0 : k)), b_.U32(6)})});
+                const Id extent = b_.Op(Op::OpConvertSToF, t_f32_, {b_.Op(Op::OpCompositeExtract, t_i32_, {size, k})});
+                v = b_.Op(Op::OpFAdd, t_f32_, {v, b_.Op(Op::OpFDiv, t_f32_, {off, extent})});
+            }
+            c.push_back(v);
+        }
+        const Id coord = b_.Op(Op::OpCompositeConstruct, b_.TypeVector(t_f32_, qn), std::span<const u32>(c.data(), c.size()));
         results(b_.Op(Op::OpImageSampleExplicitLod, im.texel,
-                      {sampled, coords(false), static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
+                      {sampled, coord, static_cast<u32>(spv::ImageOperandsMask::Lod), lod}),
                 false);
         return true;
     }
