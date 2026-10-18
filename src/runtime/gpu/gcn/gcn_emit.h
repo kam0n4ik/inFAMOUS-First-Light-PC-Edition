@@ -81,6 +81,13 @@ struct EmitOptions {
         bool depth_minus_one_to_one = false; ///< z = (z + w) / 2 at the end (no VK_EXT_depth_clip_control)
         bool clip_space = false;             ///< CLIP_DISABLE / a rect list: the position is in screen space
         float viewport_w = 0, viewport_h = 0; ///< (clip_space: half the device's largest viewport, at most 8 K)
+        /// PA_CL_CLIP_CNTL.UCP_ENA lowered (the bridge's LowerUserClipPlanes): clip distance p = dot(position, plane p),
+        /// the planes (PA_CL_UCP_*) a buffer after the stage's others (BufferKind::ClipPlanes); 0 when the program
+        /// exports clip distances of its own
+        u32 ucp_mask = 0;
+        /// the device emulates clip distances (the bridge's needs_clip_distance_emulation): distances 0-3 are a vec4
+        /// output at location 0, the PARAMs at n + 1 (the fragment program discards where one is negative)
+        bool emulate_clip = false;
     };
     bool vertex = false;
     VertexOptions vs;
@@ -114,6 +121,12 @@ struct EmitOptions {
         /// BaryCoordKHR's y/z, v_interp_p1/p2 the hardware's P0 + I * (P1 - P0) + J * (P2 - P0) - exact for an input
         /// constant over the primitive (an index), which the device's interpolation is not
         bool manual_interpolation = false;
+        /// CB0 blends with a second source (SRC1 factors): MRT1 exports it - with MRT0's parameters, to location 0
+        /// index 1 (MRT0: index 0), as the bridge's
+        bool dual_source = false;
+        /// clip distances emulated (the vertex side's emulate_clip): the inputs at SPI_PS_INPUT_CNTL.OFFSET + 1, the
+        /// distances 0-3 a vec4 at location 0 - a fragment where one is negative is discarded
+        bool clip_emulation = false;
     };
     bool fragment = false;
     FragmentOptions fs;

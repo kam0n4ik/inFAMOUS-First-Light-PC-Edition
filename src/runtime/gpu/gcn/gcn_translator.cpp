@@ -275,10 +275,10 @@ private:
                 o[i] = ((ctl >> k) & 1) != 0 ? static_cast<u8>(2 + k) : (((ctl >> (8 + k)) & 1) != 0 ? static_cast<u8>(10 + k) : 0);
             }
         }
-        if (prof.needs_clip_distance_emulation && (ctl & 0xFF) != 0) {
-            why = "clip distances on a device that emulates them";
-            return false;
-        }
+        // clip distances: the user clip planes lowered unless the program exports its own (CLIP_DIST_ENA); emulated
+        // where the device needs it - by the condition the fragment side uses (ps_vs_out_cntl, ps_ucp_enable)
+        vs.ucp_mask = (ctl & 0xFF) != 0 ? 0 : (p.clip_cntl & 0x3F);
+        vs.emulate_clip = prof.needs_clip_distance_emulation && ((ctl & 0xFF) != 0 || (p.clip_cntl & 0x3F) != 0);
         vs.depth_minus_one_to_one = !prof.depth_clip_control && ((p.clip_cntl >> 19) & 1) == 0;
         vs.clip_space = ((p.clip_cntl >> 16) & 1) != 0;
         vs.viewport_w = static_cast<float>(std::min<u32>(prof.max_viewport_width / 2, 8192));
@@ -383,25 +383,20 @@ private:
     static bool PrepareFragment(const GS::TranslationRequest& req, EmitOptions::FragmentOptions& fs, std::string& why) {
         const GS::RuntimeParams& p = req.runtime;
         const GS::DeviceProfile& prof = *req.profile;
-        if (p.dual_source != 0) {
-            why = "dual-source blending";
-            return false;
-        }
         const bool ls = (p.stages_en & 3) != 0, gs = ((p.stages_en >> 5) & 1) != 0;
-        if (((p.ps_vs_out_cntl != 0 && !ls) || (p.ps_ucp_enable != 0 && !gs)) && prof.needs_clip_distance_emulation) {
-            why = "clip distances emulated on this device";
-            return false;
-        }
+        fs.clip_emulation =
+            ((p.ps_vs_out_cntl != 0 && !ls) || (p.ps_ucp_enable != 0 && !gs)) && prof.needs_clip_distance_emulation;
         fs.input_addr = p.ps_input_addr;
         fs.input_ena = p.ps_input_ena;
         fs.front_face_all_bits = p.front_face_all_bits != 0;
         fs.manual_interpolation = prof.needs_manual_interpolation;
+        fs.dual_source = p.dual_source != 0;
         fs.num_inputs = std::min<u32>(p.num_interp, 32);
         for (u32 i = 0; i < fs.num_inputs; ++i) {
             const u32 c = p.ps_input_cntl[i];
             fs.inputs[i] = {.location = c & 0x1F,
                             .flat = ((c >> 10) & 1) != 0,
-                            .is_default = ((c >> 5) & 1) != 0,
+                            .is_default = ((c >> 5) & 1) != 0 && ((c >> 10) & 1) == 0, // (with FLAT_SHADE: an input)
                             .default_value = (c >> 8) & 3};
         }
         // MRTZ: DB_SHADER_CONTROL's exports, then SPI_SHADER_Z_FORMAT's components (MaskFromExportFormat)
@@ -653,6 +648,9 @@ private:
         refl.buffers.push_back({.kind = GS::BufferKind::Flatbuf});
         if (ri.uses_gds) {
             refl.buffers.push_back({.kind = GS::BufferKind::GdsBuffer, .is_written = true});
+        }
+        if (eo.vertex && eo.vs.ucp_mask != 0) {
+            refl.buffers.push_back({.kind = GS::BufferKind::ClipPlanes});
         }
         for (const ImageUse& im : ri.images) {
             refl.images.push_back({.sharp = Location(im.sharp, im.r128 ? 4 : 8),

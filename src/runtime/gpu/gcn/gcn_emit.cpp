@@ -186,6 +186,9 @@ private:
     }
     Id t_vec4_ = 0, t_ptr_out_f32_ = 0;
     Id position_ = 0, point_size_ = 0, clip_dist_ = 0, cull_dist_ = 0;
+    Id clip_planes_ = 0; ///< the user clip planes' buffer (VertexOptions::ucp_mask)
+    /// clip distance k's output component: gl_ClipDistance[k], or the emulation's vec4 at location 0 (k < 4; 0: none)
+    Id ClipDistance(u32 k);
     std::array<Id, 32> params_{};
     std::vector<Id> vinputs_;
     // the fragment stage (EmitOptions::fragment)
@@ -219,11 +222,64 @@ void Emitter::BuildGraph() {
             nd.succ.push_back(blk.next);
         }
     }
+    // a block that ends the program, entered from several blocks (early exits sharing their `exp; s_endpgm`): a copy
+    // per predecessor beyond the first - shared, it would be in two selections' constructs, one left other than by
+    // its merge
+    for (u32 e = 0; e < n; ++e) {
+        if (!cfg_.blocks[e].exit || !nodes_[e].succ.empty()) {
+            continue;
+        }
+        // (a construct's merge stays one block: the selections / loops that merge there)
+        const bool merges = std::ranges::any_of(st_.selection_merge, [&](s32 m) { return m == static_cast<s32>(e); }) ||
+                            std::ranges::any_of(st_.loops, [&](const LoopInfo& l) { return l.merge == static_cast<s32>(e); });
+        if (merges) {
+            continue;
+        }
+        bool first = true;
+        for (u32 p = 0; p < n; ++p) {
+            s32 copy = -1;
+            for (s32& s : nodes_[p].succ) {
+                if (s != static_cast<s32>(e)) {
+                    continue;
+                }
+                if (first) {
+                    first = false;
+                    copy = static_cast<s32>(e); // (the first predecessor keeps the block)
+                    idom[e] = static_cast<s32>(p);
+                    continue;
+                }
+                if (copy < 0) {
+                    Node c;
+                    c.orig = static_cast<s32>(e);
+                    c.exit = true;
+                    copy = static_cast<s32>(nodes_.size());
+                    nodes_.push_back(c);
+                    idom.push_back(static_cast<s32>(p));
+                }
+                s = copy;
+            }
+        }
+    }
     for (const LoopInfo& l : st_.loops) {
         Node& h = nodes_[l.header];
         h.loop_header = true;
         h.loop_merge = l.merge;
         h.loop_continue = static_cast<s32>(l.latches.front());
+        if (l.latches.front() == l.header) {
+            // a loop of one block: its code is several SPIR-V blocks (the `if (exec)` runs), so the back edge leaves
+            // the last of them, not the continue target - a continue block of its own takes the back edge
+            const s32 c = static_cast<s32>(nodes_.size());
+            for (s32& s : nodes_[l.header].succ) {
+                if (s == static_cast<s32>(l.header)) {
+                    s = c;
+                }
+            }
+            Node cn;
+            cn.succ = {static_cast<s32>(l.header)};
+            nodes_.push_back(cn);
+            idom.push_back(static_cast<s32>(l.header));
+            nodes_[l.header].loop_continue = c;
+        }
         if (l.merge >= 0) {
             // a merge block of the loop's own (its exits go to it, it goes on): the block the loop exits to may merge
             // an enclosing selection too (a selection around the loop that skips it), and a block merges one construct
@@ -262,7 +318,7 @@ void Emitter::BuildGraph() {
         }
         const LoopInfo& l = st_.loops[li];
         return target == merge_of(l) || target == static_cast<s32>(l.header) ||
-               target == static_cast<s32>(l.latches.front());
+               target == static_cast<s32>(l.latches.front()) || target == nodes_[l.header].loop_continue;
     };
     std::vector<u32> sel;
     for (u32 b = 0; b < n; ++b) {
@@ -486,6 +542,10 @@ void Emitter::DeclareResources() {
     if (res_.uses_gds) {
         gds_ = ssbo(true, base + 1 + static_cast<u32>(res_.buffers.size()));
     }
+    const u32 clip_planes = options_.vertex && options_.vs.ucp_mask != 0 ? 1 : 0;
+    if (clip_planes != 0) {
+        clip_planes_ = ssbo(false, base + 1 + static_cast<u32>(res_.buffers.size()) + (res_.uses_gds ? 1 : 0));
+    }
     if (res_.uses_lds && (options_.vertex || options_.fragment)) {
         throw Unsupported{"the local data share outside a compute program"};
     }
@@ -500,7 +560,7 @@ void Emitter::DeclareResources() {
         lds_ = b_.Variable(b_.TypePointer(spv::StorageClass::Workgroup, arr), spv::StorageClass::Workgroup);
         interface_.push_back(lds_);
     }
-    DeclareImages(base + static_cast<u32>(res_.buffers.size()) + 1 + (res_.uses_gds ? 1 : 0));
+    DeclareImages(base + static_cast<u32>(res_.buffers.size()) + 1 + (res_.uses_gds ? 1 : 0) + clip_planes);
     // PushData: float xoffset, yoffset, xscale, yscale; u8 buf_offsets[56] (as 14 dwords)
     const Id f4 = b_.TypeArray(t_f32_, b_.U32(4));
     b_.Decorate(f4, spv::Decoration::ArrayStride, {4});
@@ -993,8 +1053,9 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
     if (im.null) {
         if (name.starts_with("image_load") || name.starts_with("image_sample") || name.starts_with("image_gather")) {
             const u32 vd = kVgpr + ((in.w1 >> 8) & 0xFF);
+            const u32 written = name.starts_with("image_gather") ? 0xF : dmask; // (a gather: four texels)
             for (u32 c = 0, k = 0; c < 4; ++c) {
-                if (((dmask >> c) & 1) != 0) {
+                if (((written >> c) & 1) != 0) {
                     Set(vd + k++, b_.U32(0));
                 }
             }
@@ -1029,6 +1090,7 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
                      std::span<const u32>(c.data(), c.size()));
     };
     bool degamma = false; // (set by sampling: the sampler's FORCE_DEGAMMA on a non-sRGB image)
+    u32 out_mask = dmask; // (the components written: a gather's four texels whatever its dmask)
     const auto results = [&](Id texel, bool swizzle) {
         // a sampled image's texel as the bridge reads it: its format's number conversion, the sampler's degamma
         u32 kind = im.kind;
@@ -1075,7 +1137,7 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         u32 k = 0;
         const Id one = kind == 0 ? b_.U32(0x3F800000u) : b_.U32(1);
         for (u32 c = 0; c < 4; ++c) {
-            if (((dmask >> c) & 1) == 0) {
+            if (((out_mask >> c) & 1) == 0) {
                 continue;
             }
             const u32 sel = swizzle ? (im.dst_sel >> (3 * c)) & 7 : 4 + c;
@@ -1128,12 +1190,13 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         b_.OpNoResult(Op::OpImageWrite, {image, coords(true), texel});
         return true;
     }
-    if (name.starts_with("image_sample")) {
+    const bool gather = name.starts_with("image_gather4");
+    if (name.starts_with("image_sample") || gather) {
         // the modifiers (c compare, d / cd derivatives, cl LOD clamp, l LOD, b bias, lz LOD 0, o offset) and the
         // address they lay out (Sea Islands ISA 8.2.4): [offset] [bias] [z-compare] [derivatives] coordinates [LOD /
         // clamp]
         bool cmp = false, deriv = false, clamp = false, lod_given = false, bias = false, lz = false;
-        for (std::string_view rest = name.substr(12); !rest.empty();) {
+        for (std::string_view rest = name.substr(gather ? 13 : 12); !rest.empty();) {
             rest.remove_prefix(1); // ('_')
             const size_t u = rest.find('_');
             const std::string_view t = rest.substr(0, u);
@@ -1150,6 +1213,9 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
         }
         if (deriv) {
             return Decline(" (explicit derivatives)");
+        }
+        if (gather && (!lz || bias || clamp)) {
+            return Decline(" (a gather at a LOD other than 0)"); // (Vulkan's gathers read the base level)
         }
         const s32 si = res_.sampler_of[index];
         if (si < 0 || im.storage) {
@@ -1219,6 +1285,33 @@ bool Emitter::EmitImage(const Inst& in, u32 index, std::string_view name) {
             const Id r = b_.Op(dref_op, t_f32_, std::span<const u32>(ops.data(), ops.size()));
             return b_.Op(Op::OpCompositeConstruct, im.texel, {r, b_.F32(0.0f), b_.F32(0.0f), b_.F32(0.0f)});
         };
+        if (gather) {
+            // the four texels of the 2x2 footprint, of the component dmask's highest bit (the bridge's) or compared
+            // with the reference; the texel offset a dynamic Offset (shaderImageGatherExtended)
+            const u32 dims = im.coords - (im.arrayed ? 1 : 0) + (im.one_d ? 1 : 0);
+            if (dims != 2) {
+                return Decline(" (a gather on a 3D image)");
+            }
+            std::vector<u32> ops{sampled, sample_coords(coords_reg),
+                                 cmp ? GetF(dref_reg, in) : b_.U32(static_cast<u32>(std::bit_width(dmask)) - 1)};
+            if (has_offset) {
+                if (im.cube) {
+                    return Decline(" (a gather offset on a cube)");
+                }
+                b_.Capability(spv::Capability::ImageGatherExtended);
+                const Id packed = Bit(t_i32_, Get(offset_reg, in));
+                const Id ox = b_.Op(Op::OpBitFieldSExtract, t_i32_, {packed, b_.U32(0), b_.U32(6)});
+                const Id oy = im.one_d ? b_.Constant(t_i32_, 0)
+                                       : b_.Op(Op::OpBitFieldSExtract, t_i32_, {packed, b_.U32(8), b_.U32(6)});
+                ops.push_back(static_cast<u32>(spv::ImageOperandsMask::Offset));
+                ops.push_back(b_.Op(Op::OpCompositeConstruct, b_.TypeVector(t_i32_, 2), {ox, oy}));
+            }
+            out_mask = 0xF;
+            results(b_.Op(cmp ? Op::OpImageDrefGather : Op::OpImageGather, im.texel,
+                          std::span<const u32>(ops.data(), ops.size())),
+                    false);
+            return true;
+        }
         if (implicit) {
             // the coordinates after [offset] [bias] [z-compare]; the LOD clamp after them (a minimum LOD)
             const u32 first = coords_reg;
@@ -1588,11 +1681,9 @@ void Emitter::EmitExport(const Inst& in) {
                 }
                 b_.OpNoResult(Op::OpStore, {point_size_, vsrc(c)});
             } else if (out >= 2 && out < 10) {
-                if (clip_dist_ == 0) {
-                    b_.Capability(spv::Capability::ClipDistance);
-                    clip_dist_ = array8(spv::BuiltIn::ClipDistance);
+                if (const Id ptr = ClipDistance(out - 2); ptr != 0) {
+                    b_.OpNoResult(Op::OpStore, {ptr, vsrc(c)});
                 }
-                b_.OpNoResult(Op::OpStore, {OutputComponent(clip_dist_, out - 2), vsrc(c)});
             } else if (out >= 10 && out < 18) {
                 if (cull_dist_ == 0) {
                     b_.Capability(spv::Capability::CullDistance);
@@ -1611,7 +1702,7 @@ void Emitter::EmitExport(const Inst& in) {
         Id& p = params_[target - 32];
         if (p == 0) {
             p = b_.Variable(b_.TypePointer(spv::StorageClass::Output, t_vec4_), spv::StorageClass::Output);
-            b_.Decorate(p, spv::Decoration::Location, {target - 32});
+            b_.Decorate(p, spv::Decoration::Location, {target - 32 + (options_.vs.emulate_clip ? 1u : 0u)});
             interface_.push_back(p);
         }
         for (u32 c = 0; c < 4; ++c) {
@@ -1687,13 +1778,13 @@ void Emitter::InitFragment() {
     // manual interpolation: the vec4s of the primitive's three vertices (PerVertexKHR)
     const bool manual = fs.manual_interpolation;
     bool barycentric = false; // (SPV_KHR_fragment_shader_barycentric declared)
-    std::array<Id, 32> at_location{};
-    std::array<s32, 32> location_mode{};
+    std::array<Id, 33> at_location{};
+    std::array<s32, 33> location_mode{};
     for (u32 a = 0; a < 32; ++a) {
         if (mode[a] < 0) {
             continue;
         }
-        const u32 loc = fs.inputs[a].location;
+        const u32 loc = fs.inputs[a].location + (fs.clip_emulation ? 1 : 0);
         if (at_location[loc] != 0) {
             if (!manual && location_mode[loc] != mode[a]) {
                 throw Unsupported{fmt::format("location {} read with two interpolations", loc)};
@@ -1729,6 +1820,27 @@ void Emitter::InitFragment() {
         finputs_[a] = var;
         at_location[loc] = var;
         location_mode[loc] = m;
+    }
+    // emulated clip distances (the bridge's InjectClipDistanceAttributes): a fragment where one of the vertex
+    // program's distances 0-3 is negative is discarded
+    if (fs.clip_emulation) {
+        const Id var = b_.Variable(b_.TypePointer(spv::StorageClass::Input, t_vec4_), spv::StorageClass::Input);
+        b_.Decorate(var, spv::Decoration::Location, {0});
+        interface_.push_back(var);
+        const Id bvec4 = b_.TypeVector(t_bool_, 4);
+        const Id zero = b_.F32(0.0f);
+        const std::array<Id, 4> zeros{zero, zero, zero, zero};
+        const Id neg = b_.Op(Op::OpFOrdLessThan, bvec4, {b_.Op(Op::OpLoad, t_vec4_, {var}), b_.ConstantComposite(t_vec4_, zeros)});
+        const Id clipped = b_.Op(Op::OpAny, t_bool_, {neg});
+        has_discard_ = true;
+        b_.Capability(spv::Capability::DemoteToHelperInvocation);
+        const Id kill = b_.NewId(), after = b_.NewId();
+        b_.OpNoResult(Op::OpSelectionMerge, {after, 0});
+        b_.OpNoResult(Op::OpBranchConditional, {clipped, kill, after});
+        b_.Label(kill);
+        b_.OpNoResult(Op::OpDemoteToHelperInvocation, {});
+        b_.OpNoResult(Op::OpBranch, {after});
+        b_.Label(after);
     }
     // the VGPRs after the barycentrics (left 0 unless the interpolation is manual: v_interp_p2 does not read them
     // otherwise): the position, the front face
@@ -1801,22 +1913,62 @@ void Emitter::InitFragment() {
             // (LowerPackedAncillary): only bit-field extracts of it are known - each gives its built-in
             const u32 reg = kVgpr + v;
             bool sample = false, layer = false;
-            for (const Inst& in : insts_) {
-                const Operands o = GetOperands(in);
-                for (u32 s = 0; s < o.num_src; ++s) {
-                    if (o.src[s] != reg) {
-                        continue;
+            // the reads the VGPR's value reaches (the bridge's SSA): from the program's start along the blocks until an
+            // instruction writes it - a write under a partial EXEC leaves the other lanes this same value, which holds
+            // the fields the bridge gives too; a read of several VGPRs (an image address, a 64-bit operand) counts if
+            // it covers it
+            std::vector<u8> reached(cfg_.blocks.size(), 0);
+            std::vector<u32> pending;
+            if (!cfg_.blocks.empty()) {
+                reached[0] = 1;
+                pending.push_back(0);
+            }
+            while (!pending.empty()) {
+                const Block& blk = cfg_.blocks[pending.back()];
+                pending.pop_back();
+                bool killed = false;
+                for (u32 idx = blk.first; idx <= blk.last && !killed; ++idx) {
+                    const Inst& in = insts_[idx];
+                    const Operands o = GetOperands(in);
+                    const std::string_view mn = Mnemonic(in.format, in.op);
+                    const u32 width = in.format == Format::Mimg ? 4 : (mn.find("64") != std::string_view::npos ? 2 : 1);
+                    // (a memory load's VDATA - its src[1] - is written, not read)
+                    const bool vdata_written =
+                        (in.format == Format::Mimg || in.format == Format::Mubuf || in.format == Format::Mtbuf) &&
+                        (mn.find("load") != std::string_view::npos || mn.starts_with("image_sample") ||
+                         mn.starts_with("image_gather") || mn == "image_get_resinfo");
+                    for (u32 s = 0; s < o.num_src; ++s) {
+                        if (vdata_written && s == 1) {
+                            continue;
+                        }
+                        if (o.src[s] < kVgpr || reg < o.src[s] || reg >= o.src[s] + width) {
+                            continue;
+                        }
+                        if (o.src[s] != reg) {
+                            throw Unsupported{"the ancillary VGPR read within a multi-register operand"};
+                        }
+                        const auto off = ConstOperand(o.src[1], in), bits = ConstOperand(o.src[2], in);
+                        if (Mnemonic(in.format, in.op) != "v_bfe_u32" || s != 0 || !off || !bits) {
+                            throw Unsupported{fmt::format("the ancillary VGPR v{} read other than by v_bfe_u32 of constant "
+                                                          "fields (dword {}: {})", reg - kVgpr, in.offset, mn)};
+                        }
+                        if (*off >= 8 && *off + *bits <= 12) {
+                            sample = true;
+                        } else if (*off >= 16 && *off + *bits <= 27) {
+                            layer = true;
+                        } else {
+                            throw Unsupported{fmt::format("the ancillary VGPR's bits {}..{}", *off, *off + *bits)};
+                        }
                     }
-                    const auto off = ConstOperand(o.src[1], in), bits = ConstOperand(o.src[2], in);
-                    if (Mnemonic(in.format, in.op) != "v_bfe_u32" || s != 0 || !off || !bits) {
-                        throw Unsupported{"the ancillary VGPR read other than by v_bfe_u32 of constant fields"};
-                    }
-                    if (*off >= 8 && *off + *bits <= 12) {
-                        sample = true;
-                    } else if (*off >= 16 && *off + *bits <= 27) {
-                        layer = true;
-                    } else {
-                        throw Unsupported{fmt::format("the ancillary VGPR's bits {}..{}", *off, *off + *bits)};
+                    killed = (o.num_dst > 0 && o.dst[0] == reg) || (o.num_dst > 1 && o.dst[1] == reg) ||
+                             (vdata_written && o.num_src > 1 && o.src[1] == reg);
+                }
+                if (!killed) {
+                    for (const s32 s : {blk.taken, blk.next}) {
+                        if (s >= 0 && !reached[s]) {
+                            reached[s] = 1;
+                            pending.push_back(static_cast<u32>(s));
+                        }
                     }
                 }
             }
@@ -1910,7 +2062,11 @@ void Emitter::EmitFragmentExport(const Inst& in) {
     }
     if (target < 8) {
         mrt_mask_ |= static_cast<u8>(1u << target);
-        const EmitOptions::ColorTarget& t = options_.fs.targets[target];
+        const bool dual = options_.fs.dual_source;
+        if (dual && target > 1) {
+            throw Unsupported{fmt::format("an export to MRT{} with dual-source blending", target)};
+        }
+        const EmitOptions::ColorTarget& t = options_.fs.targets[dual ? 0 : target];
         if (t.export_format == 0 || en == 0) {
             return;
         }
@@ -1971,7 +2127,10 @@ void Emitter::EmitFragmentExport(const Inst& in) {
             const std::array<Id, 4> zeros{zero, zero, zero, zero};
             mrt_[target] = b_.Variable(b_.TypePointer(spv::StorageClass::Output, type), spv::StorageClass::Output,
                                        b_.ConstantComposite(type, zeros));
-            b_.Decorate(mrt_[target], spv::Decoration::Location, {target});
+            b_.Decorate(mrt_[target], spv::Decoration::Location, {dual ? 0u : target});
+            if (dual) {
+                b_.Decorate(mrt_[target], spv::Decoration::Index, {target});
+            }
             interface_.push_back(mrt_[target]);
         }
         if_exec([&] {
@@ -2037,8 +2196,56 @@ void Emitter::EmitFragmentExport(const Inst& in) {
     throw Unsupported{fmt::format("exp to target {} (a fragment program)", target)};
 }
 
+Id Emitter::ClipDistance(u32 k) {
+    if (options_.vs.emulate_clip) {
+        if (k >= 4) {
+            return 0; // (the bridge's emulation carries four)
+        }
+        if (clip_dist_ == 0) {
+            const Id zero = b_.F32(0.0f);
+            const std::array<Id, 4> zeros{zero, zero, zero, zero};
+            clip_dist_ = b_.Variable(b_.TypePointer(spv::StorageClass::Output, t_vec4_), spv::StorageClass::Output,
+                                     b_.ConstantComposite(t_vec4_, zeros));
+            b_.Decorate(clip_dist_, spv::Decoration::Location, {0});
+            interface_.push_back(clip_dist_);
+        }
+        return OutputComponent(clip_dist_, k);
+    }
+    if (clip_dist_ == 0) {
+        b_.Capability(spv::Capability::ClipDistance);
+        const Id type = b_.TypeArray(t_f32_, b_.U32(8));
+        const Id zero = b_.F32(0.0f);
+        const std::array<Id, 8> zeros{zero, zero, zero, zero, zero, zero, zero, zero};
+        clip_dist_ = b_.Variable(b_.TypePointer(spv::StorageClass::Output, type), spv::StorageClass::Output,
+                                 b_.ConstantComposite(type, zeros));
+        b_.Decorate(clip_dist_, spv::Decoration::BuiltIn, {static_cast<u32>(spv::BuiltIn::ClipDistance)});
+        interface_.push_back(clip_dist_);
+    }
+    return OutputComponent(clip_dist_, k);
+}
+
 void Emitter::VertexEpilogue() {
     const EmitOptions::VertexOptions& vs = options_.vs;
+    if (vs.ucp_mask != 0) {
+        // the user clip planes against the position the program exported (dwords 4p..4p+3: plane p's equation)
+        const Id pos = b_.Op(Op::OpLoad, t_vec4_, {position_});
+        for (u32 plane = 0; plane < 6; ++plane) {
+            if (((vs.ucp_mask >> plane) & 1) == 0) {
+                continue;
+            }
+            const auto eq = [&](u32 c) {
+                const Id w = b_.Op(Op::OpLoad, t_u32_, {b_.Op(Op::OpAccessChain, t_ptr_sb_u32_, {clip_planes_, b_.U32(0), b_.U32(plane * 4 + c)})});
+                return Bit(t_f32_, w);
+            };
+            Id d = b_.Op(Op::OpFMul, t_f32_, {b_.Op(Op::OpCompositeExtract, t_f32_, {pos, 0}), eq(0)});
+            for (u32 c = 1; c < 4; ++c) {
+                d = Glsl(GLSLstd450Fma, t_f32_, {b_.Op(Op::OpCompositeExtract, t_f32_, {pos, c}), eq(c), d});
+            }
+            if (const Id ptr = ClipDistance(plane); ptr != 0) {
+                b_.OpNoResult(Op::OpStore, {ptr, d});
+            }
+        }
+    }
     if (!vs.depth_minus_one_to_one && !vs.clip_space) {
         return;
     }
