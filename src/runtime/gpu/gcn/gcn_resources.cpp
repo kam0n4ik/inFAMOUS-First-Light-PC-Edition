@@ -265,6 +265,67 @@ void Analysis::Step(State& s, u32 index, bool record) {
 
 } // namespace
 
+bool BuildSrtWalker(const ResourceInfo& info, std::vector<u8>& out, std::string& error) {
+    out.clear();
+    if (info.walk.empty()) {
+        return true;
+    }
+    const auto u32le = [&](u32 v) {
+        for (u32 i = 0; i < 4; ++i) {
+            out.push_back(static_cast<u8>(v >> (8 * i)));
+        }
+    };
+    // the displacements of the pointers leading to flat[p..p+1] (from the user data registers)
+    std::vector<u32> steps;
+    const auto chain = [&](auto&& self, u32 p, u32 depth) -> bool {
+        if (depth > 16) {
+            return false;
+        }
+        if (p + 1 < 16) {
+            steps.push_back(p * 4);
+            return true;
+        }
+        for (const WalkLoad& w : info.walk) {
+            if (w.dst <= p && p + 1 < w.dst + w.dwords) {
+                if (!self(self, w.ptr, depth + 1)) {
+                    return false;
+                }
+                steps.push_back(w.byte_offset + (p - w.dst) * 4);
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const WalkLoad& w : info.walk) {
+        steps.clear();
+        if (!chain(chain, w.ptr, 0)) {
+            error = fmt::format("the walk's pointer flat[{}] is not two dwords of the user data or of one load", w.ptr);
+            out.clear();
+            return false;
+        }
+        for (const u32 d : steps) {
+            out.push_back(0x57);                       // push rdi
+            out.insert(out.end(), {0x48, 0x8B, 0xBF}); // mov rdi, qword [rdi + d]
+            u32le(d);
+            out.insert(out.end(), {0x49, 0xBA}); // mov r10, 0xFFFFFFFFFFFF
+            u32le(0xFFFFFFFFu);
+            u32le(0x0000FFFFu);
+            out.insert(out.end(), {0x4C, 0x21, 0xD7}); // and rdi, r10
+        }
+        for (u32 i = 0; i < w.dwords; ++i) {
+            out.insert(out.end(), {0x44, 0x8B, 0x97}); // mov r10d, dword [rdi + d]
+            u32le(w.byte_offset + i * 4);
+            out.insert(out.end(), {0x44, 0x89, 0x96}); // mov dword [rsi + 4 * dst], r10d
+            u32le((w.dst + i) * 4);
+        }
+        for (size_t i = 0; i < steps.size(); ++i) {
+            out.push_back(0x5F); // pop rdi
+        }
+    }
+    out.push_back(0xC3); // ret
+    return true;
+}
+
 bool AnalyzeResources(std::span<const Inst> insts, const Cfg& cfg, u32 user_sgprs, ResourceInfo& out) {
     out = {};
     out.buffer_of.assign(insts.size(), -1);

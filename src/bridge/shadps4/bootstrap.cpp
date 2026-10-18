@@ -57,6 +57,7 @@
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "bridge/shadps4/settings_host.h"
+#include "runtime/gpu/gcn/gcn_translator.h"
 #include "runtime/savedata/savedata.h"
 #include "runtime/gpu/upscale/reflex.h"
 #include "ui/menu_controller.h"
@@ -724,6 +725,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // P4.3: SecondSonPC's translator interface over the bridge's recompiler (used only by SecondSonPC's frontend:
     // --gpu-shaders, --gpu-shader-verify, the self-test)
     InstallShaderTranslatorAdapter();
+    Gpu::Gcn::InstallOwnTranslatorIfEnabled(); // SSPC_OWN_SHADERS=cs: SecondSonPC's GCN translator for compute
     InstallHostShaders(); // P4.4: SecondSonPC's backend's tiling kernels (data only)
     const bool native_gpu = cfg.gpu_backend == App::Config::GpuBackend::Sspc;
     if (!cfg.selftest) {

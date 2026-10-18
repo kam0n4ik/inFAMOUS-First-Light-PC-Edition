@@ -130,6 +130,7 @@ private:
     u32 cur_index_ = 0;
     std::vector<Id> interface_; ///< the entry point's interface (every global variable used: SPIR-V 1.4+)
     Id LaneId();
+    void InitCompute(); ///< the thread ids (v0-v2) and the group ids / TG_SIZE after the user data (COMPUTE_PGM_RSRC2)
     std::unordered_map<u32, Id> regs_; ///< register code -> its function variable
 };
 
@@ -755,6 +756,38 @@ bool Emitter::EmitDs(const Inst& in, std::string_view name) {
         return false;
     }
     return true;
+}
+
+void Emitter::InitCompute() {
+    const Id uvec3 = b_.TypeVector(t_u32_, 3);
+    const auto input = [&](spv::BuiltIn builtin, Id type) {
+        const Id v = b_.Variable(b_.TypePointer(spv::StorageClass::Input, type), spv::StorageClass::Input);
+        b_.Decorate(v, spv::Decoration::BuiltIn, {static_cast<u32>(builtin)});
+        interface_.push_back(v);
+        return b_.Op(Op::OpLoad, type, {v});
+    };
+    const u32 rsrc2 = options_.rsrc2;
+    const Id tid = input(spv::BuiltIn::LocalInvocationId, uvec3);
+    const u32 tid_count = (rsrc2 >> 11) & 3; // TIDIG_COMP_CNT: v0 x, v1 y, v2 z
+    for (u32 c = 0; c <= std::min<u32>(tid_count, 2); ++c) {
+        Set(kVgpr + c, b_.Op(Op::OpCompositeExtract, t_u32_, {tid, c}));
+    }
+    u32 sgpr = (rsrc2 >> 1) & 0x1F; // after the user data
+    const Id group = ((rsrc2 >> 7) & 7) != 0 ? input(spv::BuiltIn::WorkgroupId, uvec3) : 0;
+    for (u32 c = 0; c < 3; ++c) {
+        if (((rsrc2 >> (7 + c)) & 1) != 0) {
+            Set(sgpr++, b_.Op(Op::OpCompositeExtract, t_u32_, {group, c}));
+        }
+    }
+    if (((rsrc2 >> 10) & 1) != 0) {
+        // TG_SIZE: the wave's index in the group (bits 0-5), the group's waves (bits 6-11)
+        const u32 threads = std::max(options_.threads[0], 1u) * std::max(options_.threads[1], 1u) *
+                            std::max(options_.threads[2], 1u);
+        const u32 waves = (threads + 63) / 64;
+        const Id index = input(spv::BuiltIn::LocalInvocationIndex, t_u32_);
+        const Id wave = b_.Op(Op::OpShiftRightLogical, t_u32_, {index, b_.U32(6)});
+        Set(sgpr++, b_.Op(Op::OpBitwiseOr, t_u32_, {wave, b_.U32(waves << 6)}));
+    }
 }
 
 Id Emitter::LaneId() {
@@ -1653,6 +1686,9 @@ EmitResult Emitter::Run() {
         for (u32 i = 0; i < std::min<u32>(options_.user_sgprs, 16); ++i) {
             Set(i, FlatDword(b_.U32(i))); // the user data registers
         }
+        if (options_.compute) {
+            InitCompute();
+        }
         b_.OpNoResult(Op::OpBranch, {labels_[0]});
         for (const u32 x : Rpo()) {
             const Node& nd = nodes_[x];
@@ -1730,7 +1766,13 @@ EmitResult Emitter::Run() {
         }
         b_.EndFunction();
         b_.EntryPoint(spv::ExecutionModel::GLCompute, fn, "main", interface_);
-        b_.ExecutionMode(fn, spv::ExecutionMode::LocalSize, {64, 1, 1});
+        if (options_.compute) {
+            b_.ExecutionMode(fn, spv::ExecutionMode::LocalSize,
+                             {std::max(options_.threads[0], 1u), std::max(options_.threads[1], 1u),
+                              std::max(options_.threads[2], 1u)});
+        } else {
+            b_.ExecutionMode(fn, spv::ExecutionMode::LocalSize, {64, 1, 1});
+        }
         res.spirv = b_.Assemble();
         res.resources = res_;
         res.ok = true;

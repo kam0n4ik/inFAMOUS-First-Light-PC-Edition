@@ -125,6 +125,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/gcn/gcn_emit.cpp
     src/runtime/gpu/gcn/gcn_inventory.cpp
     src/runtime/gpu/gcn/gcn_resources.cpp
+    src/runtime/gpu/gcn/gcn_translator.cpp
     src/runtime/gpu/gcn/gcn_structure.cpp
     src/runtime/gpu/gcn/spirv_builder.cpp
     src/runtime/kernel/event_queues.cpp

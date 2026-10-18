@@ -37,6 +37,11 @@ struct EmitOptions {
     bool stub_memory = false;
     /// SGPRs holding user data at the start (SPI_SHADER_PGM_RSRC2.USER_SGPR)
     u32 user_sgprs = 16;
+    /// a compute program (else the tests' form: one group of 64, no thread / group ids): its group size and
+    /// COMPUTE_PGM_RSRC2 (after the user data the enabled group ids X/Y/Z and TG_SIZE; v0-v2 the thread ids)
+    bool compute = false;
+    std::array<u32, 3> threads{64, 1, 1};
+    u32 rsrc2 = 0;
 };
 
 EmitResult EmitProgram(std::span<const Inst> insts, const Cfg& cfg, const Structure& st,

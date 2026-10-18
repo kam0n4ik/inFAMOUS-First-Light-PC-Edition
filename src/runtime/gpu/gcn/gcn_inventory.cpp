@@ -14,8 +14,10 @@
 #include "runtime/gpu/gcn/gcn_cfg.h"
 #include "runtime/gpu/gcn/gcn_decoder.h"
 #include "runtime/gpu/gcn/gcn_emit.h"
+#include "runtime/gpu/gcn/gcn_resources.h"
 #include "runtime/gpu/gcn/gcn_structure.h"
 #include "runtime/gpu/shader/game_shader_index.h"
+#include "runtime/gpu/shader/shader_resources.h"
 
 namespace SecondSon::Gpu::Gcn {
 
@@ -187,6 +189,8 @@ bool RunTranslateTest(const std::filesystem::path& game_dir, const std::filesyst
     std::map<std::string, u64> invalid; // the validator's first message (digits masked) -> programs
     std::map<std::string, std::string> invalid_example;
     u64 programs = 0, emitted = 0, valid = 0, words = 0;
+    u64 walkers = 0, walker_failures = 0; // the SRT walks as x86, through the runtime's SrtProgram
+    std::string walker_example;
     std::vector<u32> code;
     std::vector<Inst> insts;
     std::map<u32, std::ifstream> files;
@@ -222,6 +226,16 @@ bool RunTranslateTest(const std::filesystem::path& game_dir, const std::filesyst
         }
         ++emitted;
         words += r.spirv.size();
+        if (std::vector<u8> walker; !r.resources.walk.empty()) {
+            ++walkers;
+            std::string werr;
+            Gpu::Shader::SrtProgram srt;
+            if (!BuildSrtWalker(r.resources, walker, werr) || !srt.Compile(walker, werr)) {
+                if (walker_failures++ == 0) {
+                    walker_example = where + ": " + werr;
+                }
+            }
+        }
         const auto spv_file = tmp / "module.spv";
         {
             std::ofstream out(spv_file, std::ios::binary | std::ios::trunc);
@@ -259,6 +273,8 @@ bool RunTranslateTest(const std::filesystem::path& game_dir, const std::filesyst
         "(spirv-val, vulkan1.3; {:.1f} %), {} words\n\nstopped at (programs, first example):\n",
         programs, emitted, 100.0 * emitted / std::max<u64>(programs, 1), valid,
         100.0 * valid / std::max<u64>(programs, 1), words);
+    text += fmt::format("SRT walks: {} programs with one, {} not built / not compiled by SrtProgram{}{}\n\n", walkers,
+                        walker_failures, walker_failures != 0 ? " - first: " : "", walker_example);
     std::vector<std::pair<std::string, u64>> rows(stopped.begin(), stopped.end());
     std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     for (const auto& [k, n] : rows) {

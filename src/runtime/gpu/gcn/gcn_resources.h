@@ -54,4 +54,10 @@ struct ResourceInfo {
 /// `user_sgprs`: how many SGPRs hold user data at the start (SPI_SHADER_PGM_RSRC2.USER_SGPR, at most 16).
 bool AnalyzeResources(std::span<const Inst> insts, const Cfg& cfg, u32 user_sgprs, ResourceInfo& out);
 
+/// The walk as x86 of the bridge's walker generator's forms (the runtime's SrtProgram interprets them): per load, the
+/// chain of pointers from the user data (push rdi; mov rdi, [rdi + d]; mov r10, 2^48 - 1; and rdi, r10), its dwords
+/// (mov r10d, [rdi + d]; mov [rsi + 4 * dst], r10d), pop rdi per pointer; ret. Empty for no loads. false with `error`
+/// for a pointer that is not two dwords of the user data or of one earlier load.
+bool BuildSrtWalker(const ResourceInfo& info, std::vector<u8>& out, std::string& error);
+
 } // namespace SecondSon::Gpu::Gcn
