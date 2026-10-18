@@ -45,14 +45,6 @@ std::unordered_set<u64> HashList(const char* env) {
     return out;
 }
 
-/// Instructions whose result depends on the lanes of the whole wave of 64 (the emitter's lanes are a subgroup's: on a
-/// device with smaller subgroups a wave is two of them, so these would see half of it).
-bool WholeWave(std::string_view name) {
-    return name == "v_mbcnt_lo_u32_b32" || name == "v_mbcnt_hi_u32_b32" || name == "v_readlane_b32" ||
-           name == "v_writelane_b32" || name.starts_with("s_bcnt") || name.starts_with("s_ff") ||
-           name.starts_with("s_flbit") || name == "ds_append" || name == "ds_consume";
-}
-
 GS::SharpLocation Location(const BufferUse& b) {
     GS::SharpLocation loc;
     loc.dwords = 4;
@@ -151,13 +143,10 @@ private:
             why = "an irreducible graph";
             return false;
         }
-        if (req.profile->subgroup_size < 64) {
-            for (const Inst& in : insts) {
-                if (const std::string_view name = Mnemonic(in.format, in.op); WholeWave(name)) {
-                    why = fmt::format("{} needs the whole wave (subgroups of {})", name, req.profile->subgroup_size);
-                    return false;
-                }
-            }
+        const u32 subgroup = req.profile->subgroup_size;
+        if (subgroup == 0 || subgroup > 64 || (subgroup & (subgroup - 1)) != 0) {
+            why = fmt::format("subgroups of {}", subgroup);
+            return false;
         }
         const Structure st = AnalyzeStructure(cfg);
         EmitOptions eo;
@@ -165,6 +154,7 @@ private:
         eo.compute = true;
         eo.threads = req.runtime.threads;
         eo.rsrc2 = rsrc2;
+        eo.subgroup_size = subgroup;
         EmitResult r = EmitProgram(insts, cfg, st, eo);
         if (!r.ok) {
             why = r.error;

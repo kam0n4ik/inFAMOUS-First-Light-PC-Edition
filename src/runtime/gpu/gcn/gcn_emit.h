@@ -42,6 +42,11 @@ struct EmitOptions {
     bool compute = false;
     std::array<u32, 3> threads{64, 1, 1};
     u32 rsrc2 = 0;
+    /// the device's subgroup size (<= 64). A wave of 64 is then 64 / size subgroups, each run as a wave of its own
+    /// (masks, ballots, ds_append, readfirstlane per subgroup - consistent within it); what needs the whole wave's
+    /// lane numbering - v_mbcnt of a constant mask (a lane's index in the wave) - uses LocalInvocationIndex & 63 in a
+    /// compute program; v_readlane / v_writelane of a constant lane beyond the subgroup are not translated.
+    u32 subgroup_size = 64;
 };
 
 EmitResult EmitProgram(std::span<const Inst> insts, const Cfg& cfg, const Structure& st,

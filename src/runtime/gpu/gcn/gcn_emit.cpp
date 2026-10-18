@@ -1,6 +1,7 @@
 // SecondSonPC — GCN -> SPIR-V emission (gcn_emit.h).
 #include "runtime/gpu/gcn/gcn_emit.h"
 
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -130,6 +131,10 @@ private:
     u32 cur_index_ = 0;
     std::vector<Id> interface_; ///< the entry point's interface (every global variable used: SPIR-V 1.4+)
     Id LaneId();
+    Id local_index_ = 0; ///< LocalInvocationIndex (compute; on first use)
+    Id LocalIndex();
+    /// a source operand's value when it is a constant of the operand space (inline or literal)
+    static std::optional<u32> ConstOperand(u32 code, const Inst& in);
     void InitCompute(); ///< the thread ids (v0-v2) and the group ids / TG_SIZE after the user data (COMPUTE_PGM_RSRC2)
     std::unordered_map<u32, Id> regs_; ///< register code -> its function variable
 };
@@ -784,10 +789,34 @@ void Emitter::InitCompute() {
         const u32 threads = std::max(options_.threads[0], 1u) * std::max(options_.threads[1], 1u) *
                             std::max(options_.threads[2], 1u);
         const u32 waves = (threads + 63) / 64;
-        const Id index = input(spv::BuiltIn::LocalInvocationIndex, t_u32_);
-        const Id wave = b_.Op(Op::OpShiftRightLogical, t_u32_, {index, b_.U32(6)});
+        const Id wave = b_.Op(Op::OpShiftRightLogical, t_u32_, {LocalIndex(), b_.U32(6)});
         Set(sgpr++, b_.Op(Op::OpBitwiseOr, t_u32_, {wave, b_.U32(waves << 6)}));
     }
+}
+
+Id Emitter::LocalIndex() {
+    if (local_index_ == 0) {
+        local_index_ = b_.Variable(b_.TypePointer(spv::StorageClass::Input, t_u32_), spv::StorageClass::Input);
+        b_.Decorate(local_index_, spv::Decoration::BuiltIn, {static_cast<u32>(spv::BuiltIn::LocalInvocationIndex)});
+        interface_.push_back(local_index_);
+    }
+    return b_.Op(Op::OpLoad, t_u32_, {local_index_});
+}
+
+std::optional<u32> Emitter::ConstOperand(u32 code, const Inst& in) {
+    if (code == 128) {
+        return 0u;
+    }
+    if (code >= 129 && code <= 192) {
+        return code - 128;
+    }
+    if (code >= 193 && code <= 208) {
+        return static_cast<u32>(-static_cast<s32>(code - 192));
+    }
+    if (code == kLiteralOperand) {
+        return in.lit;
+    }
+    return std::nullopt;
 }
 
 Id Emitter::LaneId() {
@@ -1585,6 +1614,19 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
     } else if (name == "v_mbcnt_lo_u32_b32" || name == "v_mbcnt_hi_u32_b32") {
         // the set bits of the mask below this lane (lo: lanes 0-31, hi: 32-63) + src1: exact for subgroups <= 64
         const bool lo = name == "v_mbcnt_lo_u32_b32";
+        if (options_.compute && ConstOperand(o.src[0], in).has_value()) {
+            // a constant mask: by the lane's index in the wave of 64 (exact whatever the subgroup size)
+            const Id lane64 = b_.Op(Op::OpBitwiseAnd, t_u32_, {LocalIndex(), b_.U32(63)});
+            const Id below = lo ? Glsl(GLSLstd450UMin, t_u32_, {lane64, b_.U32(32)})
+                                : b_.Op(Op::OpISub, t_u32_, {Glsl(GLSLstd450UMax, t_u32_, {lane64, b_.U32(32)}), b_.U32(32)});
+            const Id ones = b_.Op(Op::OpISub, t_u32_,
+                                  {b_.Op(Op::OpShiftLeftLogical, t_u32_, {b_.U32(1), Glsl(GLSLstd450UMin, t_u32_, {below, b_.U32(31)})}),
+                                   b_.U32(1)});
+            const Id bits = Select(t_u32_, b_.Op(Op::OpIEqual, t_bool_, {below, b_.U32(32)}), b_.U32(~0u), ones);
+            const Id n = b_.Op(Op::OpBitCount, t_u32_, {b_.Op(Op::OpBitwiseAnd, t_u32_, {u(0), bits})});
+            Set(d, b_.Op(Op::OpIAdd, t_u32_, {n, u(1)}));
+            return;
+        }
         const Id m = b_.Op(Op::OpCompositeConstruct, t_uvec4_,
                            {lo ? u(0) : b_.U32(0), lo ? b_.U32(0) : u(0), b_.U32(0), b_.U32(0)});
         const Id n = b_.Op(Op::OpGroupNonUniformBallotBitCount, t_u32_,
@@ -1593,10 +1635,17 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
         Set(d, b_.Op(Op::OpIAdd, t_u32_, {n, u(1)}));
     } else if (name == "v_writelane_b32") {
         // the lane src1 selects gets src0 (a scalar); the others keep their value
-        const Id here = b_.Op(Op::OpIEqual, t_bool_, {LaneId(), b_.Op(Op::OpBitwiseAnd, t_u32_, {u(1), b_.U32(63)})});
+        if (const auto c = ConstOperand(o.src[1], in); c && (*c & 63) >= options_.subgroup_size) {
+            throw Unsupported{fmt::format("v_writelane_b32 of lane {} (subgroups of {})", *c & 63, options_.subgroup_size)};
+        }
+        const Id here = b_.Op(Op::OpIEqual, t_bool_,
+                              {LaneId(), b_.Op(Op::OpBitwiseAnd, t_u32_, {u(1), b_.U32(options_.subgroup_size - 1)})});
         Set(d, Select(t_u32_, here, u(0), Get(d, in)));
     } else if (name == "v_readlane_b32") {
-        const Id lane = b_.Op(Op::OpBitwiseAnd, t_u32_, {u(1), b_.U32(63)});
+        if (const auto c = ConstOperand(o.src[1], in); c && (*c & 63) >= options_.subgroup_size) {
+            throw Unsupported{fmt::format("v_readlane_b32 of lane {} (subgroups of {})", *c & 63, options_.subgroup_size)};
+        }
+        const Id lane = b_.Op(Op::OpBitwiseAnd, t_u32_, {u(1), b_.U32(options_.subgroup_size - 1)});
         Set(d, b_.Op(Op::OpGroupNonUniformShuffle, t_u32_, {b_.U32(static_cast<u32>(spv::Scope::Subgroup)), u(0), lane}));
     } else if (name == "v_mad_u64_u32") {
         // VOP3b: {vdst+1, vdst} = src0 * src1 + {src2+1, src2}; the carry to the SGPR pair in w0[14:8]
