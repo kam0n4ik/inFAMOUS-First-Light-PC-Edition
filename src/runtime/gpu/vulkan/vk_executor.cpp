@@ -3255,7 +3255,28 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
 
 bool Executor::DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& d) {
     const u32 mode = (regs.Get(kCbColorControl) >> 4) & 7;
-    return mode == 2 || mode == 5 || d.primitive_type == 0; // EliminateFastClear, FmaskDecompress, None
+    if (mode == 2 || mode == 5 || d.primitive_type == 0) { // EliminateFastClear, FmaskDecompress, None
+        return true;
+    }
+    // DIAGNOSTIC (measurement only, changes the picture): SSPC_DIAG_SKIP_DEPTH_SIZE=<width> - depth-only draws into a
+    // depth target of that width are dropped before any preparation (what such a pass costs the command processor)
+    static const u32 skip_width = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_SKIP_DEPTH_SIZE", v, sizeof(v)) > 0
+                   ? static_cast<u32>(std::strtoul(v, nullptr, 10))
+                   : 0u;
+    }();
+    // no colour: CB_TARGET_MASK 0 or CB_COLOR0_INFO.FORMAT invalid; DB_DEPTH_SIZE.PITCH_TILE_MAX = width / 8 - 1
+    const bool hit = skip_width != 0 && (regs.Get(kCbTargetMask) == 0 || ((regs.Get(0xA31C) >> 2) & 0x1F) == 0) &&
+                     (regs.Get(kDbZInfo) & 3) != 0 && ((regs.Get(0xA016) & 0x7FF) + 1) * 8 == skip_width;
+    if (hit) {
+        static std::atomic<u64> n{0};
+        if (const u64 k = n.fetch_add(1, std::memory_order_relaxed); (k & (k - 1)) == 0 && k >= 1024) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SKIP_DEPTH_SIZE={} - {} depth-only draws dropped", skip_width,
+                     k);
+        }
+    }
+    return hit;
 }
 
 void Executor::Draw(const Cp::DrawDescriptor& d) {
@@ -4123,7 +4144,9 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
             }
             return v;
         }();
-        if (std::ranges::find(detail, u64{prep.pipeline}) != detail.end()) {
+        // (a value that is a shader address - the pipeline numbers move between runs - names the draws' VS)
+        if (std::ranges::find(detail, u64{prep.pipeline}) != detail.end() ||
+            std::ranges::find(detail, vs.address) != detail.end()) {
             std::string line = fmt::format("    draw verts {} inst {} indirect {} args {:#x}", d.index_count, instances,
                                            d.indirect, d.indirect ? d.args_addr : 0);
             for (const auto* sv : {&vs, &ps}) {
