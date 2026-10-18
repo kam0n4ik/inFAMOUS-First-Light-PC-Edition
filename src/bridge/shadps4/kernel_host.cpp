@@ -12,6 +12,7 @@
 
 #include "app/config.h"
 #include "base/log.h"
+#include "runtime/kernel/event_queues.h"
 #include "bridge/shadps4/guest_stack.h"
 #include "bridge/shadps4/loader_host.h"
 #include "core/debug_state.h"
@@ -93,7 +94,11 @@ public:
 void InstallKernelHost(const App::Config& cfg, u32 psf_attributes) {
     static KernelHostImpl host;
     Kernel::SetHost(&host);
-    InstallEventQueueHost(); // P3.6: the event queue contract over the bridge's libkernel
+    if (std::ranges::find(cfg.bridged_groups, "kernel-equeue") == cfg.bridged_groups.end()) {
+        Kernel::EventQueues::InstallNativeOwner(); // the game's queues are SecondSonPC's (group kernel-equeue)
+    } else {
+        InstallEventQueueHost(); // P3.6: the event queue contract over the bridge's libkernel
+    }
     const bool title_neo = ((psf_attributes >> 23) & 1) != 0; // param.sfo ATTRIBUTE: supports PS4 Pro
     Kernel::Configure(cfg.neo_mode, title_neo);
     Kernel::Start();

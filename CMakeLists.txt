@@ -116,6 +116,7 @@ add_library(sspc_runtime STATIC
     src/runtime/kernel/clock.cpp
     src/runtime/kernel/condvar.cpp
     src/runtime/kernel/event_flag.cpp
+    src/runtime/kernel/equeue.cpp
     src/runtime/kernel/event_queues.cpp
     src/runtime/kernel/guest_errno.cpp
     src/runtime/kernel/kernel_memory.cpp

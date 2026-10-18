@@ -11,8 +11,13 @@
 #pragma once
 
 #include <optional>
+#include <span>
 
 #include "base/abi.h"
+
+namespace SecondSon::Runtime {
+struct Export;
+}
 
 namespace SecondSon::Kernel::EventQueues {
 
@@ -55,5 +60,10 @@ public:
 /// Set once at start-up, before a graphics backend starts (InstallKernelHost); nullptr until then.
 void SetOwner(Owner* owner);
 Owner* GetOwner();
+
+/// SecondSonPC's own queue table (runtime/kernel/equeue.cpp, group "kernel-equeue") as the owner: with its
+/// exports bound, instead of the bridge's (InstallKernelHost chooses).
+void InstallNativeOwner();
+std::span<const Runtime::Export> NativeExports();
 
 } // namespace SecondSon::Kernel::EventQueues

@@ -496,6 +496,13 @@ int main(int argc, char* argv[]) {
     if (config->cpu_emulate_sse4a && !native("cpu") && !native("fs-patch")) {
         return Fail("--cpu-emulate sse4a is a mode of SecondSonPC's CPU patcher: it needs --native cpu");
     }
+    // The bridge's GnmDriver/VideoOut deliver into the bridge's own queue table, and the self-tests check that
+    // table: then the game's queues stay the bridge's too (group kernel-equeue).
+    if ((config->gpu_backend != App::Config::GpuBackend::Sspc || config->selftest) &&
+        std::find(config->bridged_groups.begin(), config->bridged_groups.end(), "kernel-equeue") ==
+            config->bridged_groups.end()) {
+        config->bridged_groups.emplace_back("kernel-equeue");
+    }
     if (config->gpu_backend == App::Config::GpuBackend::Sspc) {
         // P4.4: SecondSonPC's GnmDriver and VideoOut switch together with the backend (one owner of the GPU); the
         // bridge's shadow diagnostics need the bridge's renderer. No silent switch back to the bridge, ever.

@@ -939,6 +939,14 @@ void SetHost(FsHost* host) {
     g_host = host;
 }
 
+s32 ReserveDescriptor() {
+    return g_host->ReserveDescriptor();
+}
+
+void ReleaseDescriptor(s32 fd) {
+    g_host->ReleaseDescriptor(fd);
+}
+
 std::span<const Runtime::Export> FileSystemExports() {
     return kExports;
 }

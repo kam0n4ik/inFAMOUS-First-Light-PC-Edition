@@ -9,6 +9,7 @@
 #include "runtime/gpu/gnm/gnm_driver.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/kernel/clock.h"
+#include "runtime/kernel/event_queues.h"
 #include "runtime/kernel/guest_errno.h"
 #include "runtime/kernel/kernel.h"
 #include "runtime/kernel/kernel_memory.h"
@@ -86,7 +87,7 @@ std::vector<Export> Collect() {
                              UserService::UserServiceExports(), PlayGo::PlayGoExports(),
                              AppContent::AppContentExports(), Pad::PadExports(),
                              Kernel::KernelExports(), Kernel::SemaphoreExports(),
-                             Kernel::EventFlagExports(), Kernel::KernelUtilExports(),
+                             Kernel::EventFlagExports(), Kernel::EventQueues::NativeExports(), Kernel::KernelUtilExports(),
                              Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
                              Kernel::DirectMemoryExports(), Kernel::ProcessExports(), Kernel::Threads::ThreadExports(),
                              Kernel::Signals::SignalExports(), Kernel::GuestErrno::Exports(),

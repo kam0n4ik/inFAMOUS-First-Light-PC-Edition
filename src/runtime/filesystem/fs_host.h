@@ -46,6 +46,10 @@ public:
 
 void SetHost(FsHost* host);
 
+/// A descriptor number from the table files share with event queues and sockets (-1: none left), and its release.
+s32 ReserveDescriptor();
+void ReleaseDescriptor(s32 fd);
+
 /// Host code wrote guest memory [address, address + size): the GPU's copies there (textures, buffers) are refreshed.
 void NotifyHostWrite(u64 address, u64 size);
 
