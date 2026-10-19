@@ -63,6 +63,9 @@ std::string ApplyCpMode(std::string mode, bool native_backend) {
         // Phase 5: the engine's mesh and shadow casters' draws tagged by its draw functions, their runs one record
         // (thread 1) recorded with only each draw's own bindings (thread 2) - docs/CITY_ENGINE_OPTIMIZATION.md
         preset.push_back({"SSPC_CITY_ENGINE_OPT", "1"});
+        // Phase 6: the G-buffer's instanced draws (0x1a1770) in runs too, a member whose material changed (0x448640)
+        // refused at once - docs/CITY_ENGINE_RESOURCES.md
+        preset.push_back({"SSPC_CITY_ENGINE_GBUFFER_RUNS", "1"});
     }
     std::string set, kept;
     for (const auto& [name, value] : preset) {
