@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iterator>
 #include <set>
+#include <tuple>
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_mouse.h>
@@ -160,6 +161,37 @@ void UserFile(const CheckFn& check, const fs::path& dir) {
                                  back.size() == 1, perr);
     check(g, "broken TOML detected", !ParseUserText("[Display\nfullscreen = ", back, warnings, perr), perr);
 
+    // keys this version does not take (a newer version's, a hand-edited bad value) are written back by every save
+    {
+        const std::string newer = "[Display]\nfullscreen = true\nhdrPeakNits = 1000\n[Audio]\nvolume = 400\n"
+                                  "[FutureTable]\nmode = \"x\"\nlist = [1, 2]\n";
+        Overrides ov;
+        KeptKeys kept;
+        warnings.clear();
+        const bool p = ParseUserText(newer, ov, warnings, perr, &kept);
+        const std::string again = SerializeUserFile(ov, kept);
+        Overrides ov2;
+        KeptKeys kept2;
+        std::vector<std::string> w2;
+        const bool p2 = ParseUserText(again, ov2, w2, perr, &kept2);
+        const auto by_key = [](const KeptKey& a, const KeptKey& b) {
+            return std::tie(a.table, a.key) < std::tie(b.table, b.key);
+        };
+        std::ranges::sort(kept, by_key);
+        std::ranges::sort(kept2, by_key);
+        check(g, "unknown keys and bad values kept: written back unchanged (nothing of the file is lost)",
+              p && p2 && kept.size() == 4 && ov2 == ov && kept2 == kept &&
+                  again.find("hdrPeakNits = 1000") != std::string::npos &&
+                  again.find("[FutureTable]") != std::string::npos && again.find("volume = 400") != std::string::npos,
+              fmt::format("kept {}, again {}", kept.size(), kept2.size()));
+        ov["audio.volume"] = s64{40};
+        const std::string replaced = SerializeUserFile(ov, kept);
+        check(g, "a kept key's setting changed in the menu: the new value replaces the old line",
+              replaced.find("volume = 40\n") != std::string::npos &&
+                  replaced.find("volume = 400") == std::string::npos,
+              "");
+    }
+
     // files
     std::error_code ec;
     fs::create_directories(dir, ec);
@@ -259,7 +291,7 @@ void ServiceChecks(const CheckFn& check, const fs::path& dir) {
     s.SetCapabilities(Capability::Window | Capability::LiveVolume | Capability::RealController);
     const Desc& fps = *Find("display.showFps");
     const auto a = s.Available(fps);
-    check(g, "without the bridge's presenter: FPS counter unavailable, with the reason",
+    check(g, "a presenter without the FPS counter: the setting unavailable, with the reason",
           !a.available && !a.why_ru.empty() && s.Set(fps, Value{false}) == SetResult::Unavailable,
           std::string(a.why_en));
     s.SetCapabilities(Capability::Window | Capability::BridgePresenter | Capability::LiveVolume |
@@ -670,8 +702,10 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
     const auto g = "Ui.menu";
     const auto defaults = TestConfig();
     Service s;
-    s.Init(defaults, {}, defaults, {}, Capability::Window | Capability::BridgePresenter | Capability::LiveVolume |
-                                          Capability::RealController);
+    constexpr u32 kCaps = Capability::Window | Capability::LiveVolume | Capability::RealController |
+                          Capability::RenderScale | Capability::FrameLimiter | Capability::FpsCounter |
+                          Capability::FsrFrameGen; // the native backend on a GPU without DLSS
+    s.Init(defaults, {}, defaults, {}, kCaps);
     (void)dir;
     Ui::SettingsMenu menu(s);
     Ui::MenuEnv env;
@@ -681,13 +715,16 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
     menu.Open();
     Ui::EstimateMeasure measure;
     Ui::DrawList list;
+    const auto contains = [](const std::vector<std::string>& v, std::string_view id) {
+        return std::ranges::find(v, id) != v.end();
+    };
 
-    // layout at the usual window sizes: the panel inside the window, scaled with it
+    // the window: about 900 x 700 at 1080p, inside every window, scaled with it, the same size on every page
     std::string layout;
-    float prev_w = 0;
+    float w1080 = 0, w2160 = 0;
     bool fits = true;
     for (const auto& [w, h] : {std::pair{1280.0f, 720.0f}, {1920.0f, 1080.0f}, {2560.0f, 1440.0f}, {3840.0f, 2160.0f},
-                               {800.0f, 600.0f}}) {
+                               {800.0f, 600.0f}, {2560.0f, 1080.0f}, {1024.0f, 768.0f}}) {
         auto e = env;
         e.width = w;
         e.height = h;
@@ -696,24 +733,89 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
         const auto r = list.Surface();
         fits = fits && r.x >= 0 && r.y >= 0 && r.Right() <= w && r.Bottom() <= h && !list.Commands().empty();
         layout += fmt::format("{}x{}: {:.0f}x{:.0f}; ", w, h, r.w, r.h);
-        if (h == 2160.0f) {
-            fits = fits && r.w > prev_w * 1.4f; // 4K: about twice 1080p
-        }
-        if (h == 1080.0f) {
-            prev_w = r.w;
-        }
+        w1080 = h == 1080.0f && w == 1920.0f ? r.w : w1080;
+        w2160 = h == 2160.0f ? r.w : w2160;
     }
-    check(g, "layout fits and scales (720p..4K, 800x600)", fits, layout);
+    check(g, "window fits and scales (720p..4K, 800x600, 21:9, 4:3)", fits && w2160 > w1080 * 1.8f, layout);
+    {
+        auto e = env;
+        e.width = 1920;
+        e.height = 1080;
+        menu.SetEnv(e);
+        bool same = true;
+        Ui::Rect first{};
+        for (size_t p = 0; p < Ui::kPageCount; ++p) {
+            menu.SelectPage(static_cast<Ui::Page>(p));
+            menu.Build(measure, list);
+            const auto r = list.Surface();
+            if (p == 0) {
+                first = r;
+            }
+            same = same && r.x == first.x && r.y == first.y && r.w == first.w && r.h == first.h;
+        }
+        check(g, "1080p: 900 x 700 (+ its shadow), the same on every page",
+              same && std::abs(first.w - 920.0f) < 1.0f && std::abs(first.h - 720.0f) < 1.0f,
+              fmt::format("{:.0f}x{:.0f}", first.w, first.h));
+        auto hi = e;
+        hi.dpi_scale = 1.5f;
+        menu.SetEnv(hi);
+        menu.Build(measure, list);
+        check(g, "display scale 150 %: the window grows (still inside)", list.Surface().w > first.w * 1.1f &&
+                                                                          list.Surface().Right() <= 1920.0f,
+              fmt::format("{:.0f}", list.Surface().w));
+    }
     menu.SetEnv(env);
+    menu.SelectPage(Ui::Page::Graphics);
 
-    check(g, "opens on Display, first row focused", menu.CurrentCategory() == Category::Display &&
-                                                       menu.FocusedId() == "display.fullscreen", menu.FocusedId());
+    check(g, "opens on Graphics, the upscaler focused",
+          menu.CurrentPage() == Ui::Page::Graphics && menu.FocusedId() == "upscaling.upscaler", menu.FocusedId());
+    const auto graphics = menu.ListedIds();
+    check(g, "Graphics: not implemented settings and the bridge's presenter rows are not listed",
+          !contains(graphics, "graphics.renderScale") && !contains(graphics, "graphics.textures") &&
+              !contains(graphics, "graphics.fsr") && !contains(graphics, "upscaling.output") &&
+              !contains(graphics, "upscaling.frameGenMultiplier") && contains(graphics, "graphics.smokeQuality") &&
+              contains(graphics, "info.render"),
+          fmt::format("{} rows", graphics.size()));
+
+    // only what this system runs: DLSS is offered greyed with the reason, DLSS frame generation not at all
+    const Desc& up = *Find("upscaling.upscaler");
+    const auto ups = menu.Options(up);
+    const bool dlss_greyed = std::ranges::any_of(ups, [](const auto& o) { return o.value == "dlss" && !o.ok && !o.why.empty(); });
+    menu.Focus("upscaling.upscaler");
+    menu.OnNav(Ui::Nav::Right); // off -> (dlss skipped) -> fsr
+    check(g, "upscaler: DLSS greyed with why on a GPU without it, Right skips to FSR",
+          dlss_greyed && s.Current().pc.upscaler == "fsr", s.Current().pc.upscaler);
+    const auto fgs = menu.Options(*Find("upscaling.frameGeneration"));
+    check(g, "frame generation: DLSS FG (not in this build) not offered",
+          std::ranges::none_of(fgs, [](const auto& o) { return o.value == "dlss"; }) && fgs.size() == 2, "");
+
+    // a drop-down list: opened with Enter, moved, chosen; Esc closes it without a change
+    menu.Focus("upscaling.quality");
+    const auto q0 = s.Current().pc.upscale_quality;
+    menu.OnNav(Ui::Nav::Accept);
+    const bool opened = menu.ListOpen();
+    menu.OnNav(Ui::Nav::Down);
+    menu.OnNav(Ui::Nav::Back);
+    const bool unchanged = !menu.ListOpen() && s.Current().pc.upscale_quality == q0;
+    menu.OnNav(Ui::Nav::Accept);
+    menu.OnNav(Ui::Nav::Down);
+    menu.OnNav(Ui::Nav::Accept);
+    check(g, "drop-down list: Esc closes it unchanged, Enter chooses (quality -> balanced)",
+          opened && unchanged && !menu.ListOpen() && s.Current().pc.upscale_quality == "balanced",
+          s.Current().pc.upscale_quality);
+    menu.Build(measure, list); // (a list closed by Close: nothing chosen)
+    menu.OnNav(Ui::Nav::Accept);
+    menu.OnNav(Ui::Nav::Down);
+    menu.Close();
+    menu.Open();
+    check(g, "closed with a list open: nothing chosen, the page kept for the session",
+          s.Current().pc.upscale_quality == "balanced" && !menu.ListOpen() && menu.CurrentPage() == Ui::Page::Graphics &&
+              menu.FocusedId() == "upscaling.quality",
+          menu.FocusedId());
+
     menu.OnNav(Ui::Nav::NextTab);
     menu.OnNav(Ui::Nav::NextTab);
-    menu.OnNav(Ui::Nav::NextTab);
-    menu.OnNav(Ui::Nav::NextTab);
-    check(g, "tabs: Display -> Graphics -> Upscaling -> Audio -> Mouse", menu.CurrentCategory() == Category::Controls,
-          "");
+    check(g, "pages: Graphics -> Display -> Controls", menu.CurrentPage() == Ui::Page::Controls, "");
     menu.Focus("input.invertY");
     menu.OnNav(Ui::Nav::Accept);
     const bool toggled = std::get<bool>(s.Get(*Find("input.invertY")));
@@ -726,14 +828,7 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
     const double sens = std::get<double>(s.Get(*Find("input.mouseSensitivity")));
     check(g, "slider: two steps right = +0.10", std::abs(sens - 1.10) < 1e-9, fmt::format("{}", sens));
 
-    menu.SelectCategory(Category::Graphics);
-    menu.Focus("graphics.renderScale");
-    menu.OnNav(Ui::Nav::Accept);
-    check(g, "unavailable row: nothing changes, the reason is shown", !menu.Status().empty() &&
-                                                                          s.CurrentOverrides().size() == 1,
-          menu.Status());
-
-    menu.SelectCategory(Category::Keyboard);
+    menu.SelectPage(Ui::Page::Keys);
     menu.Focus("keyboard.cross");
     menu.OnNav(Ui::Nav::Accept);
     const bool capturing = menu.Capturing();
@@ -754,7 +849,7 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
                                                   Bindings{Key(SDL_SCANCODE_SPACE)}, "");
 
     // display changes are confirmed or reverted
-    menu.SelectCategory(Category::Display);
+    menu.SelectPage(Ui::Page::Display);
     menu.Focus("display.fullscreen");
     menu.OnNav(Ui::Nav::Accept);
     const bool asked = menu.ConfirmPending() && std::get<bool>(s.Get(*Find("display.fullscreen")));
@@ -771,27 +866,48 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
     menu.OnNav(Ui::Nav::Accept);
     check(g, "window size: next preset sets width and height together",
           cfg.window_width == 1600 && cfg.window_height == 900, fmt::format("{}x{}", cfg.window_width, cfg.window_height));
+    menu.Focus("display.fullscreen");
+    menu.OnNav(Ui::Nav::Accept);
+    menu.Close(); // closed while asking: the safe side
+    menu.Open();
+    check(g, "closed during the confirmation: the display change is reverted",
+          std::get<bool>(s.Get(*Find("display.fullscreen"))) && !menu.ConfirmPending(), "");
 
-    menu.Focus("reset.category");
+    menu.Focus("reset.page");
     menu.OnNav(Ui::Nav::Accept);
     const bool reset_asked = menu.ResetPending();
     menu.OnNav(Ui::Nav::Left);
     menu.OnNav(Ui::Nav::Accept);
     const auto after = s.Current();
     menu.OnNav(Ui::Nav::Accept); // keep the reset display settings
-    check(g, "reset the section: asked, then defaults", reset_asked && !after.fullscreen && after.window_width == 1280,
+    check(g, "reset the page: asked (Cancel first), then defaults",
+          reset_asked && !after.fullscreen && after.window_width == 1280,
           fmt::format("fullscreen {}, {}x{}", after.fullscreen, after.window_width, after.window_height));
 
+    // restart settings: stored now, shown as not in use yet
+    menu.SelectPage(Ui::Page::Game);
+    menu.Focus("game.enterButton");
+    menu.OnNav(Ui::Nav::Right);
+    check(g, "a restart setting: stored, marked as waiting for a restart, the window says so",
+          s.NeedsRestart(*Find("game.enterButton")) && !menu.Status().empty(), menu.Status());
+    menu.OnNav(Ui::Nav::Left);
+
+    menu.SelectPage(Ui::Page::Advanced);
+    check(g, "Advanced: the FPS counter listed and available (a presenter that has it)",
+          contains(menu.ListedIds(), "display.showFps") && s.Available(*Find("display.showFps")).available, "");
     menu.OnNav(Ui::Nav::Back);
     check(g, "Esc at the top asks the host to close", menu.TakeCloseRequest(), "");
 
-    // without the bridge's presenter (sspc): the bridge-only rows are greyed with the reason
-    s.SetCapabilities(Capability::Window | Capability::LiveVolume | Capability::RealController);
-    menu.SelectCategory(Category::Graphics);
-    menu.Focus("graphics.fsr");
-    menu.OnNav(Ui::Nav::Accept);
-    check(g, "--gpu-backend sspc: FSR unavailable, says why", !std::get<bool>(s.Get(*Find("graphics.fsr"))) &&
-                                                                  !menu.Status().empty(), menu.Status());
+    // the bridge (--gpu-backend bridge): its presenter's rows listed, the native backend's greyed with the reason
+    s.SetCapabilities(Capability::Window | Capability::BridgePresenter | Capability::LiveVolume |
+                      Capability::RealController | Capability::FpsCounter);
+    menu.SelectPage(Ui::Page::Graphics);
+    menu.Focus("upscaling.frameGeneration");
+    menu.OnNav(Ui::Nav::Right);
+    check(g, "--gpu-backend bridge: FSR 1.0 listed, frame generation unavailable and says why",
+          contains(menu.ListedIds(), "graphics.fsr") && s.Current().pc.frame_generation == "off" &&
+              !menu.Status().empty(),
+          menu.Status());
 }
 
 } // namespace

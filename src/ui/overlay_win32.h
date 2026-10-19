@@ -44,6 +44,7 @@ public:
         std::uint64_t frames = 0;
         double last_ms = 0.0; // the last render + UpdateLayeredWindow
         double max_ms = 0.0;
+        double total_ms = 0.0; // all renders together (the average: total_ms / frames)
     };
     Stats GetStats() const;
 

@@ -23,6 +23,7 @@
 #include "input/keyboard_mouse.h"
 #include "runtime/gpu/menu_focus.h"
 #include "runtime/gpu/native_backend.h"
+#include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/pad/pad.h"
 #include "settings/registry.h"
 #include "settings/settings_service.h"
@@ -76,6 +77,7 @@ struct State {
     bool exclusive_lifted = false; // exclusive full screen turned borderless while the menu is shown
     std::vector<std::string> displays, audio_devices;
     std::vector<std::pair<u32, u32>> window_sizes;
+    std::string fsr_why; // FSR 3.1 cannot run: its DLL is not next to the exe (looked at when the menu opens)
     // PC Edition: the PC settings are an entry of the game's own Settings screen (Esc / Options during play)
     u32 poll_event = 0;          // SDL user event of the game-menu poll timer
     u32 prompt_event = 0;        // SDL user event of the button icons' timer (ui/prompt_service.h)
@@ -296,12 +298,9 @@ MenuEnv BuildEnv() {
         env.height = static_cast<float>(cr.bottom);
     }
     env.ru = Ru(cfg);
-    // opened from the game's Settings screen: "Additional settings", drawn over that screen's panel as a page of it
-    if (Engine::GameMenu::SettingsScreenOnTop()) {
-        const Rect f = GameFrame();
-        const float k = f.w / 1920.0f;
-        if (f.w > 0) {
-            env.game_panel = {f.x + 315.0f * k, f.y + 92.0f * k, 742.0f * k, 895.0f * k};
+    if (st.hwnd != nullptr) {
+        if (const UINT dpi = GetDpiForWindow(st.hwnd); dpi >= 96) {
+            env.dpi_scale = static_cast<float>(dpi) / 96.0f; // the system's scale for this window's display
         }
     }
     env.prompts = Input::ResolvePrompts(cfg.pc.prompts, Input::Devices().Active());
@@ -310,9 +309,9 @@ MenuEnv BuildEnv() {
                            ? std::string(env.ru ? "Клавиатура и мышь" : "Keyboard and mouse")
                            : (st.pad_name.empty() ? std::string(env.ru ? "Контроллер" : "Controller") : st.pad_name);
     const bool bridge = (st.opt.capabilities & Settings::Capability::BridgePresenter) != 0;
-    env.backend_label = bridge ? std::string(env.ru ? "мост shadPS4 (по умолчанию)" : "shadPS4 bridge (default)")
-                               : std::string(env.ru ? "собственный SecondSonPC (экспериментальный)"
-                                                    : "SecondSonPC's own (experimental)");
+    env.backend_label = bridge ? std::string(env.ru ? "мост shadPS4 (--gpu-backend bridge)"
+                                                    : "shadPS4 bridge (--gpu-backend bridge)")
+                               : std::string(env.ru ? "собственный Vulkan SecondSonPC" : "SecondSonPC's own Vulkan");
     env.displays = st.displays;
     env.audio_devices = st.audio_devices;
     env.window_sizes = st.window_sizes;
@@ -322,6 +321,25 @@ MenuEnv BuildEnv() {
                                : "Changes are not saved in this run (the settings file is not available).";
     } else if (const auto error = service.LastSaveError(); !error.empty()) {
         env.save_note = (env.ru ? "Не удалось сохранить настройки: " : "Settings not saved: ") + error;
+    }
+    env.settings_file = service.File().empty() ? std::string{} : service.File().string();
+    // upscaling (the native backend): the scene's size now, why a technology cannot run here
+    if (!bridge) {
+        namespace Up = Gpu::Upscale;
+        const auto us = Up::GetStatus();
+        u32 rw = 0, rh = 0;
+        Up::GetRenderSize(rw, rh);
+        if (rw != 0 && rh != 0 && (rw != 1920 || rh != 1080)) {
+            env.render_label = fmt::format("{} × {} → 1920 × 1080", rw, rh);
+        } else {
+            env.render_label = env.ru ? "1920 × 1080 (без масштабирования)" : "1920 × 1080 (native)";
+        }
+        env.dlss_why = us.dlss_why;
+        env.fsr_fg_why = us.fsr_fg_why;
+        env.fsr_why = st.fsr_why;
+        if (cfg.pc.upscaler != "off" && us.active == Up::Backend::Off && !us.reason.empty()) {
+            env.upscale_reason = us.reason;
+        }
     }
     // P4.14: the native backend's shader cache
     if (const auto ci = Gpu::Native::CacheInfo(); ci.enabled) {
@@ -857,8 +875,9 @@ void MenuController::Install(const Options& options) {
     installed_ = true;
     if (st.overlay_ok) {
         SSPC_LOG(App, Info,
-                 "PC settings: an entry of the game's Settings screen (Esc / Options, then triangle, its key or a "
-                 "click){}{} (overlay: Win32 layered window, Direct2D software; capabilities 0x{:x})",
+                 "PC settings: the game's Settings screen (Esc / Options), its last item \"Additional settings\" (cross: "
+                 "its key, the controller's, a click){}{} (overlay: Win32 layered window, Direct2D software; "
+                 "capabilities 0x{:x})",
                  cfg.pc.menu_button == "guide"  ? "; controller PS/Guide"
                  : cfg.pc.menu_button == "l3r3" ? "; controller L3+R3 held"
                                                 : "",
@@ -892,6 +911,16 @@ void MenuController::Open() {
     st.displays = DisplayNames();
     st.audio_devices = AudioDeviceNames();
     st.window_sizes = WindowSizes(st.opt.window);
+    {
+        // as Bridge::ApplyUpscaling checks it: FSR 3.1 needs amd_fidelityfx_vk.dll next to SecondSonPC.exe
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::error_code ec;
+        st.fsr_why = std::filesystem::is_regular_file(std::filesystem::path(exe).parent_path() / L"amd_fidelityfx_vk.dll",
+                                                      ec)
+                         ? std::string{}
+                         : std::string("amd_fidelityfx_vk.dll is not next to SecondSonPC.exe");
+    }
     st.held_nav.reset();
     st.menu->SetEnv(BuildEnv());
     st.menu->Open();
@@ -924,9 +953,9 @@ void MenuController::Close() {
         Pad::SetMenuBlocksInput(false);
     }
     const auto stats = st.overlay.GetStats();
-    SSPC_LOG(App, Info, "settings menu closed ({} renders, slowest {:.1f} ms); settings file {}", stats.frames,
-             stats.max_ms, Settings::Instance().File().empty() ? std::string("not used")
-                                                               : Settings::Instance().File().string());
+    SSPC_LOG(App, Info, "settings menu closed ({} renders, average {:.2f} ms, slowest {:.1f} ms); settings file {}",
+             stats.frames, stats.frames != 0 ? stats.total_ms / static_cast<double>(stats.frames) : 0.0, stats.max_ms,
+             Settings::Instance().File().empty() ? std::string("not used") : Settings::Instance().File().string());
 }
 
 EventRoute MenuController::OnEvent(const SDL_Event& e) {
@@ -1088,6 +1117,8 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
             }
         } else if (e.button.button == SDL_BUTTON_LEFT) {
             st.menu->OnMouseButton(x, y, down);
+        } else if (e.button.button == SDL_BUTTON_RIGHT && down) {
+            st.menu->OnNav(Nav::Back); // as in the game's menus: back (a list, a dialog, then the window)
         }
         AfterInput();
         return EventRoute::Consumed;

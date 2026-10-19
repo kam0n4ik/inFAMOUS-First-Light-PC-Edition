@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 
 #include <windows.h>
 #include <d2d1.h>
@@ -53,12 +55,15 @@ struct Win32Overlay::Impl final : TextMeasure {
     ID2D1DCRenderTarget* rt = nullptr;
     ID2D1SolidColorBrush* brush = nullptr;
     std::map<std::tuple<int, int, bool>, IDWriteTextFormat*> formats; // (size * 4, weight, wrap)
+    std::unordered_map<std::string, float> widths; // measured texts (a text layout each is the costly part of a build)
     bool ok = false;
 
     HWND owner = nullptr;
     HWND dim = nullptr;
     HWND panel = nullptr;
     bool visible = false;
+    u8 fade = 255;      // the window's opacity while it fades in after being shown (0..255)
+    u8 dim_alpha = 0;   // the backdrop's opacity the list asked for
     HDC mem_dc = nullptr;
     HBITMAP dib = nullptr;
     void* bits = nullptr;
@@ -90,13 +95,32 @@ struct Win32Overlay::Impl final : TextMeasure {
             return MA_NOACTIVATE;
         case WM_TIMER: {
             auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-            if (self != nullptr && self->timer_cb != nullptr) {
+            if (self != nullptr && wp == kFadeTimer) {
+                self->FadeStep();
+            } else if (self != nullptr && self->timer_cb != nullptr) {
                 self->timer_cb(self->timer_ctx);
             }
             return 0;
         }
         default:
             return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    }
+
+    static constexpr UINT_PTR kFadeTimer = 2;
+
+    /// One step of the fade-in: the same pixels, a higher constant opacity (no new drawing).
+    void FadeStep() {
+        fade = static_cast<u8>(std::min(255, fade + 64));
+        if (panel != nullptr) {
+            BLENDFUNCTION blend{AC_SRC_OVER, 0, fade, AC_SRC_ALPHA};
+            UpdateLayeredWindow(panel, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &blend, ULW_ALPHA);
+        }
+        if (dim != nullptr) {
+            SetLayeredWindowAttributes(dim, 0, static_cast<BYTE>(dim_alpha * fade / 255), LWA_ALPHA);
+        }
+        if (fade == 255 && panel != nullptr) {
+            KillTimer(panel, kFadeTimer);
         }
     }
 
@@ -193,8 +217,16 @@ struct Win32Overlay::Impl final : TextMeasure {
     }
 
     float Width(std::string_view utf8, float size, FontWeight weight) override {
+        if (utf8.empty()) {
+            return 0.0f;
+        }
+        std::string key = std::to_string(std::lround(size * 4)) + '/' + std::to_string(static_cast<int>(weight)) + '/';
+        key += utf8;
+        if (const auto it = widths.find(key); it != widths.end()) {
+            return it->second;
+        }
         IDWriteTextFormat* f = Format(size, weight, true);
-        if (f == nullptr || utf8.empty()) {
+        if (f == nullptr) {
             return 0.0f;
         }
         const auto text = Wide(utf8);
@@ -207,7 +239,12 @@ struct Win32Overlay::Impl final : TextMeasure {
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);
         layout->Release();
-        return m.widthIncludingTrailingWhitespace * (game_fonts != nullptr ? FontStretch(weight) : 1.0f);
+        const float w = m.widthIncludingTrailingWhitespace * (game_fonts != nullptr ? FontStretch(weight) : 1.0f);
+        if (widths.size() >= 4096) {
+            widths.clear(); // (texts with numbers that change: kept bounded)
+        }
+        widths.emplace(std::move(key), w);
+        return w;
     }
 
     void Triangle(const float* p, bool fill, float width) {
@@ -375,6 +412,7 @@ struct Win32Overlay::Impl final : TextMeasure {
     void DestroyWindows() {
         if (panel != nullptr) {
             KillTimer(panel, 1);
+            KillTimer(panel, kFadeTimer);
             DestroyWindow(panel);
             panel = nullptr;
         }
@@ -484,8 +522,13 @@ bool Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
     GetClientRect(owner, &client);
     const int cw = client.right - client.left, ch = client.bottom - client.top;
 
+    // shown again: it fades in over a few timer steps (the opacity of the same pixels, nothing drawn again)
+    if (!m.visible) {
+        m.fade = 0;
+    }
+    m.dim_alpha = list.Dim();
     // backdrop: one colour with a constant alpha (no pixels to upload)
-    SetLayeredWindowAttributes(m.dim, 0, list.Dim(), LWA_ALPHA);
+    SetLayeredWindowAttributes(m.dim, 0, static_cast<BYTE>(m.dim_alpha * m.fade / 255), LWA_ALPHA);
     SetWindowPos(m.dim, HWND_TOP, origin.x, origin.y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
     const Rect s = list.Surface();
@@ -499,7 +542,7 @@ bool Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
         POINT dst{origin.x + sx, origin.y + sy};
         SIZE size{sw, sh};
         POINT src{0, 0};
-        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, m.fade, AC_SRC_ALPHA};
         HDC screen = GetDC(nullptr);
         drawn = UpdateLayeredWindow(m.panel, screen, &dst, &size, m.mem_dc, &src, 0, &blend, ULW_ALPHA) != FALSE;
         ReleaseDC(nullptr, screen);
@@ -512,11 +555,15 @@ bool Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
     if (!m.visible && m.timer_cb != nullptr) {
         ::SetTimer(m.panel, 1, m.timer_ms, nullptr);
     }
+    if (!m.visible && m.fade < 255) {
+        ::SetTimer(m.panel, Impl::kFadeTimer, 16, nullptr);
+    }
     m.visible = true;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     ++m.stats.frames;
     m.stats.last_ms = ms;
     m.stats.max_ms = std::max(m.stats.max_ms, ms);
+    m.stats.total_ms += ms;
     return true;
 }
 
@@ -524,12 +571,14 @@ void Win32Overlay::Hide() {
     auto& m = *impl_;
     if (m.panel != nullptr) {
         KillTimer(m.panel, 1);
+        KillTimer(m.panel, Impl::kFadeTimer);
         ShowWindow(m.panel, SW_HIDE);
     }
     if (m.dim != nullptr) {
         ShowWindow(m.dim, SW_HIDE);
     }
     m.visible = false;
+    m.fade = 255;
 }
 
 bool Win32Overlay::RenderToPixels(const DrawList& list, std::vector<std::uint32_t>& pixels, unsigned& width,
