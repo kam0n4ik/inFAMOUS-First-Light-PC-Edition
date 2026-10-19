@@ -22,6 +22,7 @@ E:/tools/ghidra-mcp/.venv/Scripts/python.exe -X utf8 run.py queries/<snippet>.py
 | `find_vtables.py` | `addr...` | data tables holding a pointer to each function, walked back to the table start |
 | `qword_table.py` | `addr count stride [disasm-addr...]` | qword table rows with function names; optional raw disassembly at addresses |
 | `u32_table.py` | `addr count` | u32 table |
+| `candidates.py` | `outdir addr...` | per function: size, FNV-1a 64 of the body (the hash `src/native_engine` pins), callers, callees, the 14-byte prologue cut and any reference into it, full disassembly (<= 0x600 bytes), decompiled C (Native Engine Reconstruction) |
 | `prologue.py` | `addr...` | the whole instructions covering the first 14 bytes (bytes, RIP-relative flag) and any reference into them — the check for an entry probe (`src/engine/guest_probe.h`) |
 
 Results feed `docs/native-reconstruction/RENDER_ENGINE_ARCHITECTURE.md`.
