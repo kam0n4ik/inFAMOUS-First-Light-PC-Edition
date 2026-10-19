@@ -322,7 +322,10 @@ MenuEnv BuildEnv() {
     } else if (const auto error = service.LastSaveError(); !error.empty()) {
         env.save_note = (env.ru ? "Не удалось сохранить настройки: " : "Settings not saved: ") + error;
     }
-    env.settings_file = service.File().empty() ? std::string{} : service.File().string();
+    if (!service.File().empty()) {
+        const auto u8 = service.File().u8string(); // (UTF-8: a user name outside the ANSI code page)
+        env.settings_file.assign(reinterpret_cast<const char*>(u8.data()), u8.size());
+    }
     // upscaling (the native backend): the scene's size now, why a technology cannot run here
     if (!bridge) {
         namespace Up = Gpu::Upscale;
