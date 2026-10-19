@@ -69,6 +69,7 @@
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
+#include "engine/render/draw_runs.h"
 #include "engine/render/native_draw.h"
 #include "engine/render/render_resolution.h"
 #include "app/product.h"
@@ -872,6 +873,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                  "sspc) hands frames on early");
     }
     Engine::Render::NativeDraw::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
+    // CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT, off by default): the engine's mesh/shadow draws tagged for the processor's runs
+    Engine::Render::DrawRuns::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
     // Smoke Quality and Particle Resolution (both backends): the game's own unless [Graphics] smokeQuality /
     // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
     Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,

@@ -121,6 +121,39 @@ struct DrawDescriptor {
     /// kNoEnginePass: a draw of the game's PM4 alone.
     s32 engine_pass = kNoEnginePass;
     EngineTable engine_vs, engine_ps;
+    /// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): the engine function that wrote the draw tagged it in its trailing NOP
+    /// (engine/render/draw_runs.h: 1 a mesh draw 0x1a1960, 2 a shadow casters' draw 0x43d480; 0 not tagged)
+    u8 engine_run = 0;
+};
+
+/// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): a draw that joined the run of the engine's tagged draw before it
+/// (parallel_cp.h). Everything but its geometry is the run's first draw's: what is its own is kept here - its VS user
+/// data, index range, instances and vertex streams (each V# as read from its table, and the range it gives).
+struct RunMember {
+    u64 seq = 0;
+    u64 packet_addr = 0;
+    u64 index_base = 0;
+    u32 index_offset = 0, index_count = 0, instance_count = 0, max_index_size = 0, vgt_index_offset = 0;
+    GroupMask changed = 0;
+    std::array<u32, 16> vs_user_data{};
+    struct Stream {
+        u64 address = 0, size = 0;
+        std::array<u32, 4> desc{}, read{};
+    };
+    static constexpr u32 kMaxStreams = 8;
+    u32 streams = 0;
+    std::array<Stream, kMaxStreams> v{};
+    /// Its own VS buffers (the shadow casters' instance constants): the first draw's plan index, the range, the V#.
+    struct Buffer {
+        u32 index = 0;
+        u64 address = 0, size = 0;
+        std::array<u32, 4> desc{};
+    };
+    static constexpr u32 kMaxBuffers = 2;
+    u32 buffers = 0;
+    std::array<Buffer, kMaxBuffers> b{};
+    /// Its VS user data reach the stage (its own copy of the flattened user data, not the first draw's).
+    bool own_user_data = false;
 };
 
 struct DispatchDescriptor {
@@ -306,6 +339,8 @@ struct Counters {
     std::array<u64, 256> graphics_ticks{}, compute_ticks{};
     u64 rptr_ticks = 0;
     u64 rptr_same = 0; ///< CP-8: read pointer writes left out (the same value as the last one)
+    u64 ahead_draws = 0, ahead_packets = 0; ///< CITY-OPT Phase 5: engine draws (their packets) taken by RunAhead
+    u64 ahead_stops = 0;                    ///< ... its scans that met another packet (the loop goes on)
     u64 type2 = 0;
     u64 draws = 0, dispatches = 0, dispatches_disabled = 0, flips = 0;
     u64 fences = 0, fences_deferred = 0, fences_written = 0, fences_dropped = 0;
@@ -495,6 +530,11 @@ private:
     StepStatus WaitRegMem(Queue& q, u64 addr, std::span<const u32> p);
     StepStatus IndirectBuffer(Queue& q, u64 addr, std::span<const u32> p);
     void ExtentHint(const Frame& f, u32 reg, u32 count);
+    /// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): right after a tagged engine draw, the next one's packets - when they are
+    /// only what such a draw sets (user data, index type, primitive type, instances, NOPs) up to its draw packet and
+    /// tagged NOP - executed one after another here as Step would (Isolated, no observer, not a ring), without the
+    /// loop's work per packet; anything else: Step goes on with it.
+    void RunAhead(Queue& q);
     void BuildDraw(DrawDescriptor& d);
     /// P5.3B: a SecondSonPC operation in the stream (engine/render/native_render_ops.h) / the draw it describes.
     StepStatus NativeMarker(Queue& q, u64 addr, std::span<const u32> p);
@@ -519,6 +559,9 @@ private:
     Options options_;
     /// CP-8 fallback (SSPC_CP_RPTR_EVERY_PACKET=1): a compute ring's read pointer written after every packet, as before
     bool rptr_every_packet_ = false;
+    bool engine_runs_ = false; ///< CITY-OPT Phase 5: draws' run tags read (SSPC_CITY_ENGINE_OPT)
+    bool run_ahead_ = false;   ///< ... RunAhead (SSPC_CITY_ENGINE_AHEAD=1 or SSPC_CITY_ENGINE_OPT=ahead)
+    bool in_run_ahead_ = false;
     RegisterFile regs_;
     std::array<std::unique_ptr<Queue>, kNumQueues> queues_;
     std::array<u64, 4> set_base_{}; ///< SET_BASE: 0 display list patch table, 1 draw indirect args, 2 GDS, 3 CE

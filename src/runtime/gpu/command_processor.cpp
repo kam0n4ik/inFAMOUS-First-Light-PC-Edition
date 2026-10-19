@@ -13,6 +13,7 @@
 #include <windows.h> // GetEnvironmentVariableA (SSPC_P53_CAPTURE_*)
 
 #include "base/log.h"
+#include "engine/render/draw_runs.h"
 #include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
@@ -212,6 +213,14 @@ CommandProcessor::CommandProcessor(const Options& options) : options_(options) {
     queues_[kGraphicsQueue]->id = kGraphicsQueue;
     if (char v[4] = {}; GetEnvironmentVariableA("SSPC_CP_RPTR_EVERY_PACKET", v, sizeof(v)) == 1 && v[0] == '1') {
         rptr_every_packet_ = true;
+    }
+    // (the loader installs the engine's probes with the same switch; without them no draw carries a tag)
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_CITY_ENGINE_OPT", v, sizeof(v)) > 0 && v[0] != '0') {
+        engine_runs_ = true;
+        // (RunAhead: measured without a gain - only with SSPC_CITY_ENGINE_AHEAD=1 or =ahead; docs/CITY_ENGINE_OPTIMIZATION.md)
+        char a[4] = {};
+        run_ahead_ = (GetEnvironmentVariableA("SSPC_CITY_ENGINE_AHEAD", a, sizeof(a)) == 1 && a[0] == '1') ||
+                     std::string_view(v) == "ahead";
     }
 }
 
@@ -1046,6 +1055,13 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
         }
     }
     DrawDescriptor d;
+    // CITY-OPT Phase 5: the engine's tag in the NOP right after the draw packet (a hint: parallel_cp.cpp decides)
+    if (packet && engine_runs_) {
+        const Frame& f = q.frames[q.depth - 1];
+        if (u64{f.pos} + 4 <= f.size) {
+            d.engine_run = static_cast<u8>(Engine::Render::DrawRuns::TagOf(f.data + f.pos));
+        }
+    }
     switch (kind) {
     case DrawKind::Index2:
         SetOne(regs_, Reg::VgtDmaMaxSize, b[0]);
@@ -1105,7 +1121,84 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
     if (native_t0_ != 0) {
         native_t0_ = __rdtsc();
     }
+    if (d.engine_run != 0 && run_ahead_ && packet && !in_run_ahead_) {
+        RunAhead(q);
+    }
     return StepStatus::Packet;
+}
+
+void CommandProcessor::RunAhead(Queue& q) {
+    if (observer_ != nullptr || options_.mode != Mode::Isolated || options_.packet_ticks || q.depth == 0) {
+        return;
+    }
+    Frame& f = q.frames[q.depth - 1];
+    if (f.ring) {
+        return; // (a ring's read pointer follows each packet: Step's)
+    }
+    namespace O = Pm4::Op;
+    in_run_ahead_ = true;
+    for (;;) {
+        // f.pos: the trailing NOP of the tagged draw just made. The packets up to the next draw packet, followed by its
+        // tagged NOP: only those a tagged draw sets (none of them blocks, chains or writes memory)
+        u32 pos = f.pos, end = 0, dwords = 0;
+        while (pos < f.size) {
+            const u32 h = f.data[pos];
+            if ((h >> 30) != 3 || (h & 1) != 0) {
+                break; // (not type 3, or predicated: Step's)
+            }
+            const u32 n = ((h >> 16) & 0x3FFF) + 2;
+            const u8 op = static_cast<u8>(h >> 8);
+            if (u64{pos} + n > f.size) {
+                break;
+            }
+            if (op == O::DrawIndex2) {
+                if (u64{pos} + n + 4 <= f.size &&
+                    Engine::Render::DrawRuns::TagOf(f.data + pos + n) != Engine::Render::DrawRuns::Source::None) {
+                    end = pos + n;
+                    dwords += n;
+                }
+                break;
+            }
+            // (a NOP: the driver's own and the CUE's V#/T#/S# markers - not a flip's, nor SecondSonPC's P5.3 ones)
+            const std::span<const u32> nop(f.data + pos, n);
+            const Pm4::NopMarker mk = op == O::Nop ? Pm4::ClassifyNop(nop) : Pm4::NopMarker::Other;
+            const bool plain_nop = op == O::Nop && mk != Pm4::NopMarker::PatchedFlip &&
+                                   mk != Pm4::NopMarker::PrepareFlip && mk != Pm4::NopMarker::PrepareFlipLabel &&
+                                   mk != Pm4::NopMarker::PrepareFlipInterrupt &&
+                                   mk != Pm4::NopMarker::PrepareFlipInterruptLabel &&
+                                   !(n == Engine::Render::kStreamTokenDwords && nop[1] == Engine::Render::kStreamMagic) &&
+                                   !Engine::Render::IsMarker(nop);
+            const bool uconfig_prim = op == O::SetUconfigReg && n == 3 &&
+                                      (f.data[pos + 1] & 0xFFFF) + kSpaceBase[static_cast<u32>(Space::Uconfig)] ==
+                                          Reg::VgtPrimitiveType;
+            if (!(plain_nop || uconfig_prim || op == O::SetShReg || op == O::IndexType || op == O::NumInstances)) {
+                break;
+            }
+            pos += n;
+            dwords += n;
+        }
+        if (end == 0 || q.budget + dwords > options_.max_dwords_per_submission) {
+            ++stats_.ahead_stops;
+            break;
+        }
+        // as Step: each packet's dwords counted, the processor's position past it, Execute, its count
+        while (f.pos < end) {
+            const u32 n = ((f.data[f.pos] >> 16) & 0x3FFF) + 2;
+            const u64 addr = f.addr + u64{f.pos} * 4;
+            const std::span<const u32> p(f.data + f.pos, n);
+            q.budget += n;
+            f.pos += n;
+            const StepStatus s = Execute(q, f, addr, p); // (the draw packet's Draw runs the work's draw)
+            if (s != StepStatus::Packet) {
+                in_run_ahead_ = false;
+                return; // (a refused packet: the submission was dropped by Fail)
+            }
+            ++stats_.graphics_packets[static_cast<u8>(p[0] >> 8)];
+            ++stats_.ahead_packets;
+        }
+        ++stats_.ahead_draws;
+    }
+    in_run_ahead_ = false;
 }
 
 void CommandProcessor::BuildDraw(DrawDescriptor& d) {
