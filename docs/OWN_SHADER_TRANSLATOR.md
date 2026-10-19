@@ -170,7 +170,7 @@ gcn_aux — вспомогательные стадии RECT/QUAD
 **Огр.** S#/T#/V#, которые программа собирает ALU-операциями над загруженным значением (шаблоны post-op моста:
 `ConvertCubeTo2DArray`, `DisableAnisoIfSingleLod`, `ForceRepeatXyzClamp`, `ForceLastTexelXyClamp`,
 `ClearAnisoRatioAndThreshold`, патч stride V#), не распознаются: анализ видит неизвестный dword и отдаёт программу мосту.
-Поиск по всем паку игры (`art\cache\*.xpps`, 26 ГБ):
+Поиск по всем пакам игры (`art\cache\*.xpps`, 26 ГБ):
 * литералов шаблонов S# (`0xfffffe00`, `0xfff8f1ff`, `0xfffff1ff`, `s_bfe_u32 …, 0x0008000c`) — 0;
 * литералов cube→2D-массив (`0x0fffffff`, `0xffffe000`) — 0;
 * `s_getpc_b64` (inline-буфер констант, `OffsetByProgramBase`) — 1 программа из 10 301 (инвентарь);
