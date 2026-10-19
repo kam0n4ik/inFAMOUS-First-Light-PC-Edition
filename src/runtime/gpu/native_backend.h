@@ -90,6 +90,8 @@ void Stop();
 bool Running();
 /// FSR frame generation on / off while the game runs (the settings menu; the presenter switches its swapchain).
 void SetFrameGen(bool on);
+/// [Display] showFps: the presenter's FPS counter shown or hidden (at start and while the game runs; any thread).
+void SetFpsCounter(bool on);
 /// FrameBreak FB-2: [Display] frameRateLimit while the game runs (VideoOut::ParsePacing; the spin kept). false: unknown.
 bool SetFrameLimit(const std::string& limit);
 /// A summary of what the backend did (also written to <logs>\gpu_native.txt at Stop).

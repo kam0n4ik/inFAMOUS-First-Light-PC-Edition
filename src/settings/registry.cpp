@@ -258,10 +258,13 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "display.showFps", .table = "Display", .key = "showFps", .category = Category::Display,
-        .type = Type::Bool, .apply = Apply::Live, .needs = Capability::BridgePresenter, .en = "FPS counter",
-        .ru = "Счётчик FPS", .help_en = "A frame counter in the corner of the screen (F10).",
-        .help_ru = "Счётчик кадров в углу экрана (F10).", .why_en = kNeedsBridgePresenterEn,
-        .why_ru = kNeedsBridgePresenterRu,
+        .type = Type::Bool, .apply = Apply::Live, .needs = Capability::FpsCounter, .en = "FPS counter",
+        .ru = "Счётчик FPS",
+        .help_en = "Frames per second and the frame time in the top left corner of the picture. F10 switches it "
+                   "while playing; the choice is kept.",
+        .help_ru = "Кадры в секунду и время кадра в левом верхнем углу картинки. F10 переключает его во время игры; "
+                   "выбор сохраняется.",
+        .why_en = "This run's presenter has no FPS counter.", .why_ru = "У презентера этого запуска нет счётчика FPS.",
         .get = [](const Config& c, const Desc&) -> Value { return c.show_fps; },
         .set = [](Config& c, const Desc&, const Value& x) { c.show_fps = std::get<bool>(x); },
         .legacy_parse = true,
@@ -502,19 +505,25 @@ void Build(Registry& r) {
     v.push_back(Desc{
         .id = "audio.volume", .table = "Audio", .key = "volume", .category = Category::Audio, .type = Type::Int,
         .apply = Apply::Live, .needs = Capability::LiveVolume, .min = 0, .max = 100, .ui_min = 0, .ui_max = 100,
-        .step = 5, .unit = "%", .en = "Volume", .ru = "Громкость",
-        .help_en = "SecondSonPC's master volume, on top of the game's own sound settings.",
-        .help_ru = "Общая громкость SecondSonPC поверх настроек звука самой игры.",
+        .step = 5, .unit = "%", .en = "Master volume", .ru = "Общая громкость",
+        .help_en = "SecondSonPC's master volume, on top of the game's own sound settings (music, effects, speech are "
+                   "in the game's Options - Audio). Heard at once.",
+        .help_ru = "Общая громкость SecondSonPC поверх настроек звука самой игры (музыка, эффекты и речь — в "
+                   "«Параметры» → «Звук» игры). Слышно сразу.",
+        .why_en = "SecondSonPC's own audio output (--native audio) has no master volume yet; the bridge's has.",
+        .why_ru = "У собственного аудиовывода SecondSonPC (--native audio) пока нет общей громкости; у моста есть.",
         .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.volume); },
         .set = [](Config& c, const Desc&, const Value& x) { c.volume = static_cast<u32>(std::get<s64>(x)); },
         .legacy_parse = true,
     });
     v.push_back(Desc{
         .id = "audio.device", .table = "Audio", .key = "device", .category = Category::Audio, .type = Type::Text,
-        .apply = Apply::Restart, .en = "Output device", .ru = "Устройство вывода",
-        .help_en = "The playback device. Empty: the Windows default. Takes effect after a restart.",
-        .help_ru = "Устройство воспроизведения. Пусто — устройство Windows по умолчанию. Вступает в силу после "
-                   "перезапуска.",
+        .apply = Apply::Restart, .needs = Capability::LiveVolume, .en = "Output device", .ru = "Устройство вывода",
+        .help_en = "The playback device. System default: the Windows default device.",
+        .help_ru = "Устройство воспроизведения. «По умолчанию» — устройство Windows по умолчанию.",
+        .why_en = "SecondSonPC's own audio output (--native audio) always follows the Windows default device.",
+        .why_ru = "Собственный аудиовывод SecondSonPC (--native audio) всегда следует устройству Windows по "
+                  "умолчанию.",
         .get = [](const Config& c, const Desc&) -> Value { return c.audio_device; },
         .set = [](Config& c, const Desc&, const Value& x) { c.audio_device = std::get<std::string>(x); },
         .legacy_parse = true,
@@ -650,10 +659,14 @@ void Build(Registry& r) {
         .id = "gamepad.menuButton", .table = "Gamepad", .key = "menuButton", .category = Category::Gamepad,
         .type = Type::Choice, .apply = Apply::Live, .choices = kMenuButtons, .en = "Controller shortcut to this menu",
         .ru = "Быстрый вызов с контроллера",
-        .help_en = "This menu is in the game's Settings screen (Options / Esc, then △ or F); a shortcut besides it. The PS (Guide) button never reaches a PS4 game, so it is free; on Windows the Xbox Guide button "
-                   "may open the Game Bar, and Steam may take the PS button.",
-        .help_ru = "Это меню открывается из экрана «Настройки» игры (Options / Esc, затем △ или F); здесь — дополнительный быстрый вызов. Кнопка PS (Guide) не доходит до игр PS4, поэтому свободна; в Windows кнопка Guide Xbox может "
-                   "открыть Game Bar, а Steam — забрать кнопку PS.",
+        .help_en = "This window opens from the game's Settings screen (Options / Esc), its last item \"Additional "
+                   "Settings\" (✕, Space or a click); here, a shortcut besides it. The PS (Guide) button never reaches "
+                   "a PS4 game, so it is free; on Windows the Xbox Guide button may open the Game Bar, and Steam may "
+                   "take the PS button.",
+        .help_ru = "Это окно открывается из экрана «Настройки» игры (Options / Esc), последний пункт «Дополнительные "
+                   "настройки» (✕, Пробел или щелчок); здесь — дополнительный быстрый вызов. Кнопка PS (Guide) не "
+                   "доходит до игр PS4, поэтому свободна; в Windows кнопка Guide Xbox может открыть Game Bar, а Steam "
+                   "— забрать кнопку PS.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.menu_button; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.menu_button = std::get<std::string>(x); },
     });
@@ -672,8 +685,10 @@ void Build(Registry& r) {
         .id = "interface.scale", .table = "Interface", .key = "scale", .category = Category::Interface,
         .type = Type::Int, .apply = Apply::Live, .min = 75, .max = 200, .ui_min = 75, .ui_max = 200, .step = 5,
         .unit = "%", .en = "Interface scale", .ru = "Масштаб интерфейса",
-        .help_en = "The size of this menu relative to the window height (100 % = a 1080-pixel tall window).",
-        .help_ru = "Размер этого меню относительно высоты окна (100 % — окно высотой 1080 пикселей).",
+        .help_en = "The size of this window: 100 % follows the game window's height (900 x 700 in a 1080-pixel tall "
+                   "window) or the system's display scale, whichever is larger; it never exceeds the game window.",
+        .help_ru = "Размер этого окна: при 100 % — по высоте окна игры (900 × 700 в окне высотой 1080 пикселей) или "
+                   "по системному масштабу экрана, если он больше; за пределы окна игры не выходит.",
         .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.ui_scale); },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.ui_scale = static_cast<u32>(std::get<s64>(x)); },
     });

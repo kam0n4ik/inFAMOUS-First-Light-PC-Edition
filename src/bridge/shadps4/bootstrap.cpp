@@ -799,10 +799,11 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
             Fatal("--gpu-backend sspc: SecondSonPC's GPU backend did not start: " + gpu_error);
         }
         Lifecycle::AddExitStep(Lifecycle::Stage::Devices, "native GPU backend", [] { Gpu::Native::Stop(); });
+        Gpu::Native::SetFpsCounter(cfg.show_fps); // [Display] showFps (F10 and the settings switch it later)
         {
             // the settings menu: what the upscaling rows can do with this GPU (known now the device exists)
             namespace Cap = Settings::Capability;
-            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter;
+            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter | Cap::FpsCounter;
             if (Gpu::Upscale::GetStatus().dlss_available) {
                 caps |= Cap::Dlss;
             }

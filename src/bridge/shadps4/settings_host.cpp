@@ -116,12 +116,15 @@ void ApplyPcBridgeSettings(const App::Config& cfg) {
 
 void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_mode, bool native_gpu) {
     namespace Cap = Settings::Capability;
-    u32 caps = Cap::LiveVolume | Cap::RealController; // the bridge's audio output and SecondSonPC's libScePad
+    u32 caps = Cap::RealController; // SecondSonPC's libScePad
+    if (std::ranges::find(cfg.native_groups, "audio") == cfg.native_groups.end()) {
+        caps |= Cap::LiveVolume; // the bridge's audio output (SecondSonPC's own, --native audio, has no volume yet)
+    }
     if (window != nullptr) {
         caps |= Cap::Window;
     }
     if (!native_gpu) {
-        caps |= Cap::BridgePresenter;
+        caps |= Cap::BridgePresenter | Cap::FpsCounter; // (the native backend adds FpsCounter once it runs)
     }
     const bool bridge_presenter = !native_gpu;
     Settings::Instance().AddApplier([bridge_presenter](const App::Config& c,
@@ -134,6 +137,8 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
             } else if (d->id == "display.showFps" && bridge_presenter) {
                 EmulatorSettings.SetShowFpsCounter(c.show_fps);
                 Overlay::SetSimpleFps(c.show_fps);
+            } else if (d->id == "display.showFps") {
+                Gpu::Native::SetFpsCounter(c.show_fps); // the native presenter's counter, at its next present
             } else if (d->id == "display.frameRateLimit" && !bridge_presenter) {
                 Gpu::Native::SetFrameLimit(c.pc.frame_rate_limit); // the present thread's pacing, at once
             } else if (d->id == "graphics.smokeQuality") {

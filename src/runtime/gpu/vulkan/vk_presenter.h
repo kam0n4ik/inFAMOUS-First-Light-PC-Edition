@@ -24,6 +24,10 @@ namespace SecondSon::Gpu::Vk {
 class DeviceContext;
 class Timeline;
 
+/// The FPS counter over the presented picture shown or hidden ([Display] showFps, F10, the settings window; any
+/// thread, read by the present thread at its next present). SSPC_FPS_OVERLAY=0 still hides it.
+void SetFpsCounterShown(bool shown);
+
 class Presenter {
 public:
     /// `sdl_window`: the game's SDL_Window; `present_mode` the wanted one ("Mailbox" | "Fifo" | "Immediate", [Display]

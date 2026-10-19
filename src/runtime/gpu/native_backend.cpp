@@ -2594,6 +2594,10 @@ void SetFrameGen(bool on) {
     }
 }
 
+void SetFpsCounter(bool on) {
+    Vk::SetFpsCounterShown(on);
+}
+
 bool SetFrameLimit(const std::string& limit) {
     VideoOut::Pacing p;
     if (!VideoOut::ParsePacing(limit, p)) {
