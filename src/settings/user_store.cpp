@@ -1,6 +1,7 @@
 // SecondSonPC — the user settings file (see user_store.h).
 #include "settings/user_store.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -150,8 +151,23 @@ std::filesystem::path DefaultUserFile() {
 }
 
 bool ParseUserText(std::string_view text, Overrides& out, std::vector<std::string>& warnings,
-                   std::string& parse_error) {
+                   std::string& parse_error, KeptKeys* kept) {
     out.clear();
+    if (kept != nullptr) {
+        kept->clear();
+    }
+    // a key not taken: kept for the next save (a nested table cannot be: it is reported)
+    const auto keep = [kept](const std::string& table, const std::string& key, const toml::value& v) {
+        if (kept == nullptr || v.is_table()) {
+            return false;
+        }
+        try {
+            kept->push_back({table, key, toml::format(v)});
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
     if (text.starts_with("\xEF\xBB\xBF")) {
         text.remove_prefix(3); // a BOM from a text editor
     }
@@ -174,17 +190,20 @@ bool ParseUserText(std::string_view text, Overrides& out, std::vector<std::strin
         for (const auto& [key, kv] : tv.as_table()) {
             const Desc* d = FindByKey(table, key);
             if (d == nullptr) {
-                warnings.push_back(fmt::format("[{}] {}: not a setting of this version: skipped", table, key));
+                warnings.push_back(fmt::format("[{}] {}: not a setting of this version: {}", table, key,
+                                               keep(table, key, kv) ? "not used, kept in the file" : "skipped"));
                 continue;
             }
             if (d->apply == Apply::Unavailable) {
-                warnings.push_back(fmt::format("[{}] {}: not available: skipped", table, key));
+                warnings.push_back(fmt::format("[{}] {}: not available: {}", table, key,
+                                               keep(table, key, kv) ? "not used, kept in the file" : "skipped"));
                 continue;
             }
             Value value;
             std::string error;
             if (!FromToml(*d, kv, value, error)) {
-                warnings.push_back(fmt::format("[{}] {}: {}: skipped", table, key, error));
+                warnings.push_back(fmt::format("[{}] {}: {}: {}", table, key, error,
+                                               keep(table, key, kv) ? "not used, kept in the file" : "skipped"));
                 continue;
             }
             out.insert_or_assign(std::string(d->id), std::move(value));
@@ -193,9 +212,12 @@ bool ParseUserText(std::string_view text, Overrides& out, std::vector<std::strin
     return true;
 }
 
-LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out) {
+LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out, KeptKeys* kept) {
     LoadReport report;
     out.clear();
+    if (kept != nullptr) {
+        kept->clear();
+    }
     std::error_code ec;
     const bool exists = !file.empty() && std::filesystem::exists(file, ec);
     if (ec) {
@@ -214,7 +236,7 @@ LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out) {
     }
     const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     in.close();
-    if (!ParseUserText(text, out, report.warnings, report.error)) {
+    if (!ParseUserText(text, out, report.warnings, report.error, kept)) {
         // Kept for the user to look at, out of the way of the next save.
         auto aside = file;
         aside += ".corrupt-" + Timestamp();
@@ -225,27 +247,57 @@ LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out) {
         }
         report.status = LoadReport::Status::Corrupt;
         out.clear();
+        if (kept != nullptr) {
+            kept->clear(); // (the whole file is kept aside)
+        }
         return report;
     }
     report.status = LoadReport::Status::Loaded;
     return report;
 }
 
-std::string SerializeUserFile(const Overrides& overrides) {
+std::string SerializeUserFile(const Overrides& overrides, const KeptKeys& kept) {
     std::string out =
-        "# SecondSonPC user settings, written by the PC settings (the game's Settings screen, Esc).\n"
-        "# They override SecondSonPC.toml (the defaults); delete a line to use the SecondSonPC.toml value again.\n";
-    std::string_view table;
+        "# SecondSonPC user settings, written by the PC settings (the game's Settings screen, Esc, then \"Additional\n"
+        "# Settings\"). They override SecondSonPC.toml (the defaults); delete a line to use its value again.\n";
+    // tables in registry order, then the kept keys' own tables; each table's lines: the overrides in registry order,
+    // then its kept keys (unless a setting now written has the same key)
+    std::vector<std::pair<std::string, std::vector<std::string>>> tables;
+    const auto table_of = [&tables](std::string_view name) -> std::vector<std::string>& {
+        for (auto& [t, lines] : tables) {
+            if (t == name) {
+                return lines;
+            }
+        }
+        return tables.emplace_back(std::string(name), std::vector<std::string>{}).second;
+    };
     for (const auto& d : All()) {
         const auto it = overrides.find(d.id);
         if (it == overrides.end() || d.table.empty()) {
             continue;
         }
-        if (d.table != table) {
-            table = d.table;
-            out += fmt::format("\n[{}]\n", table);
+        table_of(d.table).push_back(fmt::format("{} = {}", d.key, TomlText(it->second)));
+    }
+    for (const auto& k : kept) {
+        const Desc* d = FindByKey(k.table, k.key);
+        if (d != nullptr && overrides.contains(d->id)) {
+            continue; // the user's new value replaces the line this version did not take
         }
-        out += fmt::format("{} = {}\n", d.key, TomlText(it->second));
+        // a key that is not a bare TOML key is written quoted
+        const bool bare = !k.key.empty() && std::ranges::all_of(k.key, [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        });
+        table_of(k.table).push_back(fmt::format("{} = {}", bare ? k.key : Quote(k.key), k.text));
+    }
+    for (const auto& [t, lines] : tables) {
+        if (lines.empty()) {
+            continue;
+        }
+        out += fmt::format("\n[{}]\n", t);
+        for (const auto& l : lines) {
+            out += l;
+            out += '\n';
+        }
     }
     return out;
 }

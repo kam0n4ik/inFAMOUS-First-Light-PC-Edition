@@ -202,9 +202,10 @@ int main(int argc, char* argv[]) {
     }
     user_settings = (user_settings || explicit_settings) && !user_settings_file.empty();
     Settings::Overrides user_overrides;
+    Settings::KeptKeys user_kept; // keys this version does not take: written back unchanged
     Settings::LoadReport user_report;
     if (user_settings) {
-        user_report = Settings::LoadUserFile(user_settings_file, user_overrides);
+        user_report = Settings::LoadUserFile(user_settings_file, user_overrides, &user_kept);
         Settings::ApplyOverrides(*config, user_overrides);
     }
     bool stock_bootstrap = false;
@@ -561,7 +562,7 @@ int main(int argc, char* argv[]) {
     // A user file that exists but cannot be read is never overwritten by this run's changes (they stay unsaved).
     const bool save_settings = user_settings && user_report.status != Settings::LoadReport::Status::Unreadable;
     Settings::Instance().Init(toml_defaults, user_overrides, *config,
-                              save_settings ? user_settings_file : std::filesystem::path{}, 0);
+                              save_settings ? user_settings_file : std::filesystem::path{}, 0, user_kept);
     Lifecycle::AddExitStep(Lifecycle::Stage::Storage, "user settings", [] {
         if (!Settings::Instance().Flush(3000)) {
             SSPC_LOG(App, Warning, "user settings: the last change was not written ({})",

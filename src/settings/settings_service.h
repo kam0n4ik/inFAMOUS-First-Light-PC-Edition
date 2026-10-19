@@ -32,7 +32,7 @@ public:
     /// configuration this run uses (defaults + overrides + command line); `file`: where changes are saved (empty:
     /// not saved - automated runs, self-tests); `capabilities`: Capability bits of this run.
     void Init(const App::Config& defaults, Overrides overrides, const App::Config& started,
-              std::filesystem::path file, u32 capabilities);
+              std::filesystem::path file, u32 capabilities, KeptKeys kept = {});
     bool Initialized() const;
     void SetCapabilities(u32 capabilities);
     u32 Capabilities() const;
@@ -75,6 +75,7 @@ private:
     App::Config current_;
     App::Config started_;
     Overrides overrides_;
+    KeptKeys kept_; // keys of the user file this version does not take: written back unchanged
     u32 capabilities_ = 0;
     std::unique_ptr<AsyncWriter> writer_;
     std::vector<Applier> appliers_;
