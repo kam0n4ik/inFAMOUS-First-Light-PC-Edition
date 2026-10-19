@@ -63,6 +63,7 @@ namespace {
 
 std::mutex g_settings_mutex;
 Settings g_settings;
+std::atomic<bool> g_backend_on{false}; ///< g_settings.backend != Off (written with it)
 std::atomic<u32> g_render_w{1920}, g_render_h{1080};
 std::mutex g_status_mutex;
 Status g_status;
@@ -72,6 +73,11 @@ Status g_status;
 void SetSettings(const Settings& s) {
     std::scoped_lock lock{g_settings_mutex};
     g_settings = s;
+    g_backend_on.store(s.backend != Backend::Off, std::memory_order_release);
+}
+
+bool BackendOn() {
+    return g_backend_on.load(std::memory_order_acquire);
 }
 
 Settings GetSettings() {

@@ -87,6 +87,7 @@ struct ExecutorStats {
     u64 ring_mirror_copies = 0;           ///< hybrid ring: host -> video memory copies at the head of submissions
     u64 stream_promotions = 0;            ///< small read-only ranges cached instead of streamed (BufferCache::Promotable)
     u64 binds_skipped = 0, push_constants_skipped = 0; ///< draws repeating the bound pipeline / pushed constants
+    u64 dyn_memo_hits = 0; ///< SSPC_CITY_DYN_MEMO: draws whose dynamic state was not computed again (DynMemo)
     /// SSPC_DIAG_STREAM_STATS: streamed ranges first seen / again in the frame unchanged / changed / unchanged since an
     /// earlier frame / changed since (count, bytes)
     std::array<u64, 5> stream_kinds{}, stream_kind_bytes{};
@@ -538,6 +539,24 @@ private:
     VkIndexType ib_type_last_ = VK_INDEX_TYPE_MAX_ENUM;
     bool dyn_vertex_valid_ = false;
     u64 dyn_skipped_ = 0, dyn_set_ = 0;
+    /// SSPC_CITY_DYN_MEMO=1 (docs/CITY_PERFORMANCE.md): SetDynamicState's inputs at its last whole run - the versions of
+    /// the register groups it reads (a group's version moves with any change of one of its values), the pipeline
+    /// state's fields it reads, the draw's indexing and the jitter. The same inputs with dyn_ still valid (this command
+    /// buffer's): every state it would set is the one set - nothing computed or recorded.
+    struct DynMemo {
+        bool valid = false;
+        const Cp::RegisterFile* regs = nullptr;
+        std::array<u32, 16> versions{};
+        u32 prim_type = 0, mrt_mask = 0;
+        std::array<u32, 8> write_masks{};
+        bool indexed = false, jitter = false;
+        float jx = 0.0f, jy = 0.0f;
+        bool operator==(const DynMemo&) const = default;
+    };
+    DynMemo dyn_memo_;
+    std::vector<Cp::Group> dyn_groups_; ///< the groups of the registers SetDynamicState reads (once)
+    int dyn_memo_on_ = -1;              ///< -1 not decided yet, 0 off, 1 on
+    u32 dyn_memo_ab_ = 0;               ///< =ab:<n>: on in odd blocks of n flips only (image A/B)
 
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md, vk_executor_upscale.cpp): the game's scene at its render size goes
     // through DLSS / FSR 3.1 in place of the game's own scaling to the display buffer.
@@ -589,6 +608,7 @@ private:
                    const u32* user_data = nullptr);
     bool PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bind, std::vector<VkWriteDescriptorSet>& writes);
     void SetDynamicState(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
+    void SetDynamicStateWhole(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
     void RecordFrameCopy();
     /// SSPC_DIAG_CAPTURE_FRAMES: the displayed image of this flip read back (recorded after its copy; P4.5).
     void CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h);

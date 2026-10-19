@@ -37,6 +37,8 @@ void ApplyConfig(std::string_view upscaler, std::string_view quality, u32 sharpn
                  std::string_view frame_generation, u32 fg_multiplier, bool reflex);
 void SetSettings(const Settings& s);
 Settings GetSettings();
+/// GetSettings().backend != Backend::Off without the settings' lock (the recording thread asks at every draw).
+bool BackendOn();
 /// SSPC_UPSCALER=off|dlss|fsr, SSPC_UPSCALE_QUALITY=native|quality|balanced|performance|ultra, SSPC_UPSCALE_SHARPNESS=
 /// 0..1, SSPC_UPSCALE_JITTER=0 over the current settings (automated runs; logged).
 void ApplyEnvironmentOverrides();

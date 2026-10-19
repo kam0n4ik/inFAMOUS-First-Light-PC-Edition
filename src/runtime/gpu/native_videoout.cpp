@@ -132,6 +132,7 @@ struct Port {
 };
 
 Port g_port;
+std::atomic<u64> g_next_flip_id{1}; ///< g_port.next_flip_id as NextFlipId reads it (written with it, under the mutex)
 // the labels: the GPU writes them (the patched flip's WRITE_DATA), the game waits on them (WAIT_REG_MEM), the
 // present thread clears the previous buffer's after each flip
 alignas(64) std::array<std::atomic<u64>, kMaxBuffers> g_labels{};
@@ -871,6 +872,15 @@ u64 RequestedFlips() {
 }
 
 u64 NextFlipId() {
+    // SSPC_CITY_HOT_LOCKS=1 (SSPC_CITY_PERFORMANCE; docs/CITY_PERFORMANCE.md): without the port's mutex - the recording
+    // thread asks for every buffer range of every draw (the lock was ~1% of that thread in the city)
+    static const bool lock_free = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_CITY_HOT_LOCKS", v, sizeof(v)) == 1 && v[0] == '1';
+    }();
+    if (lock_free) {
+        return g_next_flip_id.load(std::memory_order_acquire);
+    }
     std::scoped_lock lock{g_port.mutex};
     return g_port.next_flip_id;
 }
@@ -893,6 +903,7 @@ bool OnFlipMarker(u64 gpu_value, s32 frame) {
     r.gpu_value = gpu_value;
     r.frame = frame;
     r.flip_id = g_port.next_flip_id++;
+    g_next_flip_id.store(g_port.next_flip_id, std::memory_order_release);
     const Slot& slot = g_port.slots[p.index];
     if (slot.group >= 0) {
         const BufferAttribute& a = g_port.groups[slot.group].attrib;

@@ -2995,6 +2995,83 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
 }
 
 void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipelineState& st, bool indexed) {
+    if (dyn_memo_on_ < 0) {
+        // SSPC_CITY_DYN_MEMO=1: the groups of every register read below (one outside the groups: the memo stays off);
+        // =ab:<n> (image A/B, docs/CITY_PERFORMANCE.md): on in every second block of n flips only
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_CITY_DYN_MEMO", v, sizeof(v));
+        const std::string_view sv(v, n < sizeof(v) ? n : 0);
+        dyn_memo_on_ = sv == "1" ? 1 : 0;
+        if (sv.starts_with("ab:")) {
+            dyn_memo_ab_ = std::max<u32>(1, static_cast<u32>(std::strtoul(v + 3, nullptr, 10)));
+            dyn_memo_on_ = 1;
+        }
+        std::vector<u32> read = {kPaClClipCntl,       kPaClVteCntl,        kWindowOffset,     kWindowScissorTl,
+                                 kWindowScissorBr,    kGenericScissorTl,   kGenericScissorBr, kScreenScissorTl,
+                                 kScreenScissorBr,    kPaScModeCntl0,      kDbDepthControl,   kDbRenderControl,
+                                 kDbZInfo,            kDbStencilInfo,      kDbDepthBoundsMin, kDbDepthBoundsMax,
+                                 kPaSuScModeCntl,     kDbStencilControl,   kDbStencilRefMask, kDbStencilRefMaskBf,
+                                 kVgtMultiPrimIbResetEn};
+        for (u32 i = 0; i < 16 * 6; ++i) {
+            read.push_back(kViewport0 + i);
+        }
+        for (u32 i = 0; i < 16 * 2; ++i) {
+            read.push_back(kViewportScissor0 + i);
+        }
+        for (u32 i = 0; i < 5; ++i) {
+            read.push_back(kPolyOffsetClamp + i);
+        }
+        for (u32 i = 0; i < 4; ++i) {
+            read.push_back(kCbBlendRed + i);
+        }
+        for (const u32 reg : read) {
+            const Cp::Group g = Cp::GroupOf(reg);
+            if (g == Cp::Group::Count) {
+                dyn_memo_on_ = 0;
+                SSPC_LOG(GPU, Error, "SSPC_CITY_DYN_MEMO: register {:#x} is in no group - off", reg);
+                break;
+            }
+            if (std::ranges::find(dyn_groups_, g) == dyn_groups_.end()) {
+                dyn_groups_.push_back(g);
+            }
+        }
+        if (dyn_groups_.size() > dyn_memo_.versions.size()) {
+            dyn_memo_on_ = 0;
+        }
+        if (dyn_memo_on_ == 1) {
+            SSPC_LOG(GPU, Info, "SSPC_CITY_DYN_MEMO=1: the dynamic state is computed again only when one of {} register "
+                                "groups, the pipeline state's fields or the jitter changed",
+                     dyn_groups_.size());
+        }
+    }
+    DynMemo memo;
+    if (dyn_memo_on_ == 1 && (dyn_memo_ab_ == 0 || (VideoOut::NextFlipId() / dyn_memo_ab_) % 2 == 1)) {
+        memo.valid = true;
+        memo.regs = &r;
+        for (size_t i = 0; i < dyn_groups_.size(); ++i) {
+            memo.versions[i] = r.Version(dyn_groups_[i]);
+        }
+        memo.prim_type = st.prim_type;
+        memo.mrt_mask = st.mrt_mask;
+        for (u32 i = 0, n = static_cast<u32>(std::bit_width(st.mrt_mask & 0xFFu)); i < n; ++i) {
+            memo.write_masks[i] = st.targets[i].write_mask & 0xF;
+        }
+        memo.indexed = indexed;
+        memo.jitter = jitter_draw_;
+        if (jitter_draw_) {
+            memo.jx = jitter_x_;
+            memo.jy = jitter_y_;
+        }
+        if (dyn_.valid && memo == dyn_memo_) {
+            ++stats_.dyn_memo_hits;
+            return;
+        }
+    }
+    SetDynamicStateWhole(r, st, indexed);
+    dyn_memo_ = memo; // (off: never valid)
+}
+
+void Executor::SetDynamicStateWhole(const Cp::RegisterFile& r, const GS::GraphicsPipelineState& st, bool indexed) {
     const auto& f = Fn();
     const VkCommandBuffer cb = cur_.cb;
     const u32 clip = r.Get(kPaClClipCntl);

@@ -286,6 +286,12 @@ void Executor::UpscaleOnTargets(const Cp::DrawDescriptor& d, const std::array<Ca
                                 CachedImage* depth, u32 depth_control) {
     jitter_draw_ = false;
     up_display_draw_ = false;
+    // SSPC_CITY_HOT_LOCKS=1 (SSPC_CITY_PERFORMANCE; docs/CITY_PERFORMANCE.md): upscaling off is seen without copying
+    // the settings under their lock at each draw
+    static const bool hot_locks = Env("SSPC_CITY_HOT_LOCKS") == "1";
+    if (hot_locks && !Upscale::BackendOn()) {
+        return;
+    }
     const Upscale::Settings s = Upscale::GetSettings();
     if (s.backend == Upscale::Backend::Off) {
         return;

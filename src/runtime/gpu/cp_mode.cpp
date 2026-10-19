@@ -50,6 +50,12 @@ std::string ApplyCpMode(std::string mode, bool native_backend) {
                   // the frame handed to the processor at the game's sceGnmSubmitDone (P5.4; docs/NATIVE_CP.md, GPU-1)
                   {"SSPC_P54_EARLY_SUBMIT", "1"}};
     }
+    // SSPC_CITY_PERFORMANCE=1 (docs/CITY_PERFORMANCE.md): the city's measured CPU optimizations of the draw path, each
+    // its own variable (one given explicitly, =0 too, keeps its value); nothing of them without it
+    if (Env("SSPC_CITY_PERFORMANCE") == "1") {
+        preset.push_back({"SSPC_CITY_HOT_LOCKS", "1"});
+        preset.push_back({"SSPC_CITY_DYN_MEMO", "1"});
+    }
     std::string set, kept;
     for (const auto& [name, value] : preset) {
         if (Env(name).empty()) {
