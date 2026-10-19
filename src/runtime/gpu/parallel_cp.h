@@ -309,6 +309,8 @@ private:
         /// SSPC_CITY_ENGINE_OPT: the draws that joined this one's run (recorded right after it, each with only its own
         /// geometry; their registers are in the journal after this record's journal_end)
         std::vector<Cp::RunMember> members;
+        /// Phase 6: the members' own whole flattened user data (RunMember::vs_flat_at / ps_flat_at; capacity reused)
+        std::vector<u32> member_flat;
         const GS::StageView& Vs() const { return stage_shared != nullptr ? *stage_shared : stage; }
         const GS::StageView& Ps() const { return ps_shared != nullptr ? *ps_shared : ps; }
     };
@@ -437,10 +439,47 @@ private:
     GS::ResourceBindingPlan dc_vs_, dc_ps_;
     GS::SpecializationKey dc_key_;
     std::atomic<u64> dc_vs_hits_{0}, dc_ps_hits_{0}, dc_key_refused_{0};
-    /// The plan of stage `v` (prepared for the draw before) for `user_data`: false when the stage has an SRT walk, or
-    /// the registers give another specialization or other binding numbers.
+    /// The plan of stage `v` (prepared for the draw before) for `user_data`: false when the stage has an SRT walk (that
+    /// Phase 6 cannot take again), or the registers give another specialization or other binding numbers.
     bool RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
                        std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out);
+    /// CITY-OPT Phase 6 (SSPC_CITY_ENGINE_RESOURCES=1|verify, with SSPC_CITY_GEOFAST; docs/CITY_ENGINE_RESOURCES.md):
+    /// the engine's instanced draws of one material (0x1a1770 G-buffer, 0x43d480 shadows) change only the registers of
+    /// the per-object constant buffer's V# and the vertex table; the material's tables the stages' SRT walks follow
+    /// stay. The template of SSPC_CITY_DRAW_CACHE is taken for stages with a walk too: the draw before's walk output
+    /// (the flattened user data past the registers) again when none of the registers it read changed, it wrote none and
+    /// every read succeeded (no guest memory change between the two draws, as for the template itself) - the stage's
+    /// descriptors decoded from it with the new registers, the key the module's, the bindings' end the same. verify:
+    /// SSPC_CITY_GEOFAST's (each such draw also prepared in full and compared).
+    u8 resources_ = 0; ///< 0 off, 1 on, 2 verify
+    std::atomic<u64> res_walk_vs_{0}, res_walk_ps_{0}; ///< stages whose walk output was taken again
+    /// stages whose walk read a register that differs (the CUE's table at a new address at each commit): walked again
+    /// with the new registers - only the walk and the decoding, not the program, layout, fetch shader and module search
+    std::atomic<u64> res_rewalk_vs_{0}, res_rewalk_ps_{0};
+    /// RedecodeStage's refusals of a stage with a walk: 1 (unused), 2 it wrote the registers / a read failed / no walk
+    /// program, 3 the layout's reflection differs, 4 another key, 5 other bindings, 6 the walk again failed
+    std::array<std::atomic<u64>, 8> res_refused_{};
+    // SSPC_DIAG_ENGINE_SRT=1 (CITY-OPT Phase 6): thread 1's draw preparations by the engine function that drew them
+    // (DrawDescriptor::engine_run: 0 none, 1 mesh 0x1a1960, 2 shadow 0x43d480, 3 G-buffer 0x1a1770 - tagged with this
+    // diagnostic or SSPC_CITY_ENGINE_GBUFFER_RUNS): prepared in full / from the draw before, their time, the SRT walks
+    // and reads of the full ones, the stages' flattened data, the copies into the record, run members
+    struct SrtDiag {
+        std::atomic<u64> full{0}, fast{0}, t_full{0}, t_fast{0}, t_copy{0}, reads{0}, walk_vs{0}, walk_ps{0};
+        std::atomic<u64> flat_vs{0}, flat_ps{0}, images{0}, buffers{0}, members{0}, own_ps{0};
+        std::atomic<u64> t_join{0}, joins{0}, t_refused{0}, refusals{0}; ///< JoinRun: joined / refused, their time
+        std::array<std::atomic<u64>, 16> why{}; ///< the template's refusals (geofast_why_)
+        std::array<std::atomic<u64>, 64> groups{}; ///< JoinRun's refusal 3: the other register groups that changed
+    };
+    bool srt_diag_ = false;
+    std::array<SrtDiag, 4> srt_by_{};
+    // CITY-OPT Phase 6 (SSPC_CITY_ENGINE_GBUFFER_RUNS=1|verify): runs of 0x1a1770's draws too - their stages may have SRT
+    // walks (taken again as above) and the members may differ in PS user data (the per-object constant buffer the CUE
+    // binds for both stages): each member's PS plan decoded again, only read-only constant blocks of the same format may
+    // differ (recorded with its own PS buffers and flattened user data)
+    u8 gruns_ = 0; ///< 0 off, 1 on, 2 verify (each member prepared in full too, as SSPC_CITY_ENGINE_OPT=verify)
+    u32 gruns_ab_ = 0; ///< =ab:<n>: in odd blocks of n flips only (image A/B)
+    bool GRunsNow() const; ///< on, and (=ab:<n>) in an odd block
+    GS::ResourceBindingPlan run_ps_plan_;
     // SSPC_DIAG_PREP_CENSUS=<first flip>:<flips> (CITY-OPT Phase 4): the draws of those flips by their VS/PS programs -
     // both threads' time, GEOFAST's answers, what changed since the draw before (Report)
     struct CensusRow {
@@ -475,7 +514,10 @@ private:
     bool JoinRun(const Cp::DrawDescriptor& d);
     GS::ResourceBindingPlan run_plan_; ///< a joining draw's VS plan decoded again (its own constant buffers)
     std::atomic<u64> run_count_{0}, run_members_{0}, run_leaders_{0}, run_verified_{0}, run_mismatches_{0};
-    std::array<std::atomic<u64>, 16> run_refused_{};
+    std::array<std::atomic<u64>, 17> run_refused_{};
+    /// Phase 6: G-buffer members tagged with another material (DrawRuns::kMaterialChanged) - refused before their PS is
+    /// walked again (16); verify: not refused, those that still joined counted (the hint's misses)
+    std::atomic<u64> run_material_{0}, run_material_joined_{0};
     bool batch_on_ = false;
     u32 batch_ab_ = 0;
     std::vector<Vk::BatchDraw> batch_items_;

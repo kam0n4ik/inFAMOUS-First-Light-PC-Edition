@@ -198,6 +198,24 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         SSPC_LOG(GPU, Info, "SSPC_CITY_DRAW_CACHE=1: ... and a draw differing in other user data of stages without an SRT "
                             "walk, with their resources decoded again (the same module)");
     }
+    if (char v[16] = {}; geofast_ != 0 && GetEnvironmentVariableA("SSPC_CITY_ENGINE_RESOURCES", v, sizeof(v)) > 0 &&
+                         v[0] != '0') {
+        // CITY-OPT Phase 6: the template for stages with an SRT walk too (verify: SSPC_CITY_GEOFAST's)
+        resources_ = std::string_view(v) == "verify" ? 2 : 1;
+        if (resources_ == 2 && geofast_ != 2) {
+            geofast_ = 2;
+            geofast_check_ = std::make_unique<Record>();
+        }
+        SSPC_LOG(GPU, Info, "SSPC_CITY_ENGINE_RESOURCES={}: a draw differing from the one before it in registers the "
+                            "stages' SRT walks did not read takes that draw's walks again (CITY-OPT Phase 6){}", v,
+                 resources_ == 2 ? " - verify: each also prepared in full and compared" : "");
+    }
+    if (char v[4] = {}; frontend_ != nullptr && !fthread_mode_ &&
+                        GetEnvironmentVariableA("SSPC_DIAG_ENGINE_SRT", v, sizeof(v)) == 1 && v[0] == '1') {
+        srt_diag_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTICS: SSPC_DIAG_ENGINE_SRT=1 - draw preparations by engine function "
+                               "(gpu_native.txt)");
+    }
     if (char v[32] = {}; frontend_ != nullptr && !fthread_mode_ &&
                          GetEnvironmentVariableA("SSPC_DIAG_PREP_CENSUS", v, sizeof(v)) > 0) {
         char* end = nullptr;
@@ -217,8 +235,16 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         SSPC_LOG(GPU, Info, "SSPC_CITY_ENGINE_OPT={}: the engine's tagged mesh draws that differ only in their geometry "
                             "are one record (the first prepared, the others their geometry only){}", v,
                  runs_ == 2 ? " - verify: each also prepared in full and compared" : "");
+        if (char g[16] = {}; GetEnvironmentVariableA("SSPC_CITY_ENGINE_GBUFFER_RUNS", g, sizeof(g)) > 0 && g[0] != '0') {
+            gruns_ = std::string_view(g) == "verify" ? 2 : 1;
+            if (std::string_view(g).starts_with("ab:")) { // (image A/B: in odd blocks of n flips only)
+                gruns_ab_ = std::max<u32>(1, static_cast<u32>(std::strtoul(g + 3, nullptr, 10)));
+            }
+            SSPC_LOG(GPU, Info, "SSPC_CITY_ENGINE_GBUFFER_RUNS={}: runs of the instanced mesh draws (0x1a1770) too, their "
+                                "members with their own PS constant buffers (CITY-OPT Phase 6)", g);
+        }
     }
-    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
+    async_acquire_ =options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
     journal_changes_only_ = options.journal_changes_only;
     async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
     if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
@@ -656,10 +682,33 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
 
 bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
                                std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out) {
-    // only a stage without an SRT walk: its plan is the registers' decoding alone (ResolveResources with an empty walk)
-    if (v.program == nullptr || v.module == nullptr || v.plan.flat.size() != 16 || !v.plan.error.empty() ||
+    // a stage without an SRT walk: its plan is the registers' decoding alone (ResolveResources with an empty walk);
+    // CITY-OPT Phase 6 (resources_): one with a walk whose output stays - the registers it read are the same
+    if (v.program == nullptr || v.module == nullptr || v.plan.flat.size() < 16 || !v.plan.error.empty() ||
         !v.module->keyed) {
         return false;
+    }
+    const bool walked = v.plan.flat.size() != 16;
+    const auto refuse = [&](u32 why) {
+        Bump(res_refused_[why]);
+        return false;
+    };
+    // a walk that read a register that differs (the CUE's table copied to new frame memory at each commit): walked
+    // again for these registers (the same walk program, memory and decoding as the full preparation)
+    bool rewalk = false;
+    if (walked) {
+        if (resources_ == 0 && gruns_ == 0) {
+            return false;
+        }
+        // (the flattened data's first 16 dwords are the registers of the draw it was prepared for)
+        u32 diff = 0;
+        for (u32 i = 0; i < 16; ++i) {
+            diff |= v.plan.flat[i] != user_data[i] ? 1u << i : 0u;
+        }
+        rewalk = (diff & v.plan.srt.user_data_read) != 0;
+        if (!rewalk && (v.plan.srt.user_data_written || v.plan.srt.faults != 0)) {
+            return refuse(2);
+        }
     }
     const GS::Layout* layout = v.program->FindLayout(v.runtime);
     if (layout == nullptr || layout->module == nullptr) {
@@ -667,25 +716,48 @@ bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> 
     }
     const GS::Module& first = *layout->module; // (PrepareStage decodes with the first module of the layout)
     if (first.state.load(std::memory_order_acquire) != GS::ModuleState::Ready || !first.prepared ||
-        !first.srt.Empty() || !first.srt_error.empty()) {
-        return false;
+        !first.srt_error.empty() || first.srt.Empty() == walked) {
+        return walked ? refuse(2) : false;
     }
     const GS::ShaderReflection& r = first.result.reflection;
     const GS::ShaderReflection& mr = v.module->result.reflection;
     if (mr.buffers.size() != r.buffers.size() || mr.images.size() != r.images.size() ||
-        mr.samplers.size() != r.samplers.size() || mr.flatbuf_dwords != r.flatbuf_dwords || r.flatbuf_dwords > 16) {
-        return false; // (the module's own reflection would decide the plan)
+        mr.samplers.size() != r.samplers.size() || mr.flatbuf_dwords != r.flatbuf_dwords ||
+        (walked ? v.plan.flat.size() != std::max<size_t>(r.flatbuf_dwords, 16) : r.flatbuf_dwords > 16)) {
+        return walked ? refuse(3) : false; // (the module's own reflection would decide the plan)
     }
     const GS::FetchShader* fetch = r.fetch.present ? &mr.fetch : nullptr; // (the fetch shader at the same address)
     if (fetch != nullptr && (!mr.fetch.present || vertex_reads.size() != mr.fetch.attributes.size())) {
         return false;
     }
-    out.flat.assign(user_data.begin(), user_data.end());
-    GS::DecodeResources(r, v.start, fetch, user_data, v.address, GS::VertexSource{nullptr, vertex_reads}, out);
+    if (rewalk) {
+        // (ResolveResources as PrepareStage calls it: the vertex V#s read from the draw's tables again)
+        if (!GS::ResolveResources(r, first.srt, v.start, fetch, user_data, v.address, reader_, out) ||
+            out.srt.faults != 0 || out.srt.user_data_written || !out.error.empty()) {
+            return refuse(6);
+        }
+    } else {
+        if (walked) {
+            out.flat.assign(v.plan.flat.begin(), v.plan.flat.end()); // (the walk's output, unchanged)
+            std::copy(user_data.begin(), user_data.end(), out.flat.begin());
+        } else {
+            out.flat.assign(user_data.begin(), user_data.end());
+        }
+        GS::DecodeResources(r, v.start, fetch, user_data, v.address, GS::VertexSource{nullptr, vertex_reads}, out);
+        // (the walk the plan comes from: its registers read stay the next draw's check; no reads of its own)
+        out.srt = walked ? v.plan.srt : GS::SrtProgram::RunStats{};
+        out.srt.reads = out.srt.line_reads = 0;
+        out.error.clear();
+    }
     GS::BuildSpecializationKey(v.runtime, v.start, r, fetch, out, dc_key_);
     if (!(dc_key_ == v.module->key) || !(GS::EndOf(v.start, out) == v.end)) {
         dc_key_refused_.store(dc_key_refused_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-        return false; // another module, or other bindings for the next stage
+        return walked ? refuse(!(dc_key_ == v.module->key) ? 4 : 5) : false; // another module, or other bindings
+    }
+    if (rewalk) {
+        Bump(v.plan.stage == GS::HwStage::Ps ? res_rewalk_ps_ : res_rewalk_vs_);
+    } else if (walked) {
+        Bump(v.plan.stage == GS::HwStage::Ps ? res_walk_ps_ : res_walk_vs_);
     }
     return true;
 }
@@ -712,8 +784,9 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
                                               (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
     constexpr u8 kVsPs = (1u << static_cast<u32>(Cp::Stage::Vs)) | (1u << static_cast<u32>(Cp::Stage::Ps));
     const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
+    const bool templ = drawcache_ || resources_ != 0; // (other user data: the stages' plans decoded again)
     const Cp::GroupMask allowed =
-        kGeometryGroups | (drawcache_ ? Cp::GroupMask{1} << static_cast<u32>(G::PsUserData) : Cp::GroupMask{0});
+        kGeometryGroups | (templ ? Cp::GroupMask{1} << static_cast<u32>(G::PsUserData) : Cp::GroupMask{0});
     if ((b.changed & ~allowed) != 0) {
         return no(3);
     }
@@ -726,16 +799,18 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
         return no(5);
     }
     const bool ps_changed = a.user_data[ps] != b.user_data[ps];
-    if (ps_changed && !drawcache_) {
+    if (ps_changed && !templ) {
         return no(6);
     }
     const GS::StageView& pv = p.stage;
-    if (pv.status != GS::StageStatus::Ready || pv.module == nullptr || pv.plan.flat.size() != 16 ||
-        (pv.plan.vertices.empty() && !drawcache_)) {
-        return no(7); // (copies of an SRT walk: they may follow a pointer that changed)
+    // (copies of an SRT walk: they may follow a pointer that changed - Phase 6 checks the registers the walk read)
+    if (pv.status != GS::StageStatus::Ready || pv.module == nullptr ||
+        (pv.plan.flat.size() != 16 && (resources_ == 0 || pv.plan.flat.size() < 16)) ||
+        (pv.plan.vertices.empty() && !templ)) {
+        return no(7);
     }
     const GS::FetchShader& fetch = pv.module->result.reflection.fetch;
-    if ((!fetch.present || fetch.sgpr_base + 1 >= 16) && (!drawcache_ || !pv.plan.vertices.empty())) {
+    if ((!fetch.present || fetch.sgpr_base + 1 >= 16) && (!templ || !pv.plan.vertices.empty())) {
         return no(8);
     }
     u32 fetch_only = 0;
@@ -746,13 +821,21 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
         fetch_only &= ~(3u << fetch.sgpr_base); // (the fetch shader's own address must be the same)
     }
     bool vs_other = false; // VS user data past the vertex tables changed: its resources decoded again
+    u32 vs_diff = 0;
     for (u32 i = 0; i < 16; ++i) {
+        if (a.user_data[vs][i] != b.user_data[vs][i]) {
+            vs_diff |= 1u << i;
+        }
         if (a.user_data[vs][i] != b.user_data[vs][i] && ((fetch_only >> i) & 1) == 0) {
-            if (!drawcache_ || (fetch.present && (i == fetch.sgpr_base || i == fetch.sgpr_base + 1))) {
+            if (!templ || (fetch.present && (i == fetch.sgpr_base || i == fetch.sgpr_base + 1))) {
                 return no(9);
             }
             vs_other = true;
         }
+    }
+    if (pv.plan.flat.size() != 16 && !vs_other &&
+        ((vs_diff & pv.plan.srt.user_data_read) != 0 || pv.plan.srt.user_data_written || pv.plan.srt.faults != 0)) {
+        vs_other = true; // (Phase 6: the VS walk read a vertex table register, or is not reusable - RedecodeStage)
     }
     // nothing the previous draw prepared writes memory (its notes would be due again)
     for (const GS::StageView* s : {&pv, &p.ps}) {
@@ -820,10 +903,14 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
         out.stage.plan.samplers.assign(dc_vs_.samplers.begin(), dc_vs_.samplers.end());
         out.stage.plan.vertices.assign(dc_vs_.vertices.begin(), dc_vs_.vertices.end());
         out.stage.plan.status_counts = dc_vs_.status_counts;
+        out.stage.plan.srt = dc_vs_.srt; // (Phase 6: a walk again - its registers read)
         dc_vs_hits_.store(dc_vs_hits_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     } else {
         out.stage.plan.vertices.assign(nv.begin(), nv.end());
         std::copy(b.user_data[vs].begin(), b.user_data[vs].end(), out.stage.plan.flat.begin());
+        if (pv.plan.flat.size() != 16) {
+            Bump(res_walk_vs_); // (Phase 6: its walk's output kept, only the vertex tables new)
+        }
     }
     CopyStage(out.ps, p.ps);
     if (ps_changed) {
@@ -832,6 +919,7 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
         out.ps.plan.images.assign(dc_ps_.images.begin(), dc_ps_.images.end());
         out.ps.plan.samplers.assign(dc_ps_.samplers.begin(), dc_ps_.samplers.end());
         out.ps.plan.status_counts = dc_ps_.status_counts;
+        out.ps.plan.srt = dc_ps_.srt;
         dc_ps_hits_.store(dc_ps_hits_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
     return true;
@@ -854,15 +942,23 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         geofast_prev_ = index;
         geofast_hits_.store(geofast_hits_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         Bump(fc_.ticks, __rdtsc() - t0);
+        if (srt_diag_) {
+            SrtDiag& sd = srt_by_[r.draw.engine_run & 3];
+            Bump(sd.fast);
+            Bump(sd.t_fast, __rdtsc() - t0);
+        }
         if (census_end_ != 0) {
             CensusPrepared(r, __rdtsc() - t0, true);
         }
         return;
     }
     const bool check = geofast_ == 2 && PrepareGeometryOnly(r, index, *geofast_check_);
+    const u8 why = geofast_why_;
+    u64 t_copy = 0;
     {
         const GS::FineSample fine(front_fine_counter_);
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
+        const u64 tc = srt_diag_ ? __rdtsc() : 0;
         r.prep = prep;
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
         r.stage_shared = frontend_->SharedStage(GS::HwStage::Vs);
@@ -884,8 +980,26 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         copy(GS::HwStage::Vs, r.stage, r.stage_shared != nullptr, copied_gen_vs_, r.vs_same);
         copy(GS::HwStage::Ps, r.ps, r.ps_shared != nullptr, copied_gen_ps_, r.ps_same);
         r.state = prep.ready ? frontend_->Pipelines().Graphics(prep.pipeline) : nullptr;
+        t_copy = srt_diag_ ? __rdtsc() - tc : 0;
     }
     r.prepared = true;
+    if (srt_diag_) {
+        // (a view not copied is the frontend's current one)
+        const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
+        const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
+        SrtDiag& sd = srt_by_[r.draw.engine_run & 3];
+        Bump(sd.full);
+        Bump(sd.t_full, __rdtsc() - t0);
+        Bump(sd.t_copy, t_copy);
+        Bump(sd.reads, dv.plan.srt.reads + dp.plan.srt.reads);
+        Bump(sd.walk_vs, dv.plan.flat.size() > 16 ? 1 : 0);
+        Bump(sd.walk_ps, dp.plan.flat.size() > 16 ? 1 : 0);
+        Bump(sd.flat_vs, dv.plan.flat.size());
+        Bump(sd.flat_ps, dp.plan.flat.size());
+        Bump(sd.images, dv.plan.images.size() + dp.plan.images.size());
+        Bump(sd.buffers, dv.plan.buffers.size() + dp.plan.buffers.size());
+        Bump(sd.why[why & 15]);
+    }
     bool writes = false;
     // (a view not copied is the frontend's current one)
     NoteStageWrites(r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs(), index, writes);
@@ -1552,7 +1666,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     if (!r.members.empty()) {
                         // SSPC_CITY_ENGINE_OPT: the run's other draws on its state (their registers: the journal
                         // after this record's, applied with the next record)
-                        exec_.DrawRunMembers(r.draw, pc, r.members);
+                        exec_.DrawRunMembers(r.draw, pc, r.members, r.member_flat);
                         if (r.members.capacity() > 32) {
                             std::vector<Cp::RunMember>().swap(r.members); // (a long run's memory not kept per slot)
                         }
@@ -1640,8 +1754,19 @@ void ParallelCp::Fail(std::string text) {
 // ---- Cp::GpuWork (thread 1)
 
 void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
+    // (Phase 6: 0x1a1770's tag - SSPC_DIAG_ENGINE_SRT - leads or joins a run only with SSPC_CITY_ENGINE_GBUFFER_RUNS)
+    const bool tagged = draw.engine_run != 0 &&
+                        (draw.engine_run != static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) || GRunsNow());
     if (run_open_) {
-        if (draw.engine_run != 0 && JoinRun(draw)) {
+        const u64 tj = srt_diag_ ? __rdtsc() : 0;
+        const bool joined = tagged && JoinRun(draw);
+        if (srt_diag_ && tagged) {
+            // (Phase 6 diagnostics: a member's cost, and the cost of an attempt that did not join)
+            SrtDiag& sd = srt_by_[slots_[next_ & (kSlots - 1)].draw.engine_run & 3];
+            Bump(joined ? sd.t_join : sd.t_refused, __rdtsc() - tj);
+            Bump(joined ? sd.joins : sd.refusals);
+        }
+        if (joined) {
             ++t1_.draws;
             return;
         }
@@ -1650,6 +1775,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
     Record& r = BeginRecord(Kind::Draw);
     r.draw = draw;
     r.members.clear();
+    r.member_flat.clear();
     if (verify_) {
         r.reg_hash = RegistersHash(cp_->Registers());
     }
@@ -1657,7 +1783,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
         PrepareDraw(r, next_, cp_->Registers()); // (as they are at the draw's packet)
     }
     ++t1_.draws;
-    if (runs_ != 0 && draw.engine_run != 0 && (runs_ab_ == 0 || (VideoOut::NextFlipId() / runs_ab_) % 2 == 1) &&
+    if (runs_ != 0 && tagged && (runs_ab_ == 0 || (VideoOut::NextFlipId() / runs_ab_) % 2 == 1) &&
         RunLeaderOk(r)) {
         // SSPC_CITY_ENGINE_OPT: held - the tagged draws after it may join; its registers are the journal so far
         r.journal_end = jtail_;
@@ -1683,6 +1809,10 @@ void ParallelCp::CloseRun() {
     PushRecord(true);
 }
 
+bool ParallelCp::GRunsNow() const {
+    return gruns_ != 0 && (gruns_ab_ == 0 || (VideoOut::NextFlipId() / gruns_ab_) % 2 == 1);
+}
+
 bool ParallelCp::RunLeaderOk(const Record& r) const {
     const Cp::DrawDescriptor& d = r.draw;
     constexpr u8 kVsPs = (1u << static_cast<u32>(Cp::Stage::Vs)) | (1u << static_cast<u32>(Cp::Stage::Ps));
@@ -1691,8 +1821,12 @@ bool ParallelCp::RunLeaderOk(const Record& r) const {
         return false;
     }
     const GS::StageView& v = r.stage;
+    // (Phase 6, a G-buffer run: a VS with an SRT walk whose output its members take again - JoinRun checks the
+    // registers it read)
+    const bool walk_ok = GRunsNow() && d.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) &&
+                         v.plan.flat.size() > 16 && !v.plan.srt.user_data_written && v.plan.srt.faults == 0;
     if (v.status != GS::StageStatus::Ready || v.module == nullptr || r.ps.module == nullptr ||
-        r.ps.status != GS::StageStatus::Ready || v.plan.flat.size() != 16 || v.plan.vertices.empty() ||
+        r.ps.status != GS::StageStatus::Ready || (v.plan.flat.size() != 16 && !walk_ok) || v.plan.vertices.empty() ||
         v.plan.vertices.size() > Cp::RunMember::kMaxStreams) {
         return false;
     }
@@ -1724,7 +1858,11 @@ bool ParallelCp::RunLeaderOk(const Record& r) const {
 
 bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     Record& lead = slots_[next_ & (kSlots - 1)];
+    const size_t flat_mark = lead.member_flat.size();
     const auto no = [&](u32 why) {
+        if (run_open_) {
+            lead.member_flat.resize(flat_mark); // (a refused member's flattened data dropped - the run still held)
+        }
         auto& c = run_refused_[why];
         c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         return false;
@@ -1740,8 +1878,26 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     constexpr Cp::GroupMask kGeometryGroups = (Cp::GroupMask{1} << static_cast<u32>(G::VsUserData)) |
                                               (Cp::GroupMask{1} << static_cast<u32>(G::IndexState)) |
                                               (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
+    // Phase 6: a G-buffer run - its members may differ in PS user data too (each one's PS plan decoded again below)
+    const bool g = GRunsNow() && a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer);
+    if (g && b.engine_material) {
+        // (the engine set another material for it: its PS reads other descriptors - not walked again to see that)
+        Bump(run_material_);
+        if (gruns_ != 2) {
+            return no(16);
+        }
+    }
     // the registers since the draw before (the run's last): only its geometry's groups
-    if ((b.changed & ~kGeometryGroups) != 0) {
+    // (a G-buffer run: the PS user data, and the stencil reference the engine sets per mesh - Vulkan dynamic state)
+    constexpr Cp::GroupMask kGBufferGroups =
+        (Cp::GroupMask{1} << static_cast<u32>(G::PsUserData)) | (Cp::GroupMask{1} << static_cast<u32>(G::StencilRef));
+    if (const Cp::GroupMask other = b.changed & ~(kGeometryGroups | (g ? kGBufferGroups : 0)); other != 0) {
+        if (srt_diag_) {
+            SrtDiag& sd = srt_by_[a.engine_run & 3];
+            for (u32 k = 0; k < sd.groups.size(); ++k) {
+                Bump(sd.groups[k], (other >> k) & 1);
+            }
+        }
         return no(3);
     }
     if (b.queue != a.queue || !b.indexed || b.indirect || b.active_stages != a.active_stages ||
@@ -1755,9 +1911,9 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
             return no(5);
         }
     }
-    const size_t vs = static_cast<size_t>(Cp::Stage::Vs);
+    const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
     for (size_t s = 0; s < a.user_data.size(); ++s) {
-        if (s != vs && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
+        if (s != vs && (s != ps || !g) && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
             return no(6);
         }
     }
@@ -1783,7 +1939,12 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     }
     // other VS user data that differ (the shadow casters' instance constants' V#s): the draw's plan decoded again below -
     // only its own constant buffers may differ; its user data reach the stage as its own copy
-    const bool own = (diff & ~(tables | offsets)) != 0 || (diff & refl.user_data_used & ~tables) != 0;
+    // (Phase 6: a VS walk that read a register that differs - its plan from a walk for these registers, below)
+    const bool rewalk = pv.plan.flat.size() != 16 && (diff & pv.plan.srt.user_data_read) != 0;
+    if (rewalk && !g) {
+        return no(15);
+    }
+    const bool own = (diff & ~(tables | offsets)) != 0 || (diff & refl.user_data_used & ~tables) != 0 || rewalk;
     // its vertex streams from its own tables (shader_resources.cpp DecodeResources: the same reads and results)
     Cp::RunMember m;
     m.streams = static_cast<u32>(pv.plan.vertices.size());
@@ -1822,6 +1983,9 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
         }
         if (!RedecodeStage(pv, b.user_data[vs], std::span(reads.data(), m.streams), run_plan_)) {
             return no(12);
+        }
+        if (!run_open_ || frontend_->MemoryGeneration() != run_gen_) {
+            return no(10); // (a walk's read drained the queue)
         }
         const GS::ResourceBindingPlan& x = pv.plan;
         const GS::ResourceBindingPlan& y = run_plan_;
@@ -1863,6 +2027,85 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
             m.b[m.buffers++] = {static_cast<u32>(i), q.address, q.size, q.desc.raw};
         }
         m.own_user_data = true;
+        if (x.flat.size() != y.flat.size()) {
+            return no(13);
+        }
+        if (!std::equal(x.flat.begin() + 16, x.flat.end(), y.flat.begin() + 16)) {
+            // (Phase 6: its walk's output differs - its own V#s: its whole flattened user data in the run's store)
+            m.vs_flat_at = static_cast<u32>(lead.member_flat.size());
+            lead.member_flat.insert(lead.member_flat.end(), y.flat.begin(), y.flat.end());
+        }
+    }
+    if (g && a.user_data[ps] != b.user_data[ps]) {
+        // Phase 6: its PS plan from its registers (RedecodeStage: the walk's output again, the same module and binding
+        // numbers) - the same images and samplers; only read-only constant blocks of the same format elsewhere
+        const GS::StageView& pp = lead.ps;
+        if (!RedecodeStage(pp, b.user_data[ps], {}, run_ps_plan_)) {
+            return no(12);
+        }
+        if (!run_open_ || frontend_->MemoryGeneration() != run_gen_) {
+            return no(10); // (a walk's read drained the queue)
+        }
+        const GS::ResourceBindingPlan& x = pp.plan;
+        const GS::ResourceBindingPlan& y = run_ps_plan_;
+        bool same = x.images.size() == y.images.size() && x.samplers.size() == y.samplers.size() &&
+                    x.buffers.size() == y.buffers.size() && x.vertices.empty() && y.vertices.empty();
+        for (size_t i = 0; same && i < x.images.size(); ++i) {
+            const GS::ImageBinding& p = x.images[i];
+            const GS::ImageBinding& q = y.images[i];
+            same = p.binding == q.binding && p.count == q.count && p.desc.raw == q.desc.raw && p.view_type == q.view_type &&
+                   p.storage == q.storage && p.depth == q.depth && p.array == q.array && p.fmask == q.fmask &&
+                   p.status == q.status;
+        }
+        for (size_t i = 0; same && i < x.samplers.size(); ++i) {
+            same = x.samplers[i].binding == y.samplers[i].binding && x.samplers[i].desc.raw == y.samplers[i].desc.raw &&
+                   x.samplers[i].status == y.samplers[i].status;
+        }
+        if (!same) {
+            return no(13);
+        }
+        for (size_t i = 0; i < x.buffers.size(); ++i) {
+            const GS::BufferBinding& p = x.buffers[i];
+            const GS::BufferBinding& q = y.buffers[i];
+            if (p.binding == q.binding && p.kind == q.kind && p.desc.raw == q.desc.raw && p.address == q.address &&
+                p.size == q.size && p.written == q.written && p.formatted == q.formatted && p.status == q.status) {
+                continue;
+            }
+            if (p.binding != q.binding || p.kind != GS::BufferKind::Guest || q.kind != GS::BufferKind::Guest ||
+                p.written || q.written || p.formatted != q.formatted || p.status != GS::ResourceStatus::Ok ||
+                q.status != GS::ResourceStatus::Ok || (p.desc.raw[1] >> 16) != (q.desc.raw[1] >> 16) ||
+                p.desc.raw[3] != q.desc.raw[3] || q.address == 0 || q.size == 0 || q.size > (16u << 10) ||
+                m.ps_buffers >= Cp::RunMember::kMaxBuffers) {
+                return no(14);
+            }
+            m.pb[m.ps_buffers++] = {static_cast<u32>(i), q.address, q.size, q.desc.raw};
+        }
+        u32 pdiff = 0;
+        for (u32 i = 0; i < 16; ++i) {
+            pdiff |= a.user_data[ps][i] != b.user_data[ps][i] ? 1u << i : 0u;
+        }
+        m.own_ps = true;
+        m.own_ps_user_data = (pdiff & pp.module->result.reflection.user_data_used) != 0;
+        m.ps_user_data = b.user_data[ps];
+        if (x.flat.size() != y.flat.size()) {
+            return no(13);
+        }
+        if (!std::equal(x.flat.begin() + 16, x.flat.end(), y.flat.begin() + 16)) {
+            // (its walk's output differs: its whole flattened user data in the run's store)
+            m.own_ps_user_data = true;
+            m.ps_flat_at = static_cast<u32>(lead.member_flat.size());
+            lead.member_flat.insert(lead.member_flat.end(), y.flat.begin(), y.flat.end());
+        }
+        if (srt_diag_) {
+            Bump(srt_by_[a.engine_run & 3].own_ps);
+        }
+    }
+    if (g) {
+        // (its stencil reference at its packet: thread 2 sets it for its draw - the registers are the processor's here)
+        constexpr u32 kDbStencilRefMask = 0xA10C, kDbStencilRefMaskBf = 0xA10D;
+        m.own_stencil = true;
+        m.stencil_ref = cp_->Registers().Get(kDbStencilRefMask);
+        m.stencil_ref_bf = cp_->Registers().Get(kDbStencilRefMaskBf);
     }
     m.seq = b.seq;
     m.packet_addr = b.packet_addr;
@@ -1874,11 +2117,28 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     m.vgt_index_offset = b.vgt_index_offset;
     m.changed = b.changed;
     m.vs_user_data = b.user_data[vs];
-    if (runs_ == 2) {
+    if (runs_ == 2 || gruns_ == 2) {
         // verify: the full preparation of this draw against the first's with its geometry (it must be the same)
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(b, cp_->Registers(), reader_);
         GS::StageView expect = pv;
         std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), expect.plan.flat.begin());
+        if (m.vs_flat_at != Cp::RunMember::kNoFlat) {
+            std::copy_n(lead.member_flat.begin() + m.vs_flat_at, expect.plan.flat.size(), expect.plan.flat.begin());
+        }
+        GS::StageView expect_ps = lead.ps;
+        if (m.own_ps) {
+            std::copy(m.ps_user_data.begin(), m.ps_user_data.end(), expect_ps.plan.flat.begin());
+            if (m.ps_flat_at != Cp::RunMember::kNoFlat) {
+                std::copy_n(lead.member_flat.begin() + m.ps_flat_at, expect_ps.plan.flat.size(),
+                            expect_ps.plan.flat.begin());
+            }
+            for (u32 k = 0; k < m.ps_buffers; ++k) {
+                GS::BufferBinding& bb = expect_ps.plan.buffers[m.pb[k].index];
+                bb.address = m.pb[k].address;
+                bb.size = m.pb[k].size;
+                bb.desc.raw = m.pb[k].desc;
+            }
+        }
         for (u32 i = 0; i < m.streams; ++i) {
             GS::VertexBinding& v = expect.plan.vertices[i];
             v.read = m.v[i].read;
@@ -1897,7 +2157,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
                           frontend_->SharedStage(GS::HwStage::Vs) == nullptr &&
                           frontend_->SharedStage(GS::HwStage::Ps) == nullptr &&
                           SameStageView(frontend_->Stage(GS::HwStage::Vs), expect) &&
-                          SameStageView(frontend_->Stage(GS::HwStage::Ps), lead.ps);
+                          SameStageView(frontend_->Stage(GS::HwStage::Ps), expect_ps);
         run_verified_.store(run_verified_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         if (!same) {
             const u64 n = run_mismatches_.load(std::memory_order_relaxed) + 1;
@@ -1914,6 +2174,12 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
         }
     }
     lead.members.push_back(m);
+    if (srt_diag_) {
+        Bump(srt_by_[a.engine_run & 3].members);
+    }
+    if (g && b.engine_material) {
+        Bump(run_material_joined_);
+    }
     return true;
 }
 
@@ -2262,9 +2528,9 @@ std::string ParallelCp::Report() const {
                            geofast_hits_.load(std::memory_order_relaxed), geofast_verified_.load(std::memory_order_relaxed),
                            geofast_mismatches_.load(std::memory_order_relaxed));
     }
+    const auto ld = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
     if (runs_ != 0) {
         const auto& es = Engine::Render::DrawRuns::Stats();
-        const auto ld = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
         std::string why;
         for (size_t i = 1; i < run_refused_.size(); ++i) {
             why += fmt::format(" {}:{}", i, ld(run_refused_[i]));
@@ -2272,11 +2538,65 @@ std::string ParallelCp::Report() const {
         out += fmt::format("  CITY-OPT Phase 5 engine runs (SSPC_CITY_ENGINE_OPT{}): engine draws tagged - mesh {} of {}, "
                            "shadow {} of {} (no trailing NOP {}); runs {} with {} draws joined (first draws held {}); "
                            "refused (1 full, 2 memory, 3 groups, 4 draw, 5 shaders, 6 other user data, 7 VS user data, "
-                           "8 table read, 9 V#, 10 published meanwhile, 11 verify, 12 VS decoded again refused, 13 other "
-                           "bindings, 14 a buffer not its own constants):{}; verified {} (mismatches {})\n",
+                           "8 table read, 9 V#, 10 published meanwhile, 11 verify, 12 VS/PS decoded again refused, 13 other "
+                           "bindings, 14 a buffer not its own constants, 15 VS walk read a register that differs, 16 another "
+                           "material):{}; verified {} (mismatches {}); instanced mesh draws (0x1a1770) tagged {} of {}{}; "
+                           "materials set (0x448640) {}, G-buffer draws tagged with another material {} (as members {}, "
+                           "joined anyway {})\n",
                            runs_ == 2 ? "=verify" : "", ld(es.tagged[1]), ld(es.calls[1]), ld(es.tagged[2]),
                            ld(es.calls[2]), ld(es.no_nop), ld(run_count_), ld(run_members_), ld(run_leaders_), why,
-                           ld(run_verified_), ld(run_mismatches_));
+                           ld(run_verified_), ld(run_mismatches_), ld(es.tagged[3]), ld(es.calls[3]),
+                           gruns_ != 0 ? fmt::format(" - their runs (SSPC_CITY_ENGINE_GBUFFER_RUNS{})",
+                                                     gruns_ == 2 ? "=verify" : "")
+                                       : std::string{},
+                           ld(es.materials), ld(es.material_tagged), ld(run_material_), ld(run_material_joined_));
+    }
+    if (resources_ != 0 || gruns_ != 0) {
+        std::string why;
+        for (size_t i = 1; i < res_refused_.size(); ++i) {
+            why += fmt::format(" {}:{}", i, ld(res_refused_[i]));
+        }
+        out += fmt::format("  CITY-OPT Phase 6 SRT walks taken again (SSPC_CITY_ENGINE_RESOURCES{}): VS {}, PS {}; "
+                           "walked again for the new registers: VS {}, PS {}; refused (2 not reusable, 3 layout, 4 "
+                           "another key, 5 other bindings, 6 the walk failed):{}\n",
+                           resources_ == 2 ? "=verify" : resources_ == 0 ? "=0" : "", ld(res_walk_vs_), ld(res_walk_ps_),
+                           ld(res_rewalk_vs_), ld(res_rewalk_ps_), why);
+    }
+    if (srt_diag_) {
+        static constexpr const char* kSrc[] = {"untagged", "mesh 0x1a1960", "shadow 0x43d480", "G-buffer 0x1a1770"};
+        const double tpu = Kernel::Clock::TscFrequency() / 1e6;
+        out += "  CITY-OPT Phase 6 draw preparations by engine function (SSPC_DIAG_ENGINE_SRT; us per draw; template "
+               "refusals: 1 not after a prepared draw/memory, 3 groups, 5 programs, 6 PS user data, 7 VS walk, 9 VS user "
+               "data, 10 writes, 11 vertex reads, 12/13 VS/PS decoded again refused, 14 VS walk read a register, 15 "
+               "not asked):\n";
+        for (size_t i = 0; i < srt_by_.size(); ++i) {
+            const SrtDiag& sd = srt_by_[i];
+            const u64 full = ld(sd.full), fast = ld(sd.fast);
+            const double nf = static_cast<double>(std::max<u64>(full, 1));
+            std::string w;
+            for (size_t k = 0; k < sd.why.size(); ++k) {
+                if (ld(sd.why[k]) != 0) {
+                    w += fmt::format(" {}:{}", k, ld(sd.why[k]));
+                }
+            }
+            w += "; run refused for groups";
+            for (size_t k = 0; k < sd.groups.size(); ++k) {
+                if (ld(sd.groups[k]) != 0) {
+                    w += fmt::format(" g{}:{}", k, ld(sd.groups[k]));
+                }
+            }
+            out += fmt::format("    {}: full {} ({:.2f} us, of it the stage copies {:.2f} us; SRT reads {:.1f}, walks VS "
+                               "{:.0f}% PS {:.0f}%, flat {:.1f}/{:.1f} dwords, images {:.1f}, buffers {:.1f}), from the draw "
+                               "before {} ({:.2f} us), run members {} (own PS {}; joining {:.2f} us, refused attempts {} "
+                               "{:.2f} us); why full:{}\n",
+                               kSrc[i], full, ld(sd.t_full) / tpu / nf, ld(sd.t_copy) / tpu / nf, ld(sd.reads) / nf,
+                               100.0 * ld(sd.walk_vs) / nf, 100.0 * ld(sd.walk_ps) / nf, ld(sd.flat_vs) / nf,
+                               ld(sd.flat_ps) / nf, ld(sd.images) / nf, ld(sd.buffers) / nf, fast,
+                               ld(sd.t_fast) / tpu / static_cast<double>(std::max<u64>(fast, 1)), ld(sd.members),
+                               ld(sd.own_ps), ld(sd.t_join) / tpu / static_cast<double>(std::max<u64>(ld(sd.joins), 1)),
+                               ld(sd.refusals),
+                               ld(sd.t_refused) / tpu / static_cast<double>(std::max<u64>(ld(sd.refusals), 1)), w);
+        }
     }
     if (drawcache_) {
         out += fmt::format("  CITY-OPT draw templates (SSPC_CITY_DRAW_CACHE): of those, VS decoded again {}, PS {}; "

@@ -3065,7 +3065,8 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
         }
     }
     DynMemo memo;
-    if (dyn_memo_on_ == 1 && (dyn_memo_ab_ == 0 || (VideoOut::NextFlipId() / dyn_memo_ab_) % 2 == 1)) {
+    if (dyn_memo_on_ == 1 && !stencil_override_ &&
+        (dyn_memo_ab_ == 0 || (VideoOut::NextFlipId() / dyn_memo_ab_) % 2 == 1)) {
         memo.valid = true;
         memo.regs = &r;
         for (size_t i = 0; i < dyn_groups_.size(); ++i) {
@@ -3089,6 +3090,53 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
     }
     SetDynamicStateWhole(r, st, indexed);
     dyn_memo_ = memo; // (off: never valid)
+}
+
+void Executor::SetRunStencilRef(const Cp::RegisterFile& r, u32 front_ref, u32 back_ref) {
+    const u32 dc = r.Get(kDbDepthControl);
+    if (!dyn_.valid || (dc & 1) == 0 || (r.Get(kDbStencilInfo) & 1) == 0) {
+        return; // (no stencil test: the reference and masks do not matter, SetDynamicStateWhole sets none)
+    }
+    const auto& f = Fn();
+    const u32 sc = r.Get(kDbStencilControl);
+    const u32 rc = r.Get(kDbRenderControl);
+    const bool backface = (dc >> 7) & 1;
+    if (!backface) {
+        back_ref = front_ref;
+    }
+    const auto uses_op_val = [&](u32 shift) {
+        for (u32 k = 0; k < 3; ++k) {
+            if (((sc >> (shift + 4 * k)) & 0xF) == 4) { // ReplaceOp: the op value
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool fop = uses_op_val(0), bop = backface ? uses_op_val(12) : fop;
+    const bool clear = (rc >> 1) & 1;
+    const auto set = [&](VkStencilFaceFlags face, u32 ref, bool op_val, DynShadow::Face& have) {
+        const u32 reference = op_val ? (ref >> 24) : (ref & 0xFF);
+        const u32 write_mask = clear ? 0 : (ref >> 16) & 0xFF;
+        const u32 compare_mask = (ref >> 8) & 0xFF;
+        if (reference != have.reference) {
+            f.vkCmdSetStencilReference(cur_.cb, face, reference);
+            have.reference = reference;
+            ++dyn_set_;
+        }
+        if (write_mask != have.write_mask) {
+            f.vkCmdSetStencilWriteMask(cur_.cb, face, write_mask);
+            have.write_mask = write_mask;
+            ++dyn_set_;
+        }
+        if (compare_mask != have.compare_mask) {
+            f.vkCmdSetStencilCompareMask(cur_.cb, face, compare_mask);
+            have.compare_mask = compare_mask;
+            ++dyn_set_;
+        }
+    };
+    set(VK_STENCIL_FACE_FRONT_BIT, front_ref, fop, dyn_.front);
+    set(VK_STENCIL_FACE_BACK_BIT, back_ref, bop, dyn_.back);
+    dyn_memo_.valid = false; // (the state set is not the replica's any more)
 }
 
 void Executor::SetDynamicStateWhole(const Cp::RegisterFile& r, const GS::GraphicsPipelineState& st, bool indexed) {
@@ -3258,7 +3306,10 @@ void Executor::SetDynamicStateWhole(const Cp::RegisterFile& r, const GS::Graphic
         const VkCompareOp bfunc = backface ? CompareOp((dc >> 20) & 7).value : ffunc;
         want_front = {fo[0], fo[1], fo[2], ffunc};
         want_back = {bo[0], bo[1], bo[2], bfunc};
-        const u32 front_ref = r.Get(kDbStencilRefMask), back_ref = backface ? r.Get(kDbStencilRefMaskBf) : front_ref;
+        // (Phase 6: a G-buffer run member recorded in full has its own reference on the run's registers)
+        const u32 fr = stencil_override_ ? stencil_override_ref_ : r.Get(kDbStencilRefMask);
+        const u32 br = stencil_override_ ? stencil_override_bf_ : r.Get(kDbStencilRefMaskBf);
+        const u32 front_ref = fr, back_ref = backface ? br : front_ref;
         const auto uses_op_val = [&](u32 shift) {
             for (u32 k = 0; k < 3; ++k) {
                 if (((sc >> (shift + 4 * k)) & 0xF) == 4) { // ReplaceOp: the op value
@@ -5455,7 +5506,7 @@ bool Executor::RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& of
 }
 
 void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedCommand& pc,
-                              std::span<const Cp::RunMember> members) {
+                              std::span<const Cp::RunMember> members, std::span<const u32> member_flat) {
     const auto& f = Fn();
     const GS::StageView& vs = *pc.stage;
     const GS::FetchShader& fetch = vs.module->result.reflection.fetch;
@@ -5493,10 +5544,11 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
         // its own constant blocks and user data (the shadow casters' instances): descriptors of their own, pushed over
         // the run's (the shadow of what this command buffer has pushed decides what is pushed)
         u32 nw = 0;
-        std::array<VkDescriptorBufferInfo, Cp::RunMember::kMaxBuffers + 1> infos{};
-        std::array<VkWriteDescriptorSet, Cp::RunMember::kMaxBuffers + 1> ws{};
+        constexpr size_t kMaxWrites = 2 * (Cp::RunMember::kMaxBuffers + 1); // (VS and PS: buffers + flattened data)
+        std::array<VkDescriptorBufferInfo, kMaxWrites> infos{};
+        std::array<VkWriteDescriptorSet, kMaxWrites> ws{};
         PushData push = push_last_;
-        if (lean && (m.buffers != 0 || m.own_user_data)) {
+        if (lean && (m.buffers != 0 || m.own_user_data || m.own_ps)) {
             lean = run_push_desc_ && push_layout_ == run_layout_ && (!bind_shadow_ || desc_layout_ == run_layout_);
             stats_.run_why[1] += lean ? 0 : 1;
             const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
@@ -5509,31 +5561,56 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                           .pBufferInfo = &infos[nw]};
                 ++nw;
             };
-            for (u32 k = 0; k < m.buffers && lean; ++k) {
-                VkBuffer buf = VK_NULL_HANDLE;
-                u64 off = 0, avail = 0;
-                lean = RunRange(m.b[k].address, m.b[k].size, align, buf, off, avail);
-                stats_.run_why[2] += lean ? 0 : 1;
-                if (lean) {
-                    const u64 aligned = off & ~(align - 1), adjust = off - aligned;
-                    const u32 index = vs.start.buffer + m.b[k].index;
-                    if (index < push.buf_offsets.size()) {
-                        push.buf_offsets[index] = static_cast<u8>(adjust);
+            // a stage's own constant blocks (the run's plan index, range, V#) at its bindings
+            const auto own_buffers = [&](const GS::StageView& st, std::span<const Cp::RunMember::Buffer> own) {
+                for (u32 k = 0; k < own.size() && lean; ++k) {
+                    VkBuffer buf = VK_NULL_HANDLE;
+                    u64 off = 0, avail = 0;
+                    lean = RunRange(own[k].address, own[k].size, align, buf, off, avail);
+                    stats_.run_why[2] += lean ? 0 : 1;
+                    if (lean) {
+                        const u64 aligned = off & ~(align - 1), adjust = off - aligned;
+                        const u32 index = st.start.buffer + own[k].index;
+                        if (index < push.buf_offsets.size()) {
+                            push.buf_offsets[index] = static_cast<u8>(adjust);
+                        }
+                        add(st.plan.buffers[own[k].index].binding, buf, aligned,
+                            std::min<u64>(own[k].size + adjust, avail + adjust));
                     }
-                    add(vs.plan.buffers[m.b[k].index].binding, buf, aligned,
-                        std::min<u64>(m.b[k].size + adjust, avail + adjust));
                 }
-            }
-            if (lean && m.own_user_data) {
-                const auto fb = std::ranges::find(vs.plan.buffers, GS::BufferKind::Flatbuf, &GS::BufferBinding::kind);
+            };
+            // a stage's own flattened user data: the run's (past the registers: an SRT walk's output, the same for
+            // every member - CITY-OPT Phase 6) with its own registers at the start
+            // (`at`: its own whole flattened data in the run's store - a walk of its own, Phase 6)
+            const auto own_flat = [&](const GS::StageView& st, const std::array<u32, 16>& user_data, u32 at) {
+                const auto fb = std::ranges::find(st.plan.buffers, GS::BufferKind::Flatbuf, &GS::BufferBinding::kind);
                 StreamRing::Slice sl{};
-                const u64 bytes = vs.plan.flat.size() * 4;
-                lean = fb != vs.plan.buffers.end() && bytes == m.vs_user_data.size() * 4 &&
+                const u64 bytes = st.plan.flat.size() * 4;
+                lean = fb != st.plan.buffers.end() && bytes >= user_data.size() * 4 &&
+                       (at == Cp::RunMember::kNoFlat || u64{at} + st.plan.flat.size() <= member_flat.size()) &&
                        ring_.Allocate(bytes, align, cur_.value, sl) == StreamRing::Status::Ok;
                 stats_.run_why[3] += lean ? 0 : 1;
                 if (lean) {
-                    std::memcpy(sl.data, m.vs_user_data.data(), bytes);
+                    if (at != Cp::RunMember::kNoFlat) {
+                        std::memcpy(sl.data, member_flat.data() + at, bytes);
+                    } else {
+                        std::memcpy(sl.data, st.plan.flat.data(), bytes);
+                        std::memcpy(sl.data, user_data.data(), user_data.size() * 4);
+                    }
                     add(fb->binding, sl.buffer, sl.offset, bytes);
+                }
+            };
+            own_buffers(vs, std::span(m.b.data(), m.buffers));
+            if (lean && m.own_user_data) {
+                own_flat(vs, m.vs_user_data, m.vs_flat_at);
+            }
+            if (lean && m.own_ps) {
+                lean = pc.ps != nullptr;
+                if (lean) {
+                    own_buffers(*pc.ps, std::span(m.pb.data(), m.ps_buffers));
+                }
+                if (lean && m.own_ps_user_data) {
+                    own_flat(*pc.ps, m.ps_user_data, m.ps_flat_at);
                 }
             }
             stats_.run_not_resident += lean ? 0 : 1;
@@ -5556,6 +5633,10 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
             }
             *run_view_ = vs;
             std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), run_view_->plan.flat.begin());
+            if (m.vs_flat_at != Cp::RunMember::kNoFlat &&
+                u64{m.vs_flat_at} + run_view_->plan.flat.size() <= member_flat.size()) {
+                std::copy_n(member_flat.begin() + m.vs_flat_at, run_view_->plan.flat.size(), run_view_->plan.flat.begin());
+            }
             for (u32 i = 0; i < m.streams; ++i) {
                 GS::VertexBinding& v = run_view_->plan.vertices[i];
                 v.read = m.v[i].read;
@@ -5571,8 +5652,33 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
             }
             PreparedCommand p = pc;
             p.stage = run_view_.get();
+            if (m.own_ps && pc.ps != nullptr) {
+                // (CITY-OPT Phase 6: its PS registers and constant blocks)
+                d.user_data[static_cast<size_t>(Cp::Stage::Ps)] = m.ps_user_data;
+                if (run_ps_view_ == nullptr) {
+                    run_ps_view_ = std::make_unique<GS::StageView>();
+                }
+                *run_ps_view_ = *pc.ps;
+                std::copy(m.ps_user_data.begin(), m.ps_user_data.end(), run_ps_view_->plan.flat.begin());
+                if (m.ps_flat_at != Cp::RunMember::kNoFlat &&
+                    u64{m.ps_flat_at} + run_ps_view_->plan.flat.size() <= member_flat.size()) {
+                    std::copy_n(member_flat.begin() + m.ps_flat_at, run_ps_view_->plan.flat.size(),
+                                run_ps_view_->plan.flat.begin());
+                }
+                for (u32 k = 0; k < m.ps_buffers; ++k) {
+                    GS::BufferBinding& bb = run_ps_view_->plan.buffers[m.pb[k].index];
+                    bb.address = m.pb[k].address;
+                    bb.size = m.pb[k].size;
+                    bb.desc.raw = m.pb[k].desc;
+                }
+                p.ps = run_ps_view_.get();
+            }
             ++stats_.run_own;
+            stencil_override_ = m.own_stencil;
+            stencil_override_ref_ = m.stencil_ref;
+            stencil_override_bf_ = m.stencil_ref_bf;
             RecordDraw(d, p, t0);
+            stencil_override_ = false;
             continue;
         }
         if (bind_shadow_ && vb_valid_ && vbufs == vb_last_ && voffs == vb_off_last_) {
@@ -5608,6 +5714,9 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
         if (std::memcmp(&push, &push_last_, sizeof(PushData)) != 0) {
             f.vkCmdPushConstants(cur_.cb, run_layout_, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
             push_last_ = push;
+        }
+        if (m.own_stencil && regs_ != nullptr) {
+            SetRunStencilRef(*regs_, m.stencil_ref, m.stencil_ref_bf); // (Phase 6: the mesh's stencil reference)
         }
         // the fetch shader's vertex/instance offsets from its own registers (as RecordDraw)
         u32 vertex_offset = m.vgt_index_offset;

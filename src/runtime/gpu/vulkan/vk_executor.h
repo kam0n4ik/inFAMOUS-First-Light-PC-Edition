@@ -245,8 +245,9 @@ public:
     /// with `prepared` - each only its own vertex/index bindings and draw command on the state `lead` left (its ranges
     /// in video memory, the buffer cache's). One that cannot (`lead` not left as a plain indexed draw, a range not
     /// resident, the batch full) is recorded on its own: `lead`'s preparation with its geometry, its registers.
+    /// `member_flat`: the members' own whole flattened user data (RunMember::vs_flat_at / ps_flat_at; Phase 6)
     void DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedCommand& prepared,
-                        std::span<const Cp::RunMember> members);
+                        std::span<const Cp::RunMember> members, std::span<const u32> member_flat = {});
     /// A draw the hardware does not draw (fast clear elimination, FMASK decompression, primitive None).
     static bool DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& draw);
     /// P4.10: the frontend's memo is told about guest memory changes from here (true) or not (false: the parallel
@@ -606,6 +607,7 @@ private:
     bool batch_done_ = false;
     bool run_ok_ = false;    ///< SSPC_CITY_ENGINE_OPT: the last RecordDraw left a plain indexed draw's state (a run's)
     std::unique_ptr<GS::StageView> run_view_; ///< ... a member recorded on its own: the run's VS with its geometry
+    std::unique_ptr<GS::StageView> run_ps_view_; ///< ... and its PS with its own constant buffers (CITY-OPT Phase 6)
     /// ... a member's own range (GuestRange's read path without a command: resident, or small and streamed)
     bool RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& offset, u64& avail);
     VkPipelineLayout run_layout_ = VK_NULL_HANDLE; ///< ... its pipeline's layout
@@ -721,6 +723,12 @@ private:
     bool PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bind, std::vector<VkWriteDescriptorSet>& writes);
     void SetDynamicState(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
     void SetDynamicStateWhole(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
+    /// CITY-OPT Phase 6: a run member's own DB_STENCILREFMASK / _BF over the run's state - the faces' reference, compare
+    /// and write masks as SetDynamicStateWhole derives them (the other stencil registers are the run's)
+    void SetRunStencilRef(const Cp::RegisterFile& regs, u32 front_ref, u32 back_ref);
+    /// ... and a member recorded in full (RecordDraw on the run's registers): its DB_STENCILREFMASK / _BF instead
+    bool stencil_override_ = false;
+    u32 stencil_override_ref_ = 0, stencil_override_bf_ = 0;
     void RecordFrameCopy();
     /// SSPC_DIAG_CAPTURE_FRAMES: the displayed image of this flip read back (recorded after its copy; P4.5).
     void CaptureSeries(const CachedImage& img, VkFormat shown, u32 w, u32 h);

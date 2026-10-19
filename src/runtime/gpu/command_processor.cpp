@@ -1060,6 +1060,7 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
         const Frame& f = q.frames[q.depth - 1];
         if (u64{f.pos} + 4 <= f.size) {
             d.engine_run = static_cast<u8>(Engine::Render::DrawRuns::TagOf(f.data + f.pos));
+            d.engine_material = Engine::Render::DrawRuns::MaterialChangedOf(f.data + f.pos);
         }
     }
     switch (kind) {

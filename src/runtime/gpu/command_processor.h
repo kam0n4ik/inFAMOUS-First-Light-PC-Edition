@@ -124,6 +124,8 @@ struct DrawDescriptor {
     /// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): the engine function that wrote the draw tagged it in its trailing NOP
     /// (engine/render/draw_runs.h: 1 a mesh draw 0x1a1960, 2 a shadow casters' draw 0x43d480; 0 not tagged)
     u8 engine_run = 0;
+    /// CITY-OPT Phase 6: the tag says the engine set another material since the context's last G-buffer draw
+    bool engine_material = false;
 };
 
 /// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): a draw that joined the run of the engine's tagged draw before it
@@ -154,6 +156,22 @@ struct RunMember {
     std::array<Buffer, kMaxBuffers> b{};
     /// Its VS user data reach the stage (its own copy of the flattened user data, not the first draw's).
     bool own_user_data = false;
+    /// CITY-OPT Phase 6 (SSPC_CITY_ENGINE_GBUFFER_RUNS): its PS user data differ from the first draw's (the per-object
+    /// constant buffer): its own PS buffers (the first draw's PS plan index, range, V#) and, when the stage reads the
+    /// registers that differ, its own PS flattened user data (the first draw's with these registers at its start).
+    bool own_ps = false, own_ps_user_data = false;
+    u32 ps_buffers = 0;
+    std::array<Buffer, kMaxBuffers> pb{};
+    std::array<u32, 16> ps_user_data{};
+    /// Phase 6: a stage walked again for its registers whose flattened user data past the registers differ from the
+    /// first draw's (the walk read its own constant buffer's V# from the CUE's new table): where its whole flattened
+    /// data is in the run's store (ParallelCp's record); kNoFlat: the first draw's with its registers at the start.
+    static constexpr u32 kNoFlat = ~0u;
+    u32 vs_flat_at = kNoFlat, ps_flat_at = kNoFlat;
+    /// Phase 6: a G-buffer member's DB_STENCILREFMASK / _BF (the engine's per-mesh stencil reference, 0x6229a0 - dynamic
+    /// state in Vulkan, not the pipeline's): set before its draw
+    bool own_stencil = false;
+    u32 stencil_ref = 0, stencil_ref_bf = 0;
 };
 
 struct DispatchDescriptor {
