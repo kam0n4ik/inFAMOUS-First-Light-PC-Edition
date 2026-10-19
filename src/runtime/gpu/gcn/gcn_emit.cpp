@@ -839,13 +839,16 @@ bool Emitter::EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt
         u32 comps;
         std::array<u8, 4> bits;
     };
-    // the data formats (dfmt): components and their widths, from bit 0
+    // the data formats (dfmt): components and their widths, from bit 0 - 2_10_10_10 is R10G10B10A2 (x in bits 0-9, w in
+    // 30-31), 10_10_10_2 the same dword read from bit 31 down (x in bits 30-31, w in 0-9): the bridge's (Unpack2_10_10_10;
+    // RemapDataFormat / RemapSwizzle for 10_10_10_2)
     static constexpr Fmt kFmt[15] = {
         {0, {0, 0, 0, 0}},     {1, {8, 0, 0, 0}},    {1, {16, 0, 0, 0}},   {2, {8, 8, 0, 0}},
         {1, {32, 0, 0, 0}},    {2, {16, 16, 0, 0}},  {3, {10, 11, 11, 0}}, {3, {11, 11, 10, 0}},
-        {4, {10, 10, 10, 2}},  {4, {2, 10, 10, 10}}, {4, {8, 8, 8, 8}},    {2, {32, 32, 0, 0}},
+        {4, {2, 10, 10, 10}},  {4, {10, 10, 10, 2}}, {4, {8, 8, 8, 8}},    {2, {32, 32, 0, 0}},
         {4, {16, 16, 16, 16}}, {3, {32, 32, 32, 0}}, {4, {32, 32, 32, 32}},
     };
+    const bool from_top = dfmt == 8;
     if (dfmt > 14 || dfmt == 6 || dfmt == 7) {
         return Decline(fmt::format(" (dfmt {} nfmt {})", dfmt, nfmt)); // (invalid / packed floats / reserved)
     }
@@ -879,7 +882,7 @@ bool Emitter::EmitTypedLoad(const Inst& in, u32 index, u32 n, u32 dfmt, u32 nfmt
             continue;
         }
         const u32 w = f.bits[c];
-        const Id raw = ReadBits(buffer, addr, bit, w);
+        const Id raw = ReadBits(buffer, addr, from_top ? 32 - bit - w : bit, w);
         bit += w;
         const auto sext = [&]() {
             return w == 32 ? Bit(t_i32_, raw) : b_.Op(Op::OpBitFieldSExtract, t_i32_, {Bit(t_i32_, raw), b_.U32(0), b_.U32(w)});
@@ -3019,7 +3022,14 @@ void Emitter::EmitVector(const Inst& in, std::string_view name) {
     };
     const Id lit = in.literal ? Bit(t_f32_, b_.U32(in.lit)) : 0;
     if (name == "v_mov_b32") {
-        Set(d, u(0));
+        // VOP3 modifiers (abs / neg on the source, clamp / omod on the result) make it a float move, as the bridge's
+        // V_MOV (GetSrc<F32>, SetDst) - `v_mov_b32_e64 v3, |v8|`; without them the bits as they are
+        const bool mods = in.format == Format::Vop3 && (((in.w0 >> 8) & 0xF) != 0 || (in.w1 >> 27) != 0);
+        if (mods) {
+            VDstF(in, d, f(0));
+        } else {
+            Set(d, u(0));
+        }
     } else if (name == "v_nop") {
     } else if (name == "v_add_f32") {
         fbin(Op::OpFAdd);

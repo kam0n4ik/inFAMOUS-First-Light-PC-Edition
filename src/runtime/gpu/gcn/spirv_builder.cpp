@@ -226,6 +226,14 @@ Id SpirvBuilder::Op(spv::Op op, Id result_type, std::span<const u32> operands, b
     }
     w.insert(w.end(), operands.begin(), operands.end());
     Append(function_body_, op, w);
+    // float arithmetic exactly as written, never contracted (a * b + c fused) nor reassociated by the driver - as the
+    // bridge's (emit_spirv_floating_point.cpp): two programs computing one position (a depth pre-pass and the pass
+    // that tests EQUAL against it, the bridge's and the own translator's) must give the same bits
+    const bool fma = op == spv::Op::OpExtInst && operands.size() >= 2 && operands[1] == 50; // (GLSLstd450Fma)
+    if (has_result && (op == spv::Op::OpFAdd || op == spv::Op::OpFSub || op == spv::Op::OpFMul ||
+                       op == spv::Op::OpFDiv || fma)) {
+        Decorate(id, spv::Decoration::NoContraction);
+    }
     return id;
 }
 
