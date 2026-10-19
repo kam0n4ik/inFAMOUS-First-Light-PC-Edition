@@ -1,6 +1,7 @@
 // SecondSonPC — a callable copy of a guest function (see guest_code_clone.h).
 #include "native_engine/guest_code_clone.h"
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -125,6 +126,14 @@ bool RelocateCode(std::vector<u8>& code, u64 from, u64 to, u32& relocated, u32& 
     return true;
 }
 
+namespace {
+std::atomic<NearCodeAllocator> g_near_code{nullptr};
+} // namespace
+
+void SetNearCodeAllocator(NearCodeAllocator allocator) {
+    g_near_code.store(allocator);
+}
+
 CloneResult CloneGuestFunction(u64 address, const u8* source, u32 size, std::string& error) {
     CloneResult r;
     std::vector<u8> code(source, source + size);
@@ -138,18 +147,29 @@ CloneResult CloneGuestFunction(u64 address, const u8* source, u32 size, std::str
     }
     static std::mutex lock;
     std::lock_guard guard(lock);
-    u8* mem = AllocateNear(address, size, outside != 0, error);
+    // near code first from the allocator the runtime set (memory that stays RWX and is never freed)
+    u8* mem = nullptr;
+    bool shared = false;
+    if (const NearCodeAllocator near_code = g_near_code.load(); outside != 0 && near_code != nullptr) {
+        mem = reinterpret_cast<u8*>(near_code(address, size));
+        shared = mem != nullptr;
+    }
+    if (mem == nullptr) {
+        mem = AllocateNear(address, size, outside != 0, error);
+    }
     if (mem == nullptr) {
         return r;
     }
     const u64 to = reinterpret_cast<u64>(mem);
     if (!RelocateCode(code, address, to, r.relocated, r.instructions, error)) {
-        VirtualFree(mem, 0, MEM_RELEASE);
+        if (!shared) {
+            VirtualFree(mem, 0, MEM_RELEASE);
+        }
         return r;
     }
     std::memcpy(mem, code.data(), code.size());
     DWORD old = 0;
-    if (!VirtualProtect(mem, code.size(), PAGE_EXECUTE_READ, &old)) {
+    if (!shared && !VirtualProtect(mem, code.size(), PAGE_EXECUTE_READ, &old)) {
         error = fmt::format("VirtualProtect failed ({})", GetLastError());
         VirtualFree(mem, 0, MEM_RELEASE);
         return r;

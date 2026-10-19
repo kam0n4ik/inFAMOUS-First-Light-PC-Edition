@@ -222,6 +222,7 @@ struct Module {
     u64 trampoline = 0;
     u64 trampoline_end = 0;
     u64 cursor = 0;                   // next free trampoline byte (under lock)
+    u64 free_end = 0;                 // end of the patcher's part; above it, code given away (AllocateModuleCode)
     std::atomic<u64> writing_site{0}; // the site whose jump is being written into live code
     SRWLOCK lock = SRWLOCK_INIT;      // one patch at a time in this module
     char name[48]{};
@@ -282,7 +283,7 @@ std::array<u8, 16> JumpBytes(u64 site, u64 target) {
 
 /// Writes the trampoline of `insn` into the module's area (under the module's lock). 0 = no room.
 u64 MakeTrampoline(Module& m, const FsInstruction& insn, u64 site) {
-    if (m.trampoline_end - m.cursor < kTrampolineMax) {
+    if (m.free_end - m.cursor < kTrampolineMax) {
         return 0;
     }
     const u64 at = m.cursor;
@@ -325,7 +326,7 @@ bool AddShortSite(u64 address, const Sse4a::Insn& insn) {
 
 u64 MakeSse4aTrampoline(Module& m, const Sse4a::Insn& insn, u64 site) {
     constexpr u64 kMax = 160; // the longest (insertq, register form) is ~100 bytes
-    if (m.trampoline_end - m.cursor < kMax) {
+    if (m.free_end - m.cursor < kMax) {
         return 0;
     }
     const u64 at = m.cursor;
@@ -700,6 +701,23 @@ bool FsPatcherInstalled() {
     return g_ready.load();
 }
 
+u64 AllocateModuleCode(u64 address, u64 bytes) {
+    Module* m = FindModule(address);
+    if (m == nullptr || bytes == 0) {
+        return 0;
+    }
+    const u64 size = (bytes + 63) & ~u64{63};
+    constexpr u64 kKeep = 4ull << 20; // the patcher's own trampolines keep at least half of the 8 MiB area
+    AcquireSRWLockExclusive(&m->lock);
+    u64 at = 0;
+    if (m->free_end - m->cursor >= size + kKeep) {
+        m->free_end -= size;
+        at = m->free_end;
+    }
+    ReleaseSRWLockExclusive(&m->lock);
+    return at;
+}
+
 bool RegisterModule(u64 code, u64 code_size, u64 trampoline, u64 trampoline_size, std::string_view name) {
     const u64 code_end = code + code_size;
     const u64 trampoline_end = trampoline + trampoline_size;
@@ -725,6 +743,7 @@ bool RegisterModule(u64 code, u64 code_size, u64 trampoline, u64 trampoline_size
     m.trampoline = trampoline;
     m.trampoline_end = trampoline_end;
     m.cursor = trampoline;
+    m.free_end = trampoline_end;
     const size_t n = std::min(name.size(), sizeof(m.name) - 1);
     std::memcpy(m.name, name.data(), n);
     m.name[n] = '\0';

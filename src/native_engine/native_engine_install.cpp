@@ -15,10 +15,12 @@
 
 #include "base/log.h"
 #include "engine/guest_hooks.h"
+#include "native_engine/guest_code_clone.h"
 #include "native_engine/native_engine_verify.h"
 #include "native_engine/native_function_registry.h"
 #include "native_engine/native_measure.h"
 #include "native_engine/reconstructed/frame_scratch.h"
+#include "runtime/cpu/fs_patcher.h"
 #include "runtime/gpu/native_videoout.h"
 
 namespace SecondSon::NativeEngine {
@@ -183,6 +185,7 @@ constexpr Candidate kCandidates[] = {
 
 bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_dir) {
     (void)logs_dir;
+    SetNearCodeAllocator(&Cpu::AllocateModuleCode);
     const std::string list = Env("SSPC_NATIVE_ENGINE_MEASURE");
     std::vector<u64> only;
     if (list != "1") {
@@ -215,6 +218,9 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
 } // namespace Measure
 
 bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_dir) {
+    // clones with outside references go into the eboot's trampoline area: the guest's reservation leaves no free
+    // memory within +-2 GiB of the module (measured: eboot at 0xe2d0000, 20.10.2026)
+    SetNearCodeAllocator(&Cpu::AllocateModuleCode);
     const std::string global = Env("SSPC_NATIVE_ENGINE");
     const std::string measure = Env("SSPC_NATIVE_ENGINE_MEASURE");
     Mode global_mode = Mode::Original;
@@ -263,7 +269,7 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         period = static_cast<u32>(std::strtoul(p.c_str(), nullptr, 10));
     }
 
-    // Static recompilation PoC (docs/NATIVE_ENGINE_RECONSTRUCTION.md §6): SSPC_NATIVE_ENGINE_RECOMP=<dll> - the
+    // Static recompilation PoC (docs/NATIVE_ENGINE_RECONSTRUCTION.md §9): SSPC_NATIVE_ENGINE_RECOMP=<dll> - the
     // machine-translated FrameScratch::Alloc (tools/native-reconstruction/recomp) replaces the hand-written one as
     // frame_alloc's implementation; the install's self-check and the verify/guarded modes judge it the same way.
     if (const std::string dll = Env("SSPC_NATIVE_ENGINE_RECOMP"); !dll.empty()) {

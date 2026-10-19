@@ -77,6 +77,13 @@ bool HandleIllegalInstruction(_EXCEPTION_POINTERS* info);
 /// or bad ranges.
 bool RegisterModule(u64 code, u64 code_size, u64 trampoline, u64 trampoline_size, std::string_view name);
 
+/// Native Engine Reconstruction (src/native_engine): `bytes` (rounded up to 64) of the trampoline area of the
+/// registered module whose code holds `address`, taken from the area's top - the patcher's own trampolines grow from
+/// its bottom and keep at least 4 MiB. For code that must reach the module with rel32 (the guest's reservation leaves
+/// no free memory within ±2 GiB of it). The memory stays read/write/execute and is never given back. 0: no module
+/// holds `address` (e.g. the bridge's CPU patcher runs instead) or no room.
+u64 AllocateModuleCode(u64 address, u64 bytes);
+
 struct StaticResult {
     u64 functions = 0;       // decoded functions
     u64 patched = 0;         // FS instructions rewritten
