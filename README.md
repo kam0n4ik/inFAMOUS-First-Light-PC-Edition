@@ -63,7 +63,7 @@ The bridge functions the game actually calls: `sceAjmInitialize`, `sceAjmModuleR
 | Keyboard / mouse input, pad API | Own |
 | GPU: PM4 command processor | Own |
 | GPU: Vulkan backend (default `--gpu-backend sspc`) | Own |
-| Shader translation GCN → SPIR-V | Own for compute and vertex programs (opt-in), shadPS4's recompiler for the rest by default |
+| Shader translation GCN → SPIR-V | Own, by default for compute, vertex and pixel programs; shadPS4's recompiler is kept only as an A/B reference (`SSPC_OWN_SHADERS=bridge`) |
 | Ajm / ATRAC9 audio decoding | shadPS4 |
 | Common dialogs, a few network / libc functions | shadPS4 |
 | Build without `third_party/shadPS4` | Not yet |
@@ -73,7 +73,8 @@ The bridge functions the game actually calls: `sceAjmInitialize`, `sceAjmModuleR
 The main changes since the first public description:
 
 - **Own Vulkan backend is the default.** The game's GPU command buffers are processed by SecondSonPC's PM4 command processor and recorded into Vulkan by its own executor; the bridge renderer is only a fallback (`--gpu-backend bridge`).
-- **Own shader translator.** Every compute program met in the test scenes and all vertex programs except rect/quad lists are translated by SecondSonPC's GCN → SPIR-V translator in the opt-in mode (details below).
+- **Own shader translator by default.** Compute, vertex and pixel programs (and the auxiliary stages of rect/quad lists) are translated by SecondSonPC's GCN → SPIR-V translator; 0 programs fall back to the bridge in the test scenes (details below).
+- **City performance (CITY-OPT).** In the open city (~12 000 draws per frame) the engine's own draw functions now tag their draws, and runs of draws that differ only in geometry are processed and recorded as one unit: **+16 % FPS** in the city on top of the earlier city optimizations (details under Performance).
 - **Shader cache and preparation window.** Translated shaders and Vulkan pipelines are stored on disk; before the game starts, a preparation window predicts and builds the pipelines the game will need, from the game's own data files (no save scanning).
 - **Upscaling and frame generation.** DLSS Super Resolution, AMD FSR 3.1 Super Resolution and FSR 3.1 Frame Generation inside the game's frame.
 - **Frame pacing.** The emulated 59.94 Hz vblank was the cap of the 1 % lows; the presenter now paces freely with a frame-rate limit (default 60, up to unlimited). The game's clock was measured to be independent of FPS.
@@ -121,28 +122,20 @@ FSR 3.1 Frame Generation: beach 43–53 game frames/s → 86–105 shown; the HU
 
 SecondSonPC's GCN → SPIR-V translator (`src/runtime/gpu/gcn/`): decoder, control-flow graph, structurization, resource analysis with its own SRT walk, and a SPIR-V emitter. It follows the bridge's binding and interface conventions, so its modules can be mixed with the bridge's in one pipeline, and decides per program: an instruction or shape it does not handle sends that program to the bridge's recompiler with the reason logged.
 
-Enable it with the environment variable `SSPC_OWN_SHADERS` (or `play_rea_own.cmd` for compute):
+**It is the default** for compute, vertex and pixel programs. `SSPC_OWN_SHADERS` selects a subset (`cs`, `vs`, `ps` in any combination); `SSPC_OWN_SHADERS=bridge` (`play_rea_bridge.cmd`) uses the bridge's recompiler for everything — kept as the A/B reference.
 
-| Value | Own translator for |
-|---|---|
-| `cs` | compute programs |
-| `cs,vs` | compute and vertex programs |
+| Stage | Own / sent to the bridge (2- and 6-minute gameplay runs) | `spirv-val` |
+|---|---:|---|
+| Compute | 95 / 0, 103 / 0 | all valid |
+| Vertex (incl. rect / quad lists) | 133 / 0, 149 / 0 | all valid |
+| Pixel | 369 / 0, 516 / 0 | all valid |
+| Auxiliary tessellation stages for rect / quad lists | 10 quad modules in game | all valid |
 
-Results (2-minute gameplay run, no cache, synchronous pipeline builds):
-
-| Stage | Own | Sent to the bridge | `spirv-val` |
-|---|---:|---:|---|
-| Compute | 132 translations | 0 | all valid |
-| Vertex | 284 translations | 6 (rect / quad lists) | all valid |
-| Pixel | — | all (in progress) | — |
-
-Offline, over all 10 301 GCN programs in the game's files: 7 820 SPIR-V modules emitted, 7 820 valid.
-
-Covered so far: scalar / vector ALU including 64-bit and double precision, wave64 semantics on 32-lane subgroups, buffer / typed buffer / formatted loads and stores, LDS and GDS, images (load, store, sampling with explicit LOD and texel offsets, cube and 1D views), the fetch shader and vertex attribute formats, position / parameter / clip-distance exports. The picture was checked in game against the bridge's translation.
+Offline, over all 10 301 GCN programs in the game's files: 7 934 modules emitted in the offline test form, all valid (the rest need the game's runtime state, which only the game supplies). Vulkan Validation with Synchronization Validation: 0 messages with the own stages. The picture was checked in game against the bridge's translation. Details: `docs/OWN_SHADER_TRANSLATOR.md`.
 
 ## Performance
 
-The frame is currently limited by **CPU-side command processing and Vulkan recording** (~20–25 ms in heavy scenes, 6–10 thousand draws per frame), not by the GPU. Cutscenes with ~1 200 draws run at 60–90 FPS.
+The frame is currently limited by **CPU-side command processing and Vulkan recording**, not by the GPU: the open city issues ~12 000 draws per frame, the GPU needs ~18 ms of it. Cutscenes with ~1 200 draws run at 60–90 FPS.
 
 Measured improvements (A/B, n = 3, before → after):
 
@@ -150,6 +143,15 @@ Measured improvements (A/B, n = 3, before → after):
 |---|---|---|---|
 | GPU optimizations (`3da31cf`) | 48.1 → 55.1 FPS | 42.6 → 49.9 FPS | 37.3 → 38.6 FPS |
 | Free frame pacing, 1 % low (`2f984a9`) | 29.4 → 48.8 | 29.4 → 46.8 | 29.3 → 35.3 |
+
+**City (CITY-OPT, `SSPC_CITY_PERFORMANCE=1`).** The city's ~12 000 draws per frame went through command processing and Vulkan recording one by one. The engine's two main draw functions (meshes and shadow casters, ~70 % of the draws) are now tagged by small hash-pinned probes in the driver NOP that follows every draw — no extra command dword, the game's code unchanged — and a run of tagged draws that differ only in geometry and instance constants is one record: the first draw is prepared and recorded in full, the others only bind their own vertices, indices and constants. Interleaved runs, n = 3, city:
+
+| City | FPS | 1 % low | command processing | Vulkan recording thread |
+|---|---|---|---|---|
+| before (Phase 1–3 preset) | 25.3 (24.9–25.9) | 17.5 | 33.3 ms | 36.7 ms |
+| with engine draw runs | **29.4 (28.9–30.5)** | **21.4** | 31.5 ms | **27.7 ms** |
+
+Checked: every joined draw also prepared in full and compared (21.9 M draws, 0 different), the command processor's registers against the recording thread's copy (0 different), Vulkan Validation + Sync (0 messages), frame captures (depth and shadow maps bit-exact). Details: `docs/CITY_ENGINE_OPTIMIZATION.md`, `docs/CITY_PERFORMANCE.md`.
 
 Performance work is done by controlled A/B runs; rejected experiments are documented (`docs/GPU_OPTIMIZATION.md`, `docs/FRAMEBREAK.md`, `docs/LIGHTING_PROFILE.md`). No quality setting, light or shadow is reduced to gain FPS.
 
@@ -191,7 +193,8 @@ SecondSonPC loader and runtime
 SecondSonPC GPU
         +-- PM4 command processor (graphics + async compute)
         +-- shader frontend: SRT walk, resource plans, specialization keys
-        +-- GCN -> SPIR-V: own translator (compute, vertex) / bridge recompiler (rest)
+        +-- GCN -> SPIR-V: own translator (default; bridge recompiler as A/B reference)
+        +-- engine draw runs: hash-pinned probes tag the engine's draws (CITY-OPT)
         +-- shader + pipeline disk cache, static pipeline prediction
         +-- Vulkan executor: descriptors, memory import, barriers, write-back
         +-- presenter: frame pacing, DLSS / FSR upscaling, FSR frame generation
@@ -202,8 +205,7 @@ Vulkan driver
 
 ## Known issues
 
-- FPS is bound by CPU command processing in dense scenes (foliage, city streets).
-- Pixel shaders, rect/quad-list vertex shaders and auxiliary tessellation stages still use the bridge's recompiler.
+- FPS is bound by CPU command processing in dense scenes (foliage, city streets): ~30 FPS in the open city on the development machine, far from 60.
 - Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4; the build still needs `third_party/shadPS4`.
 - On a machine without a page file, total committed memory can reach the Windows limit in long sessions (32 GB RAM); fixed causes are documented in `docs/KNOWN_ISSUES.md`, long-session soak testing continues.
 - Frame generation has not been reviewed frame by frame; input latency with it is not measured.
@@ -224,14 +226,16 @@ Vulkan driver
 - [x] Shader / pipeline disk cache, static pipeline prediction, preparation window
 - [x] DLSS / FSR 3.1 upscaling, FSR 3.1 frame generation
 - [x] Free frame pacing
-- [ ] Faster command recording (the current FPS limit)
+- [x] City: draw runs from the engine's draw functions (CITY-OPT, +16 % FPS)
+- [ ] Faster command processing for the remaining draws (the current FPS limit)
 
 ### Own shader translator
 - [x] Compute programs
-- [x] Vertex programs (except rect / quad lists)
-- [ ] Pixel programs: interpolation, colour / depth exports, implicit-LOD sampling
-- [ ] Rect / quad lists and auxiliary stages
-- [ ] Own translator by default
+- [x] Vertex programs
+- [x] Pixel programs: interpolation, colour / depth exports, implicit-LOD sampling
+- [x] Rect / quad lists and auxiliary stages (quad lists seen in game; rect lists only validated offline)
+- [x] Own translator by default
+- [ ] Other districts, fights and story scenes run through the own translator
 
 ### Independence
 - [ ] Remove the bridge (`src/bridge/shadps4`)
