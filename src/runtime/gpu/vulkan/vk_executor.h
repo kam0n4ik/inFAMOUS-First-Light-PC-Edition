@@ -25,6 +25,7 @@
 #include "runtime/gpu/command_processor.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/shader/gcn_program.h"
+#include "runtime/gpu/vulkan/vk_instancing.h"
 #include "runtime/gpu/vulkan/vk_api.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
@@ -92,6 +93,15 @@ struct ExecutorStats {
     /// SSPC_CITY_BATCH: draws recorded as one draw (batches, the draws in them, batches recorded draw by draw after all)
     u64 draw_batches = 0, batched_draws = 0, batch_fallbacks = 0;
     std::array<u64, 16> batch_rejects{}; ///< ... the next draw not batchable, by the first check it failed
+    /// ... check 1 (not a plain draw): not indexed, indirect, instances, not a list, index count, past the index buffer's
+    /// size, index type, stages
+    std::array<u64, 8> batch_plain{};
+    /// SSPC_CITY_INSTANCING: batches recorded as one multi-draw with their draws' own constants (and their draws), of
+    /// them recorded draw by draw after all (the patched pipeline not built yet, a block not current), patches refused
+    u64 inst_batches = 0, inst_draws = 0, inst_fallbacks = 0, inst_patch_refused = 0;
+    u64 inst_calls = 0; ///< vkCmdDrawMultiIndexedEXT calls (a batch: one per run of the same instance count)
+    u64 inst_no_pipeline = 0, inst_not_current = 0; ///< fallbacks: the patched pipeline not built yet / a block not current
+    u64 zc_batches = 0, zc_draws = 0; ///< batches (draws) drawn from their ranges in video memory, nothing copied
     /// SSPC_CITY_GEOMETRY_CACHE: batches drawn from their kept geometry, kept ones whose sources changed, geometry built
     /// (and its bytes), built into an arena (kept), arenas recycled
     u64 geo_hits = 0, geo_changed = 0, geo_builds = 0, geo_built_bytes = 0, geo_stored = 0, geo_recycles = 0;
@@ -223,6 +233,7 @@ public:
     /// and index ranges the CPU wrote, VS user data the shader does not read) its own. The registers are `first`'s.
     bool Batchable(const Cp::DrawDescriptor& first, const PreparedCommand& a, const Cp::DrawDescriptor& next,
                    const PreparedCommand& b);
+    u8 LastBatchReject() const { return last_batch_reject_; } ///< the last refusal's check (SSPC_DIAG_PREP_CENSUS)
     /// Records `draws` (each Batchable after the first) as one draw: their vertices copied one after another into the
     /// stream ring, their indices moved to them (32-bit) - the primitives in the same order. false: a range could not be
     /// copied so - the first draw was recorded on its own (as DrawPrepared), the caller records the others.
@@ -608,9 +619,39 @@ private:
     int stream_who_on_ = -1;
     u32 stream_pipe_ = 0; ///< the draw being recorded (its pipeline + 1; 0 other commands)
     std::unordered_map<u32, std::array<u64, 2>> stream_who_; ///< pipeline + 1 -> ranges, bytes
+    u8 last_batch_reject_ = 0;
     /// per module: its SPIR-V reads no vertex index / primitive ID (a batch moves both)
     std::unordered_map<const GS::Module*, bool> batch_modules_;
+    /// SSPC_CITY_INSTANCING=1 (CITY-OPT Phase 4, vk_instancing.h): a batch whose draws differ in VS constant buffers too -
+    /// every draw's block copied at a stride into one buffer, the stage patched to read its own at DrawIndex * stride,
+    /// recorded as one vkCmdDrawMultiIndexedEXT
+    int inst_on_ = -1;
+    u32 inst_ab_ = 0;
+    /// (module id << 8 | buffer): the stage reads that buffer only through buf_offsets extracts the patch moves, and its
+    /// V#'s words in the flattened user data only for the stride (the same in every draw of a batch)
+    std::unordered_map<u64, bool> inst_buffer_ok_;
+    struct InstVariant {
+        std::unique_ptr<GS::Module> module; ///< the patched stage (nullptr: the patch failed)
+        std::unordered_map<u32, u32> pipeline_ids; ///< the frontend's pipeline -> the patched one's id
+    };
+    std::unordered_map<u64, InstVariant> inst_variants_; ///< (module id, the buffers and strides) -> the patched stage
+    u32 inst_next_module_ = 0x40000000u, inst_next_pipeline_ = 0x80000000u;
+    std::vector<InstancedBuffer> inst_bufs_;            ///< the batch being recorded: its buffers that differ
+    std::vector<std::pair<u32, VkDescriptorBufferInfo>> inst_bind_; ///< BindStage: those buffers' copies (index, info)
+    std::vector<VkMultiDrawIndexedInfoEXT> inst_draws_;
+    std::vector<std::pair<u32, VkDescriptorBufferInfo>> inst_runs_; ///< the copies' descriptors (binding, info)
+    bool InstancingOn();
+    bool InstanceBufferOk(const GS::StageView& vs, size_t buffer);
+    /// The patched stage for inst_bufs_ (nullptr: cannot be patched).
+    InstVariant* InstancedVariant(const GS::Module& vs);
+    /// inst_bind_: every draw's block of each of inst_bufs_ copied at its stride (false: a block not current on the host)
+    bool GatherInstanced(u64 align);
     bool BatchModuleOk(const GS::Module* m, bool vertex);
+    /// SSPC_CITY_INSTANCING: a batch whose vertex and index ranges are all in video memory, one buffer per stream - drawn
+    /// where they are as a multi-draw (inst_draws_: each draw's firstIndex / vertexOffset); false: not so
+    bool ZeroCopyBatch(const GS::StageView& vs, std::array<VkBuffer, 16>& vbufs, std::array<VkDeviceSize, 16>& voffs,
+                       VkBuffer& ibuf, u64& ioff);
+    std::vector<u64> zc_voff_, zc_ioff_;
     bool BatchGeometry(const GS::StageView& vs, std::array<VkBuffer, 16>& vbufs, std::array<VkDeviceSize, 16>& voffs,
                        VkBuffer& ibuf, u64& ioff, u32& count);
 

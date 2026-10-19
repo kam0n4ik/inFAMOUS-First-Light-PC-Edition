@@ -2303,10 +2303,23 @@ std::string Backend::Report() {
                            "batchable by check {}\n",
                            s.binds_skipped, s.push_constants_skipped, s.dyn_memo_hits, s.batched_draws, s.draw_batches,
                            s.batch_fallbacks, fmt::join(s.batch_rejects, " "));
+        if (s.batch_plain != decltype(s.batch_plain){}) {
+            out += fmt::format("  not batchable as not a plain draw: not indexed, indirect, instances, not a list, index "
+                               "count, past the index buffer, index type, stages: {}\n",
+                               fmt::join(s.batch_plain, " "));
+        }
         out += fmt::format("batch geometry (SSPC_CITY_GEOMETRY_CACHE): drawn from kept geometry {}, kept geometry whose "
                            "sources changed {}, built {} ({} MiB; kept {}), arenas recycled {}\n",
                            s.geo_hits, s.geo_changed, s.geo_builds, s.geo_built_bytes >> 20, s.geo_stored,
                            s.geo_recycles);
+        if (s.inst_batches != 0 || s.inst_fallbacks != 0 || s.inst_patch_refused != 0) {
+            out += fmt::format("draws with their own constants (SSPC_CITY_INSTANCING): {} draws in {} batches, {} "
+                               "batches recorded draw by draw (pipeline not built yet, constants not current), patches "
+                               "refused {}; multi-draw calls {}; fallbacks: pipeline not built yet {}, constants not "
+                               "current {}; batches drawn from video memory without a copy {} ({} draws)\n",
+                               s.inst_draws, s.inst_batches, s.inst_fallbacks, s.inst_patch_refused, s.inst_calls,
+                               s.inst_no_pipeline, s.inst_not_current, s.zc_batches, s.zc_draws);
+        }
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",
                            s.wb_bytes_by[0] >> 20, s.wb_bytes_by[1] >> 20, s.wb_bytes_by[2] >> 20, s.flushes_full);

@@ -52,6 +52,8 @@ struct DeviceCaps {
     bool attachment_feedback_loop = false;
     bool image_view_min_lod = false;
     bool maintenance5 = false;
+    /// VK_EXT_multi_draw with shaderDrawParameters (enabled only with SSPC_CITY_INSTANCING=1)
+    bool multi_draw = false;
     bool swapchain_maintenance1 = false; ///< present fences: required for safe native presentation teardown
     bool low_latency = false; ///< VK_NV_low_latency2 + the presentId feature (NVIDIA Reflex)
     bool debug_utils = false;

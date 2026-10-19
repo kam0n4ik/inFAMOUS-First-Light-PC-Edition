@@ -2719,6 +2719,14 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             if (b.status != GS::ResourceStatus::Ok || b.size == 0 || b.address == 0) {
                 break; // a null descriptor: robustness2 reads zeros (the bridge binds null for base 0 / size 0)
             }
+            if (const auto ov = std::ranges::find(inst_bind_, index, &std::pair<u32, VkDescriptorBufferInfo>::first);
+                ov != inst_bind_.end()) {
+                info = ov->second; // SSPC_CITY_INSTANCING: every draw's block of the batch, at the stride (aligned)
+                if (index < push.buf_offsets.size()) {
+                    push.buf_offsets[index] = 0;
+                }
+                break;
+            }
             VkBuffer vb = VK_NULL_HANDLE;
             u64 voff = 0, vavail = 0;
             if (!GuestRange(b.address, b.size, b.written, align, vb, voff, vavail)) {
@@ -3474,10 +3482,291 @@ bool Executor::BatchModuleOk(const GS::Module* m, bool vertex) {
     return ok;
 }
 
+namespace {
+
+/// SSPC_CITY_INSTANCING: the largest constant block a draw of a multi-draw has (its copy is taken per draw)
+constexpr u64 kInstMaxBytes = 4096;
+
+/// The user data registers a descriptor is read from (bit i: register i; past the registers: none).
+u32 SharpSlots(const GS::SharpLocation& loc) {
+    u32 m = 0;
+    for (u32 i = 0; i < 4; ++i) {
+        u32 o = 16;
+        if (loc.summary == GS::SharpLocation::Summary::SingleLoad) {
+            o = loc.offsets[0] + i;
+        } else if (loc.summary == GS::SharpLocation::Summary::MultiLoad && ((loc.load_mask >> i) & 1) != 0) {
+            o = loc.offsets[i];
+        }
+        m |= o < 16 ? 1u << o : 0u;
+    }
+    return m;
+}
+
+/// The stride class of a constant block of `bytes` (a few patched variants per stage, not one per size).
+u32 InstStride(u64 bytes) {
+    return bytes <= 256 ? 256u : bytes <= 1024 ? 1024u : 4096u;
+}
+
+} // namespace
+
+bool Executor::InstancingOn() {
+    if (inst_on_ < 0) {
+        char v[16] = {};
+        const std::string_view sv(v, GetEnvironmentVariableA("SSPC_CITY_INSTANCING", v, sizeof(v)) < sizeof(v)
+                                         ? std::strlen(v)
+                                         : 0);
+        inst_on_ = sv == "1" || sv.starts_with("ab:") ? 1 : 0;
+        inst_ab_ = sv.starts_with("ab:") ? std::max<u32>(1, static_cast<u32>(std::strtoul(v + 3, nullptr, 10))) : 0;
+        if (inst_on_ == 1 && (!ctx_.Caps().multi_draw || Fn().vkCmdDrawMultiIndexedEXT == nullptr)) {
+            SSPC_LOG(GPU, Warning, "SSPC_CITY_INSTANCING=1: the device has no VK_EXT_multi_draw with shaderDrawParameters "
+                                   "- off");
+            inst_on_ = 0;
+        } else if (inst_on_ == 1) {
+            SSPC_LOG(GPU, Info, "SSPC_CITY_INSTANCING={}: batches of draws differing in VS constants too, as one "
+                                "multi-draw (each draw's constants at DrawIndex * stride)", sv);
+        }
+    }
+    // =ab:<n>: in odd blocks of n flips only (image A/B in one run)
+    return inst_on_ == 1 && (inst_ab_ == 0 || (VideoOut::NextFlipId() / inst_ab_) % 2 == 1);
+}
+
+bool Executor::InstanceBufferOk(const GS::StageView& vs, size_t buffer) {
+    const u64 key = (u64{vs.module->id} << 8) | buffer;
+    if (const auto it = inst_buffer_ok_.find(key); it != inst_buffer_ok_.end()) {
+        return it->second;
+    }
+    bool& ok = inst_buffer_ok_[key];
+    ok = false;
+    const auto no = [&](std::string_view why) {
+        if (inst_buffer_ok_.size() <= 400) {
+            SSPC_LOG(GPU, Info, "SSPC_CITY_INSTANCING: VS {:#x} (module {}) buffer {} not instanced: {}", vs.address,
+                     vs.module->id, buffer, why);
+        }
+        return false;
+    };
+    const GS::ShaderReflection& r = vs.module->result.reflection;
+    const std::vector<u32>& w = vs.module->result.spirv;
+    if (buffer >= r.buffers.size() || r.buffers[buffer].kind != GS::BufferKind::Guest || w.size() < 5 ||
+        vs.plan.buffers.size() != r.buffers.size()) {
+        return no("not a guest buffer of the module's reflection");
+    }
+    // the patch itself (the stage reads the buffer through the translator's buf_offsets extracts only)
+    std::vector<u32> patched;
+    std::string why;
+    const InstancedBuffer ib{static_cast<u32>(vs.start.buffer + buffer), 256};
+    if (!PatchDrawIndexOffsets(w, std::span(&ib, 1), patched, why)) {
+        ++stats_.inst_patch_refused;
+        return no(why);
+    }
+    // the V#'s words in the flattened user data (the batch binds the first draw's): read only as the stride
+    // (bitfieldExtract(word 1, 16, 14), the same in every draw), never at an index not known here
+    const u32 slots = SharpSlots(r.buffers[buffer].sharp);
+    const GS::SharpLocation& loc = r.buffers[buffer].sharp;
+    const u32 stride_word = loc.summary == GS::SharpLocation::Summary::SingleLoad ? loc.offsets[0] + 1u
+                            : ((loc.load_mask >> 1) & 1) != 0                    ? loc.offsets[1]
+                                                                                 : 16u;
+    u32 flat_binding = ~0u;
+    for (const GS::BufferBinding& b : vs.plan.buffers) {
+        flat_binding = b.kind == GS::BufferKind::Flatbuf ? b.binding : flat_binding;
+    }
+    if (flat_binding == ~0u) {
+        ok = true; // (no flattened user data: the V#'s words are not read at all)
+        return true;
+    }
+    std::vector<size_t> at;
+    for (size_t i = 5; i < w.size();) {
+        const u32 n = w[i] >> 16;
+        if (n == 0 || i + n > w.size()) {
+            return false;
+        }
+        at.push_back(i);
+        i += n;
+    }
+    // uses of values are looked for in the function only (the globals' literals - capabilities, constants' values -
+    // are not ids)
+    std::vector<size_t> code;
+    for (const size_t i : at) {
+        if ((w[i] & 0xFFFF) == 54 || !code.empty()) { // from OpFunction on
+            code.push_back(i);
+        }
+    }
+    std::unordered_map<u32, u32> constants; // OpConstant (32-bit) -> value
+    std::unordered_set<u32> flat_vars;
+    for (const size_t i : at) {
+        const u32 op = w[i] & 0xFFFF, n = w[i] >> 16;
+        if (op == 43 && n == 4) {
+            constants[w[i + 2]] = w[i + 3];
+        } else if (op == 71 && n == 4 && w[i + 2] == 33 && w[i + 3] == flat_binding) { // OpDecorate Binding
+            flat_vars.insert(w[i + 1]);
+        }
+    }
+    if (flat_vars.size() != 1) {
+        return no("no single variable of the flattened user data");
+    }
+    const u32 flat_var = *flat_vars.begin();
+    std::unordered_map<u32, u32> word_ptrs; // a pointer to flat[c] for c among the V#'s words -> c
+    for (const size_t i : code) {
+        const u32 op = w[i] & 0xFFFF, n = w[i] >> 16;
+        for (size_t j = i + 1; j < i + n; ++j) {
+            if (w[j] != flat_var || (op == 59 && j == i + 2) || op == 71 || op == 72 || op == 5 || op == 6) {
+                continue; // (its own OpVariable and decorations)
+            }
+            if (op == 15) {
+                continue; // (the entry point's interface)
+            }
+            // only OpAccessChain %ptr %flat %0 %const (the translator's FlatDword); anything else: not proven
+            if ((op != 65 && op != 66) || j != i + 3 || n != 6) {
+                return no(fmt::format("the flattened user data used by op {}", op));
+            }
+            const auto c = constants.find(w[i + 5]);
+            if (c == constants.end()) {
+                return no("the flattened user data at an index not known"); // (it could be one of the V#'s words)
+            }
+            if (c->second < 16 && ((slots >> c->second) & 1) != 0) {
+                word_ptrs[w[i + 2]] = c->second;
+            }
+        }
+    }
+    // each such word: loaded, the value only extracted at bits 16..29 of word 1 - or parked in a register variable
+    // nothing reads (the translator copies every user SGPR at the entry; a variable only stored to is dead)
+    std::unordered_set<u32> dead_vars;
+    {
+        std::unordered_map<u32, bool> fvars; // Function variable -> read somewhere
+        for (const size_t i : code) {
+            if ((w[i] & 0xFFFF) == 59 && (w[i] >> 16) >= 4 && w[i + 3] == 7) { // OpVariable Function
+                fvars[w[i + 2]] = false;
+            }
+        }
+        for (const size_t i : code) {
+            const u32 op = w[i] & 0xFFFF, n = w[i] >> 16;
+            for (size_t j = i + 1; j < i + n; ++j) {
+                const auto v = fvars.find(w[j]);
+                if (v == fvars.end() || (op == 59 && j == i + 2) || (op == 62 && j == i + 1) || op == 5) {
+                    continue; // (its definition, a store into it, its name)
+                }
+                v->second = true;
+            }
+        }
+        for (const auto& [v, read] : fvars) {
+            if (!read) {
+                dead_vars.insert(v);
+            }
+        }
+    }
+    std::unordered_set<u32> loads, dead_only;
+    for (const size_t i : code) {
+        const u32 op = w[i] & 0xFFFF, n = w[i] >> 16;
+        for (size_t j = i + 1; j < i + n; ++j) {
+            const auto p = word_ptrs.find(w[j]);
+            if (p == word_ptrs.end() || (j == i + 2 && (op == 65 || op == 66))) {
+                continue; // (the pointer's own definition)
+            }
+            if (op != 61 || j != i + 3) {
+                return no(fmt::format("the V#'s word {} used by op {}", p->second, op));
+            }
+            loads.insert(w[i + 2]);
+            if (p->second != stride_word) {
+                dead_only.insert(w[i + 2]); // (another word of the V#: only into a dead variable)
+            }
+        }
+    }
+    for (const size_t i : code) {
+        const u32 op = w[i] & 0xFFFF, n = w[i] >> 16;
+        for (size_t j = i + 1; j < i + n; ++j) {
+            if (!loads.contains(w[j]) || (op == 61 && j == i + 2)) {
+                continue;
+            }
+            if (op == 62 && j == i + 2 && dead_vars.contains(w[i + 1])) {
+                continue; // OpStore %dead %value
+            }
+            const auto off = constants.find(n == 6 ? w[i + 4] : 0);
+            const auto cnt = constants.find(n == 6 ? w[i + 5] : 0);
+            if (dead_only.contains(w[j]) || op != 203 || j != i + 3 || off == constants.end() || cnt == constants.end() ||
+                off->second != 16 || cnt->second != 14) {
+                return no(fmt::format("a word of the V# used by op {}", op));
+            }
+        }
+    }
+    ok = true;
+    return true;
+}
+
+Executor::InstVariant* Executor::InstancedVariant(const GS::Module& vs) {
+    u64 key = vs.id;
+    for (const InstancedBuffer& b : inst_bufs_) {
+        key = (key ^ (u64{b.index} << 40) ^ (u64{b.stride} << 16)) * 0x100000001B3ull;
+    }
+    auto [it, fresh] = inst_variants_.try_emplace(key);
+    InstVariant& v = it->second;
+    if (fresh) {
+        std::vector<u32> patched;
+        std::string why;
+        if (!PatchDrawIndexOffsets(vs.result.spirv, inst_bufs_, patched, why)) {
+            ++stats_.inst_patch_refused;
+            SSPC_LOG(GPU, Warning, "SSPC_CITY_INSTANCING: module {} not patched: {}", vs.id, why);
+            return &v; // (module stays nullptr: never again)
+        }
+        auto m = std::make_unique<GS::Module>();
+        m->id = inst_next_module_++; // (ids of the translated modules count from 1: no clash)
+        m->key = vs.key;
+        m->keyed = true;
+        m->result = vs.result;
+        m->result.spirv = std::move(patched);
+        m->runtime = vs.runtime;
+        m->start = vs.start;
+        m->prepared = true;
+        m->spirv_hash = GS::HashSpirv(m->result.spirv);
+        m->state.store(GS::ModuleState::Ready, std::memory_order_release);
+        if (char d[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_INSTANCING_DUMP", d, sizeof(d)) == 1 && d[0] == '1') {
+            // (diagnostics: the original and the patched stage, for spirv-val / spirv-dis)
+            const auto dir = options_.capture_path.parent_path();
+            for (const auto& [name, code] : {std::pair<const char*, const std::vector<u32>*>{"orig", &vs.result.spirv},
+                                     std::pair<const char*, const std::vector<u32>*>{"inst", &m->result.spirv}}) {
+                std::ofstream(dir / fmt::format("instancing_{}_{}_{}.spv", vs.id, m->id, name), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(code->data()), static_cast<std::streamsize>(code->size() * 4));
+            }
+        }
+        v.module = std::move(m);
+    }
+    return &v;
+}
+
+bool Executor::GatherInstanced(u64 align) {
+    inst_bind_.clear();
+    const u64 completed = timeline_.CompletedCached();
+    const u32 n = static_cast<u32>(batch_.size());
+    for (const InstancedBuffer& ib : inst_bufs_) {
+        const u64 bytes = u64{ib.stride} * n;
+        StreamRing::Slice sl{};
+        if (ring_.Allocate(bytes, align, cur_.value, sl) != StreamRing::Status::Ok) {
+            return false;
+        }
+        for (u32 k = 0; k < n; ++k) {
+            const GS::StageView& v = *batch_[k].prepared.stage;
+            const GS::BufferBinding& b = v.plan.buffers[ib.index - v.start.buffer];
+            u8* dst = sl.data + u64{k} * ib.stride;
+            if (b.size > ib.stride || buffers_.HostWritePending(b.address, b.size) ||
+                TimelineWritePending(b.address, b.size) || buffers_.GpuWritePending(b.address, b.size, completed) ||
+                buffers_.KeptBack(b.address, b.size)) {
+                return false; // (the bytes on the host are not the current ones)
+            }
+            const u8* src = guest_.BackingPointer(b.address, b.size);
+            if (src == nullptr) {
+                return false;
+            }
+            std::memcpy(dst, src, b.size);
+            std::memset(dst + b.size, 0, ib.stride - b.size); // (past the block: zeros, as a robust read past it)
+        }
+        inst_bind_.push_back({ib.index, VkDescriptorBufferInfo{sl.buffer, sl.offset, bytes}});
+    }
+    return true;
+}
+
 bool Executor::Batchable(const Cp::DrawDescriptor& a, const PreparedCommand& pa, const Cp::DrawDescriptor& b,
                          const PreparedCommand& pb) {
     using G = Cp::Group;
     const auto Reject = [&](size_t why) {
+        last_batch_reject_ = static_cast<u8>(why);
         ++stats_.batch_rejects[std::min(why, stats_.batch_rejects.size() - 1)];
         return false;
     };
@@ -3488,15 +3777,32 @@ bool Executor::Batchable(const Cp::DrawDescriptor& a, const PreparedCommand& pa,
     if ((b.changed & ~kGeometryGroups) != 0) {
         return Reject(2);
     }
-    const auto plain = [](const Cp::DrawDescriptor& d) {
+    // SSPC_CITY_INSTANCING: draws of several instances too - as one multi-draw each draw keeps its instances together
+    // (one draw as one would draw instance by instance: the primitives in another order)
+    const bool multi = InstancingOn();
+    const auto plain = [multi](const Cp::DrawDescriptor& d) {
         // a direct, indexed, single-instance triangle list of VS + PS (lists: one after another they stay lists)
-        return d.indexed && !d.indirect && d.instance_count <= 1 && d.primitive_type == 4 && d.index_count != 0 &&
+        return d.indexed && !d.indirect && (d.instance_count <= 1 || multi) && d.primitive_type == 4 && d.index_count != 0 &&
                d.index_count % 3 == 0 && d.index_count <= d.max_index_size && (d.index_type & 3) <= 1 &&
                d.active_stages == ((1u << static_cast<u32>(Cp::Stage::Vs)) | (1u << static_cast<u32>(Cp::Stage::Ps)));
     };
-    if (!plain(a) || !plain(b) || a.queue != b.queue || a.index_type != b.index_type || a.cb_extent != b.cb_extent ||
-        a.db_extent != b.db_extent ||
-        !std::equal(a.shaders.begin(), a.shaders.end(), b.shaders.begin(),
+    if (!plain(a) || !plain(b)) {
+        const Cp::DrawDescriptor& x = plain(a) ? b : a;
+        ++stats_.batch_plain[!x.indexed                               ? 0
+                             : x.indirect                             ? 1
+                             : x.instance_count > 1                   ? 2
+                             : x.primitive_type != 4                  ? 3
+                             : x.index_count == 0 || x.index_count % 3 ? 4
+                             : x.index_count > x.max_index_size       ? 5
+                             : (x.index_type & 3) > 1                 ? 6
+                                                                      : 7];
+        return Reject(1);
+    }
+    if (a.queue != b.queue || a.index_type != b.index_type || a.cb_extent != b.cb_extent || a.db_extent != b.db_extent ||
+        (!multi && std::max<u32>(a.instance_count, 1) != std::max<u32>(b.instance_count, 1))) {
+        return Reject(15);
+    }
+    if (!std::equal(a.shaders.begin(), a.shaders.end(), b.shaders.begin(),
                     [](const Cp::ShaderRef& x, const Cp::ShaderRef& y) {
                         return x.address == y.address && x.rsrc1 == y.rsrc1 && x.rsrc2 == y.rsrc2;
                     }) ||
@@ -3537,7 +3843,8 @@ bool Executor::Batchable(const Cp::DrawDescriptor& a, const PreparedCommand& pa,
                });
     };
     // the flattened user data: the walk's copies the same, the registers the shader reads the same
-    const auto same_flat = [](const GS::StageView& x, const GS::StageView& y) {
+    u32 inst_slots = 0; // SSPC_CITY_INSTANCING: the user data of the V#s of the VS buffers that differ
+    const auto same_flat = [&inst_slots](const GS::StageView& x, const GS::StageView& y) {
         const std::vector<u32>& f = x.plan.flat;
         const std::vector<u32>& g = y.plan.flat;
         if (f.size() != g.size() || f.size() < 16 ||
@@ -3554,7 +3861,7 @@ bool Executor::Batchable(const Cp::DrawDescriptor& a, const PreparedCommand& pa,
                 fetch_only |= 3u << at.sgpr_base;
             }
         }
-        const u16 used = static_cast<u16>(x.module->result.reflection.user_data_used & ~fetch_only);
+        const u16 used = static_cast<u16>(x.module->result.reflection.user_data_used & ~fetch_only & ~inst_slots);
         for (u32 i = 0; i < 16; ++i) {
             if (((used >> i) & 1) != 0 && f[i] != g[i]) {
                 return false;
@@ -3563,7 +3870,30 @@ bool Executor::Batchable(const Cp::DrawDescriptor& a, const PreparedCommand& pa,
         return true;
     };
     if (!same_buffers(va.plan, vb.plan)) {
-        return Reject(6);
+        // SSPC_CITY_INSTANCING: VS constant buffers that differ only in where their bytes are (and how many) - each
+        // draw reads its own copy at DrawIndex * stride (vk_instancing.h)
+        if (!InstancingOn() || va.plan.buffers.size() != vb.plan.buffers.size()) {
+            return Reject(6);
+        }
+        const GS::ShaderReflection& mr = va.module->result.reflection;
+        u32 differ = 0;
+        for (size_t i = 0; i < va.plan.buffers.size(); ++i) {
+            const GS::BufferBinding& x = va.plan.buffers[i];
+            const GS::BufferBinding& y = vb.plan.buffers[i];
+            if (x.binding == y.binding && x.kind == y.kind && x.desc.raw == y.desc.raw && x.address == y.address &&
+                x.size == y.size && !x.written && !y.written && x.formatted == y.formatted && x.status == y.status) {
+                continue;
+            }
+            if (x.binding != y.binding || x.kind != GS::BufferKind::Guest || y.kind != GS::BufferKind::Guest ||
+                x.written || y.written || x.formatted != y.formatted || x.status != GS::ResourceStatus::Ok ||
+                y.status != GS::ResourceStatus::Ok || (x.desc.raw[1] >> 16) != (y.desc.raw[1] >> 16) ||
+                x.desc.raw[3] != y.desc.raw[3] || x.size > kInstMaxBytes || y.size > kInstMaxBytes ||
+                (x.address & 3) != 0 || (y.address & 3) != 0 || i >= mr.buffers.size() || ++differ > 4 ||
+                !InstanceBufferOk(va, i)) {
+                return Reject(14);
+            }
+            inst_slots |= SharpSlots(mr.buffers[i].sharp);
+        }
     }
     if (!same_images(va.plan, vb.plan)) {
         return Reject(7);
@@ -3822,19 +4152,123 @@ bool Executor::BatchGeometry(const GS::StageView& vs, std::array<VkBuffer, 16>& 
     return true;
 }
 
+bool Executor::ZeroCopyBatch(const GS::StageView& vs, std::array<VkBuffer, 16>& vbufs,
+                             std::array<VkDeviceSize, 16>& voffs, VkBuffer& ibuf, u64& ioff) {
+    // every draw's vertex and index ranges in video memory (the buffer cache's own copy, write-tracked) in one buffer
+    // per stream: bound once at the lowest offset, each draw's own place given by its vertexOffset / firstIndex (its
+    // indices as they are) - nothing copied. Vertices as the draw alone reads them: its binding + (index + its vertex
+    // offset) * stride.
+    const size_t streams = vs.plan.vertices.size();
+    if (streams == 0 || streams > vbufs.size()) {
+        return false;
+    }
+    const GS::FetchShader& fetch = vs.module->result.reflection.fetch;
+    const u64 isize = (batch_[0].draw->index_type & 3) == 1 ? 4 : 2;
+    zc_voff_.assign(batch_.size() * streams, 0);
+    zc_ioff_.assign(batch_.size(), 0);
+    VkBuffer ib = VK_NULL_HANDLE;
+    std::array<VkBuffer, 16> vb{};
+    std::array<u64, 16> vlow{};
+    vlow.fill(~0ull);
+    u64 ilow = ~0ull;
+    for (size_t k = 0; k < batch_.size(); ++k) {
+        const Cp::DrawDescriptor& d = *batch_[k].draw;
+        const GS::StageView& v = *batch_[k].prepared.stage;
+        for (size_t s = 0; s < streams; ++s) {
+            const GS::VertexBinding& x = v.plan.vertices[s];
+            BufferCache::Range r;
+            if (buffers_.Classify(x.address, x.size, r) != BufferCache::Residency::All ||
+                (vb[s] != VK_NULL_HANDLE && vb[s] != r.buffer)) {
+                return false;
+            }
+            vb[s] = r.buffer;
+            zc_voff_[k * streams + s] = r.offset;
+            vlow[s] = std::min(vlow[s], r.offset);
+        }
+        BufferCache::Range r;
+        if (buffers_.Classify(d.index_base + u64{d.index_offset} * isize, u64{d.index_count} * isize, r) !=
+                BufferCache::Residency::All ||
+            (ib != VK_NULL_HANDLE && ib != r.buffer) || r.offset % isize != 0) {
+            return false;
+        }
+        ib = r.buffer;
+        zc_ioff_[k] = r.offset;
+        ilow = std::min(ilow, r.offset);
+    }
+    // each draw's place: the same number of vertices from the lowest binding in every stream
+    inst_draws_.clear();
+    for (size_t k = 0; k < batch_.size(); ++k) {
+        const Cp::DrawDescriptor& d = *batch_[k].draw;
+        const auto& ud = d.user_data[static_cast<size_t>(Cp::Stage::Vs)];
+        u32 vo = d.vgt_index_offset;
+        if (fetch.present && vo == 0 && fetch.vertex_offset_sgpr >= 0 && fetch.vertex_offset_sgpr < 16) {
+            vo = ud[fetch.vertex_offset_sgpr];
+        }
+        u64 q = ~0ull;
+        for (size_t s = 0; s < streams; ++s) {
+            const u32 stride = batch_[k].prepared.stage->plan.vertices[s].desc.Stride();
+            const u64 delta = zc_voff_[k * streams + s] - vlow[s];
+            if (stride == 0 || delta % stride != 0 || (q != ~0ull && q != delta / stride)) {
+                return false;
+            }
+            q = delta / stride;
+        }
+        const u64 first = (zc_ioff_[k] - ilow) / isize;
+        const u64 voff = q + vo;
+        if (first > 0xFFFFFFFFull || voff > 0x7FFFFFFFull) {
+            return false;
+        }
+        inst_draws_.push_back({static_cast<u32>(first), d.index_count, static_cast<s32>(voff)});
+    }
+    for (size_t s = 0; s < streams; ++s) {
+        vbufs[s] = vb[s];
+        voffs[s] = vlow[s];
+    }
+    ibuf = ib;
+    ioff = ilow;
+    ++stats_.zc_batches;
+    stats_.zc_draws += batch_.size();
+    return true;
+}
+
 bool Executor::DrawPreparedBatch(std::span<const BatchDraw> draws) {
     const u64 t0 = GS::Ticks();
     const GS::FineSample fine_sample(fine_counter_);
     batch_ = draws;
     batch_done_ = false;
+    // SSPC_CITY_INSTANCING: the VS buffers that differ in the batch (Batchable let only constant blocks differ), each
+    // at the stride class of its largest block
+    inst_bufs_.clear();
+    const GS::StageView& head = *draws[0].prepared.stage;
+    for (size_t i = 0; i < head.plan.buffers.size(); ++i) {
+        const GS::BufferBinding& h = head.plan.buffers[i];
+        u64 most = h.size;
+        bool differ = false;
+        for (const BatchDraw& b : draws.subspan(1)) {
+            const GS::BufferBinding& x = b.prepared.stage->plan.buffers[i];
+            differ = differ || x.address != h.address || x.size != h.size || x.desc.raw != h.desc.raw;
+            most = std::max(most, x.size);
+        }
+        if (differ) {
+            inst_bufs_.push_back({static_cast<u32>(head.start.buffer + i), InstStride(most)});
+        }
+    }
     RecordDraw(*draws[0].draw, draws[0].prepared, t0);
     batch_ = {};
+    inst_bind_.clear();
+    if (!inst_bufs_.empty() && !batch_done_) {
+        ++stats_.inst_fallbacks;
+    }
     if (!batch_done_) {
         ++stats_.batch_fallbacks; // (the first draw recorded on its own)
         return false;
     }
     ++stats_.draw_batches;
     stats_.batched_draws += draws.size();
+    if (!inst_bufs_.empty()) {
+        ++stats_.inst_batches;
+        stats_.inst_draws += draws.size();
+    }
     for (const BatchDraw& b : draws.subspan(1)) {
         // what RecordDraw counts for each draw: its work recorded in this batch
         ++stats_.draws;
@@ -3891,10 +4325,28 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     const GS::StageView& ps = *pc.ps;
     const bool has_ps = st != nullptr && st->ps_module != 0 && ps.module != nullptr;
     std::string err;
-    const PipelineObjects* pipe = st == nullptr ? nullptr
-                                                : pipelines_.Graphics(prep.pipeline, *st, vs.module, vs.plan,
-                                                                      has_ps ? ps.module : nullptr,
-                                                                      has_ps ? &ps.plan : nullptr, err);
+    const PipelineObjects* pipe = nullptr;
+    // SSPC_CITY_INSTANCING: a batch whose draws differ in constant blocks - the patched stage's pipeline (a single
+    // draw with it reads its own block: DrawIndex 0); not built yet - recorded draw by draw with the stage's own
+    bool instanced = !batch_.empty() && !inst_bufs_.empty() && st != nullptr;
+    if (instanced) {
+        InstVariant* iv = InstancedVariant(*vs.module);
+        instanced = iv->module != nullptr;
+        if (instanced) {
+            auto [pid, fresh_id] = iv->pipeline_ids.try_emplace(prep.pipeline, inst_next_pipeline_);
+            inst_next_pipeline_ += fresh_id ? 1 : 0;
+            std::string ierr;
+            pipe = pipelines_.Graphics(pid->second, *st, iv->module.get(), vs.plan, has_ps ? ps.module : nullptr,
+                                       has_ps ? &ps.plan : nullptr, ierr);
+            instanced = pipe != nullptr;
+            stats_.inst_no_pipeline += instanced ? 0 : 1;
+        }
+    }
+    if (pipe == nullptr) {
+        pipe = st == nullptr ? nullptr
+                             : pipelines_.Graphics(prep.pipeline, *st, vs.module, vs.plan, has_ps ? ps.module : nullptr,
+                                                   has_ps ? &ps.plan : nullptr, err);
+    }
     if (pipe == nullptr) {
         Skipped(Skip::Pipeline, err.empty() ? "no pipeline state" : err);
         return;
@@ -4141,8 +4593,19 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
                              d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data())) {
         return;
     }
-    if (!BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
-                   d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data())) {
+    if (instanced && !GatherInstanced(std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4))) {
+        ++stats_.inst_not_current;
+        instanced = false; // (the first draw's own block below; the batch is recorded draw by draw)
+        inst_bind_.clear();
+    }
+    const bool vs_bound = BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
+                                    d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data());
+    inst_runs_.clear(); // (the copies' descriptors: a run of the multi-draw after the first binds them further on)
+    for (const auto& [index, info] : inst_bind_) {
+        inst_runs_.push_back({vs.plan.buffers[index - vs.start.buffer].binding, info});
+    }
+    inst_bind_.clear();
+    if (!vs_bound) {
         return;
     }
     stats_.t_bind += GS::FineTicks() - tb0;
@@ -4165,11 +4628,25 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     VkBuffer batch_ib = VK_NULL_HANDLE;
     u64 batch_io = 0;
     u32 batch_count = 0;
-    const bool batched = !batch_.empty() && !writes_memory && !occ_.open && !up_display_draw_ && !trace_.Active() &&
+    // SSPC_CITY_INSTANCING: a batch with a draw of several instances, or of differing ones, only as a multi-draw (one
+    // draw would draw it instance by instance); runs of the same count need push descriptors for the copies
+    bool inst_counts = false;
+    for (const BatchDraw& b : batch_) {
+        inst_counts = inst_counts || std::max<u32>(b.draw->instance_count, 1) != 1;
+    }
+    bool multi = (instanced || inst_counts) && (inst_runs_.empty() || pipe->push_descriptors);
+    const bool batch_ok = !batch_.empty() && (inst_bufs_.empty() || instanced) && (!inst_counts || multi) &&
+                          !writes_memory && !occ_.open &&
+                         !up_display_draw_ && !trace_.Active() &&
                          !histo_.active && insp_catalog_ == nullptr && !prof_ && skip_draws_.empty() &&
                          !texdump_.active && (diag_ == nullptr || !diag_->Enabled()) &&
-                         (regs.Get(kVgtMultiPrimIbResetEn) & 1) == 0 &&
-                         BatchGeometry(vs, batch_vb, batch_vo, batch_ib, batch_io, batch_count);
+                         (regs.Get(kVgtMultiPrimIbResetEn) & 1) == 0;
+    // SSPC_CITY_INSTANCING: a batch whose ranges are all in video memory - a multi-draw of them where they are (no copy);
+    // else the batch's geometry copied one after another (a multi-draw's draws then at their place in the copy)
+    const bool zero_copy = batch_ok && InstancingOn() && (inst_runs_.empty() || pipe->push_descriptors) &&
+                           ZeroCopyBatch(vs, batch_vb, batch_vo, batch_ib, batch_io);
+    multi = multi || zero_copy;
+    const bool batched = batch_ok && (zero_copy || BatchGeometry(vs, batch_vb, batch_vo, batch_ib, batch_io, batch_count));
     // vertex inputs
     std::vector<VkVertexInputBindingDescription2EXT>& vbind = scratch_.vbind;
     std::vector<VkVertexInputAttributeDescription2EXT>& vattr = scratch_.vattr;
@@ -4697,7 +5174,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     } else {
     if (d.indexed) {
         if (ibuf != VK_NULL_HANDLE) {
-            const VkIndexType it = idx32 || batched ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            const VkIndexType it = idx32 || (batched && !zero_copy) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
             if (bind_shadow_ && ibuf == ib_last_ && ioff == ib_off_last_ && it == ib_type_last_) {
                 ++stats_.ib_binds_skipped; // (P4.7: the bound one)
             } else {
@@ -4718,6 +5195,49 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         } else {
             f.vkCmdDrawIndirect(cur_.cb, argbuf, argoff, 1, 16);
         }
+    } else if (batched && multi) {
+        // one draw per draw of the batch (its own indices, already moved to its vertices), in their order: DrawIndex
+        // picks its constants. A multi-draw has one instance count: a run of draws with the same count each - a run
+        // after the first takes the constants' copies from its first draw on (DrawIndex starts at 0 again)
+        if (!zero_copy) { // (the copy: each draw's indices one after another, already moved to its vertices)
+            inst_draws_.clear();
+            u32 first = 0;
+            for (const BatchDraw& b : batch_) {
+                inst_draws_.push_back({first, b.draw->index_count, 0});
+                first += b.draw->index_count;
+            }
+        }
+        for (size_t k0 = 0; k0 < batch_.size();) {
+            const u32 n_inst = std::max<u32>(batch_[k0].draw->instance_count, 1);
+            size_t k1 = k0 + 1;
+            while (k1 < batch_.size() && std::max<u32>(batch_[k1].draw->instance_count, 1) == n_inst) {
+                ++k1;
+            }
+            if (k0 != 0 && !inst_runs_.empty()) {
+                std::array<VkDescriptorBufferInfo, 4> infos{};
+                std::array<VkWriteDescriptorSet, 4> ws{};
+                for (size_t r = 0; r < inst_runs_.size() && r < 4; ++r) {
+                    const auto& [binding, info] = inst_runs_[r];
+                    const u64 skip = u64{inst_bufs_[r].stride} * k0;
+                    infos[r] = {info.buffer, info.offset + skip, info.range - skip};
+                    ws[r] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                             .dstBinding = binding,
+                             .descriptorCount = 1,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             .pBufferInfo = &infos[r]};
+                    if (binding < desc_shadow_.size()) {
+                        desc_shadow_[binding].valid = false; // (the next draw pushes its own)
+                    }
+                }
+                f.vkCmdPushDescriptorSetKHR(cur_.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->layout, 0,
+                                            static_cast<u32>(std::min<size_t>(inst_runs_.size(), 4)), ws.data());
+            }
+            f.vkCmdDrawMultiIndexedEXT(cur_.cb, static_cast<u32>(k1 - k0), inst_draws_.data() + k0, n_inst,
+                                       instance_offset, sizeof(VkMultiDrawIndexedInfoEXT), nullptr);
+            ++stats_.inst_calls;
+            k0 = k1;
+        }
+        batch_done_ = true;
     } else if (batched) {
         f.vkCmdDrawIndexed(cur_.cb, batch_count, instances, 0, 0, instance_offset); // (the offsets are in the indices)
         batch_done_ = true;

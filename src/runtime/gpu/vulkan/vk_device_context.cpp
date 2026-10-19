@@ -357,6 +357,16 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         return nullptr;
     }
     denable.push_back(divisor);
+    // CITY-OPT Phase 4 (SSPC_CITY_INSTANCING=1, docs/CITY_DRAW_PRECOMPUTE.md): batches of draws as one multi-draw - only
+    // then (the normal mode's device is unchanged)
+    const bool want_multi_draw = [] {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_CITY_INSTANCING", v, sizeof(v));
+        return n > 0 && n < sizeof(v) && (std::string_view(v) == "1" || std::string_view(v).starts_with("ab:"));
+    }();
+    if (want_multi_draw && Has(dexts, VK_EXT_MULTI_DRAW_EXTENSION_NAME)) {
+        denable.push_back(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
+    }
     if (options.presentation) {
         if (!Has(dexts, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
             error = fmt::format("{} lacks {}", ctx->name_, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -480,6 +490,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceShaderClockFeaturesKHR clock{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    VkPhysicalDeviceMultiDrawFeaturesEXT mdraw{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT};
     VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR wgl{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR};
     VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT af2{
@@ -553,6 +564,9 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     if (caps.maintenance5) {
         link(m5);
     }
+    if (enabled(VK_EXT_MULTI_DRAW_EXTENSION_NAME)) {
+        link(mdraw);
+    }
     f.vkGetPhysicalDeviceFeatures2(pd, &f2);
     caps.swapchain_maintenance1 = options.presentation && swap_maintenance.swapchainMaintenance1 == VK_TRUE;
     caps.low_latency = enabled(VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && present_id.presentId == VK_TRUE;
@@ -607,6 +621,8 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     caps.color_write_mask_dynamic =
         enabled(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && eds3.extendedDynamicState3ColorWriteMask == VK_TRUE;
     caps.list_restart = lr.primitiveTopologyListRestart == VK_TRUE;
+    caps.multi_draw = enabled(VK_EXT_MULTI_DRAW_EXTENSION_NAME) && mdraw.multiDraw == VK_TRUE &&
+                      v11.shaderDrawParameters == VK_TRUE;
     caps.patch_list_restart = lr.primitiveTopologyPatchListRestart == VK_TRUE;
     caps.vertex_input_dynamic = caps.vertex_input_dynamic && vids.vertexInputDynamicState == VK_TRUE;
 

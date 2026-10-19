@@ -159,7 +159,7 @@ namespace SecondSon::Gpu::Vk {
 #define SSPC_VKA_DEVICE_OPT(X)                                                                                         \
     X(vkGetMemoryHostPointerPropertiesEXT)                                                                             \
     X(vkCmdSetColorWriteMaskEXT)                                                                                       \
-    X(vkCmdSetVertexInputEXT)                                                                                          \
+    X(vkCmdSetVertexInputEXT)                                                                                              X(vkCmdDrawMultiIndexedEXT)                                                                                        \
     X(vkCreateSwapchainKHR)                                                                                            \
     X(vkDestroySwapchainKHR)                                                                                           \
     X(vkGetSwapchainImagesKHR)                                                                                         \

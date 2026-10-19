@@ -628,6 +628,14 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
     return true;
 }
 
+namespace {
+/// A stage the executor made for this run only (SSPC_CITY_INSTANCING's patched modules, ids from 0x40000000): its
+/// SPIR-V is in no disk cache, so its pipelines are not in the manifest the next run precompiles.
+bool Transient(const GS::Module* m) {
+    return m != nullptr && m->id >= 0x40000000u;
+}
+} // namespace
+
 const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& desc, const GS::Module* vs,
                                                const GS::Module* ps, u32 pipeline_id, std::string& error) {
     const u64 hash = desc.Hash();
@@ -705,7 +713,7 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
             pipelines_.emplace(key, raw);
             by_desc_.emplace(hash, std::pair{desc, raw});
             created_.fetch_add(1, std::memory_order_relaxed);
-            if (disk_ != nullptr) {
+            if (disk_ != nullptr && !Transient(vs)) {
                 disk_->AddPipeline(desc, hash, j.ns);
             }
             async_jobs_.erase(it);
@@ -772,7 +780,7 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
     pipelines_.emplace(key, raw);
     by_desc_.emplace(hash, std::pair{desc, raw});
     created_.fetch_add(1, std::memory_order_relaxed);
-    if (disk_ != nullptr) {
+    if (disk_ != nullptr && !Transient(vs)) {
         disk_->AddPipeline(desc, hash, ns); // (P4.14: the manifest the next run precompiles)
     }
     return raw;
