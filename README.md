@@ -153,6 +153,8 @@ Measured improvements (A/B, n = 3, before → after):
 
 Checked: every joined draw also prepared in full and compared (21.9 M draws, 0 different), the command processor's registers against the recording thread's copy (0 different), Vulkan Validation + Sync (0 messages), frame captures (depth and shadow maps bit-exact). Details: `docs/CITY_ENGINE_OPTIMIZATION.md`, `docs/CITY_PERFORMANCE.md`.
 
+Phase 6 brings the G-buffer's instanced draws (`0x1a1770`) into runs too. The engine's constant update engine copies a stage's resource table to new memory at every commit, so a member's shader resource walk is redone with its new registers. A second probe on the material setup (`0x448640`) turns a material change into an immediate refusal. Preset with and without it, interleaved, n = 3, city: **27.9 → 31.6 FPS**, 1 % low 24.2 → 26.6, command processing 34.1 → 30.3 ms (better in every round); the beach is not slower and the village unchanged. Checked: 23.1 M members also prepared in full (0 different), depth and shadow maps bit-exact, the G-buffer, normals, lighting and final frame within the scene's frame-to-frame noise, Vulkan Validation + Sync (0 messages from command recording). Details: `docs/CITY_ENGINE_RESOURCES.md`.
+
 Performance work is done by controlled A/B runs; rejected experiments are documented (`docs/GPU_OPTIMIZATION.md`, `docs/FRAMEBREAK.md`, `docs/LIGHTING_PROFILE.md`). No quality setting, light or shadow is reduced to gain FPS.
 
 ## Native audio, video and saves
