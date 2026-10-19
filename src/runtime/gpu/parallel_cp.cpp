@@ -361,8 +361,10 @@ bool ParallelCp::RoundEndQueued() {
     }
     BeginRecord(Kind::RoundEnd);
     PushRecord();
-    if (frontend_ != nullptr) {
-        RetireGpuWrites(); // (only records already executed: safe with thread 2 running)
+    if (frontend_ != nullptr && !fthread_mode_) {
+        // (only records already executed: safe with thread 2 running; with the frontend thread the list is that
+        // thread's - it retires them itself, FrontStep - and a second writer here corrupted it: CITY-OPT)
+        RetireGpuWrites();
     }
     return true;
 }
