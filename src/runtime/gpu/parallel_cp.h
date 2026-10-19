@@ -48,6 +48,7 @@
 namespace SecondSon::Gpu::Vk {
 class BufferCache;
 class Executor;
+struct BatchDraw;
 class Timeline;
 }
 
@@ -349,6 +350,12 @@ private:
     /// Stage 2: the frontend for record `index`, `regs` as they are at its packet; its GPU writes noted; the memo told
     /// when it writes memory. (Thread 1 with the record being filled, or the frontend thread.)
     void PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs);
+    /// SSPC_CITY_GEOFAST (docs/CITY_PERFORMANCE.md): the draw right after a prepared draw that differs from it only in
+    /// its geometry - registers of the VS user data / index / draw parameter groups, VS user data only in the fetch
+    /// shader's table pairs, no guest memory change between them - takes that draw's preparation with its own vertex
+    /// bindings (the V#s read again from its table, as the frontend reads them). `out`: the views written (r's, or a
+    /// scratch record for verify). false: not such a draw (nothing usable written).
+    bool PrepareGeometryOnly(const Record& r, u64 index, Record& out);
     void PrepareDispatch(Record& r, u64 index);
     // P5.3D frontend thread
     void FrontLoop();
@@ -381,7 +388,9 @@ private:
     void ApplyDeferred(u64 before); ///< the deferred invalidations of writes before record `before`
     // thread 2
     void Loop();
-    void Execute(Record& r, u64 index);
+    /// Executes record `index`; returns how many records after it it executed with it (SSPC_CITY_BATCH: draws recorded
+    /// as one with it - of the records before `avail`, the ones published)
+    u64 Execute(Record& r, u64 index, u64 avail);
     /// Nothing more executes; the first failure's text is kept (thread 2, or thread 1 while the queue is drained).
     void Fail(std::string text);
 
@@ -404,6 +413,17 @@ private:
     // execute in order, so a record marked "same" finds the view of the last copied one there). verify: copied anyway,
     // a "same" record's copy compared with last_*.
     u8 stage_reuse_ = 0; ///< 0 off, 1 on, 2 verify
+    /// SSPC_CITY_BATCH=1 (docs/CITY_PERFORMANCE.md): draws that follow a draw with only their geometry their own are
+    /// recorded with it as one draw (Executor::Batchable); =ab:<n>: in odd blocks of n flips only (image A/B)
+    u8 geofast_ = 0;            ///< SSPC_CITY_GEOFAST: 0 off, 1 on, 2 verify (prepared in full anyway and compared)
+    u64 geofast_prev_ = ~0ull;  ///< the record of the last draw prepared (thread 1)
+    u64 geofast_gen_ = 0;       ///< the frontend's memory generation after it
+    std::unique_ptr<Record> geofast_check_; ///< verify: the fast preparation
+    std::vector<GS::VertexBinding> geofast_vertices_;
+    std::atomic<u64> geofast_hits_{0}, geofast_verified_{0}, geofast_mismatches_{0};
+    bool batch_on_ = false;
+    u32 batch_ab_ = 0;
+    std::vector<Vk::BatchDraw> batch_items_;
     /// Thread 2: the view a prepared draw's stage executes with (`rec` itself when off or shared).
     const GS::StageView& ReuseView(GS::StageView& rec, bool shared, bool same, GS::StageView& last);
     static constexpr u64 kNoGen = ~0ull;

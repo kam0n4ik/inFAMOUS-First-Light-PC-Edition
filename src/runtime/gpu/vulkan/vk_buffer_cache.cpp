@@ -264,6 +264,7 @@ void BufferCache::ApplyInvalidations() {
                 const u16 keep = is_coarse && blk.pending_seq > completed_ ? static_cast<u16>(blk.gpu_pending & mask)
                                                                            : u16{0};
                 blk.valid &= static_cast<u16>(~(mask & ~keep));
+                ++blk.version;
                 if (keep != 0) {
                     deferred_inval_.push_back({b, keep, blk.pending_seq});
                 }
@@ -554,6 +555,38 @@ bool BufferCache::Promotable(u64 addr, u64 size, u64 frame) {
     return tracker_->CanArm(addr, size);
 }
 
+u32 BufferCache::RangeVersion(u64 addr, u64 size) {
+    if (!Ok() || size == 0 || addr + size > space_) {
+        return 0;
+    }
+    const u64 first_page = addr >> kPageBits, last_page = (addr + size - 1) >> kPageBits;
+    u32 v = 0;
+    for (u64 b = first_page / kPagesPerBlock; b <= last_page / kPagesPerBlock; ++b) {
+        const Block* blk = FindBlock(b);
+        const u16 mask = PageMask(b, first_page, last_page);
+        if (blk == nullptr || !blk->bound || (blk->valid & mask) != mask || blk->deferred) {
+            return 0; // not wholly current in video memory (then not write-tracked either)
+        }
+        v = v * 0x9E3779B1u + blk->version + 1;
+    }
+    return v == 0 ? 1 : v;
+}
+
+u32 BufferCache::PromoteWhy(u64 addr, u64 size) {
+    if (!Ok() || tracker_ == nullptr || size == 0 || size > kMaxCached || addr + size > space_) {
+        return 1;
+    }
+    if (stats_.resident_bytes + (2ull << kBlockBits) > budget_ - budget_ / 8) {
+        return 2;
+    }
+    for (u64 b = addr >> kBlockBits; b <= (addr + size - 1) >> kBlockBits; ++b) {
+        if (const Block* blk = FindBlock(b); blk != nullptr && frame_ < blk->quiet_from) {
+            return 3;
+        }
+    }
+    return tracker_->CanArm(addr, size) ? 0 : 4;
+}
+
 bool BufferCache::AnyValid(u64 addr, u64 size) {
     if (!Ok() || size == 0 || addr + size > space_) {
         return false;
@@ -745,6 +778,7 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
                 for (u64 blk_i = fp / kPagesPerBlock; blk_i <= lp / kPagesPerBlock; ++blk_i) {
                     if (Block* blk = FindBlock(blk_i)) {
                         blk->valid &= static_cast<u16>(~PageMask(blk_i, fp, lp));
+                        ++blk->version;
                     }
                 }
                 if (stats_.first_error.empty()) {
@@ -762,6 +796,7 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         for (u64 b = first_block; b <= last_block; ++b) {
             Block& blk = GetBlock(b);
             blk.gpu_pending |= PageMask(b, first_page, last_page);
+            ++blk.version;
             blk.pending_seq = seq;
         }
         if (!written_.empty() && written_.back().second >= addr && written_.back().first <= addr + size) {
@@ -993,6 +1028,7 @@ void BufferCache::Collect(u64 completed) {
                 return false;
             }
             blk->valid &= static_cast<u16>(~d.mask);
+            ++blk->version;
             ++valid_gen_;
             return true;
         });
@@ -1437,6 +1473,7 @@ bool BufferCache::SubmitBinds(VkSemaphore& wait, u64& wait_value) {
             if (Block* blk = FindBlock(bind.resourceOffset >> kBlockBits)) {
                 blk->bound = false;
                 blk->valid = 0;
+                ++blk->version;
                 stats_.resident_bytes -= std::min<u64>(stats_.resident_bytes, bind.size);
             }
         }

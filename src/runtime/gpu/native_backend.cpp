@@ -19,6 +19,7 @@
 #include <unordered_set>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <xxhash.h>
 
 #include "base/lifecycle.h"
@@ -2295,9 +2296,17 @@ std::string Backend::Report() {
                            "write-after-read {}; stream ring mirrored {} MiB in {} copies\n",
                            s.barriers_elided, s.barriers_war, ring_->MirroredBytes() >> 20, s.ring_mirror_copies);
         out += fmt::format("small read-only ranges cached instead of streamed: {}\n", s.stream_promotions);
+        out += executor_->StreamWhoReport();
         out += fmt::format("draws repeating the bound state (not recorded again): pipeline {}, push constants {}; "
-                           "dynamic state not computed again (SSPC_CITY_DYN_MEMO) {}\n",
-                           s.binds_skipped, s.push_constants_skipped, s.dyn_memo_hits);
+                           "dynamic state not computed again (SSPC_CITY_DYN_MEMO) {}; draws recorded as one "
+                           "(SSPC_CITY_BATCH): {} draws in {} batches, {} batches recorded draw by draw; not "
+                           "batchable by check {}\n",
+                           s.binds_skipped, s.push_constants_skipped, s.dyn_memo_hits, s.batched_draws, s.draw_batches,
+                           s.batch_fallbacks, fmt::join(s.batch_rejects, " "));
+        out += fmt::format("batch geometry (SSPC_CITY_GEOMETRY_CACHE): drawn from kept geometry {}, kept geometry whose "
+                           "sources changed {}, built {} ({} MiB; kept {}), arenas recycled {}\n",
+                           s.geo_hits, s.geo_changed, s.geo_builds, s.geo_built_bytes >> 20, s.geo_stored,
+                           s.geo_recycles);
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",
                            s.wb_bytes_by[0] >> 20, s.wb_bytes_by[1] >> 20, s.wb_bytes_by[2] >> 20, s.flushes_full);

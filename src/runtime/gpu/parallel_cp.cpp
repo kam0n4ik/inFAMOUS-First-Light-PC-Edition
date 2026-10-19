@@ -14,6 +14,7 @@
 #include "base/log.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/inspector.h"
+#include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
@@ -143,6 +144,26 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         rec_value_ = std::make_unique<std::atomic<u64>[]>(kRecRing);
     }
     fthread_mode_ = options.frontend_thread && frontend_ != nullptr;
+    if (char v[16] = {}; frontend_ != nullptr && GetEnvironmentVariableA("SSPC_CITY_BATCH", v, sizeof(v)) > 0) {
+        const std::string_view sv(v);
+        batch_on_ = sv == "1" || sv.starts_with("ab:");
+        batch_ab_ = sv.starts_with("ab:") ? std::max<u32>(1, static_cast<u32>(std::strtoul(v + 3, nullptr, 10))) : 0;
+        if (batch_on_) {
+            SSPC_LOG(GPU, Info, "SSPC_CITY_BATCH={}: draws differing only in their geometry are recorded as one draw", sv);
+        }
+    }
+    if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
+                         GetEnvironmentVariableA("SSPC_CITY_GEOFAST", v, sizeof(v)) > 0) {
+        const std::string_view sv(v);
+        geofast_ = sv == "1" ? 1 : sv == "verify" ? 2 : 0;
+        if (geofast_ == 2) {
+            geofast_check_ = std::make_unique<Record>();
+        }
+        if (geofast_ != 0) {
+            SSPC_LOG(GPU, Info, "SSPC_CITY_GEOFAST={}: a draw differing from the one before it only in its geometry takes "
+                                "that one's preparation with its own vertex bindings", sv);
+        }
+    }
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
     journal_changes_only_ = options.journal_changes_only;
     async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
@@ -573,6 +594,101 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
     }
 }
 
+bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
+    if (index == 0 || geofast_prev_ != index - 1 || r.memory_changed ||
+        frontend_->MemoryGeneration() != geofast_gen_) {
+        return false;
+    }
+    const Record& p = slots_[(index - 1) & (kSlots - 1)];
+    if (p.kind != Kind::Draw || !p.prepared || !p.prep.ready || p.state == nullptr || p.stage_shared != nullptr ||
+        p.ps_shared != nullptr) {
+        return false;
+    }
+    const Cp::DrawDescriptor& a = p.draw;
+    const Cp::DrawDescriptor& b = r.draw;
+    using G = Cp::Group;
+    constexpr Cp::GroupMask kGeometryGroups = (Cp::GroupMask{1} << static_cast<u32>(G::VsUserData)) |
+                                              (Cp::GroupMask{1} << static_cast<u32>(G::IndexState)) |
+                                              (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
+    constexpr u8 kVsPs = (1u << static_cast<u32>(Cp::Stage::Vs)) | (1u << static_cast<u32>(Cp::Stage::Ps));
+    const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
+    if ((b.changed & ~kGeometryGroups) != 0 || a.active_stages != kVsPs || b.active_stages != kVsPs || b.indirect ||
+        a.indirect || a.user_data[ps] != b.user_data[ps] || a.shaders[vs].address != b.shaders[vs].address ||
+        a.shaders[vs].rsrc1 != b.shaders[vs].rsrc1 || a.shaders[vs].rsrc2 != b.shaders[vs].rsrc2 ||
+        a.shaders[ps].address != b.shaders[ps].address || a.shaders[ps].rsrc1 != b.shaders[ps].rsrc1 ||
+        a.shaders[ps].rsrc2 != b.shaders[ps].rsrc2) {
+        return false;
+    }
+    const GS::StageView& pv = p.stage;
+    if (pv.status != GS::StageStatus::Ready || pv.module == nullptr || pv.plan.flat.size() != 16 ||
+        pv.plan.vertices.empty()) {
+        return false; // (copies of an SRT walk: they may follow a pointer that changed)
+    }
+    const GS::FetchShader& fetch = pv.module->result.reflection.fetch;
+    if (!fetch.present || fetch.sgpr_base + 1 >= 16) {
+        return false;
+    }
+    u32 fetch_only = 3u << fetch.sgpr_base;
+    for (const GS::FetchAttribute& at : fetch.attributes) {
+        fetch_only |= at.sgpr_base + 1 < 16 ? 3u << at.sgpr_base : 0u;
+    }
+    fetch_only &= ~(3u << fetch.sgpr_base); // (the fetch shader's own address must be the same)
+    for (u32 i = 0; i < 16; ++i) {
+        if (a.user_data[vs][i] != b.user_data[vs][i] && ((fetch_only >> i) & 1) == 0) {
+            return false;
+        }
+    }
+    // nothing the previous draw prepared writes memory (its notes would be due again)
+    for (const GS::StageView* s : {&pv, &p.ps}) {
+        for (const GS::BufferBinding& bb : s->plan.buffers) {
+            if (bb.written || (bb.kind != GS::BufferKind::Guest && bb.kind != GS::BufferKind::Flatbuf &&
+                               bb.kind != GS::BufferKind::ClipPlanes)) {
+                return false;
+            }
+        }
+        for (const GS::ImageBinding& im : s->plan.images) {
+            if (im.storage) {
+                return false;
+            }
+        }
+    }
+    // the vertex bindings from this draw's table (shader_resources.cpp DecodeResources: the same reads and results)
+    std::vector<GS::VertexBinding>& nv = geofast_vertices_;
+    nv.assign(pv.plan.vertices.begin(), pv.plan.vertices.end());
+    for (GS::VertexBinding& v : nv) {
+        const GS::FetchAttribute& at = v.fetch;
+        if (v.status != GS::ResourceStatus::Ok || at.sgpr_base + 1 >= 16) {
+            return false;
+        }
+        const u64 table = (b.user_data[vs][at.sgpr_base] | (u64{b.user_data[vs][at.sgpr_base + 1]} << 32)) &
+                          0xFFFFFFFFFFFFull;
+        const u64 where = table + u64{at.dword_offset} * 4;
+        GS::BufferDesc d;
+        if (where >= (1ull << 40) || !reader_.Read(where, d.raw.data(), 16)) {
+            return false;
+        }
+        v.read = d.raw;
+        if (at.data_format != 0) {
+            d.raw[3] = (d.raw[3] & ~((0xFu << 15) | (7u << 12))) | (at.data_format << 15) | (at.num_format << 12);
+        }
+        const u64 addr = d.Base() + at.inst_offset, size = d.Size();
+        if (!d.IsBuffer() || d.NumRecords() == 0 || addr >= (1ull << 40) || size > (1ull << 40) - addr ||
+            (d.raw[3] & 0x7FFFFu) != (v.desc.raw[3] & 0x7FFFFu)) {
+            return false; // (not Ok, or another specialization of the module)
+        }
+        v.desc = d;
+        v.address = addr;
+        v.size = size;
+    }
+    out.prep = p.prep;
+    out.state = p.state;
+    CopyStage(out.stage, pv);
+    out.stage.plan.vertices.assign(nv.begin(), nv.end());
+    std::copy(b.user_data[vs].begin(), b.user_data[vs].end(), out.stage.plan.flat.begin());
+    CopyStage(out.ps, p.ps);
+    return true;
+}
+
 void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs) {
     r.prepared = false;
     r.vs_same = r.ps_same = false;
@@ -583,6 +699,14 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         return; // no preparation: thread 2 sees the same registers and skips it as filtered
     }
     const u64 t0 = __rdtsc();
+    if (geofast_ == 1 && PrepareGeometryOnly(r, index, r)) {
+        r.prepared = true;
+        geofast_prev_ = index;
+        geofast_hits_.store(geofast_hits_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        Bump(fc_.ticks, __rdtsc() - t0);
+        return;
+    }
+    const bool check = geofast_ == 2 && PrepareGeometryOnly(r, index, *geofast_check_);
     {
         const GS::FineSample fine(front_fine_counter_);
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
@@ -616,6 +740,92 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     if (writes) {
         frontend_->GuestMemoryChanged(); // (Executor::MarkWrites after the draw: no memoized preparation past it)
     }
+    if (check) {
+        // SSPC_CITY_GEOFAST=verify: the fast preparation against the full one, field by field (the bindings' padding
+        // bytes differ between two builds of the same values)
+        const auto same_view = [](const GS::StageView& x, const GS::StageView& y) {
+            const auto bufs = [](const GS::BufferBinding& a, const GS::BufferBinding& b) {
+                return a.binding == b.binding && a.kind == b.kind && a.desc.raw == b.desc.raw && a.address == b.address &&
+                       a.size == b.size && a.written == b.written && a.formatted == b.formatted && a.status == b.status;
+            };
+            const auto imgs = [](const GS::ImageBinding& a, const GS::ImageBinding& b) {
+                return a.binding == b.binding && a.count == b.count && a.desc.raw == b.desc.raw &&
+                       a.view_type == b.view_type && a.storage == b.storage && a.depth == b.depth && a.array == b.array &&
+                       a.atomic == b.atomic && a.fmask == b.fmask && a.status == b.status;
+            };
+            const auto smps = [](const GS::SamplerBinding& a, const GS::SamplerBinding& b) {
+                return a.binding == b.binding && a.desc.raw == b.desc.raw && a.status == b.status;
+            };
+            const auto vtxs = [](const GS::VertexBinding& a, const GS::VertexBinding& b) {
+                return a.attribute == b.attribute && a.fetch == b.fetch && a.read == b.read && a.desc.raw == b.desc.raw &&
+                       a.address == b.address && a.size == b.size && a.status == b.status;
+            };
+            return x.status == y.status && x.address == y.address && x.program == y.program &&
+                   x.footer_hash == y.footer_hash && x.module == y.module &&
+                   std::memcmp(&x.runtime, &y.runtime, sizeof(x.runtime)) == 0 && x.start == y.start &&
+                   x.end == y.end && x.program_error == y.program_error && x.plan.flat == y.plan.flat &&
+                   std::ranges::equal(x.plan.buffers, y.plan.buffers, bufs) &&
+                   std::ranges::equal(x.plan.images, y.plan.images, imgs) &&
+                   std::ranges::equal(x.plan.samplers, y.plan.samplers, smps) &&
+                   std::ranges::equal(x.plan.vertices, y.plan.vertices, vtxs) &&
+                   x.plan.status_counts == y.plan.status_counts && x.plan.error == y.plan.error;
+        };
+        const bool same = r.prep.ready && r.prep.pipeline == geofast_check_->prep.pipeline &&
+                          r.state == geofast_check_->state && same_view(r.Vs(), geofast_check_->stage) &&
+                          same_view(r.Ps(), geofast_check_->ps);
+        geofast_verified_.store(geofast_verified_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        if (!same) {
+            const u64 n = geofast_mismatches_.load(std::memory_order_relaxed) + 1;
+            geofast_mismatches_.store(n, std::memory_order_relaxed);
+            if (n <= 12) {
+                const auto what = [](const GS::StageView& x, const GS::StageView& y) {
+                    std::string t;
+                    t += x.status != y.status ? " status" : "";
+                    t += x.address != y.address || x.program != y.program ? " program" : "";
+                    t += x.footer_hash != y.footer_hash ? " footer" : "";
+                    t += x.module != y.module ? " module" : "";
+                    t += std::memcmp(&x.runtime, &y.runtime, sizeof(x.runtime)) != 0 ? " runtime" : "";
+                    t += !(x.start == y.start) || !(x.end == y.end) ? " start/end" : "";
+                    t += !SameBytes(x.plan.flat, y.plan.flat) ? " flat" : "";
+                    if (!SameBytes(x.plan.buffers, y.plan.buffers)) {
+                        t += fmt::format(" buffers({}/{}", x.plan.buffers.size(), y.plan.buffers.size());
+                        for (size_t i = 0; i < std::min(x.plan.buffers.size(), y.plan.buffers.size()); ++i) {
+                            const auto& a = x.plan.buffers[i];
+                            const auto& b = y.plan.buffers[i];
+                            t += fmt::format(" {}:k{}{}{}{}{}", i, static_cast<int>(a.kind),
+                                             a.address != b.address ? fmt::format("a{:x}/{:x}", a.address, b.address) : "",
+                                             a.size != b.size ? "s" : "", a.desc.raw != b.desc.raw ? "d" : "",
+                                             a.status != b.status ? "t" : "");
+                        }
+                        t += ")";
+                    }
+                    t += !SameBytes(x.plan.images, y.plan.images) ? " images" : "";
+                    t += !SameBytes(x.plan.samplers, y.plan.samplers) ? " samplers" : "";
+                    t += x.plan.status_counts != y.plan.status_counts ? " counts" : "";
+                    if (!SameBytes(x.plan.vertices, y.plan.vertices)) {
+                        t += fmt::format(" vertices({}/{}", x.plan.vertices.size(), y.plan.vertices.size());
+                        for (size_t i = 0; i < std::min(x.plan.vertices.size(), y.plan.vertices.size()); ++i) {
+                            const auto& a = x.plan.vertices[i];
+                            const auto& b = y.plan.vertices[i];
+                            t += fmt::format(" {}:{}{}{}{}{}", i, a.address != b.address ? "a" : "", a.size != b.size ? "s" : "",
+                                             a.desc.raw != b.desc.raw ? "d" : "", a.read != b.read ? "r" : "",
+                                             a.status != b.status ? "t" : "");
+                        }
+                        t += ")";
+                    }
+                    t += x.plan.error != y.plan.error ? " error" : "";
+                    return t;
+                };
+                SSPC_LOG(GPU, Warning, "SSPC_CITY_GEOFAST=verify: record {} (VS {:#x}) differs: pipeline {}/{} state {} | "
+                                       "VS:{} | PS:{}", index,
+                         r.draw.shaders[static_cast<size_t>(Cp::Stage::Vs)].address, r.prep.pipeline,
+                         geofast_check_->prep.pipeline, r.state == geofast_check_->state, what(r.Vs(), geofast_check_->stage),
+                         what(r.Ps(), geofast_check_->ps));
+            }
+        }
+    }
+    geofast_prev_ = index;
+    geofast_gen_ = frontend_->MemoryGeneration();
     Bump(fc_.ticks, __rdtsc() - t0);
 }
 
@@ -958,13 +1168,16 @@ void ParallelCp::Loop() {
         const bool stop = r.kind == Kind::Stop;
         const u16 kind = static_cast<u16>(r.kind); // (before Execute: a record is not touched by thread 1 until head_ moves)
         const u64 queue = r.kind == Kind::Dispatch ? r.dispatch.queue : 0; // (P5.4: the guest queue in the trace)
+        u64 extra = 0;
         if (!stop) {
-            Execute(r, h);
+            extra = Execute(r, h, t);
             if (lazy) {
                 exec_.ServeKeptBack();
             }
             if (rec_value_ != nullptr) {
-                rec_value_[h & (kRecRing - 1)].store(exec_.RecordedValue(), std::memory_order_relaxed);
+                for (u64 k = 0; k <= extra; ++k) {
+                    rec_value_[(h + k) & (kRecRing - 1)].store(exec_.RecordedValue(), std::memory_order_relaxed);
+                }
             }
         }
         const u64 b1 = __rdtsc();
@@ -972,8 +1185,8 @@ void ParallelCp::Loop() {
         if (trace_records) {
             StallTrace::Span(StallTrace::Ev::Record, b0, b1, queue, static_cast<u32>(h), kind);
         }
-        add(t2_records_, 1);
-        ++h;
+        add(t2_records_, 1 + extra);
+        h += 1 + extra;
         head_.store(h, std::memory_order_seq_cst);
         const u64 wt = t1_wait_target_.load(std::memory_order_seq_cst);
         const u64 ft = f_wait_target_.load(std::memory_order_seq_cst);
@@ -1048,9 +1261,10 @@ void ParallelCp::RunCopy(const Record& r) {
     exec_.CompleteRefusedWork(r.queue, r.seq);
 }
 
-void ParallelCp::Execute(Record& r, u64 index) {
+u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
+    u64 extra = 0;
     if (failed_.load(std::memory_order_relaxed)) {
-        return; // consumed, not executed: thread 1's drains still complete; the backend stops at its next check
+        return 0; // consumed, not executed: thread 1's drains still complete; the backend stops at its next check
     }
     try {
         // (stage 2: thread 1 tells the frontend about guest memory changes in stream order; nothing from here)
@@ -1083,7 +1297,40 @@ void ParallelCp::Execute(Record& r, u64 index) {
                         pc.ps = &r.Ps();
                     }
                 }
-                exec_.DrawPrepared(r.draw, pc);
+                if (r.prepared && batch_on_ && stage_reuse_ == 0 &&
+                    (batch_ab_ == 0 || (VideoOut::NextFlipId() / batch_ab_) % 2 == 1) &&
+                    !has_deferred_.load(std::memory_order_acquire)) {
+                    // the published draws right after it that differ only in their geometry (each from the one
+                    // before it: its changed register groups are since that one)
+                    constexpr size_t kMaxBatch = 256;
+                    batch_items_.clear();
+                    batch_items_.push_back({&r.draw, pc});
+                    while (batch_items_.size() < kMaxBatch && index + batch_items_.size() < avail) {
+                        Record& f = slots_[(index + batch_items_.size()) & (kSlots - 1)];
+                        if (f.kind != Kind::Draw || !f.prepared || f.memory_changed) {
+                            break;
+                        }
+                        const Vk::PreparedCommand fp{&f.prep, &f.Vs(), &f.Ps(), f.state};
+                        if (!exec_.Batchable(*batch_items_.back().draw, batch_items_.back().prepared, f.draw, fp)) {
+                            break;
+                        }
+                        batch_items_.push_back({&f.draw, fp});
+                    }
+                    extra = batch_items_.size() - 1;
+                }
+                if (extra != 0) {
+                    const bool one = exec_.DrawPreparedBatch(batch_items_);
+                    for (u64 k = 1; k <= extra; ++k) {
+                        // each draw's registers (only theirs changed: VS user data, index, draw parameters); not
+                        // recorded as one: each on its own after its registers, as Execute does it
+                        ApplyJournal(slots_[(index + k) & (kSlots - 1)].journal_end);
+                        if (!one) {
+                            exec_.DrawPrepared(*batch_items_[k].draw, batch_items_[k].prepared);
+                        }
+                    }
+                } else {
+                    exec_.DrawPrepared(r.draw, pc);
+                }
             } else {
                 exec_.Draw(r.draw);
             }
@@ -1153,6 +1400,7 @@ void ParallelCp::Execute(Record& r, u64 index) {
     } catch (...) {
         Fail("parallel command processor: the recording thread threw");
     }
+    return extra;
 }
 
 void ParallelCp::Fail(std::string text) {
@@ -1515,6 +1763,12 @@ std::string ParallelCp::Report() const {
         out += fmt::format("  frontend thread (P5.3D): preparing {:.0f} ms, waiting for records {:.0f} ms, waiting for "
                            "thread 2 {:.0f} ms ({} times)\n",
                            ms(t.tf_busy_ticks), ms(t.tf_idle_ticks), ms(t.tf_wait_ticks), t.tf_waits);
+    }
+    if (geofast_ != 0) {
+        out += fmt::format("  CITY-OPT geometry-only draw preparations (SSPC_CITY_GEOFAST): taken {}, verified {} "
+                           "(mismatches {})\n",
+                           geofast_hits_.load(std::memory_order_relaxed), geofast_verified_.load(std::memory_order_relaxed),
+                           geofast_mismatches_.load(std::memory_order_relaxed));
     }
     if (stage_reuse_ != 0) {
         out += fmt::format("  FB-6 unchanged draw stages not copied (SSPC_FB_STAGE_REUSE={}): taken from the last copy "

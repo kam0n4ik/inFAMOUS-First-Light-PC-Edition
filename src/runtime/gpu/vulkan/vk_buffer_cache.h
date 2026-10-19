@@ -110,6 +110,12 @@ public:
     /// it is cached again). Measured on the beach: ~93% of the streamed bytes were the same bytes as the range's last
     /// copy (in the frame or an earlier one).
     bool Promotable(u64 addr, u64 size, u64 frame);
+    /// SSPC_DIAG_GEOM: why Promotable refuses the range (0 it does not, 1 size/space, 2 budget, 3 the CPU wrote its
+    /// blocks lately, 4 the tracker cannot arm it)
+    u32 PromoteWhy(u64 addr, u64 size);
+    /// SSPC_CITY_GEOMETRY_CACHE: 0 unless every page of the range is current in video memory (so write-tracked);
+    /// otherwise a value that changes whenever a block of it was invalidated or GPU-written since (Block::version)
+    u32 RangeVersion(u64 addr, u64 size);
     /// The guest wrote or unmapped [addr, addr + size) behind the GPU's back: the pages are uploaded again. Any thread.
     void Invalidate(u64 addr, u64 size);
     /// Invalidate when some page of the range is valid in video memory (the GPU thread only: it reads the block table
@@ -208,6 +214,7 @@ private:
         u64 quiet_from = 0; ///< the frame from which a small read-only range here is cached again instead of streamed
         bool deferred = false; ///< FB-7: kept back (hidden): the host's copy is older until a reader writes it back
         bool eager = false;    ///< FB-7: a CPU read wanted it: never kept back again
+        u32 version = 0;       ///< CITY-OPT: bumped whenever pages stop being valid or the GPU writes it
     };
     int lazy_ = 0; ///< FB-7: 0 off, 1 on, 2 verify
     u64 deferred_count_ = 0;

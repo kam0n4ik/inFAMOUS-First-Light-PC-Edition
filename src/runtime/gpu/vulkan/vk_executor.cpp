@@ -320,6 +320,9 @@ Executor::~Executor() {
     DestroyBuffer(ctx_, lds_);
     DestroyBuffer(ctx_, lds_lane_);
     DestroyBuffer(ctx_, diag_scratch_);
+    for (OwnedBuffer& a : geo_arena_) {
+        DestroyBuffer(ctx_, a);
+    }
     for (auto& [value, b] : lds_retired_) {
         DestroyBuffer(ctx_, b);
     }
@@ -1756,6 +1759,15 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                 avail = size;
                 ++stats_.streamed;
                 stats_.streamed_bytes += size;
+                if (stream_who_on_ < 0) {
+                    char v[4] = {};
+                    stream_who_on_ = GetEnvironmentVariableA("SSPC_DIAG_STREAM_WHO", v, sizeof(v)) == 1 && v[0] == '1';
+                }
+                if (stream_who_on_ == 1) {
+                    auto& e = stream_who_[stream_pipe_];
+                    ++e[0];
+                    e[1] += size;
+                }
                 if (memo != nullptr) {
                     const u64 h = stream_verify_ ? RaceHash(sl.data, size) : 0;
                     if (verify != 0) {
@@ -3380,7 +3392,463 @@ void Executor::DrawPrepared(const Cp::DrawDescriptor& d, const PreparedCommand& 
     RecordDraw(d, pc, t0);
 }
 
+std::string Executor::StreamWhoReport() const {
+    if (stream_who_.empty()) {
+        return {};
+    }
+    std::vector<std::pair<u32, std::array<u64, 2>>> v(stream_who_.begin(), stream_who_.end());
+    std::ranges::sort(v, [](const auto& a, const auto& b) { return a.second[1] > b.second[1]; });
+    std::string t = "streamed ranges by pipeline (SSPC_DIAG_STREAM_WHO; p0 = no draw): ";
+    for (size_t i = 0; i < std::min<size_t>(v.size(), 12); ++i) {
+        t += fmt::format("p{} {} ranges {} MiB; ", v[i].first == 0 ? 0 : v[i].first - 1, v[i].second[0],
+                         v[i].second[1] >> 20);
+    }
+    return t + "\n";
+}
+
+bool Executor::BatchModuleOk(const GS::Module* m, bool vertex) {
+    const auto [it, fresh] = batch_modules_.try_emplace(m, false);
+    if (!fresh) {
+        return it->second;
+    }
+    // a batch draws its geometry at other vertex indices and primitive numbers: a stage that loads the vertex index or
+    // the base vertex (VS), or the primitive ID (PS), is never batched (a built-in only declared is fine)
+    const std::vector<u32>& w = m->result.spirv;
+    std::unordered_set<u32> ids;
+    for (size_t i = 5; i < w.size();) {
+        const u32 op = w[i] & 0xFFFF, n = w[i] >> 16;
+        if (n == 0 || i + n > w.size()) {
+            return false; // (malformed: never batched)
+        }
+        if (op == 71 && n >= 4 && w[i + 2] == 11) { // OpDecorate <id> BuiltIn <builtin>
+            const u32 b = w[i + 3];
+            if (vertex ? (b == 42 || b == 5 || b == 4424) : (b == 7)) { // VertexIndex, VertexId, BaseVertex; PrimitiveId
+                ids.insert(w[i + 1]);
+            }
+        }
+        i += n;
+    }
+    // a load of one is dead when the translator only parks it in a register variable that is written again before it
+    // is ever read (the VS's v0: the fetch shader's index, replaced by vertex inputs). Proven only for one function
+    // without branches (instruction order = execution order); anything else: never batched.
+    std::vector<size_t> at; // instruction starts
+    u32 functions = 0, branches = 0;
+    for (size_t i = 5; i < w.size(); i += w[i] >> 16) {
+        at.push_back(i);
+        const u32 op = w[i] & 0xFFFF;
+        functions += op == 54 ? 1 : 0;                                     // OpFunction
+        branches += op == 250 || op == 251 || op == 246 || op == 247 ? 1 : 0; // conditional, switch, loop/selection merge
+    }
+    const auto uses = [&](u32 id, size_t from, size_t& first) {
+        u32 n = 0;
+        for (size_t k = from; k < at.size(); ++k) {
+            const size_t i = at[k];
+            for (size_t j = i + 1; j < i + (w[i] >> 16); ++j) {
+                if (w[j] == id) {
+                    first = n == 0 ? k : first;
+                    ++n;
+                    break;
+                }
+            }
+        }
+        return n;
+    };
+    bool ok = true;
+    for (size_t k = 0; k < at.size() && ok && !ids.empty(); ++k) {
+        const size_t i = at[k];
+        if ((w[i] & 0xFFFF) != 61 || (w[i] >> 16) < 4 || !ids.contains(w[i + 3])) { // OpLoad <type> <result> <pointer>
+            continue;
+        }
+        ok = functions == 1 && branches == 0;
+        const u32 value = w[i + 2];
+        size_t use = 0;
+        if (!ok || uses(value, k + 1, use) != 1 || (w[at[use]] & 0xFFFF) != 62 || w[at[use] + 2] != value) {
+            ok = false; // (not one OpStore <variable> <value>)
+            break;
+        }
+        const u32 var = w[at[use] + 1];
+        size_t next = 0;
+        ok = uses(var, use + 1, next) != 0 && (w[at[next]] & 0xFFFF) == 62 && w[at[next] + 1] == var; // written again
+    }
+    it->second = ok;
+    return ok;
+}
+
+bool Executor::Batchable(const Cp::DrawDescriptor& a, const PreparedCommand& pa, const Cp::DrawDescriptor& b,
+                         const PreparedCommand& pb) {
+    using G = Cp::Group;
+    const auto Reject = [&](size_t why) {
+        ++stats_.batch_rejects[std::min(why, stats_.batch_rejects.size() - 1)];
+        return false;
+    };
+    // the registers: between the two draws only the VS user data, the index buffer and the draw's own parameters
+    constexpr Cp::GroupMask kGeometryGroups = (Cp::GroupMask{1} << static_cast<u32>(G::VsUserData)) |
+                                              (Cp::GroupMask{1} << static_cast<u32>(G::IndexState)) |
+                                              (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
+    if ((b.changed & ~kGeometryGroups) != 0) {
+        return Reject(2);
+    }
+    const auto plain = [](const Cp::DrawDescriptor& d) {
+        // a direct, indexed, single-instance triangle list of VS + PS (lists: one after another they stay lists)
+        return d.indexed && !d.indirect && d.instance_count <= 1 && d.primitive_type == 4 && d.index_count != 0 &&
+               d.index_count % 3 == 0 && d.index_count <= d.max_index_size && (d.index_type & 3) <= 1 &&
+               d.active_stages == ((1u << static_cast<u32>(Cp::Stage::Vs)) | (1u << static_cast<u32>(Cp::Stage::Ps)));
+    };
+    if (!plain(a) || !plain(b) || a.queue != b.queue || a.index_type != b.index_type || a.cb_extent != b.cb_extent ||
+        a.db_extent != b.db_extent ||
+        !std::equal(a.shaders.begin(), a.shaders.end(), b.shaders.begin(),
+                    [](const Cp::ShaderRef& x, const Cp::ShaderRef& y) {
+                        return x.address == y.address && x.rsrc1 == y.rsrc1 && x.rsrc2 == y.rsrc2;
+                    }) ||
+        a.user_data[static_cast<size_t>(Cp::Stage::Ps)] != b.user_data[static_cast<size_t>(Cp::Stage::Ps)]) {
+        return Reject(3);
+    }
+    if (pa.prep == nullptr || pb.prep == nullptr || !pa.prep->ready || !pb.prep->ready ||
+        pa.prep->pipeline != pb.prep->pipeline || pa.state == nullptr || pa.state != pb.state || pa.stage == nullptr ||
+        pb.stage == nullptr || pa.ps == nullptr || pb.ps == nullptr) {
+        return Reject(4);
+    }
+    const GS::StageView& va = *pa.stage;
+    const GS::StageView& vb = *pb.stage;
+    const GS::StageView& qa = *pa.ps;
+    const GS::StageView& qb = *pb.ps;
+    if (va.module == nullptr || va.module != vb.module || qa.module == nullptr || qa.module != qb.module ||
+        !(va.start == vb.start) || !(va.end == vb.end) || !(qa.start == qb.start) || !(qa.end == qb.end)) {
+        return Reject(5);
+    }
+    const auto same_buffers = [](const GS::ResourceBindingPlan& x, const GS::ResourceBindingPlan& y) {
+        return x.buffers.size() == y.buffers.size() &&
+               std::equal(x.buffers.begin(), x.buffers.end(), y.buffers.begin(), [](const auto& p, const auto& q) {
+                   return p.binding == q.binding && p.kind == q.kind && p.desc.raw == q.desc.raw &&
+                          p.address == q.address && p.size == q.size && !p.written && !q.written &&
+                          p.formatted == q.formatted && p.status == q.status;
+               });
+    };
+    const auto same_images = [](const GS::ResourceBindingPlan& x, const GS::ResourceBindingPlan& y) {
+        return x.images.size() == y.images.size() &&
+               std::equal(x.images.begin(), x.images.end(), y.images.begin(), [](const auto& p, const auto& q) {
+                   return p.binding == q.binding && p.count == q.count && p.desc.raw == q.desc.raw &&
+                          p.view_type == q.view_type && !p.storage && !q.storage && p.depth == q.depth &&
+                          p.array == q.array && p.fmask == q.fmask && p.status == q.status;
+               }) &&
+               x.samplers.size() == y.samplers.size() &&
+               std::equal(x.samplers.begin(), x.samplers.end(), y.samplers.begin(), [](const auto& p, const auto& q) {
+                   return p.binding == q.binding && p.desc.raw == q.desc.raw && p.status == q.status;
+               });
+    };
+    // the flattened user data: the walk's copies the same, the registers the shader reads the same
+    const auto same_flat = [](const GS::StageView& x, const GS::StageView& y) {
+        const std::vector<u32>& f = x.plan.flat;
+        const std::vector<u32>& g = y.plan.flat;
+        if (f.size() != g.size() || f.size() < 16 ||
+            !std::equal(f.begin() + 16, f.end(), g.begin() + 16)) {
+            return false;
+        }
+        // (the vertex buffer table's and the fetch shader's pairs: the fetch shader alone reads them - the translated
+        // stage takes its vertices as vertex inputs, from each draw's own ranges)
+        const GS::FetchShader& fs = x.module->result.reflection.fetch;
+        u32 fetch_only = 0;
+        if (fs.present) {
+            fetch_only |= 3u << fs.sgpr_base;
+            for (const GS::FetchAttribute& at : fs.attributes) {
+                fetch_only |= 3u << at.sgpr_base;
+            }
+        }
+        const u16 used = static_cast<u16>(x.module->result.reflection.user_data_used & ~fetch_only);
+        for (u32 i = 0; i < 16; ++i) {
+            if (((used >> i) & 1) != 0 && f[i] != g[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!same_buffers(va.plan, vb.plan)) {
+        return Reject(6);
+    }
+    if (!same_images(va.plan, vb.plan)) {
+        return Reject(7);
+    }
+    if (!same_flat(va, vb)) {
+        return Reject(12);
+    }
+    if (!same_buffers(qa.plan, qb.plan) || !same_images(qa.plan, qb.plan) || qa.plan.flat != qb.plan.flat) {
+        return Reject(13);
+    }
+    // the vertex inputs: the same attributes, formats and strides (their own ranges)
+    if (va.plan.vertices.empty() || va.plan.vertices.size() != vb.plan.vertices.size()) {
+        return Reject(8);
+    }
+    for (size_t i = 0; i < va.plan.vertices.size(); ++i) {
+        const GS::VertexBinding& x = va.plan.vertices[i];
+        const GS::VertexBinding& y = vb.plan.vertices[i];
+        if (x.attribute != y.attribute || !(x.fetch == y.fetch) || x.fetch.instance_data != 0 ||
+            x.desc.raw[1] >> 16 != y.desc.raw[1] >> 16 || x.desc.raw[3] != y.desc.raw[3] || x.desc.Stride() == 0 ||
+            x.status != GS::ResourceStatus::Ok || y.status != GS::ResourceStatus::Ok || y.address == 0 || y.size == 0) {
+            return Reject(9);
+        }
+    }
+    return BatchModuleOk(va.module, true) ? (BatchModuleOk(qa.module, false) ? true : Reject(11)) : Reject(10);
+}
+
+bool Executor::BatchGeometry(const GS::StageView& vs, std::array<VkBuffer, 16>& vbufs,
+                             std::array<VkDeviceSize, 16>& voffs, VkBuffer& ibuf, u64& ioff, u32& count) {
+    const size_t streams = vs.plan.vertices.size();
+    if (streams == 0 || streams > vbufs.size()) {
+        return false;
+    }
+    const GS::FetchShader& fetch = vs.module->result.reflection.fetch;
+    // the vertex offset a draw adds to its indices (as RecordDraw: VGT_INDX_OFFSET or the fetch shader's)
+    const auto vertex_offset = [&](const Cp::DrawDescriptor& d) {
+        u32 vo = d.vgt_index_offset;
+        const auto& ud = d.user_data[static_cast<size_t>(Cp::Stage::Vs)];
+        if (fetch.present && vo == 0 && fetch.vertex_offset_sgpr >= 0 && fetch.vertex_offset_sgpr < 16) {
+            vo = ud[fetch.vertex_offset_sgpr];
+        }
+        return vo;
+    };
+    // the batch's composition (the persistent copy's key): strides, every draw's vertex ranges, index range and
+    // vertex offset - the bytes behind them are versioned by the buffer cache
+    std::vector<u64>& key = geo_key_;
+    key.clear();
+    key.push_back(streams);
+    for (size_t s = 0; s < streams; ++s) {
+        key.push_back(vs.plan.vertices[s].desc.Stride());
+    }
+    u64 indices = 0, slots = 0;
+    for (const BatchDraw& b : batch_) {
+        const Cp::DrawDescriptor& d = *b.draw;
+        const GS::StageView& v = *b.prepared.stage;
+        u64 most = 0;
+        for (size_t s = 0; s < streams; ++s) {
+            const GS::VertexBinding& vb = v.plan.vertices[s];
+            key.push_back(vb.address);
+            key.push_back(vb.size);
+            most = std::max<u64>(most, (vb.size + vb.desc.Stride() - 1) / vb.desc.Stride());
+        }
+        key.push_back(d.index_base + u64{d.index_offset} * ((d.index_type & 3) == 1 ? 4 : 2));
+        key.push_back((u64{d.index_count} << 2) | (d.index_type & 3));
+        key.push_back(vertex_offset(d));
+        slots += most;
+        indices += d.index_count;
+    }
+    if (slots > 0xFFFFFFF0ull || indices > (1u << 24)) {
+        return false;
+    }
+    u64 h = 0xCBF29CE484222325ull;
+    for (const u64 w : key) {
+        h = (h ^ w) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    const u64 completed = timeline_.CompletedCached();
+    // SSPC_CITY_GEOMETRY_CACHE=1: the batch's geometry built once into video memory and drawn again while every source
+    // range is unchanged (the versions of its blocks in the buffer cache) - no copy, no index rebase
+    if (geo_on_ < 0) {
+        char v[4] = {};
+        geo_on_ = GetEnvironmentVariableA("SSPC_CITY_GEOMETRY_CACHE", v, sizeof(v)) == 1 && v[0] == '1';
+        if (char mb[16] = {}; GetEnvironmentVariableA("SSPC_CITY_GEOMETRY_CACHE_MB", mb, sizeof(mb)) > 0) {
+            geo_arena_bytes_ = std::clamp<u64>(std::strtoull(mb, nullptr, 10), 4, 512) << 20;
+        }
+        if (geo_on_ == 1) {
+            SSPC_LOG(GPU, Info, "SSPC_CITY_GEOMETRY_CACHE=1: batch geometry kept in video memory (2 x {} MiB)",
+                     geo_arena_bytes_ >> 20);
+        }
+    }
+    if (geo_on_ == 1) {
+        if (const auto it = geo_cache_.find(h); it != geo_cache_.end()) {
+            GeoEntry& e = it->second;
+            bool same = e.key == key;
+            for (size_t i = 0; i < e.sources.size() && same; ++i) {
+                same = buffers_.RangeVersion(e.sources[i].first, e.sources[i].second) == e.versions[i];
+            }
+            if (same) {
+                for (size_t s = 0; s < streams; ++s) {
+                    vbufs[s] = geo_arena_[e.arena].buffer;
+                    voffs[s] = e.vb_off[s];
+                }
+                ibuf = geo_arena_[e.arena].buffer;
+                ioff = e.ib_off;
+                count = e.count;
+                geo_arena_seq_[e.arena] = std::max(geo_arena_seq_[e.arena], cur_.value);
+                ++stats_.geo_hits;
+                return true;
+            }
+            ++stats_.geo_changed;
+            geo_cache_.erase(it);
+        }
+    }
+    // the bytes: the host's copy, when it is current (no write of the GPU or of the timeline pending, none kept back)
+    const auto host = [&](u64 addr, u64 size) -> const u8* {
+        if (size == 0 || size > 16 * 1024 || buffers_.HostWritePending(addr, size) || TimelineWritePending(addr, size) ||
+            buffers_.GpuWritePending(addr, size, completed) || buffers_.KeptBack(addr, size)) {
+            return nullptr;
+        }
+        return guest_.BackingPointer(addr, size);
+    };
+    std::array<u64, 16> stream_bytes{};
+    u64 total = 0;
+    for (size_t s = 0; s < streams; ++s) {
+        stream_bytes[s] = (slots * vs.plan.vertices[s].desc.Stride() + 15) & ~15ull;
+        total += stream_bytes[s];
+    }
+    total += indices * 4;
+    // kept in an arena when every source range is current in video memory (write-tracked: versioned), else this
+    // batch's stream ring
+    std::vector<std::pair<u64, u64>>& sources = geo_sources_;
+    std::vector<u32>& versions = geo_versions_;
+    sources.clear();
+    versions.clear();
+    bool persistent = geo_on_ == 1 && total <= geo_arena_bytes_ / 4;
+    for (size_t k = 0; k < batch_.size() && persistent; ++k) {
+        const Cp::DrawDescriptor& d = *batch_[k].draw;
+        for (const GS::VertexBinding& vb : batch_[k].prepared.stage->plan.vertices) {
+            sources.emplace_back(vb.address, vb.size);
+        }
+        const u64 isz = (d.index_type & 3) == 1 ? 4 : 2;
+        sources.emplace_back(d.index_base + u64{d.index_offset} * isz, u64{d.index_count} * isz);
+    }
+    for (size_t i = 0; i < sources.size() && persistent; ++i) {
+        const u32 v = buffers_.RangeVersion(sources[i].first, sources[i].second);
+        persistent = v != 0;
+        versions.push_back(v);
+    }
+    u8* dst = nullptr;
+    VkBuffer dst_buffer = VK_NULL_HANDLE;
+    u64 dst_offset = 0;
+    u32 arena = 0;
+    if (persistent && geo_arena_[0].buffer == VK_NULL_HANDLE) {
+        std::string err;
+        for (OwnedBuffer& a : geo_arena_) {
+            if (!CreateBuffer(ctx_, geo_arena_bytes_, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                              true, a, err, false, HostPlacement::Bar)) {
+                SSPC_LOG(GPU, Error, "SSPC_CITY_GEOMETRY_CACHE: an arena of {} MiB: {} - off", geo_arena_bytes_ >> 20, err);
+                geo_on_ = 0;
+                persistent = false;
+                break;
+            }
+        }
+    }
+    if (persistent) {
+        u32 a = geo_cur_;
+        if (geo_used_[a] + total > geo_arena_bytes_ && geo_arena_seq_[a ^ 1] <= completed) {
+            // the other arena takes over once the GPU finished every draw that read it: its entries go (LRU by halves)
+            a ^= 1;
+            std::erase_if(geo_cache_, [&](const auto& e) { return e.second.arena == a; });
+            ++stats_.geo_recycles;
+            geo_used_[a] = 0;
+            geo_cur_ = a;
+        }
+        if (geo_used_[a] + total <= geo_arena_bytes_) {
+            arena = a;
+            dst_buffer = geo_arena_[a].buffer;
+            dst_offset = geo_used_[a];
+            dst = geo_arena_[a].mapped + dst_offset;
+            geo_used_[a] += (total + 255) & ~255ull;
+        }
+    }
+    StreamRing::Slice ring{};
+    if (dst == nullptr) {
+        persistent = false;
+        if (ring_.Allocate(total, 16, cur_.value, ring) != StreamRing::Status::Ok) {
+            return false;
+        }
+        dst = ring.data;
+        dst_buffer = ring.buffer;
+        dst_offset = ring.offset;
+    }
+    // the vertices of each draw one after another in each stream, the indices moved to them (32-bit)
+    std::array<u64, 16> soff{};
+    u64 at = 0;
+    for (size_t s = 0; s < streams; ++s) {
+        soff[s] = at;
+        at += stream_bytes[s];
+    }
+    u32* out = reinterpret_cast<u32*>(dst + at);
+    u64 base = 0;
+    for (const BatchDraw& b : batch_) {
+        const Cp::DrawDescriptor& d = *b.draw;
+        const GS::StageView& v = *b.prepared.stage;
+        u64 most = 0, least = ~0ull;
+        for (size_t s = 0; s < streams; ++s) {
+            const GS::VertexBinding& vb = v.plan.vertices[s];
+            const u8* src = host(vb.address, vb.size);
+            if (src == nullptr) {
+                return false; // (bytes taken in an arena stay unused until it is recycled)
+            }
+            const u32 stride = vb.desc.Stride();
+            std::memcpy(dst + soff[s] + base * stride, src, vb.size);
+            most = std::max<u64>(most, (vb.size + stride - 1) / stride);
+            least = std::min<u64>(least, vb.size / stride);
+        }
+        const u32 vo = vertex_offset(d);
+        const u64 isize = (d.index_type & 3) == 1 ? 4 : 2;
+        const u8* src = host(d.index_base + u64{d.index_offset} * isize, u64{d.index_count} * isize);
+        if (src == nullptr) {
+            return false;
+        }
+        for (u32 k = 0; k < d.index_count; ++k) {
+            u32 ix = 0;
+            std::memcpy(&ix, src + k * isize, isize);
+            const u64 vtx = u64{ix} + vo;
+            if (vtx >= least) {
+                return false; // past its own vertices (robustness reads zeros there; in a batch, another draw's)
+            }
+            *out++ = static_cast<u32>(base + vtx);
+        }
+        base += most;
+    }
+    for (size_t s = 0; s < streams; ++s) {
+        vbufs[s] = dst_buffer;
+        voffs[s] = dst_offset + soff[s];
+    }
+    ibuf = dst_buffer;
+    ioff = dst_offset + at;
+    count = static_cast<u32>(indices);
+    stats_.geo_built_bytes += total;
+    ++stats_.geo_builds;
+    if (persistent) {
+        GeoEntry& e = geo_cache_[h];
+        e.key = key;
+        e.sources = sources;
+        e.versions = versions;
+        e.arena = arena;
+        for (size_t s = 0; s < streams; ++s) {
+            e.vb_off[s] = voffs[s];
+        }
+        e.ib_off = ioff;
+        e.count = count;
+        geo_arena_seq_[arena] = std::max(geo_arena_seq_[arena], cur_.value);
+        ++stats_.geo_stored;
+    }
+    return true;
+}
+
+bool Executor::DrawPreparedBatch(std::span<const BatchDraw> draws) {
+    const u64 t0 = GS::Ticks();
+    const GS::FineSample fine_sample(fine_counter_);
+    batch_ = draws;
+    batch_done_ = false;
+    RecordDraw(*draws[0].draw, draws[0].prepared, t0);
+    batch_ = {};
+    if (!batch_done_) {
+        ++stats_.batch_fallbacks; // (the first draw recorded on its own)
+        return false;
+    }
+    ++stats_.draw_batches;
+    stats_.batched_draws += draws.size();
+    for (const BatchDraw& b : draws.subspan(1)) {
+        // what RecordDraw counts for each draw: its work recorded in this batch
+        ++stats_.draws;
+        ++stats_.draws_executed;
+        ++stats_.indexed;
+        ++trace_.ordinal;
+        Note(b.draw->queue, b.draw->seq);
+        ++commands_;
+    }
+    return true;
+}
+
 void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0) {
+    stream_pipe_ = 0;
     ++stats_.draws;
     ++trace_.ordinal;
     const auto& f = Fn();
@@ -3432,6 +3900,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         return;
     }
     stage(stats_.t_pipe);
+    stream_pipe_ = prep.pipeline + 1;
     if (markers_) {
         // a new label at a new pipeline or a change of the target registers (before this draw's uploads and barriers:
         // they count to it)
@@ -3689,6 +4158,18 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         NoteOrderRange(&ps.plan, ps.address, d.queue, false);
     }
     ts = GS::FineTicks();
+    // SSPC_CITY_BATCH: the batch's geometry (DrawPreparedBatch) in place of this draw's - not with a memory write, an
+    // occlusion query, the upscaler's display draw or a diagnostic that looks at single draws
+    std::array<VkBuffer, 16> batch_vb{};
+    std::array<VkDeviceSize, 16> batch_vo{};
+    VkBuffer batch_ib = VK_NULL_HANDLE;
+    u64 batch_io = 0;
+    u32 batch_count = 0;
+    const bool batched = !batch_.empty() && !writes_memory && !occ_.open && !up_display_draw_ && !trace_.Active() &&
+                         !histo_.active && insp_catalog_ == nullptr && !prof_ && skip_draws_.empty() &&
+                         !texdump_.active && (diag_ == nullptr || !diag_->Enabled()) &&
+                         (regs.Get(kVgtMultiPrimIbResetEn) & 1) == 0 &&
+                         BatchGeometry(vs, batch_vb, batch_vo, batch_ib, batch_io, batch_count);
     // vertex inputs
     std::vector<VkVertexInputBindingDescription2EXT>& vbind = scratch_.vbind;
     std::vector<VkVertexInputAttributeDescription2EXT>& vattr = scratch_.vattr;
@@ -3725,7 +4206,10 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
                          .stride = v.desc.Stride(),
                          .inputRate = inst == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE,
                          .divisor = inst == 0 ? 1u : std::max<u32>(divisor, 1)});
-        if (v.status == GS::ResourceStatus::Ok && v.address != 0 && v.size != 0) {
+        if (batched) {
+            vbufs.push_back(batch_vb[slot]);
+            voffs.push_back(batch_vo[slot]);
+        } else if (v.status == GS::ResourceStatus::Ok && v.address != 0 && v.size != 0) {
             VkBuffer vb = VK_NULL_HANDLE;
             u64 voff = 0, vavail = 0;
             if (!GuestRange(v.address, v.size, false, 4, vb, voff, vavail)) {
@@ -3743,7 +4227,10 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     VkBuffer ibuf = VK_NULL_HANDLE;
     u64 ioff = 0;
     const bool idx32 = (d.index_type & 3) == 1;
-    if (d.indexed) {
+    if (batched) {
+        ibuf = batch_ib;
+        ioff = batch_io;
+    } else if (d.indexed) {
         const u32 isize = idx32 ? 4 : 2;
         const u64 addr = d.index_base + u64{d.index_offset} * isize;
         const u64 count = d.indirect ? d.max_index_size : std::min(d.index_count, d.max_index_size);
@@ -3766,6 +4253,61 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
 
     stage(stats_.t_vertex);
+    {
+        // SSPC_DIAG_GEOM=<VS address hex>:<first flip>:<flips> (CITY-OPT Phase 3, diagnostics): every range of that VS's
+        // draws - address, size, content hash, residency, why it is not cached - to logs\geom\geom.tsv
+        struct GeomDiag {
+            u64 vs = 0, from = 0, to = 0;
+            std::ofstream out;
+        };
+        static GeomDiag* gd = [this]() -> GeomDiag* {
+            char v[64] = {};
+            if (GetEnvironmentVariableA("SSPC_DIAG_GEOM", v, sizeof(v)) == 0) {
+                return nullptr;
+            }
+            auto* g = new GeomDiag;
+            char* p = v;
+            g->vs = std::strtoull(p, &p, 16);
+            g->from = *p == ':' ? std::strtoull(p + 1, &p, 10) : 3000;
+            g->to = g->from + (*p == ':' ? std::strtoull(p + 1, &p, 10) : 300);
+            const auto dir = options_.capture_path.parent_path().parent_path() / "geom";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            g->out.open(dir / "geom.tsv", std::ios::trunc);
+            g->out << "flip\tn\tstream\taddr\tsize\tstride\thash\tresidency\twhy\tcount\tvo\trt0\tdepth\n";
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_GEOM - VS {:#x}, flips {}..{}", g->vs, g->from, g->to);
+            return g;
+        }();
+        if (gd != nullptr && vs.address == gd->vs) {
+            const u64 flip = VideoOut::NextFlipId();
+            static u64 last_flip = 0, n = 0;
+            n = flip == last_flip ? n + 1 : 0;
+            last_flip = flip;
+            if (flip >= gd->from && flip < gd->to) {
+                const auto line = [&](int s, u64 addr, u64 size, u32 stride) {
+                    BufferCache::Range r;
+                    const auto res = buffers_.Classify(addr, size, r);
+                    const u8* host = guest_.BackingPointer(addr, size);
+                    gd->out << flip << '\t' << n << '\t' << s << '\t' << std::hex << addr << std::dec << '\t' << size
+                            << '\t' << stride << '\t' << std::hex << (host != nullptr ? RaceHash(host, size) : 0)
+                            << std::dec << '\t' << static_cast<int>(res) << '\t' << buffers_.PromoteWhy(addr, size)
+                            << '\t' << d.index_count << '\t' << d.vgt_index_offset << '\t' << std::hex
+                            << (color_img[0] != nullptr ? color_img[0]->layout.guest_address : 0) << '\t'
+                            << (depth_img != nullptr ? depth_img->layout.guest_address : 0) << std::dec << '\n';
+                };
+                for (size_t s = 0; s < vs.plan.vertices.size(); ++s) {
+                    const auto& v = vs.plan.vertices[s];
+                    line(static_cast<int>(s), v.address, v.size, v.desc.Stride());
+                }
+                if (d.indexed) {
+                    const u64 isz = idx32 ? 4 : 2;
+                    line(-1, d.index_base + u64{d.index_offset} * isz, u64{d.index_count} * isz, static_cast<u32>(isz));
+                }
+            } else if (flip == gd->to) {
+                gd->out.flush();
+            }
+        }
+    }
     if (histo_.active && d.indirect && argbuf != VK_NULL_HANDLE) {
         static const u64 detail_p = [] {
             char v[16] = {};
@@ -4155,7 +4697,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     } else {
     if (d.indexed) {
         if (ibuf != VK_NULL_HANDLE) {
-            const VkIndexType it = idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            const VkIndexType it = idx32 || batched ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
             if (bind_shadow_ && ibuf == ib_last_ && ioff == ib_off_last_ && it == ib_type_last_) {
                 ++stats_.ib_binds_skipped; // (P4.7: the bound one)
             } else {
@@ -4176,6 +4718,9 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         } else {
             f.vkCmdDrawIndirect(cur_.cb, argbuf, argoff, 1, 16);
         }
+    } else if (batched) {
+        f.vkCmdDrawIndexed(cur_.cb, batch_count, instances, 0, 0, instance_offset); // (the offsets are in the indices)
+        batch_done_ = true;
     } else if (d.indexed) {
         if (ibuf != VK_NULL_HANDLE) {
             f.vkCmdDrawIndexed(cur_.cb, std::min(d.index_count, d.max_index_size), instances, 0,
@@ -4375,6 +4920,7 @@ void Executor::DispatchPrepared(const Cp::DispatchDescriptor& d, const Cp::Compu
 
 void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs,
                               const PreparedCommand& pc, u64 t0) {
+    stream_pipe_ = 0;
     ++stats_.dispatches;
     ++trace_.ordinal;
     const auto& f = Fn();

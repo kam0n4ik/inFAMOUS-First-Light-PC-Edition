@@ -15,6 +15,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -88,6 +89,12 @@ struct ExecutorStats {
     u64 stream_promotions = 0;            ///< small read-only ranges cached instead of streamed (BufferCache::Promotable)
     u64 binds_skipped = 0, push_constants_skipped = 0; ///< draws repeating the bound pipeline / pushed constants
     u64 dyn_memo_hits = 0; ///< SSPC_CITY_DYN_MEMO: draws whose dynamic state was not computed again (DynMemo)
+    /// SSPC_CITY_BATCH: draws recorded as one draw (batches, the draws in them, batches recorded draw by draw after all)
+    u64 draw_batches = 0, batched_draws = 0, batch_fallbacks = 0;
+    std::array<u64, 16> batch_rejects{}; ///< ... the next draw not batchable, by the first check it failed
+    /// SSPC_CITY_GEOMETRY_CACHE: batches drawn from their kept geometry, kept ones whose sources changed, geometry built
+    /// (and its bytes), built into an arena (kept), arenas recycled
+    u64 geo_hits = 0, geo_changed = 0, geo_builds = 0, geo_built_bytes = 0, geo_stored = 0, geo_recycles = 0;
     /// SSPC_DIAG_STREAM_STATS: streamed ranges first seen / again in the frame unchanged / changed / unchanged since an
     /// earlier frame / changed since (count, bytes)
     std::array<u64, 5> stream_kinds{}, stream_kind_bytes{};
@@ -172,6 +179,12 @@ struct PreparedCommand {
     const GS::GraphicsPipelineState* state = nullptr; ///< a ready draw's pipeline state
 };
 
+/// SSPC_CITY_BATCH: one draw of a batch (Executor::DrawPreparedBatch).
+struct BatchDraw {
+    const Cp::DrawDescriptor* draw = nullptr;
+    PreparedCommand prepared;
+};
+
 class Executor final : public Cp::GpuWork {
 public:
     Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, GuestBuffers& guest, BufferCache& buffers,
@@ -205,6 +218,15 @@ public:
     void DrawPrepared(const Cp::DrawDescriptor& draw, const PreparedCommand& prepared);
     void DispatchPrepared(const Cp::DispatchDescriptor& dispatch, const Cp::ComputeRegisters* cs,
                           const PreparedCommand& prepared);
+    /// SSPC_CITY_BATCH (docs/CITY_PERFORMANCE.md): may `next`, the draw right after `first` in the stream, be recorded
+    /// with it as one draw - the same pipeline, resources, constants, targets and registers, only the geometry (vertex
+    /// and index ranges the CPU wrote, VS user data the shader does not read) its own. The registers are `first`'s.
+    bool Batchable(const Cp::DrawDescriptor& first, const PreparedCommand& a, const Cp::DrawDescriptor& next,
+                   const PreparedCommand& b);
+    /// Records `draws` (each Batchable after the first) as one draw: their vertices copied one after another into the
+    /// stream ring, their indices moved to them (32-bit) - the primitives in the same order. false: a range could not be
+    /// copied so - the first draw was recorded on its own (as DrawPrepared), the caller records the others.
+    bool DrawPreparedBatch(std::span<const BatchDraw> draws);
     /// A draw the hardware does not draw (fast clear elimination, FMASK decompression, primitive None).
     static bool DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& draw);
     /// P4.10: the frontend's memo is told about guest memory changes from here (true) or not (false: the parallel
@@ -352,6 +374,8 @@ public:
     bool WaitOldestOrWake(u64 wake_value, u64 timeout_ns);
 
     const ExecutorStats& Stats() const { return stats_; }
+    /// SSPC_DIAG_STREAM_WHO=1: the streamed ranges by the pipeline of the draw that streamed them (top 12; empty: off)
+    std::string StreamWhoReport() const;
 
     /// P4.8 Performance Inspector (SSPC_INSPECTOR): the draws and dispatches classified by effect category and counted
     /// (recording CPU time included); GPU timestamps at category changes in every `gpu_every`-th frame (0: none), read
@@ -557,6 +581,38 @@ private:
     std::vector<Cp::Group> dyn_groups_; ///< the groups of the registers SetDynamicState reads (once)
     int dyn_memo_on_ = -1;              ///< -1 not decided yet, 0 off, 1 on
     u32 dyn_memo_ab_ = 0;               ///< =ab:<n>: on in odd blocks of n flips only (image A/B)
+    /// SSPC_CITY_BATCH: the draws RecordDraw records as one (empty: one draw); `batch_done_` whether it did
+    std::span<const BatchDraw> batch_;
+    bool batch_done_ = false;
+    /// SSPC_CITY_GEOMETRY_CACHE=1: a batch's geometry kept in video memory (two arenas mapped through the BAR, recycled
+    /// in turn once the GPU is done with the older one) by its exact composition, valid while its source ranges'
+    /// buffer cache versions are those it was built from
+    struct GeoEntry {
+        std::vector<u64> key;
+        std::vector<std::pair<u64, u64>> sources;
+        std::vector<u32> versions;
+        u32 arena = 0;
+        std::array<u64, 16> vb_off{};
+        u64 ib_off = 0;
+        u32 count = 0;
+    };
+    u64 geo_arena_bytes_ = 64ull << 20; ///< each arena (SSPC_CITY_GEOMETRY_CACHE_MB=<n>: n MiB)
+    int geo_on_ = -1;
+    std::unordered_map<u64, GeoEntry> geo_cache_;
+    std::array<OwnedBuffer, 2> geo_arena_{};
+    std::array<u64, 2> geo_used_{}, geo_arena_seq_{}; ///< bytes taken; the last submission that drew from it
+    u32 geo_cur_ = 0;
+    std::vector<u64> geo_key_;
+    std::vector<std::pair<u64, u64>> geo_sources_;
+    std::vector<u32> geo_versions_;
+    int stream_who_on_ = -1;
+    u32 stream_pipe_ = 0; ///< the draw being recorded (its pipeline + 1; 0 other commands)
+    std::unordered_map<u32, std::array<u64, 2>> stream_who_; ///< pipeline + 1 -> ranges, bytes
+    /// per module: its SPIR-V reads no vertex index / primitive ID (a batch moves both)
+    std::unordered_map<const GS::Module*, bool> batch_modules_;
+    bool BatchModuleOk(const GS::Module* m, bool vertex);
+    bool BatchGeometry(const GS::StageView& vs, std::array<VkBuffer, 16>& vbufs, std::array<VkDeviceSize, 16>& voffs,
+                       VkBuffer& ibuf, u64& ioff, u32& count);
 
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md, vk_executor_upscale.cpp): the game's scene at its render size goes
     // through DLSS / FSR 3.1 in place of the game's own scaling to the display buffer.

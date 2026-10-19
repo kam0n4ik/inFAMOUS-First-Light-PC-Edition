@@ -55,6 +55,11 @@ std::string ApplyCpMode(std::string mode, bool native_backend) {
     if (Env("SSPC_CITY_PERFORMANCE") == "1") {
         preset.push_back({"SSPC_CITY_HOT_LOCKS", "1"});
         preset.push_back({"SSPC_CITY_DYN_MEMO", "1"});
+        // Phase 3: draws differing only in their geometry - prepared from the draw before (thread 1), recorded as one
+        // draw (thread 2) from geometry kept in video memory (each alone moves the limit to the other thread)
+        preset.push_back({"SSPC_CITY_GEOFAST", "1"});
+        preset.push_back({"SSPC_CITY_BATCH", "1"});
+        preset.push_back({"SSPC_CITY_GEOMETRY_CACHE", "1"});
     }
     std::string set, kept;
     for (const auto& [name, value] : preset) {
