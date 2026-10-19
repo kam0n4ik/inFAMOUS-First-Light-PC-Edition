@@ -29,6 +29,12 @@ Remove-Item "$out\run.json", "$out\screen.png" -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.Drawing
 
+# the own GCN translator is the default (SSPC_OWN_SHADERS=bridge: the bridge's): its cache seeded as tools\manual_run.ps1
+if ($Exe -eq "$root\build\bin\SecondSonPC.exe") {
+    & python -I "$root\tools\seed_own_shader_cache.py"
+    if ($LASTEXITCODE -ne 0) { throw "tools\seed_own_shader_cache.py failed ($LASTEXITCODE) - not started" }
+}
+
 $argList = @()
 if ($Lang) { $argList += @("--lang", $Lang) }
 $argList += $ExtraArgs.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)

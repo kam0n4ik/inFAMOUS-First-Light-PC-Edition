@@ -1,7 +1,8 @@
-"""Seeds the own GCN translator's shader cache (play_rea_own.cmd) from the main one.
+"""Seeds the own GCN translator's shader cache from the main one (tools/manual_run.ps1, run_phase0.ps1 before each start:
+the own translator is the default; SSPC_OWN_SHADERS=bridge turns it off and this does nothing).
 
 cache\\shaders\\<game>\\native\\<gen>\\shaders.pack -> ...\\native_own\\<gen>\\shaders.pack, every record but the modules
-of the stages the own translator makes (--stages, default SSPC_OWN_SHADERS: cs, vs, ps) and the pipelines built of
+of the stages the own translator makes (--stages, default SSPC_OWN_SHADERS, unset: cs,vs,ps) and the pipelines built of
 them: with cs the compute modules ('M' of stage Cs) and compute pipelines ('L' compute); with vs or ps every graphics
 module (the auxiliary tessellation stages of rect / quad lists too: the own translator gives them with its vertex
 programs) and every graphics pipeline. vulkan.bin (the driver's pipeline cache) as it is, not the static prediction's
@@ -72,9 +73,11 @@ def main():
     ap.add_argument('--cache', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cache', 'shaders'))
     ap.add_argument('--game', default='CUSA00004')
     ap.add_argument('--force', action='store_true')
-    ap.add_argument('--stages', default=os.environ.get('SSPC_OWN_SHADERS', 'cs'),
-                    help="the own translator's stages, as SSPC_OWN_SHADERS (cs,vs,ps)")
+    ap.add_argument('--stages', default=os.environ.get('SSPC_OWN_SHADERS', 'cs,vs,ps'),
+                    help="the own translator's stages, as SSPC_OWN_SHADERS (unset: cs,vs,ps; bridge: off)")
     a = ap.parse_args()
+    if a.stages.strip() == 'bridge':
+        return 0  # (the bridge's translator: the main cache, nothing to seed)
     stages = sorted({s.strip() for s in a.stages.split(',')} & {'cs', 'vs', 'ps'})
     if not stages:
         print('no own translator stage in', repr(a.stages))

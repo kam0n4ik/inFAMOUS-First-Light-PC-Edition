@@ -725,7 +725,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // P4.3: SecondSonPC's translator interface over the bridge's recompiler (used only by SecondSonPC's frontend:
     // --gpu-shaders, --gpu-shader-verify, the self-test)
     InstallShaderTranslatorAdapter();
-    Gpu::Gcn::InstallOwnTranslatorIfEnabled(); // SSPC_OWN_SHADERS=cs: SecondSonPC's GCN translator for compute
+    // SecondSonPC's GCN translator for cs,vs,ps (SSPC_OWN_SHADERS=bridge: off); the self-test keeps the bridge's
+    // adapter it tests unless SSPC_OWN_SHADERS names stages
+    Gpu::Gcn::InstallOwnTranslatorIfEnabled(!cfg.selftest);
     InstallHostShaders(); // P4.4: SecondSonPC's backend's tiling kernels (data only)
     const bool native_gpu = cfg.gpu_backend == App::Config::GpuBackend::Sspc;
     if (!cfg.selftest) {
@@ -1230,7 +1232,7 @@ GameMetadata ReadGameMetadataShad(Core::FileSys::MntPoints& mnt) {
 /// and translated into the native backend's shader cache, before any guest memory or game code exists.
 int RunPredictShaders(const App::Config& cfg, const std::string& game) {
     InstallShaderTranslatorAdapter();
-    Gpu::Gcn::InstallOwnTranslatorIfEnabled(); // SSPC_OWN_SHADERS=cs: the compute modules prepared by the own translator
+    Gpu::Gcn::InstallOwnTranslatorIfEnabled(true); // the modules prepared by the own translator (SSPC_OWN_SHADERS=bridge: the bridge's)
     Gpu::Native::PredictShadersOptions po;
     po.device_index = cfg.gpu_device;
     po.game_dir = cfg.game_dir;

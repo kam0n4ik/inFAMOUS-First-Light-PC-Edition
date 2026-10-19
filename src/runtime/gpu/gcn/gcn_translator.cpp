@@ -76,11 +76,15 @@ GS::SharpLocation Location(const BufferUse& b) {
     return Location(b.sharp, 4);
 }
 
-/// The stages SSPC_OWN_SHADERS names ("cs", "vs", "ps", comma-separated): bit 0 compute, 1 vertex, 2 fragment.
-u32 OwnStages() {
+/// The stages SSPC_OWN_SHADERS names ("cs", "vs", "ps", comma-separated; "bridge": none): bit 0 compute, 1 vertex,
+/// 2 fragment; unset: `unset` (cs,vs,ps for the game).
+u32 OwnStages(u32 unset) {
     const char* v = std::getenv("SSPC_OWN_SHADERS");
+    if (v == nullptr) {
+        return unset;
+    }
     u32 stages = 0;
-    std::string_view s = v != nullptr ? std::string_view(v) : std::string_view{};
+    std::string_view s(v);
     while (!s.empty()) {
         const size_t comma = s.find(',');
         const std::string_view item = s.substr(0, comma);
@@ -730,11 +734,20 @@ private:
     std::atomic<u32> own_{0}, declined_{0}, aux_{0};
 };
 
+std::atomic<bool> g_installed{false};
+
 } // namespace
 
-void InstallOwnTranslatorIfEnabled() {
-    const u32 stages = OwnStages();
+bool OwnTranslatorInstalled() {
+    return g_installed.load(std::memory_order_acquire);
+}
+
+void InstallOwnTranslatorIfEnabled(bool by_default) {
+    const u32 stages = OwnStages(by_default ? 7u : 0u);
     if (stages == 0) {
+        if (const char* v = std::getenv("SSPC_OWN_SHADERS"); v != nullptr) {
+            SSPC_LOG(GPU, Info, "own GCN translator: off (SSPC_OWN_SHADERS={}) - every program the bridge's recompiler's", v);
+        }
         return;
     }
     GS::ShaderTranslator* fallback = GS::GetShaderTranslator();
@@ -744,9 +757,11 @@ void InstallOwnTranslatorIfEnabled() {
     }
     static OwnTranslator own(fallback, stages);
     GS::InstallShaderTranslator(&own);
+    g_installed.store(true, std::memory_order_release);
+    const char* v = std::getenv("SSPC_OWN_SHADERS");
     SSPC_LOG(GPU, Info, "own GCN translator: enabled for{}{}{} programs (SSPC_OWN_SHADERS={}), {} for the rest",
-             (stages & 1) != 0 ? " compute" : "", (stages & 2) != 0 ? " vertex" : "", (stages & 4) != 0 ? " fragment" : "", std::getenv("SSPC_OWN_SHADERS"),
-             fallback->Name());
+             (stages & 1) != 0 ? " compute" : "", (stages & 2) != 0 ? " vertex" : "", (stages & 4) != 0 ? " fragment" : "",
+             v != nullptr ? v : "unset: cs,vs,ps by default; =bridge turns it off", fallback->Name());
 }
 
 } // namespace SecondSon::Gpu::Gcn

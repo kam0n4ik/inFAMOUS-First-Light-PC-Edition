@@ -37,6 +37,7 @@
 #include "runtime/gpu/parallel_cp.h"
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
+#include "runtime/gpu/gcn/gcn_translator.h"
 #include "runtime/kernel/clock.h"
 #include "runtime/gpu/shader/game_shader_index.h"
 #include "runtime/gpu/shader/shader_disk_cache.h"
@@ -1926,9 +1927,9 @@ void Backend::StartShaderCache(const Options& o) {
                             "--no-shader-cache): shaders translated and pipelines created as they are met");
         return;
     }
-    // SSPC_OWN_SHADERS (SecondSonPC's own GCN translator, play_rea_own.cmd): a cache of its own - a module's key does
-    // not name its translator, so the bridge's modules and the own translator's must never meet in one
-    const bool own_shaders = std::getenv("SSPC_OWN_SHADERS") != nullptr;
+    // SecondSonPC's own GCN translator (the default; SSPC_OWN_SHADERS=bridge: off): a cache of its own - a module's key
+    // does not name its translator, so the bridge's modules and the own translator's must never meet in one
+    const bool own_shaders = Gcn::OwnTranslatorInstalled();
     const auto root = o.shader_cache_dir / o.game / (own_shaders ? "native_own" : "native");
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
@@ -2700,8 +2701,8 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     }
     GS::DeviceProfile profile;
     ctx->QueryProfile(profile);
-    // SSPC_OWN_SHADERS (play_rea_own.cmd): the own translator's cache, as the game opens it (StartShaderCache)
-    const auto root = std::getenv("SSPC_OWN_SHADERS") != nullptr
+    // the own translator's cache when it is installed, as the game opens it (StartShaderCache)
+    const auto root = Gcn::OwnTranslatorInstalled()
                           ? GS::NativeCacheRoot(o.shader_cache_dir, o.game).parent_path() / "native_own"
                           : GS::NativeCacheRoot(o.shader_cache_dir, o.game);
     const std::string gen = GS::ShaderCacheGeneration(profile);

@@ -35,6 +35,11 @@ if (Test-Path $saves) {
     "Сохранения скопированы в $backup"
 }
 
+# the own GCN translator is the default (SSPC_OWN_SHADERS=bridge: the bridge's): its cache seeded from the main one when
+# the translator changed, so that no module of an earlier own translator is used (docs\OWN_SHADER_TRANSLATOR.md)
+& python -I "$root\tools\seed_own_shader_cache.py"
+if ($LASTEXITCODE -ne 0) { throw "tools\seed_own_shader_cache.py failed ($LASTEXITCODE) - not started" }
+
 "Запуск: SecondSonPC.exe $argLine (закройте окно игры, чтобы завершить сессию)"
 $p = Start-Process -FilePath "$root\build\bin\SecondSonPC.exe" -ArgumentList $argLine -WorkingDirectory $root -PassThru
 $p.WaitForExit()
