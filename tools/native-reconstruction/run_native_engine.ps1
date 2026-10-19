@@ -1,5 +1,5 @@
 # Native Engine Reconstruction: one city run of a worktree's SecondSonPC.exe with the shared-machine rules
-# (docs/NATIVE_ENGINE_RECONSTRUCTION.md §5). Waits while E:\research\sspc_bench.lock exists (an FPS series of another
+# (docs/NATIVE_ENGINE_RECONSTRUCTION.md §5.4). Waits while E:\research\sspc_bench.lock exists (an FPS series of another
 # agent), takes E:\research\sspc_game.lock, runs tools\run_phase0.ps1 on a fresh copy of the stand's save, copies the
 # run's logs out of the worktree and releases the lock.
 #   powershell -File run_native_engine.ps1 -Tag <tag> [-Env "SSPC_NATIVE_ENGINE=verify;..."] [-Seconds 150]
@@ -12,7 +12,8 @@ param(
     [string]$Save = "E:\research\native-recon\saves\p0_orig",
     [string]$ShaderCache = "E:\SecondSonPC\cache\shaders",
     [string]$Press = "space@12,space@22,w@60:3,return@75",
-    [string]$Owner = "native-recon"
+    [string]$Owner = "native-recon",
+    [int]$QuietSeconds = 300
 )
 $ErrorActionPreference = "Stop"
 $bench = "E:\research\sspc_bench.lock"
@@ -22,8 +23,15 @@ $run = Join-Path $Out $Tag
 New-Item -ItemType Directory -Force $run | Out-Null
 
 # the shared-machine rules: no FPS series running, the game lock taken atomically, no other game process
+# An FPS series re-creates its bench lock for every run, so the gap between two of its runs is not "no series": the
+# game lock is taken only after neither lock has existed for -QuietSeconds.
+$quiet = $null
 while ($true) {
-    if (Test-Path $bench) { Start-Sleep -Seconds 180; continue }
+    if ((Test-Path $bench) -or (Test-Path $lock) -or (Get-Process SecondSonPC -ErrorAction SilentlyContinue)) {
+        $quiet = $null; Start-Sleep -Seconds 30; continue
+    }
+    if ($null -eq $quiet) { $quiet = Get-Date }
+    if (((Get-Date) - $quiet).TotalSeconds -lt $QuietSeconds) { Start-Sleep -Seconds 30; continue }
     try { New-Item -ItemType Directory $lock -ErrorAction Stop | Out-Null } catch { Start-Sleep -Seconds 120; continue }
     if (Test-Path $bench) { Remove-Item $lock -Recurse -Force; continue } # lost the race to a series
     if (Get-Process SecondSonPC -ErrorAction SilentlyContinue) { Remove-Item $lock -Recurse -Force; Start-Sleep 120; continue }
@@ -31,9 +39,9 @@ while ($true) {
 }
 "$Owner $(Get-Date -Format 'HH:mm:ss') $Tag" | Set-Content -Encoding ASCII "$lock\owner.txt"
 try {
-    $save = Join-Path $run "save"
-    if (Test-Path $save) { Remove-Item $save -Recurse -Force }
-    Copy-Item $Save $save -Recurse
+    $saveCopy = Join-Path $run "save"
+    if (Test-Path $saveCopy) { Remove-Item $saveCopy -Recurse -Force }
+    Copy-Item $Save $saveCopy -Recurse
     # the stand's preset (docs/CITY_PERFORMANCE.md) + this run's switches
     $vars = [ordered]@{
         SSPC_CP_MODE = "native"; SSPC_REA_MERGE_RUNS = "1"; SSPC_CP_ROUND_NODRAIN = "1"; SSPC_P411_ASYNC_ACQUIRE = "1"
@@ -46,7 +54,7 @@ try {
     $vars | ConvertTo-Json | Set-Content -Encoding UTF8 "$run\env.json"
     Remove-Item "$Worktree\logs\gpu_frames.csv", "$Worktree\logs\SecondSonPC.log" -ErrorAction SilentlyContinue
     Remove-Item "$Worktree\logs\native_engine" -Recurse -ErrorAction SilentlyContinue
-    $extra = "--loader sspc --user-data $save --shader-cache $ShaderCache --press $Press"
+    $extra = "--loader sspc --user-data $saveCopy --shader-cache $ShaderCache --press $Press"
     & "$Worktree\tools\run_phase0.ps1" -Seconds $Seconds -Tag $Tag -NoReport -ExtraArgs $extra -Exe $exe `
         -LogsDir "E:\research\native-recon\logs" | Tee-Object "$run\console.txt"
     foreach ($f in "SecondSonPC.log", "gpu_frames.csv", "gpu_native.txt", "bridge_shadps4.log") {

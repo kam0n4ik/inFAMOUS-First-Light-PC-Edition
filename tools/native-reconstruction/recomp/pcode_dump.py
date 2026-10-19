@@ -1,5 +1,5 @@
 # Static recompilation PoC, step 1 (decoder + IR): the raw P-code of whole functions, as Ghidra's SLEIGH x86-64
-# specification lifts each instruction (docs/NATIVE_ENGINE_RECONSTRUCTION.md §6). Read-only Ghidra snippet for
+# specification lifts each instruction (docs/NATIVE_ENGINE_RECONSTRUCTION.md §9). Read-only Ghidra snippet for
 # ../ghidra/run.py:
 #   run.py ../recomp/pcode_dump.py <out.json> <addr>...
 # Output: {"functions": [{entry, size, bytes, instructions: [{addr, len, text, mnemonic, pcode: [

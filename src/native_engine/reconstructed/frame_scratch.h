@@ -1,9 +1,10 @@
 // SecondSonPC — reconstruction of eboot 0x1f0870, "FrameScratch::Alloc" (our name; no symbols in the eboot).
 // Second function of Native Engine Reconstruction (docs/NATIVE_ENGINE_FUNCTIONS.md): shared memory and atomics.
 //
-// What it does [A: disassembly, docs/native-reconstruction/RENDER_ENGINE_ARCHITECTURE.md §6; E: in-game verify]:
-// the lock-free bump allocator of the frame's scratch memory (instance constants of the shadow and G-buffer draws,
-// particles, UI - 19 call sites). System V: (rdi scratch, esi size, edx alignment) -> rax address or 0.
+// What it does [A: disassembly, docs/native-reconstruction/RENDER_ENGINE_ARCHITECTURE.md §6; E: bit-exact offline
+// comparison with the eboot's code; in the game every call of a 10 s run went to the reconstruction]: the lock-free
+// bump allocator of the frame's scratch memory (instance constants of the shadow and G-buffer draws, particles, UI -
+// 19 call sites). System V: (rdi scratch, esi size, edx alignment) -> rax address or 0.
 //
 //   size 0                     -> 0
 //   primary arena  +0x38 cursor (CAS), +0x40 end: p = align_up(cursor, alignment); cursor = p + size;

@@ -1,11 +1,11 @@
 // SecondSonPC — reconstruction of eboot 0x11c890, "ObjectConstants::Update" (our name; no symbols in the eboot).
 // Pilot of Native Engine Reconstruction: docs/NATIVE_ENGINE_RECONSTRUCTION.md §3, docs/NATIVE_ENGINE_FUNCTIONS.md.
 //
-// What it does [A: disassembly + Ghidra, E: in-game verification]: the per-draw object constants of a draw context
-// (R + 0xd190, R a pool context of the render passes) are refreshed from the object's matrices, each block only when
-// its bit in `flags` is set, and the block's "changed" byte (+0x158) is OR-ed with whether any value differs from
-// what the block held - the caller (0x1a2030 mesh pass loop, 0x43d590 shadow pass, 0x19cf20, 0x19fbd0, 0x3f93e0,
-// 0x561810, 0x5a8b80) re-uploads the constants only when that byte is set.
+// What it does [A: disassembly + Ghidra; E: bit-exact offline comparison with the eboot's code]: the per-draw object
+// constants of a draw context (R + 0xd190, R a pool context of the render passes) are refreshed from the object's
+// matrices, each block only when its bit in `flags` is set, and the block's "changed" byte (+0x158) is OR-ed with
+// whether any value differs from what the block held - the caller (0x1a2030 mesh pass loop, 0x43d590 shadow pass,
+// 0x19cf20, 0x19fbd0, 0x3f93e0, 0x561810, 0x5a8b80) re-uploads the constants only when that byte is set.
 //
 //   System V: (rdi world[4], rsi previous world[4], rdx view-projection[4], rcx object, r8 extra[4], r9d value,
 //              [rsp+8] flags (u32, low byte used), [rsp+16] block)            float4 rows, row-major; returns nothing

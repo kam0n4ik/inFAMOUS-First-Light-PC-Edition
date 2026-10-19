@@ -1,4 +1,4 @@
-# Static recompilation PoC: eboot functions -> Ghidra P-code -> C++ -> native DLL (docs/NATIVE_ENGINE_RECONSTRUCTION.md §6).
+# Static recompilation PoC: eboot functions -> Ghidra P-code -> C++ -> native DLL (docs/NATIVE_ENGINE_RECONSTRUCTION.md §9).
 #   powershell -File recomp_build.ps1 [-Out E:\research\native-recon\recomp] [-Functions 1f0870,61e260,61f430,11c890]
 # The generated C++ is derived from the game's code: it is written to -Out (outside the repository), never committed.
 # Needs Ghidra (pyghidra, the read-only scripts project) and SecondSonPC's clang-cl toolchain (tools\env.ps1).

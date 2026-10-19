@@ -2,9 +2,10 @@
 // (Native Engine Reconstruction; docs/NATIVE_ENGINE_RECONSTRUCTION.md §2).
 //
 // What the boundary is (checked in the code of the loader and the runtime, not assumed):
-// - The eboot's x86-64 code runs on the host CPU as it is, at the address the loader gave it (0x400000 + offset with
-//   the SecondSonPC loader). Guest address = host address (memory/host_address_space.h, H1): a guest pointer is
-//   dereferenced directly, no translation.
+// - The eboot's x86-64 code runs on the host CPU as it is, at the address the loader gave it (the first free place
+//   at or above 0x400000 with the SecondSonPC loader; 0xe2d0000 in the runs of 20.10.2026).
+//   Guest address = host address (memory/host_address_space.h, H1): a guest pointer is dereferenced directly, no
+//   translation.
 // - The guest calls with the System V AMD64 convention; SecondSonPC is a Windows x64 program. clang-cl compiles a
 //   host function with `SSPC_SYSV_ABI` (base/abi.h) to the System V convention: arguments in RDI, RSI, RDX, RCX, R8,
 //   R9, XMM0-7, then the stack; RBX, RBP, R12-R15 preserved; RSI/RDI and XMM6-15 are NOT preserved for the caller
