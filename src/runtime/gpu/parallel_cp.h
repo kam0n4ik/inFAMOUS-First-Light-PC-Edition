@@ -305,6 +305,7 @@ private:
         /// P5.3: the Native Render Frontend's shared preparations of the draw's VS/PS (instead of the copies above)
         std::shared_ptr<const GS::StageView> stage_shared, ps_shared;
         const GS::GraphicsPipelineState* state = nullptr;
+        u64 census_key = 0; ///< SSPC_DIAG_PREP_CENSUS: the draw's row (0: not counted)
         const GS::StageView& Vs() const { return stage_shared != nullptr ? *stage_shared : stage; }
         const GS::StageView& Ps() const { return ps_shared != nullptr ? *ps_shared : ps; }
     };
@@ -421,9 +422,39 @@ private:
     std::unique_ptr<Record> geofast_check_; ///< verify: the fast preparation
     std::vector<GS::VertexBinding> geofast_vertices_;
     std::atomic<u64> geofast_hits_{0}, geofast_verified_{0}, geofast_mismatches_{0};
+    u8 geofast_why_ = 0; ///< PrepareGeometryOnly's last refusal (the census' numbers)
+    /// SSPC_CITY_DRAW_CACHE=1 (CITY-OPT Phase 4, with SSPC_CITY_GEOFAST): the draw before is the template - a draw that
+    /// differs from it in user data past the vertex tables too (a constant buffer's V#, a texture's T#), VS or PS, keeps
+    /// its preparation when the stage has no SRT walk: the stage's resources are decoded again from the new registers
+    /// (DecodeResources, as the full preparation does) and the specialization key must be the module's
+    bool drawcache_ = false;
+    std::vector<std::array<u32, 4>> dc_reads_;
+    GS::ResourceBindingPlan dc_vs_, dc_ps_;
+    GS::SpecializationKey dc_key_;
+    std::atomic<u64> dc_vs_hits_{0}, dc_ps_hits_{0}, dc_key_refused_{0};
+    /// The plan of stage `v` (prepared for the draw before) for `user_data`: false when the stage has an SRT walk, or
+    /// the registers give another specialization or other binding numbers.
+    bool RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
+                       std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out);
+    // SSPC_DIAG_PREP_CENSUS=<first flip>:<flips> (CITY-OPT Phase 4): the draws of those flips by their VS/PS programs -
+    // both threads' time, GEOFAST's answers, what changed since the draw before (Report)
+    struct CensusRow {
+        u64 vs = 0, ps = 0;
+        u64 draws = 0, t1 = 0, t2 = 0, t2_draws = 0, srt_reads = 0, vs_flat = 0, ps_flat = 0;
+        u64 vs_buffers = 0, ps_buffers = 0, ps_images = 0, vertices = 0;
+        std::array<u64, 16> why{};
+        std::array<u64, 16> batch_end{}; ///< thread 2: why the draw ended its batch (Executor::Batchable's check; 0 none)
+        std::vector<std::pair<u64, u64>> groups, vs_ud, ps_ud; ///< (mask, draws), the first 8 masks
+    };
+    u64 census_first_ = 0, census_end_ = 0;
+    mutable std::mutex census_mu_;
+    std::vector<CensusRow> census_;
+    Cp::DrawDescriptor census_last_; ///< thread 1: the draw before
+    void CensusPrepared(Record& r, u64 ticks, bool fast);
     bool batch_on_ = false;
     u32 batch_ab_ = 0;
     std::vector<Vk::BatchDraw> batch_items_;
+    u8 batch_end_ = 0; ///< thread 2: the Batchable check that ended the last batch (0: none, or not checked)
     /// Thread 2: the view a prepared draw's stage executes with (`rec` itself when off or shared).
     const GS::StageView& ReuseView(GS::StageView& rec, bool shared, bool same, GS::StageView& last);
     static constexpr u64 kNoGen = ~0ull;
