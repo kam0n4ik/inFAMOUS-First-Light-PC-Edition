@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -623,6 +624,35 @@ private:
                                         flat && v.value < res.flatbuf.size() ? res.flatbuf[v.value] : v.value);
                 }
                 text += "\n";
+            }
+            // the T#s / S#s as the translation read them (the module is specialized on their type and formats)
+            const auto dword = [&](const ScalarValue& v) -> std::optional<u32> {
+                if (v.kind == ScalarValue::Kind::Const) {
+                    return v.value;
+                }
+                if (v.kind == ScalarValue::Kind::Flat && v.value < res.flatbuf.size()) {
+                    return res.flatbuf[v.value];
+                }
+                return std::nullopt;
+            };
+            for (u32 i = 0; i < ri.images.size(); ++i) {
+                const auto w1 = dword(ri.images[i].sharp[1]), w3 = dword(ri.images[i].sharp[3]);
+                text += fmt::format("image {}{}{}{}{}:", i, ri.images[i].written ? " written" : "",
+                                    ri.images[i].array ? " DA" : "", ri.images[i].depth ? " depth" : "",
+                                    ri.images[i].r128 ? " r128" : "");
+                if (w1 && w3) {
+                    text += fmt::format(" type {} dfmt {} nfmt {} dst_sel {:04o}", *w3 >> 28, (*w1 >> 20) & 0x3F,
+                                        (*w1 >> 26) & 0xF, *w3 & 0xFFF);
+                } else {
+                    text += " (T# not known)";
+                }
+                text += "\n";
+            }
+            for (u32 i = 0; i < ri.samplers.size(); ++i) {
+                const auto w0 = dword(ri.samplers[i].sharp[0]);
+                text += fmt::format("sampler {}{}:", i, ri.samplers[i].depth ? " depth" : "");
+                text += w0 ? fmt::format(" unnormalized {} degamma {} dw0 {:08x}\n", (*w0 >> 15) & 1, (*w0 >> 20) & 1, *w0)
+                           : std::string(" (S# not known)\n");
             }
             for (const Inst& in : insts) {
                 const Operands ops = GetOperands(in);
