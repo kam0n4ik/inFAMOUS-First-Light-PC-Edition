@@ -12,6 +12,7 @@
 #include <fmt/format.h>
 
 #include "base/log.h"
+#include "engine/render/draw_runs.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
@@ -84,6 +85,34 @@ bool SameView(const GS::StageView& a, const GS::StageView& b) {
            SameBytes(a.plan.buffers, b.plan.buffers) && SameBytes(a.plan.images, b.plan.images) &&
            SameBytes(a.plan.samplers, b.plan.samplers) && SameBytes(a.plan.vertices, b.plan.vertices) &&
            a.plan.status_counts == b.plan.status_counts && a.plan.error == b.plan.error;
+}
+
+/// SSPC_CITY_ENGINE_OPT=verify: two preparations field by field (bindings built twice differ in padding bytes).
+bool SameStageView(const GS::StageView& x, const GS::StageView& y) {
+    const auto bufs = [](const GS::BufferBinding& a, const GS::BufferBinding& b) {
+        return a.binding == b.binding && a.kind == b.kind && a.desc.raw == b.desc.raw && a.address == b.address &&
+               a.size == b.size && a.written == b.written && a.formatted == b.formatted && a.status == b.status;
+    };
+    const auto imgs = [](const GS::ImageBinding& a, const GS::ImageBinding& b) {
+        return a.binding == b.binding && a.count == b.count && a.desc.raw == b.desc.raw && a.view_type == b.view_type &&
+               a.storage == b.storage && a.depth == b.depth && a.array == b.array && a.atomic == b.atomic &&
+               a.fmask == b.fmask && a.status == b.status;
+    };
+    const auto smps = [](const GS::SamplerBinding& a, const GS::SamplerBinding& b) {
+        return a.binding == b.binding && a.desc.raw == b.desc.raw && a.status == b.status;
+    };
+    const auto vtxs = [](const GS::VertexBinding& a, const GS::VertexBinding& b) {
+        return a.attribute == b.attribute && a.fetch == b.fetch && a.read == b.read && a.desc.raw == b.desc.raw &&
+               a.address == b.address && a.size == b.size && a.status == b.status;
+    };
+    return x.status == y.status && x.address == y.address && x.program == y.program && x.footer_hash == y.footer_hash &&
+           x.module == y.module && std::memcmp(&x.runtime, &y.runtime, sizeof(x.runtime)) == 0 && x.start == y.start &&
+           x.end == y.end && x.program_error == y.program_error && x.plan.flat == y.plan.flat &&
+           std::ranges::equal(x.plan.buffers, y.plan.buffers, bufs) &&
+           std::ranges::equal(x.plan.images, y.plan.images, imgs) &&
+           std::ranges::equal(x.plan.samplers, y.plan.samplers, smps) &&
+           std::ranges::equal(x.plan.vertices, y.plan.vertices, vtxs) &&
+           x.plan.status_counts == y.plan.status_counts && x.plan.error == y.plan.error;
 }
 
 } // namespace
@@ -178,6 +207,17 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         SSPC_LOG(GPU, Info, "SSPC_DIAG_PREP_CENSUS={}: the draws of flips {}..{} by program (gpu_native.txt)", v,
                  census_first_, census_end_ - 1);
     }
+    if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
+                         GetEnvironmentVariableA("SSPC_CITY_ENGINE_OPT", v, sizeof(v)) > 0 && v[0] != '0' &&
+                         std::string_view(v) != "ahead") { // (=ahead: the processor's RunAhead only - A/B)
+        runs_ = std::string_view(v) == "verify" ? 2 : 1;
+        if (std::string_view(v).starts_with("ab:")) { // (image A/B: runs in odd blocks of n flips only)
+            runs_ab_ = std::max<u32>(1, static_cast<u32>(std::strtoul(v + 3, nullptr, 10)));
+        }
+        SSPC_LOG(GPU, Info, "SSPC_CITY_ENGINE_OPT={}: the engine's tagged mesh draws that differ only in their geometry "
+                            "are one record (the first prepared, the others their geometry only){}", v,
+                 runs_ == 2 ? " - verify: each also prepared in full and compared" : "");
+    }
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
     journal_changes_only_ = options.journal_changes_only;
     async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
@@ -248,6 +288,7 @@ void ParallelCp::Stop() {
 // ---- thread 1
 
 ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
+    CloseRun(); // (a held run's first draw goes before any other record)
     if (next_ - head_.load(std::memory_order_acquire) >= kSlots) {
         WaitHead(next_ - kSlots + 1, true, kWhyFull); // backpressure: the oldest slot executed
     }
@@ -263,9 +304,11 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
     return r;
 }
 
-void ParallelCp::PushRecord() {
+void ParallelCp::PushRecord(bool keep_journal_end) {
     Record& r = slots_[next_ & (kSlots - 1)];
-    r.journal_end = jtail_; // every register write of the stream before the record
+    if (!keep_journal_end) {
+        r.journal_end = jtail_; // every register write of the stream before the record
+    }
     const u64 depth = next_ - head_.load(std::memory_order_relaxed);
     t1_.depth_sum += depth;
     t1_.depth_max = std::max(t1_.depth_max, depth);
@@ -376,6 +419,7 @@ void ParallelCp::Drain(DrainReason why) {
     if (!started_) {
         return;
     }
+    CloseRun();
     if (Idle()) {
         ++t1_.drains_empty;
     } else {
@@ -423,6 +467,7 @@ bool ParallelCp::CopyQueuedOver(u64 addr, u64 bytes) const {
 }
 
 void ParallelCp::MemoryChanged() {
+    CloseRun();
     if (fthread_mode_) {
         FrontMemoChanged(); // (with the next record, or at the next idle point)
         return;
@@ -435,6 +480,7 @@ void ParallelCp::MemoryChanged() {
 }
 
 void ParallelCp::DeferInvalidateIfCached(u64 addr, u64 bytes) {
+    CloseRun(); // (before: the first record after the write - after a held run's first draw)
     std::scoped_lock lock{deferred_mutex_};
     // (a compute ring's read pointer is written after each packet: the same range again is not queued twice)
     if (deferred_.empty() || deferred_.back().before != next_ || deferred_.back().addr != addr ||
@@ -1468,7 +1514,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                         pc.ps = &r.Ps();
                     }
                 }
-                if (r.prepared && batch_on_ && stage_reuse_ == 0 &&
+                if (r.prepared && batch_on_ && stage_reuse_ == 0 && r.members.empty() &&
                     (batch_ab_ == 0 || (VideoOut::NextFlipId() / batch_ab_) % 2 == 1) &&
                     !has_deferred_.load(std::memory_order_acquire)) {
                     // the published draws right after it that differ only in their geometry (each from the one
@@ -1479,7 +1525,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     batch_end_ = 0;
                     while (batch_items_.size() < kMaxBatch && index + batch_items_.size() < avail) {
                         Record& f = slots_[(index + batch_items_.size()) & (kSlots - 1)];
-                        if (f.kind != Kind::Draw || !f.prepared || f.memory_changed) {
+                        if (f.kind != Kind::Draw || !f.prepared || f.memory_changed || !f.members.empty()) {
                             break;
                         }
                         const Vk::PreparedCommand fp{&f.prep, &f.Vs(), &f.Ps(), f.state};
@@ -1503,6 +1549,14 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     }
                 } else {
                     exec_.DrawPrepared(r.draw, pc);
+                    if (!r.members.empty()) {
+                        // SSPC_CITY_ENGINE_OPT: the run's other draws on its state (their registers: the journal
+                        // after this record's, applied with the next record)
+                        exec_.DrawRunMembers(r.draw, pc, r.members);
+                        if (r.members.capacity() > 32) {
+                            std::vector<Cp::RunMember>().swap(r.members); // (a long run's memory not kept per slot)
+                        }
+                    }
                 }
             } else {
                 exec_.Draw(r.draw);
@@ -1586,8 +1640,16 @@ void ParallelCp::Fail(std::string text) {
 // ---- Cp::GpuWork (thread 1)
 
 void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
+    if (run_open_) {
+        if (draw.engine_run != 0 && JoinRun(draw)) {
+            ++t1_.draws;
+            return;
+        }
+        CloseRun();
+    }
     Record& r = BeginRecord(Kind::Draw);
     r.draw = draw;
+    r.members.clear();
     if (verify_) {
         r.reg_hash = RegistersHash(cp_->Registers());
     }
@@ -1595,7 +1657,264 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
         PrepareDraw(r, next_, cp_->Registers()); // (as they are at the draw's packet)
     }
     ++t1_.draws;
+    if (runs_ != 0 && draw.engine_run != 0 && (runs_ab_ == 0 || (VideoOut::NextFlipId() / runs_ab_) % 2 == 1) &&
+        RunLeaderOk(r)) {
+        // SSPC_CITY_ENGINE_OPT: held - the tagged draws after it may join; its registers are the journal so far
+        r.journal_end = jtail_;
+        run_open_ = true;
+        run_gen_ = frontend_->MemoryGeneration();
+        run_leaders_.store(run_leaders_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        return;
+    }
     PushRecord();
+}
+
+void ParallelCp::CloseRun() {
+    if (!run_open_) {
+        return;
+    }
+    run_open_ = false;
+    Record& r = slots_[next_ & (kSlots - 1)];
+    if (!r.members.empty()) {
+        geofast_prev_ = ~0ull; // (the draw before the next one is the run's last, not this record's)
+        run_count_.store(run_count_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        run_members_.store(run_members_.load(std::memory_order_relaxed) + r.members.size(), std::memory_order_relaxed);
+    }
+    PushRecord(true);
+}
+
+bool ParallelCp::RunLeaderOk(const Record& r) const {
+    const Cp::DrawDescriptor& d = r.draw;
+    constexpr u8 kVsPs = (1u << static_cast<u32>(Cp::Stage::Vs)) | (1u << static_cast<u32>(Cp::Stage::Ps));
+    if (r.kind != Kind::Draw || !r.prepared || !r.prep.ready || r.state == nullptr || r.stage_shared != nullptr ||
+        r.ps_shared != nullptr || r.vs_same || r.ps_same || !d.indexed || d.indirect || d.active_stages != kVsPs) {
+        return false;
+    }
+    const GS::StageView& v = r.stage;
+    if (v.status != GS::StageStatus::Ready || v.module == nullptr || r.ps.module == nullptr ||
+        r.ps.status != GS::StageStatus::Ready || v.plan.flat.size() != 16 || v.plan.vertices.empty() ||
+        v.plan.vertices.size() > Cp::RunMember::kMaxStreams) {
+        return false;
+    }
+    const GS::FetchShader& fetch = v.module->result.reflection.fetch;
+    if (!fetch.present || fetch.sgpr_base + 1 >= 16) {
+        return false;
+    }
+    for (const GS::VertexBinding& vb : v.plan.vertices) {
+        if (vb.status != GS::ResourceStatus::Ok || vb.fetch.sgpr_base + 1 >= 16 || vb.fetch.instance_data != 0 ||
+            vb.desc.Stride() == 0) {
+            return false;
+        }
+    }
+    // nothing it prepared writes memory (each draw of the run would write it again)
+    for (const GS::StageView* s : {&v, &r.ps}) {
+        for (const GS::BufferBinding& bb : s->plan.buffers) {
+            if (bb.written) {
+                return false;
+            }
+        }
+        for (const GS::ImageBinding& im : s->plan.images) {
+            if (im.storage) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
+    Record& lead = slots_[next_ & (kSlots - 1)];
+    const auto no = [&](u32 why) {
+        auto& c = run_refused_[why];
+        c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        return false;
+    };
+    if (lead.members.size() + 1 >= kMaxRun) {
+        return no(1);
+    }
+    if (frontend_->MemoryGeneration() != run_gen_ || pending_memory_changed_) {
+        return no(2);
+    }
+    const Cp::DrawDescriptor& a = lead.draw;
+    using G = Cp::Group;
+    constexpr Cp::GroupMask kGeometryGroups = (Cp::GroupMask{1} << static_cast<u32>(G::VsUserData)) |
+                                              (Cp::GroupMask{1} << static_cast<u32>(G::IndexState)) |
+                                              (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
+    // the registers since the draw before (the run's last): only its geometry's groups
+    if ((b.changed & ~kGeometryGroups) != 0) {
+        return no(3);
+    }
+    if (b.queue != a.queue || !b.indexed || b.indirect || b.active_stages != a.active_stages ||
+        b.primitive_type != a.primitive_type || b.index_type != a.index_type || b.stages_enable != a.stages_enable ||
+        b.cb_extent != a.cb_extent || b.db_extent != a.db_extent) {
+        return no(4);
+    }
+    for (size_t s = 0; s < a.shaders.size(); ++s) {
+        if (a.shaders[s].address != b.shaders[s].address || a.shaders[s].rsrc1 != b.shaders[s].rsrc1 ||
+            a.shaders[s].rsrc2 != b.shaders[s].rsrc2) {
+            return no(5);
+        }
+    }
+    const size_t vs = static_cast<size_t>(Cp::Stage::Vs);
+    for (size_t s = 0; s < a.user_data.size(); ++s) {
+        if (s != vs && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
+            return no(6);
+        }
+    }
+    // the VS user data: only the vertex tables' pairs (and the fetch shader's vertex/instance offsets) differ, and the
+    // stage itself reads none of them (the run's draws are recorded with the first one's flattened user data)
+    const GS::StageView& pv = lead.stage;
+    const GS::ShaderReflection& refl = pv.module->result.reflection;
+    const GS::FetchShader& fetch = refl.fetch;
+    u32 tables = 0, offsets = 0;
+    for (const GS::FetchAttribute& at : fetch.attributes) {
+        tables |= at.sgpr_base + 1 < 16 ? 3u << at.sgpr_base : 0u;
+    }
+    tables &= ~(3u << fetch.sgpr_base); // (the fetch shader's own address must be the same)
+    if (fetch.vertex_offset_sgpr >= 0 && fetch.vertex_offset_sgpr < 16) {
+        offsets |= 1u << fetch.vertex_offset_sgpr;
+    }
+    if (fetch.instance_offset_sgpr >= 0 && fetch.instance_offset_sgpr < 16) {
+        offsets |= 1u << fetch.instance_offset_sgpr;
+    }
+    u32 diff = 0;
+    for (u32 i = 0; i < 16; ++i) {
+        diff |= a.user_data[vs][i] != b.user_data[vs][i] ? 1u << i : 0u;
+    }
+    // other VS user data that differ (the shadow casters' instance constants' V#s): the draw's plan decoded again below -
+    // only its own constant buffers may differ; its user data reach the stage as its own copy
+    const bool own = (diff & ~(tables | offsets)) != 0 || (diff & refl.user_data_used & ~tables) != 0;
+    // its vertex streams from its own tables (shader_resources.cpp DecodeResources: the same reads and results)
+    Cp::RunMember m;
+    m.streams = static_cast<u32>(pv.plan.vertices.size());
+    for (u32 i = 0; i < m.streams; ++i) {
+        const GS::VertexBinding& v = pv.plan.vertices[i];
+        const GS::FetchAttribute& at = v.fetch;
+        const u64 table = (b.user_data[vs][at.sgpr_base] | (u64{b.user_data[vs][at.sgpr_base + 1]} << 32)) &
+                          0xFFFFFFFFFFFFull;
+        const u64 where = table + u64{at.dword_offset} * 4;
+        GS::BufferDesc d;
+        if (where >= (1ull << 40) || !reader_.Read(where, d.raw.data(), 16)) {
+            return no(8);
+        }
+        m.v[i].read = d.raw;
+        if (at.data_format != 0) {
+            d.raw[3] = (d.raw[3] & ~((0xFu << 15) | (7u << 12))) | (at.data_format << 15) | (at.num_format << 12);
+        }
+        const u64 addr = d.Base() + at.inst_offset, size = d.Size();
+        // (the same format, stride and specialization of the module: the first draw's vertex input state)
+        if (!d.IsBuffer() || d.NumRecords() == 0 || addr == 0 || addr >= (1ull << 40) || size == 0 ||
+            size > (1ull << 40) - addr || d.raw[3] != v.desc.raw[3] || (d.raw[1] >> 16) != (v.desc.raw[1] >> 16)) {
+            return no(9);
+        }
+        m.v[i].desc = d.raw;
+        m.v[i].address = addr;
+        m.v[i].size = size;
+    }
+    if (!run_open_ || frontend_->MemoryGeneration() != run_gen_) {
+        return no(10); // (a read drained the queue: the run was published meanwhile)
+    }
+    if (own) {
+        // a stage without an SRT walk: its plan is its registers' decoding (the same module, the same binding numbers)
+        std::array<std::array<u32, 4>, Cp::RunMember::kMaxStreams> reads{};
+        for (u32 i = 0; i < m.streams; ++i) {
+            reads[i] = m.v[i].read;
+        }
+        if (!RedecodeStage(pv, b.user_data[vs], std::span(reads.data(), m.streams), run_plan_)) {
+            return no(12);
+        }
+        const GS::ResourceBindingPlan& x = pv.plan;
+        const GS::ResourceBindingPlan& y = run_plan_;
+        bool same = x.images.size() == y.images.size() && x.samplers.size() == y.samplers.size() &&
+                    x.buffers.size() == y.buffers.size() && x.vertices.size() == y.vertices.size();
+        for (size_t i = 0; same && i < x.images.size(); ++i) {
+            const GS::ImageBinding& p = x.images[i];
+            const GS::ImageBinding& q = y.images[i];
+            same = p.binding == q.binding && p.count == q.count && p.desc.raw == q.desc.raw && p.view_type == q.view_type &&
+                   p.storage == q.storage && p.depth == q.depth && p.array == q.array && p.fmask == q.fmask &&
+                   p.status == q.status;
+        }
+        for (size_t i = 0; same && i < x.samplers.size(); ++i) {
+            same = x.samplers[i].binding == y.samplers[i].binding && x.samplers[i].desc.raw == y.samplers[i].desc.raw &&
+                   x.samplers[i].status == y.samplers[i].status;
+        }
+        for (u32 i = 0; same && i < m.streams; ++i) {
+            same = y.vertices[i].address == m.v[i].address && y.vertices[i].size == m.v[i].size &&
+                   y.vertices[i].desc.raw == m.v[i].desc && y.vertices[i].status == GS::ResourceStatus::Ok;
+        }
+        if (!same) {
+            return no(13);
+        }
+        for (size_t i = 0; i < x.buffers.size(); ++i) {
+            const GS::BufferBinding& p = x.buffers[i];
+            const GS::BufferBinding& q = y.buffers[i];
+            if (p.binding == q.binding && p.kind == q.kind && p.desc.raw == q.desc.raw && p.address == q.address &&
+                p.size == q.size && p.written == q.written && p.formatted == q.formatted && p.status == q.status) {
+                continue;
+            }
+            // (a constant block elsewhere, of another size: the same format and stride, read only, at most 16 KiB)
+            if (p.binding != q.binding || p.kind != GS::BufferKind::Guest || q.kind != GS::BufferKind::Guest ||
+                p.written || q.written || p.formatted != q.formatted || p.status != GS::ResourceStatus::Ok ||
+                q.status != GS::ResourceStatus::Ok || (p.desc.raw[1] >> 16) != (q.desc.raw[1] >> 16) ||
+                p.desc.raw[3] != q.desc.raw[3] || q.address == 0 || q.size == 0 || q.size > (16u << 10) ||
+                m.buffers >= Cp::RunMember::kMaxBuffers) {
+                return no(14);
+            }
+            m.b[m.buffers++] = {static_cast<u32>(i), q.address, q.size, q.desc.raw};
+        }
+        m.own_user_data = true;
+    }
+    m.seq = b.seq;
+    m.packet_addr = b.packet_addr;
+    m.index_base = b.index_base;
+    m.index_offset = b.index_offset;
+    m.index_count = b.index_count;
+    m.instance_count = b.instance_count;
+    m.max_index_size = b.max_index_size;
+    m.vgt_index_offset = b.vgt_index_offset;
+    m.changed = b.changed;
+    m.vs_user_data = b.user_data[vs];
+    if (runs_ == 2) {
+        // verify: the full preparation of this draw against the first's with its geometry (it must be the same)
+        const GS::DrawPreparation& prep = frontend_->PrepareDraw(b, cp_->Registers(), reader_);
+        GS::StageView expect = pv;
+        std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), expect.plan.flat.begin());
+        for (u32 i = 0; i < m.streams; ++i) {
+            GS::VertexBinding& v = expect.plan.vertices[i];
+            v.read = m.v[i].read;
+            v.desc.raw = m.v[i].desc;
+            v.address = m.v[i].address;
+            v.size = m.v[i].size;
+        }
+        for (u32 k = 0; k < m.buffers; ++k) {
+            GS::BufferBinding& bb = expect.plan.buffers[m.b[k].index];
+            bb.address = m.b[k].address;
+            bb.size = m.b[k].size;
+            bb.desc.raw = m.b[k].desc;
+        }
+        const bool same = prep.ready && prep.pipeline == lead.prep.pipeline &&
+                          frontend_->Pipelines().Graphics(prep.pipeline) == lead.state &&
+                          frontend_->SharedStage(GS::HwStage::Vs) == nullptr &&
+                          frontend_->SharedStage(GS::HwStage::Ps) == nullptr &&
+                          SameStageView(frontend_->Stage(GS::HwStage::Vs), expect) &&
+                          SameStageView(frontend_->Stage(GS::HwStage::Ps), lead.ps);
+        run_verified_.store(run_verified_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        if (!same) {
+            const u64 n = run_mismatches_.load(std::memory_order_relaxed) + 1;
+            run_mismatches_.store(n, std::memory_order_relaxed);
+            if (n <= 12) {
+                SSPC_LOG(GPU, Warning, "SSPC_CITY_ENGINE_OPT=verify: run member at {:#x} (VS {:#x}) differs from its full "
+                                       "preparation (ready {}, pipeline {}/{})", b.packet_addr, a.shaders[vs].address,
+                         prep.ready, prep.pipeline, lead.prep.pipeline);
+            }
+            return no(11); // (recorded on its own)
+        }
+        if (frontend_->MemoryGeneration() != run_gen_ || !run_open_) {
+            return no(10);
+        }
+    }
+    lead.members.push_back(m);
+    return true;
 }
 
 void ParallelCp::Dispatch(const Cp::DispatchDescriptor& dispatch) {
@@ -1942,6 +2261,22 @@ std::string ParallelCp::Report() const {
                            "(mismatches {})\n",
                            geofast_hits_.load(std::memory_order_relaxed), geofast_verified_.load(std::memory_order_relaxed),
                            geofast_mismatches_.load(std::memory_order_relaxed));
+    }
+    if (runs_ != 0) {
+        const auto& es = Engine::Render::DrawRuns::Stats();
+        const auto ld = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
+        std::string why;
+        for (size_t i = 1; i < run_refused_.size(); ++i) {
+            why += fmt::format(" {}:{}", i, ld(run_refused_[i]));
+        }
+        out += fmt::format("  CITY-OPT Phase 5 engine runs (SSPC_CITY_ENGINE_OPT{}): engine draws tagged - mesh {} of {}, "
+                           "shadow {} of {} (no trailing NOP {}); runs {} with {} draws joined (first draws held {}); "
+                           "refused (1 full, 2 memory, 3 groups, 4 draw, 5 shaders, 6 other user data, 7 VS user data, "
+                           "8 table read, 9 V#, 10 published meanwhile, 11 verify, 12 VS decoded again refused, 13 other "
+                           "bindings, 14 a buffer not its own constants):{}; verified {} (mismatches {})\n",
+                           runs_ == 2 ? "=verify" : "", ld(es.tagged[1]), ld(es.calls[1]), ld(es.tagged[2]),
+                           ld(es.calls[2]), ld(es.no_nop), ld(run_count_), ld(run_members_), ld(run_leaders_), why,
+                           ld(run_verified_), ld(run_mismatches_));
     }
     if (drawcache_) {
         out += fmt::format("  CITY-OPT draw templates (SSPC_CITY_DRAW_CACHE): of those, VS decoded again {}, PS {}; "

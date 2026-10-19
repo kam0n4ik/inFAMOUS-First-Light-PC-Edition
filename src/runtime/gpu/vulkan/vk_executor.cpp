@@ -4283,6 +4283,7 @@ bool Executor::DrawPreparedBatch(std::span<const BatchDraw> draws) {
 
 void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0) {
     stream_pipe_ = 0;
+    run_ok_ = false;
     ++stats_.draws;
     ++trace_.ordinal;
     const auto& f = Fn();
@@ -5245,6 +5246,14 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         if (ibuf != VK_NULL_HANDLE) {
             f.vkCmdDrawIndexed(cur_.cb, std::min(d.index_count, d.max_index_size), instances, 0,
                                static_cast<s32>(vertex_offset), instance_offset);
+            // SSPC_CITY_ENGINE_OPT: what a run's next draw takes on (DrawRunMembers) - nothing a single draw adds
+            run_ok_ = occ_slot == ~0u && rendering_ && !writes_memory && !up_display_draw_ && !trace_.Active() &&
+                      !histo_.active && insp_catalog_ == nullptr && !prof_ && !texdump_.active &&
+                      (diag_ == nullptr || !diag_->Enabled()) && vbufs.size() <= Cp::RunMember::kMaxStreams;
+            run_layout_ = pipe->layout;
+            // (push descriptors are updated binding by binding within one layout: a member pushes only its own)
+            run_push_desc_ = pipe->push_descriptors && push_layout_ == pipe->layout &&
+                             (!bind_shadow_ || desc_layout_ == pipe->layout);
         }
     } else {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
@@ -5410,6 +5419,221 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     if (commands_ >= options_.max_draws_per_batch) {
         ++stats_.flushes_full;
         flush_full_ = true;
+        run_ok_ = false;
+        Flush();
+    }
+}
+
+bool Executor::RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& offset, u64& avail) {
+    // a read range as GuestRange takes it, but only where that records no command: resident in video memory, or a
+    // small range nothing of which is there, copied by the CPU into the stream ring
+    BufferCache::Range r;
+    const BufferCache::Residency res = buffers_.Classify(addr, size, r);
+    ++stats_.run_range[static_cast<size_t>(res)];
+    if (res == BufferCache::Residency::All) {
+        buffer = r.buffer;
+        offset = r.offset;
+        avail = r.size;
+        return true;
+    }
+    if (res != BufferCache::Residency::None || size > (16u << 10) || buffers_.HostWritePending(addr, size) ||
+        TimelineWritePending(addr, size)) {
+        return false;
+    }
+    const u8* host = guest_.BackingPointer(addr, size);
+    StreamRing::Slice sl{};
+    if (host == nullptr || ring_.Allocate(size, align, cur_.value, sl) != StreamRing::Status::Ok) {
+        return false;
+    }
+    std::memcpy(sl.data, host, size);
+    buffer = sl.buffer;
+    offset = sl.offset;
+    avail = size;
+    ++stats_.streamed;
+    stats_.streamed_bytes += size;
+    return true;
+}
+
+void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedCommand& pc,
+                              std::span<const Cp::RunMember> members) {
+    const auto& f = Fn();
+    const GS::StageView& vs = *pc.stage;
+    const GS::FetchShader& fetch = vs.module->result.reflection.fetch;
+    const bool idx32 = (lead.index_type & 3) == 1;
+    const u32 isize = idx32 ? 4 : 2;
+    const VkIndexType it = idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    std::vector<VkBuffer>& vbufs = scratch_.vbufs;
+    std::vector<VkDeviceSize>& voffs = scratch_.voffs;
+    for (const Cp::RunMember& m : members) {
+        const u64 t0 = GS::Ticks();
+        const u32 count = std::min(m.index_count, m.max_index_size);
+        // on the state the run's last draw left (RecordDraw keeps its vertex buffers in scratch_), its ranges where the
+        // buffer cache keeps them in video memory
+        bool lean = run_ok_ && rendering_ && open_ && commands_ < options_.max_draws_per_batch && count != 0 &&
+                    m.streams == vbufs.size();
+        VkBuffer ib = VK_NULL_HANDLE;
+        u64 io = 0;
+        if (lean) {
+            for (u32 i = 0; i < m.streams && lean; ++i) {
+                BufferCache::Range r;
+                lean = buffers_.Classify(m.v[i].address, m.v[i].size, r) == BufferCache::Residency::All;
+                vbufs[i] = r.buffer;
+                voffs[i] = r.offset;
+            }
+            BufferCache::Range r;
+            lean = lean &&
+                   buffers_.Classify(m.index_base + u64{m.index_offset} * isize, u64{count} * isize, r) ==
+                       BufferCache::Residency::All &&
+                   r.offset % isize == 0;
+            ib = r.buffer;
+            io = r.offset;
+            stats_.run_not_resident += lean ? 0 : 1;
+            stats_.run_why[0] += lean ? 0 : 1;
+        }
+        // its own constant blocks and user data (the shadow casters' instances): descriptors of their own, pushed over
+        // the run's (the shadow of what this command buffer has pushed decides what is pushed)
+        u32 nw = 0;
+        std::array<VkDescriptorBufferInfo, Cp::RunMember::kMaxBuffers + 1> infos{};
+        std::array<VkWriteDescriptorSet, Cp::RunMember::kMaxBuffers + 1> ws{};
+        PushData push = push_last_;
+        if (lean && (m.buffers != 0 || m.own_user_data)) {
+            lean = run_push_desc_ && push_layout_ == run_layout_ && (!bind_shadow_ || desc_layout_ == run_layout_);
+            stats_.run_why[1] += lean ? 0 : 1;
+            const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
+            const auto add = [&](u32 binding, VkBuffer buf, u64 offset, u64 range) {
+                infos[nw] = {buf, offset, range};
+                ws[nw] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                          .dstBinding = binding,
+                          .descriptorCount = 1,
+                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                          .pBufferInfo = &infos[nw]};
+                ++nw;
+            };
+            for (u32 k = 0; k < m.buffers && lean; ++k) {
+                VkBuffer buf = VK_NULL_HANDLE;
+                u64 off = 0, avail = 0;
+                lean = RunRange(m.b[k].address, m.b[k].size, align, buf, off, avail);
+                stats_.run_why[2] += lean ? 0 : 1;
+                if (lean) {
+                    const u64 aligned = off & ~(align - 1), adjust = off - aligned;
+                    const u32 index = vs.start.buffer + m.b[k].index;
+                    if (index < push.buf_offsets.size()) {
+                        push.buf_offsets[index] = static_cast<u8>(adjust);
+                    }
+                    add(vs.plan.buffers[m.b[k].index].binding, buf, aligned,
+                        std::min<u64>(m.b[k].size + adjust, avail + adjust));
+                }
+            }
+            if (lean && m.own_user_data) {
+                const auto fb = std::ranges::find(vs.plan.buffers, GS::BufferKind::Flatbuf, &GS::BufferBinding::kind);
+                StreamRing::Slice sl{};
+                const u64 bytes = vs.plan.flat.size() * 4;
+                lean = fb != vs.plan.buffers.end() && bytes == m.vs_user_data.size() * 4 &&
+                       ring_.Allocate(bytes, align, cur_.value, sl) == StreamRing::Status::Ok;
+                stats_.run_why[3] += lean ? 0 : 1;
+                if (lean) {
+                    std::memcpy(sl.data, m.vs_user_data.data(), bytes);
+                    add(fb->binding, sl.buffer, sl.offset, bytes);
+                }
+            }
+            stats_.run_not_resident += lean ? 0 : 1;
+        }
+        if (!lean) {
+            // recorded as the draw it is: the run's preparation with its geometry, its registers (RecordDraw)
+            Cp::DrawDescriptor d = lead;
+            d.seq = m.seq;
+            d.packet_addr = m.packet_addr;
+            d.index_base = m.index_base;
+            d.index_offset = m.index_offset;
+            d.index_count = m.index_count;
+            d.instance_count = m.instance_count;
+            d.max_index_size = m.max_index_size;
+            d.vgt_index_offset = m.vgt_index_offset;
+            d.changed = m.changed;
+            d.user_data[static_cast<size_t>(Cp::Stage::Vs)] = m.vs_user_data;
+            if (run_view_ == nullptr) {
+                run_view_ = std::make_unique<GS::StageView>();
+            }
+            *run_view_ = vs;
+            std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), run_view_->plan.flat.begin());
+            for (u32 i = 0; i < m.streams; ++i) {
+                GS::VertexBinding& v = run_view_->plan.vertices[i];
+                v.read = m.v[i].read;
+                v.desc.raw = m.v[i].desc;
+                v.address = m.v[i].address;
+                v.size = m.v[i].size;
+            }
+            for (u32 k = 0; k < m.buffers; ++k) {
+                GS::BufferBinding& bb = run_view_->plan.buffers[m.b[k].index];
+                bb.address = m.b[k].address;
+                bb.size = m.b[k].size;
+                bb.desc.raw = m.b[k].desc;
+            }
+            PreparedCommand p = pc;
+            p.stage = run_view_.get();
+            ++stats_.run_own;
+            RecordDraw(d, p, t0);
+            continue;
+        }
+        if (bind_shadow_ && vb_valid_ && vbufs == vb_last_ && voffs == vb_off_last_) {
+            ++stats_.vb_binds_skipped;
+        } else {
+            f.vkCmdBindVertexBuffers(cur_.cb, 0, static_cast<u32>(vbufs.size()), vbufs.data(), voffs.data());
+            stats_.vertex_bindings += vbufs.size();
+            vb_last_ = vbufs;
+            vb_off_last_ = voffs;
+            vb_valid_ = true;
+        }
+        if (bind_shadow_ && ib == ib_last_ && io == ib_off_last_ && it == ib_type_last_) {
+            ++stats_.ib_binds_skipped;
+        } else {
+            f.vkCmdBindIndexBuffer(cur_.cb, ib, io, it);
+            ib_last_ = ib;
+            ib_off_last_ = io;
+            ib_type_last_ = it;
+        }
+        if (nw != 0) {
+            f.vkCmdPushDescriptorSetKHR(cur_.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, run_layout_, 0, nw, ws.data());
+            for (u32 k = 0; k < nw; ++k) {
+                if (ws[k].dstBinding >= desc_shadow_.size()) {
+                    desc_shadow_.resize(ws[k].dstBinding + 1);
+                }
+                DescShadow& sh = desc_shadow_[ws[k].dstBinding];
+                sh.valid = true;
+                sh.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                sh.buffer = infos[k];
+            }
+            stats_.desc_pushed += nw;
+        }
+        if (std::memcmp(&push, &push_last_, sizeof(PushData)) != 0) {
+            f.vkCmdPushConstants(cur_.cb, run_layout_, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(PushData), &push);
+            push_last_ = push;
+        }
+        // the fetch shader's vertex/instance offsets from its own registers (as RecordDraw)
+        u32 vertex_offset = m.vgt_index_offset;
+        u32 instance_offset = 0;
+        if (vertex_offset == 0 && fetch.vertex_offset_sgpr >= 0 && fetch.vertex_offset_sgpr < 16) {
+            vertex_offset = m.vs_user_data[fetch.vertex_offset_sgpr];
+        }
+        if (fetch.instance_offset_sgpr >= 0 && fetch.instance_offset_sgpr < 16) {
+            instance_offset = m.vs_user_data[fetch.instance_offset_sgpr];
+        }
+        f.vkCmdDrawIndexed(cur_.cb, count, std::max<u32>(m.instance_count, 1), 0, static_cast<s32>(vertex_offset),
+                           instance_offset);
+        // what RecordDraw counts for a draw
+        ++stats_.draws;
+        ++stats_.draws_executed;
+        ++stats_.indexed;
+        ++stats_.run_lean;
+        ++trace_.ordinal;
+        Note(lead.queue, m.seq);
+        ++commands_;
+        stats_.record_ns += GS::TicksToNs(GS::Ticks() - t0);
+    }
+    if (commands_ >= options_.max_draws_per_batch) {
+        ++stats_.flushes_full;
+        flush_full_ = true;
+        run_ok_ = false;
         Flush();
     }
 }

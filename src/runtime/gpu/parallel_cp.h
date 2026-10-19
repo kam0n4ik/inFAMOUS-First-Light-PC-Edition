@@ -306,6 +306,9 @@ private:
         std::shared_ptr<const GS::StageView> stage_shared, ps_shared;
         const GS::GraphicsPipelineState* state = nullptr;
         u64 census_key = 0; ///< SSPC_DIAG_PREP_CENSUS: the draw's row (0: not counted)
+        /// SSPC_CITY_ENGINE_OPT: the draws that joined this one's run (recorded right after it, each with only its own
+        /// geometry; their registers are in the journal after this record's journal_end)
+        std::vector<Cp::RunMember> members;
         const GS::StageView& Vs() const { return stage_shared != nullptr ? *stage_shared : stage; }
         const GS::StageView& Ps() const { return ps_shared != nullptr ? *ps_shared : ps; }
     };
@@ -334,7 +337,7 @@ private:
     };
 
     /// The queue is empty and thread 2 parked: thread 1 may use the executor itself (after ApplyPending).
-    bool Idle() const { return head_.load(std::memory_order_acquire) == next_; }
+    bool Idle() const { return !run_open_ && head_.load(std::memory_order_acquire) == next_; }
     /// The journal, deferred invalidations and a memory change not handed on yet, applied by thread 1 (queue idle).
     void ApplyPending();
     void SnapshotTimeline(); ///< the executor's pending timeline writes (queue idle)
@@ -342,7 +345,9 @@ private:
 
     // thread 1
     Record& BeginRecord(Kind kind);
-    void PushRecord();
+    /// `keep_journal_end`: the record's journal_end was set when it was filled (a run's first draw, held while the
+    /// draws after it join: their register writes are journaled behind it)
+    void PushRecord(bool keep_journal_end = false);
     void JournalReserve(u32 words);
     u32* JournalAt(u64 pos) { return journal_.get() + (pos & (kJournalWords - 1)); }
     /// until head_ >= target; `why`: the DrainReason of a drain, kWhyFull / kWhyJournal for backpressure (P4.12 trace)
@@ -451,6 +456,26 @@ private:
     std::vector<CensusRow> census_;
     Cp::DrawDescriptor census_last_; ///< thread 1: the draw before
     void CensusPrepared(Record& r, u64 ticks, bool fast);
+    // CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT=1|verify; docs/CITY_ENGINE_OPTIMIZATION.md): the engine's tagged mesh draws
+    // (engine/render/draw_runs.h) one after another that differ only in their geometry - the VS vertex table, the index
+    // range, instances - are one record: the first draw prepared in full and held (not published) while the next ones
+    // join it with their own geometry only (no record, preparation, stage copy of their own), recorded by thread 2 as
+    // the first draw's state + per draw its vertex/index bindings and draw command (Executor::DrawRunMembers). Any
+    // other record, drain, memory change or call of the processor publishes the held one first (stream order).
+    u8 runs_ = 0;           ///< 0 off, 1 on, 2 verify (each member also prepared in full and compared)
+    u32 runs_ab_ = 0;       ///< =ab:<n>: runs only in odd blocks of n flips (image A/B)
+    bool run_open_ = false; ///< thread 1: slots_[next_] is a run's first draw, held
+    u64 run_gen_ = 0;       ///< the frontend's memory generation at it
+    static constexpr size_t kMaxRun = 256;
+    /// Thread 1: publishes the held run (nothing when none).
+    void CloseRun();
+    /// The record can lead a run (prepared, VS+PS, a VS without an SRT walk taking its vertices from fetch tables, no
+    /// memory writes); the draw `d` can join the held run (the reason it cannot, counted, otherwise).
+    bool RunLeaderOk(const Record& r) const;
+    bool JoinRun(const Cp::DrawDescriptor& d);
+    GS::ResourceBindingPlan run_plan_; ///< a joining draw's VS plan decoded again (its own constant buffers)
+    std::atomic<u64> run_count_{0}, run_members_{0}, run_leaders_{0}, run_verified_{0}, run_mismatches_{0};
+    std::array<std::atomic<u64>, 16> run_refused_{};
     bool batch_on_ = false;
     u32 batch_ab_ = 0;
     std::vector<Vk::BatchDraw> batch_items_;

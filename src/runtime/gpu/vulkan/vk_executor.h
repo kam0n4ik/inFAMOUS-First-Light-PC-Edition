@@ -102,6 +102,9 @@ struct ExecutorStats {
     u64 inst_calls = 0; ///< vkCmdDrawMultiIndexedEXT calls (a batch: one per run of the same instance count)
     u64 inst_no_pipeline = 0, inst_not_current = 0; ///< fallbacks: the patched pipeline not built yet / a block not current
     u64 zc_batches = 0, zc_draws = 0; ///< batches (draws) drawn from their ranges in video memory, nothing copied
+    u64 run_lean = 0, run_own = 0, run_not_resident = 0; ///< SSPC_CITY_ENGINE_OPT: run members by bindings only / own
+    std::array<u64, 4> run_why{};   ///< ... not by bindings: geometry not resident, descriptors not pushed, own range, user data
+    std::array<u64, 3> run_range{}; ///< ... own ranges by residency: none, partial, all
     /// SSPC_CITY_GEOMETRY_CACHE: batches drawn from their kept geometry, kept ones whose sources changed, geometry built
     /// (and its bytes), built into an arena (kept), arenas recycled
     u64 geo_hits = 0, geo_changed = 0, geo_builds = 0, geo_built_bytes = 0, geo_stored = 0, geo_recycles = 0;
@@ -238,6 +241,12 @@ public:
     /// stream ring, their indices moved to them (32-bit) - the primitives in the same order. false: a range could not be
     /// copied so - the first draw was recorded on its own (as DrawPrepared), the caller records the others.
     bool DrawPreparedBatch(std::span<const BatchDraw> draws);
+    /// SSPC_CITY_ENGINE_OPT (parallel_cp.h): the draws that joined the run `lead` began, right after `lead` was recorded
+    /// with `prepared` - each only its own vertex/index bindings and draw command on the state `lead` left (its ranges
+    /// in video memory, the buffer cache's). One that cannot (`lead` not left as a plain indexed draw, a range not
+    /// resident, the batch full) is recorded on its own: `lead`'s preparation with its geometry, its registers.
+    void DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedCommand& prepared,
+                        std::span<const Cp::RunMember> members);
     /// A draw the hardware does not draw (fast clear elimination, FMASK decompression, primitive None).
     static bool DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& draw);
     /// P4.10: the frontend's memo is told about guest memory changes from here (true) or not (false: the parallel
@@ -595,6 +604,12 @@ private:
     /// SSPC_CITY_BATCH: the draws RecordDraw records as one (empty: one draw); `batch_done_` whether it did
     std::span<const BatchDraw> batch_;
     bool batch_done_ = false;
+    bool run_ok_ = false;    ///< SSPC_CITY_ENGINE_OPT: the last RecordDraw left a plain indexed draw's state (a run's)
+    std::unique_ptr<GS::StageView> run_view_; ///< ... a member recorded on its own: the run's VS with its geometry
+    /// ... a member's own range (GuestRange's read path without a command: resident, or small and streamed)
+    bool RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& offset, u64& avail);
+    VkPipelineLayout run_layout_ = VK_NULL_HANDLE; ///< ... its pipeline's layout
+    bool run_push_desc_ = false;                    ///< ... its descriptors pushed with the shadow (P4.7)
     /// SSPC_CITY_GEOMETRY_CACHE=1: a batch's geometry kept in video memory (two arenas mapped through the BAR, recycled
     /// in turn once the GPU is done with the older one) by its exact composition, valid while its source ranges'
     /// buffer cache versions are those it was built from

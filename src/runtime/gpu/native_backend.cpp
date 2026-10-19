@@ -2320,6 +2320,13 @@ std::string Backend::Report() {
                                s.inst_draws, s.inst_batches, s.inst_fallbacks, s.inst_patch_refused, s.inst_calls,
                                s.inst_no_pipeline, s.inst_not_current, s.zc_batches, s.zc_draws);
         }
+        if (s.run_lean != 0 || s.run_own != 0) {
+            out += fmt::format("engine runs' draws (SSPC_CITY_ENGINE_OPT): by their bindings only {}, recorded on their "
+                               "own {} (of them a range not in video memory {}; geometry {}, descriptors {}, own range "
+                               "{}, user data {}; own ranges none/partial/all {})\n",
+                               s.run_lean, s.run_own, s.run_not_resident, s.run_why[0], s.run_why[1], s.run_why[2],
+                               s.run_why[3], fmt::join(s.run_range, "/"));
+        }
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",
                            s.wb_bytes_by[0] >> 20, s.wb_bytes_by[1] >> 20, s.wb_bytes_by[2] >> 20, s.flushes_full);
@@ -2343,6 +2350,12 @@ std::string Backend::Report() {
                     }
                 }
                 out += '\n';
+            }
+            if (cs.ahead_draws != 0 || cs.ahead_stops != 0) {
+                out += fmt::format("CITY-OPT Phase 5 engine draws' packets taken right after the draw before "
+                                   "(SSPC_CITY_ENGINE_OPT, RunAhead): draws {}, packets {}; scans that met another "
+                                   "packet {}\n",
+                                   cs.ahead_draws, cs.ahead_packets, cs.ahead_stops);
             }
             out += fmt::format("compute ring read pointer: writes of the same value left out {} (CP-8; "
                                "SSPC_CP_RPTR_EVERY_PACKET=1 writes each), updates {:.0f} ms\n",
