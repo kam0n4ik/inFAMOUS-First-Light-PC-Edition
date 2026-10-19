@@ -68,6 +68,7 @@
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/frame_trace.h"
+#include "engine/render/draw_census.h"
 #include "engine/render/native_draw.h"
 #include "engine/render/render_resolution.h"
 #include "app/product.h"
@@ -859,6 +860,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (FrameBreak FB-3)
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+    Engine::Render::DrawCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (CITY-OPT diagnostics)
     Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::Trace::InstallCriticalComputeFromEnvironment(linker.GetModule(eboot_index)->Base());
     if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)
