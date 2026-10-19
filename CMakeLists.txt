@@ -40,6 +40,13 @@ add_library(sspc_runtime STATIC
     src/engine/render/pass_graph.cpp
     src/engine/ui/game_menu.cpp
     src/engine/render/render_resolution.cpp
+    src/native_engine/guest_code_clone.cpp
+    src/native_engine/native_engine_install.cpp
+    src/native_engine/native_engine_verify.cpp
+    src/native_engine/native_function_registry.cpp
+    src/native_engine/native_measure.cpp
+    src/native_engine/reconstructed/frame_scratch.cpp
+    src/native_engine/reconstructed/object_constants.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
     src/input/settings.cpp
@@ -171,6 +178,10 @@ target_link_libraries(sspc_runtime PUBLIC fmt::fmt toml11::toml11 dxgi SDL3::SDL
 # Zydis (x86 decoder, MIT): SecondSonPC's FS patcher (src/runtime/cpu, P3.3). An independent library that
 # comes from the bridge's externals until SecondSonPC vendors its own copy (Phase 5).
 target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
+# Native Engine Reconstruction (src/native_engine): xbyak (BSD-3, the bridge's externals like Zydis) generates the
+# signature-independent timing stubs of SSPC_NATIVE_ENGINE_MEASURE; reconstructions of AVX code are built for AVX.
+target_link_libraries(sspc_runtime PRIVATE xbyak::xbyak)
+set_source_files_properties(src/native_engine/reconstructed/object_constants.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
@@ -313,6 +324,27 @@ target_compile_definitions(sspc_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEA
 target_compile_options(sspc_engine_tests PRIVATE /utf-8 /W4)
 target_link_libraries(sspc_engine_tests PRIVATE fmt::fmt)
 set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Standalone tests of Native Engine Reconstruction (src/native_engine; docs/NATIVE_ENGINE_RECONSTRUCTION.md): the ABI
+# boundary, clones, the registry's modes, and - given the game's eboot.bin - each reconstruction against the eboot's own
+# code (cmake --build <dir> --target sspc_native_engine_tests; tools/native_engine_tests/main.cpp).
+add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
+    tools/native_engine_tests/main.cpp
+    src/native_engine/guest_code_clone.cpp
+    src/native_engine/native_engine_verify.cpp
+    src/native_engine/native_function_registry.cpp
+    src/native_engine/native_measure.cpp
+    src/native_engine/reconstructed/frame_scratch.cpp
+    src/native_engine/reconstructed/object_constants.cpp
+    src/engine/guest_hooks.cpp
+    src/loader/image_file.cpp
+    src/base/log.cpp
+)
+target_include_directories(sspc_native_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(sspc_native_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_options(sspc_native_engine_tests PRIVATE /utf-8 /W4)
+target_link_libraries(sspc_native_engine_tests PRIVATE fmt::fmt Zydis::Zydis xbyak::xbyak)
+set_target_properties(sspc_native_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Upscaling and frame generation (docs/UPSCALING_FRAME_GENERATION.md). The vendors' SDKs are not part of the sources:
 # tools/upscalers/stage_sdks.ps1 puts them into third_party/upscalers (NVIDIA DLSS SDK headers + nvsdk_ngx_s.lib,

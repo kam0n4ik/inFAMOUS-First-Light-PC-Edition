@@ -70,6 +70,7 @@
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
 #include "engine/render/draw_runs.h"
+#include "native_engine/native_function_registry.h"
 #include "engine/render/native_draw.h"
 #include "engine/render/render_resolution.h"
 #include "app/product.h"
@@ -900,6 +901,10 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
             Gpu::Upscale::SetSettings(us);
         }
     }
+    // Native Engine Reconstruction (docs/NATIVE_ENGINE_RECONSTRUCTION.md; SSPC_NATIVE_ENGINE, off by default):
+    // reconstructed engine functions replace the game's own. Installed last, so a function another switch already
+    // hooked no longer hashes and is left alone.
+    NativeEngine::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }
