@@ -26,27 +26,39 @@ namespace {
 namespace L = Layout;
 
 // the same sites as the draw census (draw_census.cpp): prologues checked in Ghidra, bodies pinned by hash
-constexpr ProbeSite kSites[2] = {
+constexpr ProbeSite kSites[3] = {
     {{0x1a1960, 0x225, 0xea1442f922a0a0ecull}, 20}, // mesh draw (param_1, context R, mesh instance)
     {{0x43d480, 0x106, 0xaffc4c64777b1e37ull}, 17}, // shadow casters' draw (param_1, R, records, count, mesh)
+    // CITY-OPT Phase 6: the mesh pass's instanced draw (param_1, R, the instances' 0xd4-byte records, count, mesh) -
+    // the G-buffer's (docs/CITY_ENGINE_RESOURCES.md); the draw census' site
+    {{0x1a1770, 0x1e4, 0x5bf111e570dcaaedull}, 17},
 };
 
+// CITY-OPT Phase 6: the mesh pass's material setup (param_1, context R, material) - the PS's descriptors of the draws
+// after it (docs/CITY_ENGINE_RESOURCES.md); prologue checked in Ghidra (17 bytes, no RIP operand, no branch into it)
+constexpr ProbeSite kMaterialSite = {{0x448640, 0x15f, 0x22c6fc74651c7374ull}, 17};
+
 using Fn = SSPC_SYSV_ABI void (*)(u64, u64, u64, u64, u64, u64);
-std::array<Fn, 2> g_orig{};
+std::array<Fn, 3> g_orig{};
+Fn g_orig_material = nullptr;
 Counters g_stats;
 bool g_on = false;
+bool g_gbuffer = false; ///< kSites[2] installed
+// the context whose material 0x448640 set last on this thread (the engine sets a context's material and draws it on
+// one thread, 0x1a2030); cleared by the context's next 0x1a1770 call
+thread_local u64 t_material_context = 0;
 
 // SSPC_DIAG_ENGINE_RUNS=1 (with SSPC_CITY_ENGINE_OPT): per frame, the meshes the two functions draw and the contexts
 // (pass, sub - the shadow cascades are contexts of their own) each mesh is drawn in; a log line every 10 s
 struct DiagFrame {
     u64 flip = 0;
     std::unordered_map<u64, u32> contexts;                 ///< (pass << 32 | sub) -> its number (the first 32 kept)
-    std::array<std::unordered_map<u64, u32>, 2> meshes;    ///< mesh -> the contexts it was drawn in (bits)
-    std::array<u64, 2> calls{}, instances{};
+    std::array<std::unordered_map<u64, u32>, 3> meshes;    ///< mesh -> the contexts it was drawn in (bits)
+    std::array<u64, 3> calls{}, instances{};
 };
 struct DiagTotals {
     u64 frames = 0;
-    std::array<u64, 2> calls{}, instances{}, meshes{}, multi{}, draws_of_multi{};
+    std::array<u64, 3> calls{}, instances{}, meshes{}, multi{}, draws_of_multi{};
     u64 contexts = 0;
 };
 bool g_diag = false;
@@ -61,7 +73,7 @@ void DiagClose() {
     }
     ++g_totals.frames;
     g_totals.contexts += g_frame.contexts.size();
-    for (u32 i = 0; i < 2; ++i) {
+    for (u32 i = 0; i < 3; ++i) {
         g_totals.calls[i] += g_frame.calls[i];
         g_totals.instances[i] += g_frame.instances[i];
         g_totals.meshes[i] += g_frame.meshes[i].size();
@@ -109,9 +121,11 @@ void DiagReporter() {
         SSPC_LOG(Engine, Info, "engine runs/10s ({} frames), per frame: contexts {:.0f}; mesh draws 0x1a1960 {:.0f} of "
                                "{:.0f} distinct meshes, {:.0f} of them in more than one context ({:.0f} draws); shadow "
                                "casters' draws 0x43d480 {:.0f} with {:.0f} instances of {:.0f} distinct meshes, {:.0f} of "
-                               "them in more than one context ({:.0f} draws)",
+                               "them in more than one context ({:.0f} draws); instanced mesh draws 0x1a1770 {:.0f} with "
+                               "{:.0f} instances of {:.0f} distinct meshes",
                  t.frames, t.contexts / n, t.calls[0] / n, t.meshes[0] / n, t.multi[0] / n, t.draws_of_multi[0] / n,
-                 t.calls[1] / n, t.instances[1] / n, t.meshes[1] / n, t.multi[1] / n, t.draws_of_multi[1] / n);
+                 t.calls[1] / n, t.instances[1] / n, t.meshes[1] / n, t.multi[1] / n, t.draws_of_multi[1] / n,
+                 t.calls[2] / n, t.instances[2] / n, t.meshes[2] / n);
     }
 }
 
@@ -125,7 +139,7 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     g_orig[I](a, r, c, d, e, f);
     constexpr u32 src = I + 1;
     if (g_diag) {
-        // 0x1a1960: the instance (c) -> its mesh **(c + 0x18); 0x43d480: the mesh (e), d instances
+        // 0x1a1960: the instance (c) -> its mesh **(c + 0x18); 0x43d480, 0x1a1770: the mesh (e), d instances
         DiagNote(I, r, I == 0 ? **reinterpret_cast<const u64* const*>(c + 0x18) : e, I == 0 ? 1 : static_cast<u32>(d));
     }
     g_stats.calls[src].fetch_add(1, std::memory_order_relaxed);
@@ -133,13 +147,27 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     // the trailing NOP of the draw this call wrote: the last 4 dwords, written by this call (in this chunk after p0,
     // or in a chunk the call started), its first body dword still the driver's 0
     const bool fresh = *begin != b0 ? p1 - *begin >= 4 : p1 - p0 >= 4;
+    u32 tag = src;
+    if constexpr (I == 2) {
+        if (t_material_context == r) {
+            t_material_context = 0;
+            tag |= kMaterialChanged;
+            g_stats.material_tagged.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (fresh && p1[-4] == kTrailingNopHeader && p1[-3] == 0) {
         p1[-3] = kRunMagic;
-        p1[-2] = src;
+        p1[-2] = tag;
         g_stats.tagged[src].fetch_add(1, std::memory_order_relaxed);
     } else {
         g_stats.no_nop.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+SSPC_SYSV_ABI void ProbeMaterial(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
+    g_orig_material(a, r, c, d, e, f);
+    t_material_context = r;
+    g_stats.materials.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace
@@ -150,6 +178,10 @@ const Counters& Stats() {
 
 bool On() {
     return g_on;
+}
+
+bool GBufferTagged() {
+    return g_gbuffer;
 }
 
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
@@ -168,16 +200,24 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         SSPC_LOG(Engine, Error, "SSPC_CITY_ENGINE_OPT not installed: SSPC_DIAG_DRAW_CENSUS probes the same functions");
         return false;
     }
+    // CITY-OPT Phase 6: 0x1a1770 too, for the G-buffer's runs or the stage diagnostics only (Phase 5 as it was without)
+    const auto env_on = [](const char* name) {
+        char e[16] = {};
+        const DWORD k = GetEnvironmentVariableA(name, e, sizeof(e));
+        return k > 0 && k < sizeof(e) && e[0] != '0';
+    };
+    const u32 sites = env_on("SSPC_CITY_ENGINE_GBUFFER_RUNS") || env_on("SSPC_DIAG_ENGINE_SRT") ? 3 : 2;
     std::string error;
-    for (const ProbeSite& s : kSites) {
-        if (!VerifyGuestFunction(eboot_base, s.function, error)) {
+    for (u32 i = 0; i < sites; ++i) {
+        if (!VerifyGuestFunction(eboot_base, kSites[i].function, error)) {
             SSPC_LOG(Engine, Error, "SSPC_CITY_ENGINE_OPT not installed (another game version?): {}", error);
             return false;
         }
     }
-    const std::array<const void*, 2> targets = {reinterpret_cast<const void*>(&Probe<0>),
-                                                reinterpret_cast<const void*>(&Probe<1>)};
-    for (u32 i = 0; i < 2; ++i) {
+    const std::array<const void*, 3> targets = {reinterpret_cast<const void*>(&Probe<0>),
+                                                reinterpret_cast<const void*>(&Probe<1>),
+                                                reinterpret_cast<const void*>(&Probe<2>)};
+    for (u32 i = 0; i < sites; ++i) {
         void* original = InstallEntryProbe(eboot_base, kSites[i], targets[i], error);
         if (original == nullptr) {
             SSPC_LOG(Engine, Critical, "SSPC_CITY_ENGINE_OPT: {}", error);
@@ -185,14 +225,27 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         }
         g_orig[i] = reinterpret_cast<Fn>(original);
     }
+    if (sites == 3) {
+        // (the G-buffer draws' material changes: a member the processor refuses before walking its PS again)
+        void* original = VerifyGuestFunction(eboot_base, kMaterialSite.function, error)
+                             ? InstallEntryProbe(eboot_base, kMaterialSite, reinterpret_cast<const void*>(&ProbeMaterial),
+                                                 error)
+                             : nullptr;
+        if (original == nullptr) {
+            SSPC_LOG(Engine, Warning, "CITY-OPT Phase 6: the material probe (0x448640) not installed: {}", error);
+        }
+        g_orig_material = reinterpret_cast<Fn>(original);
+    }
     g_on = true;
+    g_gbuffer = sites == 3;
     if (char dv[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_ENGINE_RUNS", dv, sizeof(dv)) == 1 && dv[0] == '1') {
         g_diag = true;
         std::thread(DiagReporter).detach();
         SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_DIAG_ENGINE_RUNS=1 - the engine's meshes per frame and context");
     }
     SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_CITY_ENGINE_OPT={} - the engine's mesh draws (0x1a1960) and shadow casters' "
-                              "draws (0x43d480) tagged for the command processor's runs", v);
+                              "draws (0x43d480){} tagged for the command processor's runs", v,
+             g_gbuffer ? " and instanced mesh draws (0x1a1770, CITY-OPT Phase 6)" : "");
     return true;
 }
 

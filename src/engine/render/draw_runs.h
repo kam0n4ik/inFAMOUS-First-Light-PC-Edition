@@ -26,17 +26,31 @@ enum class Source : u8 {
     None = 0,
     Mesh = 1,   ///< 0x1a1960
     Shadow = 2, ///< 0x43d480
+    /// 0x1a1770: the mesh pass's instanced draw (G-buffer, pass 1 and others; CITY-OPT Phase 6) - tagged only with
+    /// SSPC_CITY_ENGINE_GBUFFER_RUNS or SSPC_DIAG_ENGINE_SRT
+    GBuffer = 3,
 };
+
+/// CITY-OPT Phase 6, in the tag's source dword (Source::GBuffer): the mesh pass set another material on this context
+/// (0x448640, called by 0x1a2030 only when the material of its sorted objects changes) since its last 0x1a1770 call -
+/// the draw's PS reads other descriptors; a hint only: the processor refuses the draw as a run member, never accepts one
+inline constexpr u32 kMaterialChanged = 0x100;
 
 /// The tag of the trailing NOP at `nop` (4 dwords readable): None when it carries none.
 inline Source TagOf(const u32* nop) {
     return nop[0] == kTrailingNopHeader && nop[1] == kRunMagic ? static_cast<Source>(nop[2] & 0xFF) : Source::None;
 }
+/// The tag carries kMaterialChanged.
+inline bool MaterialChangedOf(const u32* nop) {
+    return nop[0] == kTrailingNopHeader && nop[1] == kRunMagic && (nop[2] & kMaterialChanged) != 0;
+}
 
 struct Counters {
-    std::atomic<u64> calls[3]{};    ///< by Source
-    std::atomic<u64> tagged[3]{};
+    std::atomic<u64> calls[4]{};    ///< by Source
+    std::atomic<u64> tagged[4]{};
     std::atomic<u64> no_nop{0};     ///< the function wrote no draw with a trailing NOP (nothing tagged)
+    std::atomic<u64> materials{0};  ///< 0x448640 calls (Phase 6, with the G-buffer's tags)
+    std::atomic<u64> material_tagged{0}; ///< G-buffer draws tagged kMaterialChanged
 };
 const Counters& Stats();
 
@@ -47,5 +61,7 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend);
 
 /// The probes are installed (the processor looks for tags then).
 bool On();
+/// CITY-OPT Phase 6: 0x1a1770's draws are tagged too (Source::GBuffer).
+bool GBufferTagged();
 
 } // namespace SecondSon::Engine::Render::DrawRuns
