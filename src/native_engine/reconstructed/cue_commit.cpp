@@ -50,7 +50,11 @@ struct Shadow {
     alignas(64) u8 arena[CC::kArenaBytes];
     alignas(64) u8 arena_original[CC::kArenaBytes];
     u64 arena_used = 0;
-    u64 arena_dirty = 0; ///< bytes of the arena the previous run may have written
+    /// Bytes of the arena the previous run may have written. All of it at first (one 96 KiB clear per thread):
+    /// `new Shadow` leaves the arrays uninitialised, and a snapshot's bytes the function does not write (0x639450
+    /// fills 0x24 of a 0x30-byte one) would otherwise be heap garbage in the first run and zero in the second (the
+    /// game's first self-check failed so).
+    u64 arena_dirty = CC::kArenaBytes;
     u64 arena_original_used = 0;
     CC::Recording rec[2];
 };
@@ -195,7 +199,23 @@ std::string DescribeDifference(const Shadow& s) {
     }
     for (u64 i = 0; i < s.arena_used; ++i) {
         if (s.arena_original[i] != s.arena[i]) {
-            return fmt::format("; arena +{:#x}: {:#04x} / {:#04x}", i, s.arena_original[i], s.arena[i]);
+            std::string d = fmt::format("; arena +{:#x}: {:#04x} / {:#04x}", i, s.arena_original[i], s.arena[i]);
+            const u64 at = reinterpret_cast<u64>(s.arena) + i;
+            for (u32 c = 0; c < s.rec[0].calls; ++c) { // the memcpy that wrote it (its arguments are equal in both)
+                const CC::Call& m = s.rec[0].call[c];
+                if (CC::kRecorded[m.target].rva == 0x9843a0 && at >= m.a[0] && at < m.a[0] + m.a[2]) {
+                    d += fmt::format(" (written by call {}: memcpy(arena+{:#x}, {:#x}, {:#x}), byte +{:#x} of it; the "
+                                     "CUE copy is {:#x}..+{:#x}, the stack window {:#x}..{:#x})",
+                                     c, m.a[0] - reinterpret_cast<u64>(s.arena), m.a[1], m.a[2], at - m.a[0], t_copy,
+                                     CC::kCopyBytes, t_stack_lo, t_stack_hi);
+                }
+            }
+            const u64 lo = i & ~15ull;
+            u64 x[2] = {}, y[2] = {};
+            std::memcpy(x, s.arena_original + lo, 16);
+            std::memcpy(y, s.arena + lo, 16);
+            d += fmt::format("; arena +{:#x}: {:016x}{:016x} / {:016x}{:016x}", lo, x[1], x[0], y[1], y[0]);
+            return d;
         }
     }
     return {};
@@ -446,7 +466,7 @@ void CC::RunRecorded(Fn fn, bool recording_original, u64 cue, Recording& out) {
     if (redirected) {
         g_redirect(0, 0);
     }
-    s.arena_dirty = std::max(s.arena_dirty, s.arena_used);
+    s.arena_dirty = s.arena_used; // the memset above cleared the rest; a run writes only the snapshots it took
     t_recording = saved;
     t_copy = saved_copy;
 }
