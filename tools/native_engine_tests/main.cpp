@@ -1697,12 +1697,19 @@ void TestCueCommitRecompiled(const Image& image, HMODULE m, u64 cases) {
     std::printf("  without an implementation: refused (%s)\n", error.c_str());
     CC::UseImplementation(reinterpret_cast<CC::Fn>(const_cast<void*>(recompiled)), "recompiled (test)", redirect);
     error.clear();
+    // as in the game: the install runs before the linker's relocation, the stack guard's GOT slot is still 0 (the
+    // first game run crashed on it in the self-check); the self-check must not depend on it and must restore it
+    *got = 0;
     const auto t0 = std::chrono::steady_clock::now();
     const bool installed = InstallFunction(image.base, spec, Mode::Native, error);
-    std::printf("  install with recomp_14ad0: %s%s (self-check of 300 generated CUEs, %.1f ms)\n",
+    std::printf("  install with recomp_14ad0 (GOT slot of the stack guard unrelocated): %s%s (self-check of 300 "
+                "generated CUEs, %.1f ms), slot after it %#llx\n",
                 installed ? "passed" : "FAILED: ", error.c_str(),
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                static_cast<unsigned long long>(*got));
     CHECK(installed);
+    CHECK(*got == 0);
+    *got = reinterpret_cast<u64>(&guard); // "relocated" for the calls below
     if (installed) {
         const auto entry = reinterpret_cast<CC::Fn>(image.base + spec.function.rva);
         // both on the same world (restored in between): the snapshots' addresses the builders put into descriptors

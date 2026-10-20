@@ -31,6 +31,8 @@ constexpr Engine::GuestFunction kAssumed[] = {
     {0x639450, 0x84, 0x31bee38c7a86b666ull}, {0x6394e0, 0x24, 0x97a9f7dc32e188cdull},
 };
 
+/// The GOT slot of the stack guard (__stack_chk_guard): the function's only absolute read (two reads, P-code).
+constexpr u64 kStackGuardSlot = 0xd9de00;
 constexpr u64 kCopyTag = 0xc0e0000000000000ull;  ///< a pointer into the CUE copy: the tag | its offset
 constexpr u64 kStackTag = 0x57ac000000000000ull; ///< a stack pointer: the tag | the argument (content recorded)
 
@@ -298,6 +300,28 @@ bool SelfCheck(void* /*original*/, std::string& error) {
         error = "no recording clone or no implementation";
         return false;
     }
+    // The prologue reads the stack guard through its GOT slot. The install runs in the loader's window, before the
+    // linker's relocation (bootstrap: NativeEngine::InstallFromEnvironment, then Linker::Execute -> RelocateAll): the
+    // slot is not the guard's address yet (0 in the game - the first run crashed on it). For the self-check it points
+    // at a guard of its own and is restored after; no guest thread runs yet and the relocation writes it later anyway.
+    const auto slot_at = reinterpret_cast<u64*>(g_module.load(std::memory_order_relaxed) + kStackGuardSlot);
+    MEMORY_BASIC_INFORMATION mbi{};
+    constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (VirtualQuery(slot_at, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & kWritable) == 0) {
+        error = fmt::format("the stack guard's GOT slot eboot+{:#x} is not writable memory (state {:#x}, protection "
+                            "{:#x}): no self-check",
+                            kStackGuardSlot, mbi.State, mbi.Protect);
+        return false;
+    }
+    static const u64 kGuard = 0x5ec0de5ec0de5ec0ull;
+    const u64 slot_saved = *slot_at;
+    *slot_at = reinterpret_cast<u64>(&kGuard);
+    struct Restore {
+        u64* at;
+        u64 value;
+        ~Restore() { *at = value; }
+    } restore{slot_at, slot_saved};
     constexpr u64 kShaders = 0x20000, kShaderBytes = 0x1000, kLayouts = 0x26400, kLayoutBytes = 0x200,
                   kBytes = 0x28000;
     std::vector<u8> mem(kBytes);
