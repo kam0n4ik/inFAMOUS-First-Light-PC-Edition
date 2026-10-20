@@ -13,6 +13,7 @@
 
 #include "base/log.h"
 #include "engine/render/draw_runs.h"
+#include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
@@ -314,6 +315,9 @@ void ParallelCp::Stop() {
 // ---- thread 1
 
 ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
+    if (run_open_ && R6::Opt().diag) {
+        R6::Bump(R6::Count().run_closed_by[static_cast<u32>(kind) & (R6::kKinds - 1)]); // (R6-P diagnostics)
+    }
     CloseRun(); // (a held run's first draw goes before any other record)
     if (next_ - head_.load(std::memory_order_acquire) >= kSlots) {
         WaitHead(next_ - kSlots + 1, true, kWhyFull); // backpressure: the oldest slot executed
@@ -999,6 +1003,12 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         Bump(sd.images, dv.plan.images.size() + dp.plan.images.size());
         Bump(sd.buffers, dv.plan.buffers.size() + dp.plan.buffers.size());
         Bump(sd.why[why & 15]);
+    }
+    if (R6::Opt().diag) { // (R6-P: how often a full walk repeats the program's last output - docs §G)
+        const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
+        const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
+        R6::NoteWalk(0, dv.address, dv.plan.flat.data(), dv.plan.flat.data(), dv.plan.flat.size());
+        R6::NoteWalk(1, dp.address, dp.plan.flat.data(), dp.plan.flat.data(), dp.plan.flat.size());
     }
     bool writes = false;
     // (a view not copied is the frontend's current one)
@@ -1770,6 +1780,9 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
             ++t1_.draws;
             return;
         }
+        if (R6::Opt().diag) { // (R6-P diagnostics: an untagged draw / a tagged one refused)
+            R6::Bump(R6::Count().run_closed_by[tagged ? R6::kKindTaggedRefused : 0]);
+        }
         CloseRun();
     }
     Record& r = BeginRecord(Kind::Draw);
@@ -2233,6 +2246,19 @@ void ParallelCp::Fence(const Cp::FenceOp& op) {
 }
 
 void ParallelCp::Dma(const Cp::DmaOp& op) {
+    // R6-P (SSPC_R6_CP_PREFETCH=skip): Gnm's L2 prefetch writes no memory - nothing for thread 2, no memory change
+    if (const R6::Options& r6 = R6::Opt(); r6.diag || r6.prefetch_skip) {
+        R6::Counters& c = R6::Count();
+        if (r6.diag) {
+            R6::Bump(c.dma_by[static_cast<u32>(op.kind) & (R6::kDmaKinds - 1)]);
+            R6::Bump(c.dma_run_open, run_open_ ? 1 : 0);
+        }
+        if (r6.prefetch_skip && op.kind == Cp::DmaKind::ReadTagsPrefetch && !op.executed && !op.timeline) {
+            R6::Bump(c.prefetch_skipped);
+            R6::Bump(c.prefetch_skipped_run_open, run_open_ ? 1 : 0);
+            return;
+        }
+    }
     SSPC_P410_QUEUED_CALL(Kind::Dma, kQDma, DrainReason::Dma, exec_.Dma(op), r.dma = op);
 }
 
@@ -2679,6 +2705,7 @@ std::string ParallelCp::Report() const {
         }
     }
     out += "\n";
+    out += R6::Report(); // (R6-P: docs/NATIVE_RENDER_R6_CP_OPTIMIZATION.md; empty when off)
     if (Failed()) {
         out += "  FAILED: " + failure_ + "\n";
     }
