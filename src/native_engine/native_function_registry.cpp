@@ -14,6 +14,7 @@
 #include "native_engine/reconstructed/cue_commit.h"
 #include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/frame_scratch.h"
+#include "native_engine/reconstructed/gbuffer_draw_constants.h"
 #include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
 
@@ -33,6 +34,8 @@ const FunctionSpec* const kFunctions[] = {
     &Reconstructed::kMaterialBindSpec,
     // R5-D: the CUE commit 0x14ad0 (its recompiled implementation only; explicit_only)
     &Reconstructed::kCueCommitSpec,
+    // R5-E: the G-buffer draws' constants 0x11e5d0
+    &Reconstructed::kDrawConstantsSetSpec,
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);

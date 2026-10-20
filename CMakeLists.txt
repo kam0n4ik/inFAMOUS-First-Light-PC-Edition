@@ -49,6 +49,7 @@ add_library(sspc_runtime STATIC
     src/native_engine/reconstructed/cue_commit.cpp
     src/native_engine/reconstructed/material_bind.cpp
     src/native_engine/reconstructed/frame_scratch.cpp
+    src/native_engine/reconstructed/gbuffer_draw_constants.cpp
     src/native_engine/reconstructed/object_constants.cpp
     src/input/keyboard_mouse.cpp
     src/input/motion.cpp
@@ -185,6 +186,7 @@ target_link_libraries(sspc_runtime PRIVATE Zydis::Zydis)
 # signature-independent timing stubs of SSPC_NATIVE_ENGINE_MEASURE; reconstructions of AVX code are built for AVX.
 target_link_libraries(sspc_runtime PRIVATE xbyak::xbyak)
 set_source_files_properties(src/native_engine/reconstructed/object_constants.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+set_source_files_properties(src/native_engine/reconstructed/gbuffer_draw_constants.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
@@ -334,6 +336,7 @@ set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CM
 add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
     tools/native_engine_tests/main.cpp
     tools/native_engine_tests/lift_check.cpp
+    tools/native_engine_tests/gbuffer_tests.cpp
     src/native_engine/guest_code_clone.cpp
     src/native_engine/native_engine_verify.cpp
     src/native_engine/native_function_registry.cpp
@@ -342,6 +345,7 @@ add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
     src/native_engine/reconstructed/cue_commit.cpp
     src/native_engine/reconstructed/material_bind.cpp
     src/native_engine/reconstructed/frame_scratch.cpp
+    src/native_engine/reconstructed/gbuffer_draw_constants.cpp
     src/native_engine/reconstructed/object_constants.cpp
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp

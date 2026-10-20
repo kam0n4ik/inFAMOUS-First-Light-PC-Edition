@@ -48,6 +48,7 @@
 
 namespace SecondSon::NativeEngine::Tests {
 int LiftCheck(u64 image_base, u64 image_size, const std::string& dll, u64 trials); // lift_check.cpp
+int GBufferTests(u64 image_base, const std::string& recomp_dll, u64 cases);       // gbuffer_tests.cpp (R5-E)
 }
 
 using namespace SecondSon;
@@ -2026,7 +2027,7 @@ void TestModes() {
     CHECK(ParseMode("bench", m) && m == Mode::Bench);
     CHECK(ParseMode("off", m) && m == Mode::Original);
     CHECK(!ParseMode("fast", m));
-    CHECK(FunctionCount() == 9);
+    CHECK(FunctionCount() == 10); // R5-C 4, R5-D 5, R5-E draw_constants_set
     u32 hits = 0;
     for (int i = 0; i < 1000; ++i) {
         hits += SampleThisCall(1, 10) ? 1 : 0;
@@ -2120,6 +2121,7 @@ int main(int argc, char** argv) {
                         *base = image.base;
                     }
                 }
+                g_failures += Tests::GBufferTests(image.base, recomp, cases); // R5-E
                 // last: it installs the setters' jumps on the mapped image
                 TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
                 // after the setters: installs 0x448640 below an entry probe on the mapped image
