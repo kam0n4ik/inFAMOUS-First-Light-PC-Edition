@@ -8,7 +8,10 @@
 //                 fallback on the mapped image, a multi-threaded stress of the allocator
 //     --bench     cost per call: original, reconstruction, both through the installed jump and dispatcher
 //     --replay    re-runs recorded in-game mismatch cases against the eboot's code (needs --eboot)
-//     --recomp    the static recompilation PoC module (recomp_build.ps1) against the eboot's code (needs --eboot)
+//     --recomp    the static recompiler's module (recomp.dll) against the eboot's code (needs --eboot), recomp_11c890 also
+//                 under FTZ/DAZ and the directed roundings
+//     --lift-check <recomp_lift.dll> [--lift-trials N]  only: every lifted instruction against the CPU running its own
+//                 bytes (lift_check.cpp), N random states per instruction and MXCSR mode (default 200)
 // Exit code = failures.
 #include <algorithm>
 #include <atomic>
@@ -20,8 +23,11 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
+#include <fmt/format.h>
+#include <immintrin.h>
 #include <windows.h>
 #include <xbyak/xbyak.h>
 
@@ -34,6 +40,10 @@
 #include "native_engine/native_measure.h"
 #include "native_engine/reconstructed/frame_scratch.h"
 #include "native_engine/reconstructed/object_constants.h"
+
+namespace SecondSon::NativeEngine::Tests {
+int LiftCheck(u64 image_base, u64 image_size, const std::string& dll, u64 trials); // lift_check.cpp
+}
 
 using namespace SecondSon;
 using namespace SecondSon::NativeEngine;
@@ -819,6 +829,8 @@ void Replay(const Image& image, const std::string& path) {
     }
 }
 
+void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases);
+
 /// The static recompilation PoC: functions machine-translated from Ghidra P-code (tools/native-reconstruction/recomp)
 /// against the eboot's own code, and the recompiled allocator through the registry.
 void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::Fn fs_original, OC::Fn oc_original) {
@@ -882,6 +894,15 @@ void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::F
         const OC::Fn before = OC::Implementation();
         OC::UseImplementation(r, "recompiled");
         TestObjectConstantsDifferential(oc_original, cases);
+        // the guest thread's MXCSR is the hardware's for both: flush-to-zero/denormals-are-zero and the directed
+        // roundings must give the same bits too
+        const u32 host_csr = _mm_getcsr();
+        for (const u32 mode : {0x9fc0u, 0x3f80u, 0x5f80u, 0x7f80u}) {
+            std::printf("  MXCSR %#x:\n", mode);
+            _mm_setcsr(mode);
+            TestObjectConstantsDifferential(oc_original, cases / 4);
+            _mm_setcsr(host_csr);
+        }
         Matrices mx{};
         std::mt19937_64 rng2{3};
         Plausible(rng2, mx.world, false);
@@ -912,6 +933,240 @@ void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::F
         }
         OC::UseImplementation(before, "hand-written reconstruction");
     }
+    TestRecompiledEngine(image, m, std::max<u64>(cases / 10, 1000));
+}
+
+// --- the related engine functions the recompiler translates (R5-B/C): original vs recompiled ----------------------
+//
+// Both run on the same buffers (restored between the two) through the guest-like caller; the functions they call are
+// replaced in the mapped image by recorders, so the calls (target, argument registers, the 16 bytes a V# source points
+// at) are compared as well as every byte of memory.
+
+struct CallRecord {
+    u32 target;
+    u64 a[6];
+    u8 src[16];
+    bool operator==(const CallRecord& o) const {
+        return target == o.target && std::memcmp(a, o.a, sizeof(a)) == 0 && std::memcmp(src, o.src, 16) == 0;
+    }
+};
+std::vector<CallRecord> g_calls;
+
+/// The argument registers each recorded callee is given [A: every call site sets exactly these]; the others are
+/// don't-care: after an earlier
+/// call they hold whatever that callee left in caller-saved registers, which the recompiled code (like any compiler)
+/// does not reproduce.
+constexpr u32 Arity(u32 target) {
+    return target == 0x626520 ? 5 : target == 0x11bed0 ? 4 : 3; // 0x11be90, 0x9843a0: 3
+}
+
+template <u32 Target>
+SSPC_SYSV_ABI u64 Recorder(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    CallRecord r{Target, {a0, a1, a2, a3, a4, a5}, {}};
+    for (u32 k = Arity(Target); k < 6; ++k) {
+        r.a[k] = 0;
+    }
+    if (Target == 0x626520) { // (gnm context, stage, slot, const V#*, 4)
+        std::memcpy(r.src, reinterpret_cast<const void*>(a3), 16);
+    }
+    if (Target == 0x11be90) { // (buffer slot, owner, count): the original allocates; the test hands out a fake address
+        const u64 fake = 0x5a5a000000ull + (a2 << 4);
+        std::memcpy(reinterpret_cast<void*>(a0), &fake, 8);
+    }
+    g_calls.push_back(r);
+    return 0;
+}
+
+/// Replaces an image function by `mov rax, fn; jmp rax`; restores on destruction.
+struct ImagePatch {
+    u8* at;
+    u8 saved[12];
+    ImagePatch(const Image& image, u64 rva, const void* fn) : at(reinterpret_cast<u8*>(image.base + rva)) {
+        std::memcpy(saved, at, 12);
+        u8 code[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+        const u64 target = reinterpret_cast<u64>(fn);
+        std::memcpy(code + 2, &target, 8);
+        std::memcpy(at, code, 12);
+    }
+    ~ImagePatch() {
+        std::memcpy(at, saved, 12);
+    }
+};
+
+/// Runs `original` and `recompiled` on one argument set; memory = the buffers both may write. Returns "" or the
+/// first difference.
+std::string RunBoth(const void* original, const void* recompiled, CallFrame f, std::vector<std::pair<u8*, size_t>> memory) {
+    std::vector<std::vector<u8>> before, after_original;
+    for (auto& [p, n] : memory) {
+        before.emplace_back(p, p + n);
+    }
+    g_calls.clear();
+    CallFrame fo = f;
+    const u64 vo = CallAsGuest(original, fo);
+    const std::vector<CallRecord> calls_original = g_calls;
+    for (auto& [p, n] : memory) {
+        after_original.emplace_back(p, p + n);
+    }
+    for (size_t i = 0; i < memory.size(); ++i) {
+        std::memcpy(memory[i].first, before[i].data(), memory[i].second);
+    }
+    g_calls.clear();
+    CallFrame fr = f;
+    const u64 vr = CallAsGuest(recompiled, fr);
+    if (vo != 0 || vr != 0) {
+        return fmt::format("ABI violations: original {:#x}, recompiled {:#x}", vo, vr);
+    }
+    if (fo.rax_out != fr.rax_out) {
+        return fmt::format("rax: original {:#x}, recompiled {:#x}", fo.rax_out, fr.rax_out);
+    }
+    if (g_calls.size() != calls_original.size()) {
+        return fmt::format("calls: original {}, recompiled {}", calls_original.size(), g_calls.size());
+    }
+    for (size_t i = 0; i < g_calls.size(); ++i) {
+        if (!(g_calls[i] == calls_original[i])) {
+            return fmt::format("call {} (to {:#x}) differs", i, calls_original[i].target);
+        }
+    }
+    for (size_t i = 0; i < memory.size(); ++i) {
+        const u8* p = memory[i].first;
+        for (size_t k = 0; k < memory[i].second; ++k) {
+            if (p[k] != after_original[i][k]) {
+                return fmt::format("memory {} +{:#x}: original {:#04x}, recompiled {:#04x}", i, k, after_original[i][k],
+                                   p[k]);
+            }
+        }
+    }
+    return {};
+}
+
+void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases) {
+    std::mt19937_64 rng{0xe9e};
+    const auto report = [](const char* what, u64 n, u64 bad, const std::string& first) {
+        std::printf("  %s: %llu cases, %llu different%s%s\n", what, static_cast<unsigned long long>(n),
+                    static_cast<unsigned long long>(bad), first.empty() ? "" : "; first: ", first.c_str());
+        CHECK(bad == 0);
+    };
+    // 0x11cde0: the second object-constants writer (rdi, rsi matrices; edx flags; rcx block; xmm0, xmm1)
+    if (const void* r = reinterpret_cast<const void*>(GetProcAddress(m, "recomp_11cde0"))) {
+        const void* o = PristineCopy(image, {0x11cde0, 0x459, 0x7195e831ed1fc41cull});
+        alignas(16) float a[16], b[16];
+        alignas(16) u8 block[0xc0];
+        u64 bad = 0;
+        std::string first;
+        for (u64 n = 0; n < cases; ++n) {
+            const bool plausible = (n % 4) != 0;
+            for (float* p : {a, b}) {
+                if (plausible) {
+                    Plausible(rng, p, p == b);
+                } else {
+                    for (int i = 0; i < 16; ++i) {
+                        p[i] = Special(rng);
+                    }
+                }
+            }
+            for (auto& x : block) {
+                x = static_cast<u8>(rng());
+            }
+            if (n % 8 == 1) { // unchanged values: the "no change" paths
+                std::memcpy(block, a, 48);
+            }
+            CallFrame f{};
+            f.gpr[0] = reinterpret_cast<u64>(a);
+            f.gpr[1] = reinterpret_cast<u64>(b);
+            f.gpr[2] = rng() & ((n % 3 == 0) ? 0xffffffffull : 0xfull);
+            f.gpr[3] = reinterpret_cast<u64>(block);
+            for (int k = 0; k < 8; ++k) {
+                for (int l = 0; l < 4; ++l) {
+                    const float v = Special(rng);
+                    std::memcpy(f.xmm[k] + 4 * l, &v, 4);
+                }
+            }
+            const std::string d = RunBoth(o, r, f, {{block, sizeof(block)}, {reinterpret_cast<u8*>(a), 64},
+                                                    {reinterpret_cast<u8*>(b), 64}});
+            if (!d.empty() && bad++ == 0) {
+                first = fmt::format("case {}: {}", n, d);
+            }
+        }
+        report("recomp_11cde0 vs eboot 0x11cde0", cases, bad, first);
+    }
+    // 0x16aa0 / 0x16b70: CUE vertex-buffer / buffer slots (rdi CUE, esi stage, edx first slot, ecx count, r8 V#s)
+    const ImagePatch gnm_set(image, 0x626520, reinterpret_cast<const void*>(&Recorder<0x626520>));
+    for (const auto& [rva, hash, name] : {std::tuple{0x16aa0ull, 0xf6c333198de2deedull, "recomp_16aa0"},
+                                          std::tuple{0x16b70ull, 0x713c9f7b4b870c4dull, "recomp_16b70"}}) {
+        const void* r = reinterpret_cast<const void*>(GetProcAddress(m, name));
+        if (r == nullptr) {
+            continue;
+        }
+        const void* o = PristineCopy(image, {rva, 0xc6, hash});
+        static std::vector<u8> cue(0x20000);
+        static std::vector<u8> table(0x400);
+        static std::vector<u8> src(64 * 16);
+        u64 bad = 0;
+        std::string first;
+        for (u64 n = 0; n < cases; ++n) {
+            const u32 stage = static_cast<u32>(rng() % 7), start = static_cast<u32>(rng() % 64),
+                      count = static_cast<u32>(rng() % 33);
+            for (size_t i = 0; i < table.size(); i += 2) {
+                u16 w;
+                switch (rng() % 4) {
+                case 0: w = 0xffff; break;
+                case 1: w = static_cast<u16>(0x8000 | (rng() & 0x3fff)); break;
+                default: w = static_cast<u16>(rng() & 0x3fff); break;
+                }
+                std::memcpy(table.data() + i, &w, 2);
+            }
+            for (auto& x : src) {
+                x = static_cast<u8>(rng());
+            }
+            const u64 t = reinterpret_cast<u64>(table.data());
+            std::memcpy(cue.data() + 0xc180 + 8 * stage, &t, 8);
+            const u64 gnm = rng();
+            std::memcpy(cue.data() + 0xc090, &gnm, 8);
+            cue[0xc1d0 + stage] = static_cast<u8>(rng());
+            CallFrame f{};
+            f.gpr[0] = reinterpret_cast<u64>(cue.data());
+            f.gpr[1] = stage | (rng() << 32);
+            f.gpr[2] = start;
+            f.gpr[3] = count;
+            f.gpr[4] = reinterpret_cast<u64>(src.data());
+            f.gpr[5] = rng();
+            const std::string d = RunBoth(o, r, f, {{cue.data(), cue.size()}});
+            if (!d.empty() && bad++ == 0) {
+                first = fmt::format("case {}: {}", n, d);
+            }
+        }
+        report(fmt::format("{} vs eboot {:#x} (calls to 0x626520 recorded)", name, rva).c_str(), cases, bad, first);
+    }
+    // 0x120280: draw constants (rdi object): 0x11be90, 0x9843a0 (copy), 0x11bed0 twice, the second as a tail call
+    if (const void* r = reinterpret_cast<const void*>(GetProcAddress(m, "recomp_120280"))) {
+        const void* o = PristineCopy(image, {0x120280, 0x9d, 0xad95be1456114d2aull});
+        const ImagePatch p1(image, 0x11be90, reinterpret_cast<const void*>(&Recorder<0x11be90>));
+        const ImagePatch p2(image, 0x9843a0, reinterpret_cast<const void*>(&Recorder<0x9843a0>));
+        const ImagePatch p3(image, 0x11bed0, reinterpret_cast<const void*>(&Recorder<0x11bed0>));
+        static std::vector<u8> object(0xe000);
+        u64 bad = 0;
+        std::string first;
+        for (u64 n = 0; n < cases; ++n) {
+            for (size_t i = 0xda00; i < object.size(); ++i) {
+                object[i] = static_cast<u8>(rng());
+            }
+            const s32 count = (n % 4 == 0) ? 0 : static_cast<s32>(rng() % 64) - (n % 9 == 0 ? 70 : 0);
+            std::memcpy(object.data() + 0xde18, &count, 4);
+            object[0xde1c] = static_cast<u8>(n % 3 == 0 ? 0 : rng());
+            const u64 slot = (n % 5 == 0) ? 0 : rng();
+            std::memcpy(object.data() + 0xde20, &slot, 8);
+            CallFrame f{};
+            f.gpr[0] = reinterpret_cast<u64>(object.data());
+            for (int k = 1; k < 6; ++k) {
+                f.gpr[k] = rng();
+            }
+            const std::string d = RunBoth(o, r, f, {{object.data(), object.size()}});
+            if (!d.empty() && bad++ == 0) {
+                first = fmt::format("case {}: {}", n, d);
+            }
+        }
+        report("recomp_120280 vs eboot 0x120280 (calls recorded, tail call included)", cases, bad, first);
+    }
 }
 
 void TestModes() {
@@ -934,8 +1189,8 @@ void TestModes() {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string eboot, replay, recomp;
-    u64 cases = 1'000'000;
+    std::string eboot, replay, recomp, lift;
+    u64 cases = 1'000'000, lift_trials = 200;
     bool bench = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -949,7 +1204,21 @@ int main(int argc, char** argv) {
             replay = argv[++i];
         } else if (a == "--recomp" && i + 1 < argc) {
             recomp = argv[++i];
+        } else if (a == "--lift-check" && i + 1 < argc) {
+            lift = argv[++i];
+        } else if (a == "--lift-trials" && i + 1 < argc) {
+            lift_trials = std::strtoull(argv[++i], nullptr, 10);
         }
+    }
+    if (!lift.empty()) { // only the instruction-level check, on its own pristine mapping of the eboot
+        Image image;
+        if (eboot.empty() || !MapEboot(eboot, image)) {
+            std::printf("--lift-check needs --eboot\n");
+            return 1;
+        }
+        const int bad = Tests::LiftCheck(image.base, image.size, lift, lift_trials);
+        std::printf("LIFT CHECK %s\n", bad == 0 ? "PASS" : "FAIL");
+        return bad;
     }
     TestModes();
     TestAbiBoundary();

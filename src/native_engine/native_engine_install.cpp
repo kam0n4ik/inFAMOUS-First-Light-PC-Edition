@@ -277,25 +277,34 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
     if (const std::string dll = Env("SSPC_NATIVE_ENGINE_RECOMP"); !dll.empty()) {
         HMODULE m = LoadLibraryA(dll.c_str());
         auto* base = m ? reinterpret_cast<u64*>(GetProcAddress(m, "recomp_image_base")) : nullptr;
-        auto* fs = m ? GetProcAddress(m, "recomp_1f0870") : nullptr;
-        auto* oc = m ? GetProcAddress(m, "recomp_11c890") : nullptr;
+        const auto selected = [&](const FunctionSpec& spec) {
+            return std::any_of(wanted.begin(), wanted.end(), [&](const Installed& w) {
+                return &Function(w.index) == &spec && w.mode != Mode::Original;
+            });
+        };
+        auto* fs = m && selected(Reconstructed::kFrameScratchAllocSpec) ? GetProcAddress(m, "recomp_1f0870") : nullptr;
+        auto* oc = m && selected(Reconstructed::kObjectConstantsSpec) ? GetProcAddress(m, "recomp_11c890") : nullptr;
         if (base == nullptr || (fs == nullptr && oc == nullptr)) {
-            SSPC_LOG(Engine, Error, "SSPC_NATIVE_ENGINE_RECOMP={}: not a recompiled module (recomp_image_base, "
-                     "recomp_1f0870 / recomp_11c890); the hand-written reconstructions stay", dll);
+            SSPC_LOG(Engine, Error, "SSPC_NATIVE_ENGINE_RECOMP={}: no recompiled function of a selected reconstruction "
+                     "(recomp_image_base, recomp_1f0870 / recomp_11c890); the hand-written reconstructions stay", dll);
         } else {
             *base = eboot_base;
             constexpr const char* kSource = "static recompilation (P-code -> C++ -> clang)";
             if (fs != nullptr) {
                 Reconstructed::FrameScratch::UseImplementation(reinterpret_cast<Reconstructed::FrameScratch::Fn>(fs),
                                                                kSource);
-                SSPC_LOG(Engine, Warning, "STATIC RECOMPILATION: frame_alloc's implementation is recomp_1f0870 from {}",
-                         dll);
+                SSPC_LOG(Engine, Warning,
+                         "STATIC RECOMPILATION: frame_alloc's implementation is recomp_1f0870 ({}) from {}",
+                         reinterpret_cast<void*>(Reconstructed::FrameScratch::Implementation()), dll);
             }
             if (oc != nullptr) {
                 Reconstructed::ObjectConstants::UseImplementation(
                     reinterpret_cast<Reconstructed::ObjectConstants::Fn>(oc), kSource);
                 SSPC_LOG(Engine, Warning,
-                         "STATIC RECOMPILATION: object_constants' implementation is recomp_11c890 from {}", dll);
+                         "STATIC RECOMPILATION: object_constants' implementation is recomp_11c890 ({}) from {} "
+                         "(hand-written: {})",
+                         reinterpret_cast<void*>(Reconstructed::ObjectConstants::Implementation()), dll,
+                         reinterpret_cast<void*>(&Reconstructed::ObjectConstants::Native));
             }
         }
     }

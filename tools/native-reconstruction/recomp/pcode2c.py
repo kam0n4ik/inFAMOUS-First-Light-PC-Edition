@@ -225,7 +225,7 @@ extern "C" __attribute__((naked, sysv_abi)) void recomp_call(CallIO*) {
 '''
 
 LIFT_PRELUDE = r'''
-struct LiftEntry { u64 addr; u32 len; u32 pad; SYSV void (*fn)(u8*, u8*); };
+struct LiftEntry { u64 addr; u32 len; u32 flags; SYSV void (*fn)(u8*, u8*); };  // flags bit 0: AF unread
 struct LiftReg { char name[8]; u32 off; u32 size; };
 '''
 
@@ -330,6 +330,10 @@ class Emitter:
     def build_layouts(self, extra, instructions=None):
         regs, uniq = set(extra), set()
         for ins in (instructions if instructions is not None else self.f["instructions"]):
+            fix = self.scalar_fix(ins)
+            for name in (fix[:2] if fix else ()):  # the scalar fix reads src1 and writes dst whole
+                off = self.regoff(name)[0]
+                regs.add((off, off + 16))
             for o in ins["pcode"]:
                 for v in [o["out"]] + o["in"]:
                     if v is None:
@@ -831,6 +835,8 @@ class Emitter:
             off, _ = self.regoff("XMM%d" % k)
             extra.append((off, off + 16))
         self.build_layouts(extra)
+        if self.reads_af():
+            raise blocked("INSTRUCTION", "reads AF, which SLEIGH does not compute for ADD/SUB/CMP/INC/DEC/NEG")
         depth, arg_bytes = self.frame()
         stack_bytes = (depth + 64 + 15) & ~15
         if arg_bytes > 256:
@@ -867,7 +873,38 @@ class Emitter:
         self.stats["frame_U"] = self.U.size
         return "\n".join(L)
 
+    def scalar_fix(self, ins):
+        """SLEIGH lifts the VEX scalar forms (VMULSS XMM0,XMM1,m32 ...) as ZMMd = INT_ZEXT result: bits above the
+        result zeroed. The hardware copies them from the first source (src1[127:32] / [127:64]) and zeroes only
+        bits 255:128 (found by --lift-check at 0x11cce6). Returns (dst XMM, src1 XMM, result bytes) or None."""
+        m = re.match(r"^V(ADD|SUB|MUL|DIV|MIN|MAX|SQRT|RSQRT|RCP|ROUND)S([SD])$", ins["mnemonic"].upper())
+        cvt = re.match(r"^VCVT(SI2SS|SI2SD|SS2SD|SD2SS|USI2SS|USI2SD)$", ins["mnemonic"].upper())
+        if not m and not cvt:
+            return None
+        ops = re.match(r"^\S+\s+(XMM\d+),(XMM\d+),", ins["text"])
+        if ops is None:
+            raise blocked("INSTRUCTION", "scalar VEX form without an XMM first source: %s" % ins["text"])
+        n = (4 if m.group(2) == "S" else 8) if m else (4 if cvt.group(1).endswith("SS") else 8)
+        return ops.group(1), ops.group(2), n
+
+    def reads_af(self):
+        """SLEIGH does not compute AF for ADD/SUB/CMP/INC/DEC/NEG (--lift-check): a function whose code reads AF
+        (LAHF, PUSHF, ...) would see a stale value. Flags are not part of the System V interface, so AF without a
+        reader in the function is unobservable."""
+        af = self.regfile.get("AF")
+        return af is not None and any(v and v[0] == "register" and v[1] == af[0]
+                                      for ins in self.f["instructions"] for o in ins["pcode"] for v in o["in"])
+
     def emit_instruction(self, ins):
+        fix = self.scalar_fix(ins)
+        body = self.emit_ops(ins)
+        if fix is None:
+            return body
+        d, s1, n = self.reg(fix[0], 16), self.reg(fix[1], 16), fix[2]
+        return (["    { const V<16> shi_ = ldv<16>(R + %d);  // %s[127:%d] (SLEIGH zeroes it)" % (s1, fix[1], 8 * n)] +
+                body + ["    std::memcpy(R + %d, shi_.b + %d, %d); }" % (d + n, n, 16 - n)])
+
+    def emit_ops(self, ins):
         L = []
         ops = ins["pcode"]
         self.stats["pcode"] += len(ops)
@@ -1004,10 +1041,11 @@ def main():
                 report.append("%x: lift functions skipped - %s" % (f["entry"], x))
                 continue
             max_r, max_u = max(max_r, le.R.size), max(max_u, le.U.size)
+            af_unread = 0 if le.reads_af() else 1  # LiftEntry.flags bit 0: AF has no reader (not compared)
             for ins in f["instructions"]:
                 try:
                     lift_parts.append("\n".join(le.lift_function(ins)))
-                    lift_rows.append("{0x%xull, %d, 0, &lift_%x}" % (ins["addr"], ins["len"], ins["addr"]))
+                    lift_rows.append("{0x%xull, %d, %d, &lift_%x}" % (ins["addr"], ins["len"], af_unread, ins["addr"]))
                     coverage[ins["mnemonic"]][2] += 1
                 except Unsupported as x:
                     if x.category != "BLOCKED_BY_CONTROL_FLOW" and "stack pointer" not in str(x):

@@ -330,6 +330,7 @@ set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CM
 # code (cmake --build <dir> --target sspc_native_engine_tests; tools/native_engine_tests/main.cpp).
 add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
     tools/native_engine_tests/main.cpp
+    tools/native_engine_tests/lift_check.cpp
     src/native_engine/guest_code_clone.cpp
     src/native_engine/native_engine_verify.cpp
     src/native_engine/native_function_registry.cpp
