@@ -229,7 +229,7 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
                  global);
         return false;
     }
-    if (global_mode == Mode::Original && measure.empty()) {
+    if (global_mode == Mode::Original && measure.empty() && Env("SSPC_NATIVE_ENGINE_FUNCS").empty()) {
         return true; // the default: the game exactly as it is
     }
     g_dir = logs_dir / "native_engine";

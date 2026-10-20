@@ -17,6 +17,10 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $bench = "E:\research\sspc_bench.lock"
+# a bench lock this agent took for its own FPS series (series.sh) does not hold its runs back
+function OtherBench {
+    (Test-Path $bench) -and -not ((Get-Content "$bench\owner.txt" -ErrorAction SilentlyContinue) -match "^$Owner ")
+}
 $lock = "E:\research\sspc_game.lock"
 $exe = "$Worktree\build\bin\SecondSonPC.exe"
 $run = Join-Path $Out $Tag
@@ -27,13 +31,13 @@ New-Item -ItemType Directory -Force $run | Out-Null
 # game lock is taken only after neither lock has existed for -QuietSeconds.
 $quiet = $null
 while ($true) {
-    if ((Test-Path $bench) -or (Test-Path $lock) -or (Get-Process SecondSonPC -ErrorAction SilentlyContinue)) {
+    if ((OtherBench) -or (Test-Path $lock) -or (Get-Process SecondSonPC -ErrorAction SilentlyContinue)) {
         $quiet = $null; Start-Sleep -Seconds 30; continue
     }
     if ($null -eq $quiet) { $quiet = Get-Date }
     if (((Get-Date) - $quiet).TotalSeconds -lt $QuietSeconds) { Start-Sleep -Seconds 30; continue }
     try { New-Item -ItemType Directory $lock -ErrorAction Stop | Out-Null } catch { Start-Sleep -Seconds 120; continue }
-    if (Test-Path $bench) { Remove-Item $lock -Recurse -Force; continue } # lost the race to a series
+    if (OtherBench) { Remove-Item $lock -Recurse -Force; continue } # lost the race to a series
     if (Get-Process SecondSonPC -ErrorAction SilentlyContinue) { Remove-Item $lock -Recurse -Force; Start-Sleep 120; continue }
     break
 }
