@@ -38,6 +38,7 @@
 #include "native_engine/native_engine_verify.h"
 #include "native_engine/native_function_registry.h"
 #include "native_engine/native_measure.h"
+#include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/frame_scratch.h"
 #include "native_engine/reconstructed/object_constants.h"
 
@@ -49,6 +50,7 @@ using namespace SecondSon;
 using namespace SecondSon::NativeEngine;
 namespace OC = SecondSon::NativeEngine::Reconstructed::ObjectConstants;
 namespace FS = SecondSon::NativeEngine::Reconstructed::FrameScratch;
+namespace CSB = SecondSon::NativeEngine::Reconstructed::CueSetBuffers;
 
 namespace {
 
@@ -811,6 +813,8 @@ void Replay(const Image& image, const std::string& path) {
     std::string line;
     const auto oc_ref = reinterpret_cast<OC::Fn>(PristineCopy(image, Reconstructed::kObjectConstantsSpec.function));
     const auto fs_ref = reinterpret_cast<FS::Fn>(PristineCopy(image, Reconstructed::kFrameScratchAllocSpec.function));
+    std::string error;
+    CHECK(CSB::Prepare(CSB::kVertexBuffers, image.base, error) && CSB::Prepare(CSB::kBuffers, image.base, error));
     u32 n = 0;
     while (std::getline(in, line)) {
         const size_t sp = line.find(' ');
@@ -822,8 +826,12 @@ void Replay(const Image& image, const std::string& path) {
             continue;
         }
         const std::string key = line.substr(0, sp);
-        const bool ok = key == "object_constants" ? OC::Replay(oc_ref, bytes, report)
-                                                  : FS::Replay(fs_ref, bytes, report);
+        const bool ok = key == "object_constants"  ? OC::Replay(oc_ref, bytes, report)
+                        : key == "frame_alloc"     ? FS::Replay(fs_ref, bytes, report)
+                        : key == Reconstructed::kCueSetVertexBuffersSpec.key
+                            ? CSB::Replay(CSB::kVertexBuffers, bytes, report)
+                        : key == Reconstructed::kCueSetBuffersSpec.key ? CSB::Replay(CSB::kBuffers, bytes, report)
+                                                                       : (report = "unknown key", false);
         std::printf("  case %u (%s): %s\n", ++n, key.c_str(), report.c_str());
         CHECK(ok);
     }
@@ -1169,6 +1177,219 @@ void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases) {
     }
 }
 
+// --- the CUE buffer setters 0x16aa0 / 0x16b70 (R5-C): reconstruction, recording clone, registry ----------------------
+
+/// A CUE as the setters see it: the stage's table pointer, the context, the changed byte, the descriptors; entries of
+/// every kind (unused, direct setUserDataRegion, in the stage's window, anywhere the 14 bits reach).
+struct CueCase {
+    std::vector<u8> cue = std::vector<u8>(0x20000);
+    std::vector<u8> table = std::vector<u8>(0x200);
+    std::vector<u8> src = std::vector<u8>(64 * 16);
+    u32 stage = 0, slot = 0, count = 0;
+
+    void Generate(std::mt19937_64& rng) {
+        stage = static_cast<u32>(rng() % 8);
+        slot = static_cast<u32>(rng() % 32);
+        count = static_cast<u32>(rng() % 33);
+        for (size_t i = 0; i < table.size(); i += 2) {
+            u16 w;
+            switch (rng() % 4) {
+            case 0: w = 0xffff; break;
+            case 1: w = static_cast<u16>(0x8000 | (rng() & 0x7fff)); break;
+            case 2: w = static_cast<u16>(rng() & 0x7fff); break;
+            default: w = static_cast<u16>((rng() % 0x5fc) & ~3ull); break;
+            }
+            std::memcpy(table.data() + i, &w, 2);
+        }
+        for (auto& x : src) {
+            x = static_cast<u8>(rng());
+        }
+        const u64 t = reinterpret_cast<u64>(table.data());
+        std::memcpy(cue.data() + 0xc180 + 8 * stage, &t, 8);
+        const u64 context = rng();
+        std::memcpy(cue.data() + 0xc090, &context, 8);
+        cue[0xc1d0 + stage] = static_cast<u8>(rng());
+    }
+    /// The guest's registers: the 32-bit arguments with garbage above (the original reads ESI/EDX/ECX).
+    CallFrame Frame(std::mt19937_64& rng) {
+        CallFrame f{};
+        f.gpr[0] = reinterpret_cast<u64>(cue.data());
+        f.gpr[1] = stage | (rng() << 32);
+        f.gpr[2] = slot | (rng() << 32);
+        f.gpr[3] = count | (rng() << 32);
+        f.gpr[4] = reinterpret_cast<u64>(src.data());
+        f.gpr[5] = rng();
+        return f;
+    }
+};
+
+/// A wrong implementation (sets the changed byte to 2): verification must see it.
+SSPC_SYSV_ABI u64 BrokenSetBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    const u64 r = CSB::NativeBuffers(cue, stage, slot, count, src);
+    *reinterpret_cast<u8*>(cue + 0xc1d0 + static_cast<u64>(static_cast<s64>(static_cast<s32>(stage)))) = 2;
+    return r;
+}
+void NoRedirect(u64, u64) {}
+
+void TestCueSetters(const Image& image, HMODULE m, u64 cases) {
+    std::printf("CUE buffer setters 0x16aa0 / 0x16b70 (R5-C):\n");
+    std::mt19937_64 rng{0xc5e};
+    const FunctionSpec* spec[CSB::kKinds] = {&Reconstructed::kCueSetVertexBuffersSpec,
+                                             &Reconstructed::kCueSetBuffersSpec};
+    const CSB::Fn hand[CSB::kKinds] = {&CSB::NativeVertexBuffers, &CSB::NativeBuffers};
+    const char* exports[CSB::kKinds] = {"recomp_16aa0", "recomp_16b70"};
+    void* reference[CSB::kKinds] = {};
+    std::string error;
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        reference[k] = PristineCopy(image, spec[k]->function);
+        CHECK(reference[k] != nullptr);
+        CHECK(CSB::Prepare(static_cast<CSB::Kind>(k), image.base, error));
+        CHECK(CSB::RecordingOriginal(static_cast<CSB::Kind>(k)) != nullptr);
+    }
+    if (reference[0] == nullptr || reference[1] == nullptr) {
+        return;
+    }
+    auto* redirect = m ? reinterpret_cast<CSB::RedirectFn>(GetProcAddress(m, "recomp_set_redirect")) : nullptr;
+    struct Variant {
+        const char* name;
+        CSB::Fn fn[CSB::kKinds];
+        CSB::RedirectFn redirect;
+    };
+    std::vector<Variant> variants{{"hand-written", {hand[0], hand[1]}, nullptr}};
+    if (redirect != nullptr) {
+        variants.push_back({"recompiled",
+                            {reinterpret_cast<CSB::Fn>(GetProcAddress(m, exports[0])),
+                             reinterpret_cast<CSB::Fn>(GetProcAddress(m, exports[1]))},
+                            redirect});
+        CHECK(variants.back().fn[0] != nullptr && variants.back().fn[1] != nullptr);
+    }
+    const auto use = [&](const Variant& v) {
+        for (u32 k = 0; k < CSB::kKinds; ++k) {
+            CSB::UseImplementation(static_cast<CSB::Kind>(k), v.fn[k], v.name, v.redirect);
+        }
+    };
+
+    // the install self-check (1000 generated cases on whole shadow buffers, recording clone vs implementation)
+    for (const Variant& v : variants) {
+        use(v);
+        for (u32 k = 0; k < CSB::kKinds; ++k) {
+            error.clear();
+            const bool ok = spec[k]->self_check(nullptr, error);
+            std::printf("  %s %s: install self-check %s%s%s\n", v.name, spec[k]->key, ok ? "passed" : "FAILED",
+                        ok ? "" : ": ", error.c_str());
+            CHECK(ok);
+        }
+    }
+    // each implementation against the eboot through the guest-like caller, setUserDataRegion recorded
+    {
+        const ImagePatch gnm_set(image, CSB::kCalleeRva, reinterpret_cast<const void*>(&Recorder<0x626520>));
+        CueCase c;
+        for (const Variant& v : variants) {
+            for (u32 k = 0; k < CSB::kKinds; ++k) {
+                u64 bad = 0;
+                std::string first;
+                for (u64 n = 0; n < cases; ++n) {
+                    c.Generate(rng);
+                    const std::string d = RunBoth(reference[k], reinterpret_cast<const void*>(v.fn[k]), c.Frame(rng),
+                                                  {{c.cue.data(), c.cue.size()}});
+                    if (!d.empty() && bad++ == 0) {
+                        first = fmt::format("case {}: {}", n, d);
+                    }
+                }
+                std::printf("  %s %s vs eboot %#llx: %llu cases, %llu different%s%s\n", v.name, spec[k]->key,
+                            static_cast<unsigned long long>(spec[k]->function.rva),
+                            static_cast<unsigned long long>(cases), static_cast<unsigned long long>(bad),
+                            first.empty() ? "" : "; first: ", first.c_str());
+                CHECK(bad == 0);
+            }
+        }
+    }
+
+    // installed on the mapped image: every mode through the jump against the reference on a copy
+    use(variants[0]);
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        error.clear();
+        const bool ok = InstallFunction(image.base, *spec[k], Mode::Native, error);
+        if (!ok) {
+            std::printf("  install %s: %s\n", spec[k]->key, error.c_str());
+        }
+        CHECK(ok);
+    }
+    const ImagePatch gnm_set(image, CSB::kCalleeRva, reinterpret_cast<const void*>(&Recorder<0x626520>));
+    CueCase c, r;
+    for (const Variant& v : variants) {
+        use(v);
+        for (const Mode mode : {Mode::Native, Mode::Verify, Mode::Guarded, Mode::Bench, Mode::Original}) {
+            for (u32 k = 0; k < CSB::kKinds; ++k) {
+                spec[k]->slot->mode.store(static_cast<u8>(mode));
+                spec[k]->slot->sample_period = 3;
+                const auto entry = reinterpret_cast<CSB::Fn>(image.base + spec[k]->function.rva);
+                const auto ref = reinterpret_cast<CSB::Fn>(reference[k]);
+                u64 differ = 0;
+                for (int n = 0; n < 2000; ++n) {
+                    c.Generate(rng);
+                    r.cue = c.cue; // the same table and descriptors (pointers into c)
+                    g_calls.clear();
+                    entry(reinterpret_cast<u64>(c.cue.data()), c.stage, c.slot, c.count,
+                          reinterpret_cast<u64>(c.src.data()));
+                    const std::vector<CallRecord> calls = g_calls;
+                    g_calls.clear();
+                    ref(reinterpret_cast<u64>(r.cue.data()), c.stage, c.slot, c.count,
+                        reinterpret_cast<u64>(c.src.data()));
+                    bool same_calls = calls.size() == g_calls.size();
+                    for (size_t i = 0; same_calls && i < calls.size(); ++i) {
+                        same_calls = calls[i] == g_calls[i];
+                    }
+                    differ += (c.cue != r.cue || !same_calls) ? 1 : 0;
+                }
+                CallFrame f = c.Frame(rng);
+                const u64 abi = CallAsGuest(reinterpret_cast<const void*>(entry), f);
+                std::printf("  %s %s %-8s: 2000 calls through the jump, different from the original %llu; guest-like "
+                            "caller: violations %#llx\n",
+                            v.name, spec[k]->key, ModeName(mode), static_cast<unsigned long long>(differ),
+                            static_cast<unsigned long long>(abi));
+                CHECK(differ == 0 && abi == 0);
+            }
+        }
+    }
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        const Slot& s = *spec[k]->slot;
+        std::printf("  %s: verified %llu, mismatches %llu, skipped %llu, live-diff %llu, bench samples %llu\n",
+                    spec[k]->key, static_cast<unsigned long long>(s.verified.load()),
+                    static_cast<unsigned long long>(s.mismatches.load()),
+                    static_cast<unsigned long long>(s.skipped.load()),
+                    static_cast<unsigned long long>(s.live_diff.load()),
+                    static_cast<unsigned long long>(s.bench_samples.load()));
+        CHECK(s.verified.load() > 0 && s.mismatches.load() == 0 && s.live_diff.load() == 0 &&
+              s.bench_samples.load() > 0);
+    }
+
+    // a wrong implementation: guarded sees it on its first sample, falls back and the result is the original's
+    {
+        Slot& s = *spec[CSB::kBuffers]->slot;
+        CSB::UseImplementation(CSB::kBuffers, &BrokenSetBuffers, "broken (test)", &NoRedirect);
+        s.mode.store(static_cast<u8>(Mode::Guarded));
+        s.sample_period = 1;
+        const u64 mismatches = s.mismatches.load(), fallbacks = s.fallbacks.load(), recorded = CasesRecorded();
+        const auto entry = reinterpret_cast<CSB::Fn>(image.base + spec[CSB::kBuffers]->function.rva);
+        c.Generate(rng);
+        r.cue = c.cue;
+        entry(reinterpret_cast<u64>(c.cue.data()), c.stage, c.slot, c.count, reinterpret_cast<u64>(c.src.data()));
+        reinterpret_cast<CSB::Fn>(reference[CSB::kBuffers])(reinterpret_cast<u64>(r.cue.data()), c.stage, c.slot,
+                                                            c.count, reinterpret_cast<u64>(c.src.data()));
+        const bool caught = s.mismatches.load() == mismatches + 1 && s.fallbacks.load() == fallbacks + 1 &&
+                            static_cast<Mode>(s.mode.load()) == Mode::Original && CasesRecorded() == recorded + 1;
+        std::printf("  a wrong implementation under guarded: mismatch %s, fallback %s, result the original's %s\n",
+                    s.mismatches.load() > mismatches ? "seen" : "MISSED",
+                    s.fallbacks.load() > fallbacks ? "done" : "MISSING", c.cue == r.cue ? "yes" : "NO");
+        CHECK(caught && c.cue == r.cue);
+    }
+    use(variants[0]);
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        spec[k]->slot->mode.store(static_cast<u8>(Mode::Native));
+    }
+}
+
 void TestModes() {
     std::printf("modes and switches:\n");
     Mode m = Mode::Original;
@@ -1178,7 +1399,7 @@ void TestModes() {
     CHECK(ParseMode("bench", m) && m == Mode::Bench);
     CHECK(ParseMode("off", m) && m == Mode::Original);
     CHECK(!ParseMode("fast", m));
-    CHECK(FunctionCount() == 2);
+    CHECK(FunctionCount() == 4);
     u32 hits = 0;
     for (int i = 0; i < 1000; ++i) {
         hits += SampleThisCall(1, 10) ? 1 : 0;
@@ -1251,9 +1472,18 @@ int main(int argc, char** argv) {
                 if (!replay.empty()) {
                     Replay(image, replay);
                 }
+                HMODULE recomp_module = nullptr;
                 if (!recomp.empty()) {
                     TestRecompiled(image, recomp, cases, fs_ref, oc_ref);
+                    recomp_module = LoadLibraryA(recomp.c_str());
+                    if (auto* base = recomp_module ? reinterpret_cast<u64*>(GetProcAddress(recomp_module,
+                                                                                         "recomp_image_base"))
+                                                   : nullptr) {
+                        *base = image.base;
+                    }
                 }
+                // last: it installs the setters' jumps on the mapped image
+                TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
             }
         }
     } else {

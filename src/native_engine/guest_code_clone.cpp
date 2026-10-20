@@ -60,10 +60,14 @@ u8* AllocateNear(u64 hint, u32 bytes, bool within_rel32, std::string& error) {
 
 } // namespace
 
-bool RelocateCode(std::vector<u8>& code, u64 from, u64 to, u32& relocated, u32& instructions, std::string& error) {
+bool RelocateCode(std::vector<u8>& code, u64 from, u64 to, u32& relocated, u32& instructions, std::string& error,
+                  const std::vector<CodeRedirect>& retarget, u32* retargeted) {
     static const ZydisDecoder decoder = MakeDecoder();
     relocated = 0;
     instructions = 0;
+    if (retargeted != nullptr) {
+        *retargeted = 0;
+    }
     const u64 size = code.size();
     u64 off = 0;
     while (off < size) {
@@ -89,6 +93,15 @@ bool RelocateCode(std::vector<u8>& code, u64 from, u64 to, u32& relocated, u32& 
                 }
                 if (target >= from && target < from + size) {
                     continue; // inside the body: moves with it
+                }
+                for (const CodeRedirect& r : retarget) {
+                    if (target == r.from) {
+                        target = r.to;
+                        if (retargeted != nullptr) {
+                            ++*retargeted;
+                        }
+                        break;
+                    }
                 }
                 u32 field = 0, width = 0;
                 if (rip_mem) {
@@ -134,9 +147,14 @@ void SetNearCodeAllocator(NearCodeAllocator allocator) {
     g_near_code.store(allocator);
 }
 
-CloneResult CloneGuestFunction(u64 address, const u8* source, u32 size, std::string& error) {
+CloneResult CloneGuestFunction(u64 address, const u8* source, u32 size, std::string& error,
+                               const std::vector<CodeRedirect>& redirects) {
     CloneResult r;
     std::vector<u8> code(source, source + size);
+    // redirect thunks after the body, 16-byte aligned: jmp qword [rip+0]; dq to
+    constexpr u32 kThunk = 16;
+    const u32 body = (size + 15u) & ~15u;
+    const u32 total = body + kThunk * static_cast<u32>(redirects.size());
     // a dry run decides whether the copy must be near (any outside reference)
     u32 outside = 0, count = 0;
     {
@@ -151,30 +169,46 @@ CloneResult CloneGuestFunction(u64 address, const u8* source, u32 size, std::str
     u8* mem = nullptr;
     bool shared = false;
     if (const NearCodeAllocator near_code = g_near_code.load(); outside != 0 && near_code != nullptr) {
-        mem = reinterpret_cast<u8*>(near_code(address, size));
+        mem = reinterpret_cast<u8*>(near_code(address, total));
         shared = mem != nullptr;
     }
     if (mem == nullptr) {
-        mem = AllocateNear(address, size, outside != 0, error);
+        mem = AllocateNear(address, total, outside != 0, error);
     }
     if (mem == nullptr) {
         return r;
     }
     const u64 to = reinterpret_cast<u64>(mem);
-    if (!RelocateCode(code, address, to, r.relocated, r.instructions, error)) {
+    std::vector<CodeRedirect> thunks;
+    for (size_t i = 0; i < redirects.size(); ++i) {
+        thunks.push_back({redirects[i].from, to + body + kThunk * i});
+    }
+    u32 retargeted = 0;
+    if (!RelocateCode(code, address, to, r.relocated, r.instructions, error, thunks, &retargeted) ||
+        retargeted < redirects.size()) {
+        if (error.empty()) {
+            error = fmt::format("{} redirected targets, {} operands aimed at them", redirects.size(), retargeted);
+        }
         if (!shared) {
             VirtualFree(mem, 0, MEM_RELEASE);
         }
         return r;
     }
     std::memcpy(mem, code.data(), code.size());
+    std::memset(mem + code.size(), 0xcc, total - code.size());
+    for (size_t i = 0; i < redirects.size(); ++i) {
+        u8* t = mem + body + kThunk * i;
+        static constexpr u8 kJmp[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword [rip+0]
+        std::memcpy(t, kJmp, sizeof(kJmp));
+        std::memcpy(t + 6, &redirects[i].to, 8);
+    }
     DWORD old = 0;
-    if (!shared && !VirtualProtect(mem, code.size(), PAGE_EXECUTE_READ, &old)) {
+    if (!shared && !VirtualProtect(mem, total, PAGE_EXECUTE_READ, &old)) {
         error = fmt::format("VirtualProtect failed ({})", GetLastError());
         VirtualFree(mem, 0, MEM_RELEASE);
         return r;
     }
-    FlushInstructionCache(GetCurrentProcess(), mem, code.size());
+    FlushInstructionCache(GetCurrentProcess(), mem, total);
     r.code = mem;
     return r;
 }

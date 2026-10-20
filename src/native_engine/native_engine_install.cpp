@@ -19,6 +19,7 @@
 #include "native_engine/native_engine_verify.h"
 #include "native_engine/native_function_registry.h"
 #include "native_engine/native_measure.h"
+#include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/frame_scratch.h"
 #include "native_engine/reconstructed/object_constants.h"
 #include "runtime/cpu/fs_patcher.h"
@@ -271,7 +272,8 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
     }
 
     // Static recompilation (docs/NATIVE_RECOMP_COMPILER.md): SSPC_NATIVE_ENGINE_RECOMP=<dll> - each function the module
-    // exports (recomp_1f0870 FrameScratch::Alloc, recomp_11c890 ObjectConstants::Update) replaces the hand-written one
+    // exports (recomp_1f0870 FrameScratch::Alloc, recomp_11c890 ObjectConstants::Update, recomp_16aa0 / recomp_16b70
+    // the CUE setters) replaces the hand-written one
     // as that reconstruction's implementation; the install's self-check and the verify/guarded modes judge it the
     // same way. Which functions are installed at all stays SSPC_NATIVE_ENGINE / SSPC_NATIVE_ENGINE_FUNCS.
     if (const std::string dll = Env("SSPC_NATIVE_ENGINE_RECOMP"); !dll.empty()) {
@@ -284,9 +286,19 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         };
         auto* fs = m && selected(Reconstructed::kFrameScratchAllocSpec) ? GetProcAddress(m, "recomp_1f0870") : nullptr;
         auto* oc = m && selected(Reconstructed::kObjectConstantsSpec) ? GetProcAddress(m, "recomp_11c890") : nullptr;
-        if (base == nullptr || (fs == nullptr && oc == nullptr)) {
+        // the CUE setters call setUserDataRegion: verification records those calls, so the module must be able to
+        // redirect them (recomp_set_redirect); without it they keep the hand-written implementation
+        auto* redirect = m ? reinterpret_cast<Reconstructed::CueSetBuffers::RedirectFn>(
+                                 GetProcAddress(m, "recomp_set_redirect"))
+                           : nullptr;
+        auto* vb = m && redirect && selected(Reconstructed::kCueSetVertexBuffersSpec) ? GetProcAddress(m, "recomp_16aa0")
+                                                                                       : nullptr;
+        auto* sb = m && redirect && selected(Reconstructed::kCueSetBuffersSpec) ? GetProcAddress(m, "recomp_16b70")
+                                                                                 : nullptr;
+        if (base == nullptr || (fs == nullptr && oc == nullptr && vb == nullptr && sb == nullptr)) {
             SSPC_LOG(Engine, Error, "SSPC_NATIVE_ENGINE_RECOMP={}: no recompiled function of a selected reconstruction "
-                     "(recomp_image_base, recomp_1f0870 / recomp_11c890); the hand-written reconstructions stay", dll);
+                     "(recomp_image_base, recomp_1f0870 / recomp_11c890 / recomp_16aa0 / recomp_16b70 with "
+                     "recomp_set_redirect); the hand-written reconstructions stay", dll);
         } else {
             *base = eboot_base;
             constexpr const char* kSource = "static recompilation (P-code -> C++ -> clang)";
@@ -305,6 +317,27 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
                          "(hand-written: {})",
                          reinterpret_cast<void*>(Reconstructed::ObjectConstants::Implementation()), dll,
                          reinterpret_cast<void*>(&Reconstructed::ObjectConstants::Native));
+            }
+            namespace CSB = Reconstructed::CueSetBuffers;
+            const struct {
+                FARPROC fn;
+                CSB::Kind kind;
+                const char* key;
+                const char* export_name;
+                CSB::Fn hand;
+            } cue[] = {{vb, CSB::kVertexBuffers, Reconstructed::kCueSetVertexBuffersSpec.key, "recomp_16aa0",
+                        &CSB::NativeVertexBuffers},
+                       {sb, CSB::kBuffers, Reconstructed::kCueSetBuffersSpec.key, "recomp_16b70", &CSB::NativeBuffers}};
+            for (const auto& c : cue) {
+                if (c.fn == nullptr) {
+                    continue;
+                }
+                CSB::UseImplementation(c.kind, reinterpret_cast<CSB::Fn>(c.fn), kSource, redirect);
+                SSPC_LOG(Engine, Warning,
+                         "STATIC RECOMPILATION: {}'s implementation is {} ({}) from {} (hand-written: {}); its calls "
+                         "to setUserDataRegion are recorded in verification through recomp_set_redirect",
+                         c.key, c.export_name, reinterpret_cast<void*>(CSB::Implementation(c.kind)), dll,
+                         reinterpret_cast<void*>(c.hand));
             }
         }
     }

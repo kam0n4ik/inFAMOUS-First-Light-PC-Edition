@@ -189,6 +189,11 @@ struct CallIO { // a call out of recompiled code
     u8 out_xmm[2][16];
 };
 static_assert(sizeof(CallIO) == 0x100, "CallIO layout is shared with recomp_call");
+// Verification on the host records a function's calls instead of making them: for the calling thread, a call to
+// `from` goes to `to` (recomp_set_redirect(0, 0) clears). One TLS read per call made.
+static thread_local u64 t_redirect_from = 0, t_redirect_to = 0;
+extern "C" __declspec(dllexport) void recomp_set_redirect(u64 from, u64 to) { t_redirect_from = from; t_redirect_to = to; }
+INL u64 call_target(u64 t) { return t_redirect_from != 0 && t == t_redirect_from ? t_redirect_to : t; }
 // System V call with every argument register, XMM0-7 and 32 stack slots copied from the private stack; the callee runs
 // on the real stack. System V callee-saved registers are kept by the callee itself.
 extern "C" __attribute__((naked, sysv_abi)) void recomp_call(CallIO*) {
@@ -396,7 +401,7 @@ class Emitter:
             parts.append("c_.gpr[%d] = ld(R, %d, 8);" % (i, self.reg(name, 8)))
         for k in range(8):
             parts.append("std::memcpy(c_.xmm[%d], R + %d, 16);" % (k, self.reg("XMM%d" % k, 16)))
-        parts.append("c_.target = %s; c_.args = ld(R, %d, 8) + 8; recomp_call(&c_);" % (target_expr, rsp))
+        parts.append("c_.target = call_target(%s); c_.args = ld(R, %d, 8) + 8; recomp_call(&c_);" % (target_expr, rsp))
         parts.append("st(R, %d, 8, c_.out_rax); st(R, %d, 8, c_.out_rdx);" % (self.reg("RAX", 8), self.reg("RDX", 8)))
         for k in range(2):
             parts.append("std::memcpy(R + %d, c_.out_xmm[%d], 16);" % (self.reg("XMM%d" % k, 16), k))

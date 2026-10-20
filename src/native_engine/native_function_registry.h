@@ -67,6 +67,9 @@ struct Slot {
 
 /// A self-check run at install with the clone of the loaded original: false (with `error`) refuses the install.
 using SelfCheckFn = bool (*)(void* original, std::string& error);
+/// Run at install before the self-check, with the module the function is in (its code still pristine): what the
+/// reconstruction takes from the loaded module (callee addresses, a clone whose calls are recorded); false refuses.
+using PrepareFn = bool (*)(u64 module_base, std::string& error);
 
 struct FunctionSpec {
     const char* key;  ///< switch name (SSPC_NATIVE_ENGINE_FUNCS)
@@ -79,6 +82,7 @@ struct FunctionSpec {
     const void* entry; ///< the dispatcher (System V) the jump goes to
     Slot* slot;
     SelfCheckFn self_check;
+    PrepareFn prepare = nullptr;
 };
 
 /// Every reconstruction SecondSonPC has (registry.cpp lists them).

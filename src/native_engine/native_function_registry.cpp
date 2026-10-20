@@ -10,6 +10,7 @@
 #include "engine/guest_hooks.h"
 #include "native_engine/guest_code_clone.h"
 #include "native_engine/native_dispatch.h"
+#include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/frame_scratch.h"
 #include "native_engine/reconstructed/object_constants.h"
 
@@ -20,6 +21,8 @@ namespace {
 const FunctionSpec* const kFunctions[] = {
     &Reconstructed::kObjectConstantsSpec,
     &Reconstructed::kFrameScratchAllocSpec,
+    &Reconstructed::kCueSetVertexBuffersSpec,
+    &Reconstructed::kCueSetBuffersSpec,
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);
@@ -141,6 +144,9 @@ bool InstallFunction(u64 module_base, const FunctionSpec& spec, Mode mode, std::
         CloneGuestFunction(entry, reinterpret_cast<const u8*>(entry), spec.function.size, why);
     if (clone.code == nullptr) {
         return fail("clone: " + why);
+    }
+    if (spec.prepare != nullptr && !spec.prepare(module_base, why)) {
+        return fail("prepare: " + why);
     }
     if (spec.self_check != nullptr && !spec.self_check(clone.code, why)) {
         return fail("self-check: " + why);
