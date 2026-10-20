@@ -1678,7 +1678,11 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                         // after this record's, applied with the next record)
                         exec_.DrawRunMembers(r.draw, pc, r.members, r.member_flat);
                         if (r.members.capacity() > 32) {
-                            std::vector<Cp::RunMember>().swap(r.members); // (a long run's memory not kept per slot)
+                            if (R6::Opt().run_pool) {
+                                R6::GiveMembers(r.members); // (R6-P: to thread 1's next long run)
+                            } else {
+                                std::vector<Cp::RunMember>().swap(r.members); // (a long run's memory not kept per slot)
+                            }
                         }
                     }
                 }
@@ -2184,6 +2188,13 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
         }
         if (frontend_->MemoryGeneration() != run_gen_ || !run_open_) {
             return no(10);
+        }
+    }
+    if (lead.members.size() == lead.members.capacity() && R6::Opt().run_pool) { // (R6-P: SSPC_R6_CP_RUN_POOL=1)
+        if (lead.members.capacity() == 0) {
+            lead.members.reserve(32); // (the slot's vector went to the pool: one allocation instead of a growth chain)
+        } else {
+            R6::TakeMembers(lead.members);
         }
     }
     lead.members.push_back(m);
