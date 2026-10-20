@@ -218,7 +218,9 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
                                                 reinterpret_cast<const void*>(&Probe<1>),
                                                 reinterpret_cast<const void*>(&Probe<2>)};
     for (u32 i = 0; i < sites; ++i) {
-        void* original = InstallEntryProbe(eboot_base, kSites[i], targets[i], error);
+        // (the slot: a Native Engine reconstruction of the function goes in below the probe - guest_probe.h)
+        void* original =
+            InstallEntryProbe(eboot_base, kSites[i], targets[i], error, reinterpret_cast<void**>(&g_orig[i]));
         if (original == nullptr) {
             SSPC_LOG(Engine, Critical, "SSPC_CITY_ENGINE_OPT: {}", error);
             std::abort();
@@ -229,7 +231,7 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         // (the G-buffer draws' material changes: a member the processor refuses before walking its PS again)
         void* original = VerifyGuestFunction(eboot_base, kMaterialSite.function, error)
                              ? InstallEntryProbe(eboot_base, kMaterialSite, reinterpret_cast<const void*>(&ProbeMaterial),
-                                                 error)
+                                                 error, reinterpret_cast<void**>(&g_orig_material))
                              : nullptr;
         if (original == nullptr) {
             SSPC_LOG(Engine, Warning, "CITY-OPT Phase 6: the material probe (0x448640) not installed: {}", error);

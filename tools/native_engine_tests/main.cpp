@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -32,14 +33,17 @@
 #include <xbyak/xbyak.h>
 
 #include "engine/guest_hooks.h"
+#include "engine/guest_probe.h"
 #include "loader/image_file.h"
 #include "native_engine/guest_code_clone.h"
 #include "native_engine/native_dispatch.h"
 #include "native_engine/native_engine_verify.h"
 #include "native_engine/native_function_registry.h"
 #include "native_engine/native_measure.h"
+#include "native_engine/reconstructed/cue_commit.h"
 #include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/frame_scratch.h"
+#include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
 
 namespace SecondSon::NativeEngine::Tests {
@@ -51,6 +55,7 @@ using namespace SecondSon::NativeEngine;
 namespace OC = SecondSon::NativeEngine::Reconstructed::ObjectConstants;
 namespace FS = SecondSon::NativeEngine::Reconstructed::FrameScratch;
 namespace CSB = SecondSon::NativeEngine::Reconstructed::CueSetBuffers;
+namespace MB = SecondSon::NativeEngine::Reconstructed::MaterialBind;
 
 namespace {
 
@@ -814,7 +819,9 @@ void Replay(const Image& image, const std::string& path) {
     const auto oc_ref = reinterpret_cast<OC::Fn>(PristineCopy(image, Reconstructed::kObjectConstantsSpec.function));
     const auto fs_ref = reinterpret_cast<FS::Fn>(PristineCopy(image, Reconstructed::kFrameScratchAllocSpec.function));
     std::string error;
-    CHECK(CSB::Prepare(CSB::kVertexBuffers, image.base, error) && CSB::Prepare(CSB::kBuffers, image.base, error));
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        CHECK(CSB::Prepare(static_cast<CSB::Kind>(k), image.base, error));
+    }
     u32 n = 0;
     while (std::getline(in, line)) {
         const size_t sp = line.find(' ');
@@ -826,18 +833,23 @@ void Replay(const Image& image, const std::string& path) {
             continue;
         }
         const std::string key = line.substr(0, sp);
-        const bool ok = key == "object_constants"  ? OC::Replay(oc_ref, bytes, report)
-                        : key == "frame_alloc"     ? FS::Replay(fs_ref, bytes, report)
-                        : key == Reconstructed::kCueSetVertexBuffersSpec.key
-                            ? CSB::Replay(CSB::kVertexBuffers, bytes, report)
-                        : key == Reconstructed::kCueSetBuffersSpec.key ? CSB::Replay(CSB::kBuffers, bytes, report)
-                                                                       : (report = "unknown key", false);
+        s32 cue_kind = -1;
+        for (u32 k = 0; k < CSB::kKinds; ++k) {
+            if (key == CSB::Spec(static_cast<CSB::Kind>(k)).key) {
+                cue_kind = static_cast<s32>(k);
+            }
+        }
+        const bool ok = key == "object_constants" ? OC::Replay(oc_ref, bytes, report)
+                        : key == "frame_alloc"    ? FS::Replay(fs_ref, bytes, report)
+                        : cue_kind >= 0           ? CSB::Replay(static_cast<CSB::Kind>(cue_kind), bytes, report)
+                                                  : (report = "unknown key", false);
         std::printf("  case %u (%s): %s\n", ++n, key.c_str(), report.c_str());
         CHECK(ok);
     }
 }
 
 void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases);
+void TestCueCommitRecompiled(const Image& image, HMODULE m, u64 cases);
 
 /// The static recompilation PoC: functions machine-translated from Ghidra P-code (tools/native-reconstruction/recomp)
 /// against the eboot's own code, and the recompiled allocator through the registry.
@@ -953,9 +965,9 @@ void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::F
 struct CallRecord {
     u32 target;
     u64 a[6];
-    u8 src[16];
+    u8 src[32];
     bool operator==(const CallRecord& o) const {
-        return target == o.target && std::memcmp(a, o.a, sizeof(a)) == 0 && std::memcmp(src, o.src, 16) == 0;
+        return target == o.target && std::memcmp(a, o.a, sizeof(a)) == 0 && std::memcmp(src, o.src, 32) == 0;
     }
 };
 std::vector<CallRecord> g_calls;
@@ -965,7 +977,14 @@ std::vector<CallRecord> g_calls;
 /// call they hold whatever that callee left in caller-saved registers, which the recompiled code (like any compiler)
 /// does not reproduce.
 constexpr u32 Arity(u32 target) {
-    return target == 0x626520 ? 5 : target == 0x11bed0 ? 4 : 3; // 0x11be90, 0x9843a0: 3
+    // 0x626520 and the CUE setters 0x169d0 / 0x16eb0 / 0x16d10 (the material setup's callees): 5
+    return target == 0x626520 || target == 0x169d0 || target == 0x16eb0 || target == 0x16d10 ? 5
+           : target == 0x11bed0                                                               ? 4
+                                                                                              : 3; // 0x11be90, 0x9843a0
+}
+/// The descriptor a CUE setter's src points at (R5-D: S# / constant-buffer V# 16 bytes, T# 32).
+constexpr u32 SetterSourceBytes(u32 target) {
+    return target == 0x16d10 ? 32 : target == 0x169d0 || target == 0x16eb0 ? 16 : 0;
 }
 
 template <u32 Target>
@@ -974,8 +993,11 @@ SSPC_SYSV_ABI u64 Recorder(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     for (u32 k = Arity(Target); k < 6; ++k) {
         r.a[k] = 0;
     }
-    if (Target == 0x626520) { // (gnm context, stage, slot, const V#*, 4)
-        std::memcpy(r.src, reinterpret_cast<const void*>(a3), 16);
+    if (Target == 0x626520) { // (gnm context, stage, slot, const values*, dwords: 4, or 8 for a T#)
+        std::memcpy(r.src, reinterpret_cast<const void*>(a3), std::min<u64>(static_cast<u32>(a4) * 4ull, 32));
+    }
+    if constexpr (SetterSourceBytes(Target) != 0) { // (cue, stage, slot, count 1, descriptor*)
+        std::memcpy(r.src, reinterpret_cast<const void*>(a4), SetterSourceBytes(Target));
     }
     if (Target == 0x11be90) { // (buffer slot, owner, count): the original allocates; the test hands out a fake address
         const u64 fake = 0x5a5a000000ull + (a2 << 4);
@@ -1002,8 +1024,9 @@ struct ImagePatch {
 };
 
 /// Runs `original` and `recompiled` on one argument set; memory = the buffers both may write. Returns "" or the
-/// first difference.
-std::string RunBoth(const void* original, const void* recompiled, CallFrame f, std::vector<std::pair<u8*, size_t>> memory) {
+/// first difference. `compare_rax` false for a function without a result (RAX is what its last callee left).
+std::string RunBoth(const void* original, const void* recompiled, CallFrame f, std::vector<std::pair<u8*, size_t>> memory,
+                    bool compare_rax = true) {
     std::vector<std::vector<u8>> before, after_original;
     for (auto& [p, n] : memory) {
         before.emplace_back(p, p + n);
@@ -1024,7 +1047,7 @@ std::string RunBoth(const void* original, const void* recompiled, CallFrame f, s
     if (vo != 0 || vr != 0) {
         return fmt::format("ABI violations: original {:#x}, recompiled {:#x}", vo, vr);
     }
-    if (fo.rax_out != fr.rax_out) {
+    if (compare_rax && fo.rax_out != fr.rax_out) {
         return fmt::format("rax: original {:#x}, recompiled {:#x}", fo.rax_out, fr.rax_out);
     }
     if (g_calls.size() != calls_original.size()) {
@@ -1097,18 +1120,21 @@ void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases) {
         }
         report("recomp_11cde0 vs eboot 0x11cde0", cases, bad, first);
     }
-    // 0x16aa0 / 0x16b70: CUE vertex-buffer / buffer slots (rdi CUE, esi stage, edx first slot, ecx count, r8 V#s)
+    // the CUE setters 0x16aa0 / 0x16b70 (R5-C), 0x169d0 / 0x16d10 / 0x16eb0 (R5-D): (rdi CUE, esi stage, edx first
+    // slot, ecx count, r8 descriptors)
     const ImagePatch gnm_set(image, 0x626520, reinterpret_cast<const void*>(&Recorder<0x626520>));
-    for (const auto& [rva, hash, name] : {std::tuple{0x16aa0ull, 0xf6c333198de2deedull, "recomp_16aa0"},
-                                          std::tuple{0x16b70ull, 0x713c9f7b4b870c4dull, "recomp_16b70"}}) {
-        const void* r = reinterpret_cast<const void*>(GetProcAddress(m, name));
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        const Engine::GuestFunction& fn = CSB::Spec(static_cast<CSB::Kind>(k)).function;
+        const u64 rva = fn.rva;
+        const std::string name = fmt::format("recomp_{:x}", rva);
+        const void* r = reinterpret_cast<const void*>(GetProcAddress(m, name.c_str()));
         if (r == nullptr) {
             continue;
         }
-        const void* o = PristineCopy(image, {rva, 0xc6, hash});
+        const void* o = PristineCopy(image, fn);
         static std::vector<u8> cue(0x20000);
         static std::vector<u8> table(0x400);
-        static std::vector<u8> src(64 * 16);
+        static std::vector<u8> src(64 * 32);
         u64 bad = 0;
         std::string first;
         for (u64 n = 0; n < cases; ++n) {
@@ -1145,6 +1171,7 @@ void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases) {
         }
         report(fmt::format("{} vs eboot {:#x} (calls to 0x626520 recorded)", name, rva).c_str(), cases, bad, first);
     }
+    TestCueCommitRecompiled(image, m, std::max<u64>(cases / 5, 1000));
     // 0x120280: draw constants (rdi object): 0x11be90, 0x9843a0 (copy), 0x11bed0 twice, the second as a tail call
     if (const void* r = reinterpret_cast<const void*>(GetProcAddress(m, "recomp_120280"))) {
         const void* o = PristineCopy(image, {0x120280, 0x9d, 0xad95be1456114d2aull});
@@ -1184,7 +1211,7 @@ void TestRecompiledEngine(const Image& image, HMODULE m, u64 cases) {
 struct CueCase {
     std::vector<u8> cue = std::vector<u8>(0x20000);
     std::vector<u8> table = std::vector<u8>(0x200);
-    std::vector<u8> src = std::vector<u8>(64 * 16);
+    std::vector<u8> src = std::vector<u8>(64 * 32); // up to 64 T# (32 bytes)
     u32 stage = 0, slot = 0, count = 0;
 
     void Generate(std::mt19937_64& rng) {
@@ -1232,21 +1259,23 @@ SSPC_SYSV_ABI u64 BrokenSetBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 
 void NoRedirect(u64, u64) {}
 
 void TestCueSetters(const Image& image, HMODULE m, u64 cases) {
-    std::printf("CUE buffer setters 0x16aa0 / 0x16b70 (R5-C):\n");
+    std::printf("CUE setters 0x16aa0 / 0x16b70 (R5-C), 0x169d0 / 0x16d10 / 0x16eb0 (R5-D):\n");
     std::mt19937_64 rng{0xc5e};
-    const FunctionSpec* spec[CSB::kKinds] = {&Reconstructed::kCueSetVertexBuffersSpec,
-                                             &Reconstructed::kCueSetBuffersSpec};
-    const CSB::Fn hand[CSB::kKinds] = {&CSB::NativeVertexBuffers, &CSB::NativeBuffers};
-    const char* exports[CSB::kKinds] = {"recomp_16aa0", "recomp_16b70"};
+    const FunctionSpec* spec[CSB::kKinds];
+    CSB::Fn hand[CSB::kKinds];
     void* reference[CSB::kKinds] = {};
     std::string error;
+    bool all = true;
     for (u32 k = 0; k < CSB::kKinds; ++k) {
+        spec[k] = &CSB::Spec(static_cast<CSB::Kind>(k));
+        hand[k] = CSB::HandWritten(static_cast<CSB::Kind>(k));
         reference[k] = PristineCopy(image, spec[k]->function);
         CHECK(reference[k] != nullptr);
         CHECK(CSB::Prepare(static_cast<CSB::Kind>(k), image.base, error));
         CHECK(CSB::RecordingOriginal(static_cast<CSB::Kind>(k)) != nullptr);
+        all = all && reference[k] != nullptr;
     }
-    if (reference[0] == nullptr || reference[1] == nullptr) {
+    if (!all) {
         return;
     }
     auto* redirect = m ? reinterpret_cast<CSB::RedirectFn>(GetProcAddress(m, "recomp_set_redirect")) : nullptr;
@@ -1255,13 +1284,19 @@ void TestCueSetters(const Image& image, HMODULE m, u64 cases) {
         CSB::Fn fn[CSB::kKinds];
         CSB::RedirectFn redirect;
     };
-    std::vector<Variant> variants{{"hand-written", {hand[0], hand[1]}, nullptr}};
+    Variant hand_written{"hand-written", {}, nullptr};
+    std::copy(std::begin(hand), std::end(hand), hand_written.fn);
+    std::vector<Variant> variants{hand_written};
     if (redirect != nullptr) {
-        variants.push_back({"recompiled",
-                            {reinterpret_cast<CSB::Fn>(GetProcAddress(m, exports[0])),
-                             reinterpret_cast<CSB::Fn>(GetProcAddress(m, exports[1]))},
-                            redirect});
-        CHECK(variants.back().fn[0] != nullptr && variants.back().fn[1] != nullptr);
+        Variant v{"recompiled", {}, redirect};
+        for (u32 k = 0; k < CSB::kKinds; ++k) {
+            v.fn[k] = reinterpret_cast<CSB::Fn>(GetProcAddress(m, fmt::format("recomp_{:x}", CSB::kRva[k]).c_str()));
+            CHECK(v.fn[k] != nullptr);
+            if (v.fn[k] == nullptr) {
+                v.fn[k] = hand[k]; // (reported above; the rest still runs)
+            }
+        }
+        variants.push_back(v);
     }
     const auto use = [&](const Variant& v) {
         for (u32 k = 0; k < CSB::kKinds; ++k) {
@@ -1390,6 +1425,591 @@ void TestCueSetters(const Image& image, HMODULE m, u64 cases) {
     }
 }
 
+// --- the CUE commit 0x14ad0 (R5-D): the recompiled function against the eboot's, every side effect recorded ------
+//
+// 0x14ad0 turns the CUE's stage shadows into user data: it allocates snapshots (0x123d0), copies the shadows into them
+// (memcpy 0x9843a0), writes SET_SH_REG / user-data packets into the DCB (0x626400, 0x626520, 0x623630, 0x624cb0) and
+// binds shaders through Gnm (0x625100 ... 0x625aa0); 0x638540 builds a descriptor through a function that calls the
+// HLE. All of these are replaced in the mapped image by recorders: the allocator hands out the test's arena, the
+// memcpy copies into it, the rest only record. The pure builders (0x61e0c0, 0x61e330, 0x639250, 0x6393a0, 0x639450,
+// 0x6394e0: no calls, no absolute stores [A: P-code]) run for real. Recorded per call: the argument registers the
+// callee reads [A: read-before-write over its P-code, E:\research\native-r5\r5d\arity.py], a stack pointer as the
+// 32 bytes it points at (the original and the recompiled frames lie at different depths; the stack is zeroed before
+// each run, so uninitialised locals are equal). 0x14ad0 itself writes no absolute address [A: P-code]; it reads one,
+// the stack guard's GOT slot (eboot+0xd9de00), which the test points at its own guard.
+
+struct CommitCall {
+    u32 target;
+    u64 a[6];
+    u8 content[6][32];
+    bool operator==(const CommitCall& o) const {
+        return target == o.target && std::memcmp(a, o.a, sizeof(a)) == 0 &&
+               std::memcmp(content, o.content, sizeof(content)) == 0;
+    }
+};
+std::vector<CommitCall> g_commit_calls;
+const bool g_trace_commit = std::getenv("SSPC_TEST_TRACE_COMMIT") != nullptr; ///< each case printed (a crash)
+u8* g_commit_arena = nullptr; ///< the snapshots the recorded allocator hands out
+u64 g_commit_arena_used = 0, g_commit_arena_size = 0;
+ULONG_PTR g_stack_lo = 0, g_stack_hi = 0;
+
+constexpr u32 CommitArity(u32 target) {
+    switch (target) {
+    case 0x626520: case 0x638540: return 5;
+    case 0x626400: return 4;
+    case 0x9843a0: case 0x623630: case 0x624cb0: case 0x625220: case 0x625300: case 0x625370: case 0x6253e0:
+    case 0x625510: case 0x6256a0: return 3;
+    case 0x123d0: case 0x625100: case 0x6251c0: case 0x625a40: case 0x625aa0: return 2;
+    default: return 0; // 0x984360 __stack_chk_fail
+    }
+}
+
+template <u32 Target>
+SSPC_SYSV_ABI u64 CommitRecorder(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    CommitCall r{Target, {a0, a1, a2, a3, a4, a5}, {}};
+    for (u32 k = 0; k < 6; ++k) {
+        if (k >= CommitArity(Target)) {
+            r.a[k] = 0;
+        } else if (r.a[k] >= g_stack_lo && r.a[k] < g_stack_hi) {
+            // setUserDataRegion's values: a4 dwords; any other stack pointer: the 32 bytes at it
+            const u64 n = Target == 0x626520 && k == 3 ? std::min<u64>(static_cast<u32>(a4) * 4ull, 32) : 32;
+            std::memcpy(r.content[k], reinterpret_cast<const void*>(r.a[k]), std::min<u64>(n, g_stack_hi - r.a[k]));
+            r.a[k] = 0x57ac000000000000ull | k;
+        }
+    }
+    u64 result = 0;
+    if constexpr (Target == 0x123d0) { // (cue, dwords): the next snapshot of the arena, nullptr when full
+        const u64 bytes = (static_cast<u64>(static_cast<u32>(a1)) * 4 + 15) & ~15ull;
+        if (g_commit_arena_used + bytes <= g_commit_arena_size) {
+            result = reinterpret_cast<u64>(g_commit_arena + g_commit_arena_used);
+            g_commit_arena_used += bytes;
+        }
+    }
+    if constexpr (Target == 0x9843a0) { // memcpy(dst, src, n): made, into the arena only
+        if (a0 >= reinterpret_cast<u64>(g_commit_arena) &&
+            a0 + a2 <= reinterpret_cast<u64>(g_commit_arena) + g_commit_arena_size) {
+            std::memcpy(reinterpret_cast<void*>(a0), reinterpret_cast<const void*>(a1), a2);
+        }
+        result = a0;
+    }
+    g_commit_calls.push_back(r);
+    return result;
+}
+
+/// Zeroes the stack below the caller (the frames of the next run and their uninitialised locals).
+__declspec(noinline) void WipeStackBelow() {
+    volatile u8 area[0x10000];
+    for (u32 i = 0; i < sizeof(area); i += 8) {
+        *reinterpret_cast<volatile u64*>(&area[i]) = 0;
+    }
+}
+
+/// A CUE as 0x14ad0 reads it: random contents; the dirty flags 0 or 1; the stage layouts, the shader structures and
+/// the prebuilt descriptor pointing into the world; counts and snapshot offsets inside the stage shadows.
+struct CommitWorld {
+    static constexpr u64 kCue = 0, kCueBytes = 0x20000, kShaders = 0x20000, kShaderBytes = 0x1000,
+                         kLayouts = 0x27000, kLayoutBytes = 0x200, kArena = 0x28000, kArenaBytes = 0x18000,
+                         kBytes = 0x40000;
+    std::vector<u8> mem = std::vector<u8>(kBytes);
+    u8* cue() {
+        return mem.data() + kCue;
+    }
+    void Put64(u64 off, u64 v) {
+        std::memcpy(mem.data() + off, &v, 8);
+    }
+    void Generate(std::mt19937_64& rng) {
+        for (u64 i = 0; i < kArena; i += 8) {
+            Put64(i, rng());
+        }
+        std::memset(mem.data() + kArena, 0, kArenaBytes);
+        const u64 base = reinterpret_cast<u64>(mem.data());
+        // the six shader structures +0xc0a8..+0xc0d0 (+0xc0a8 may be null) and the prebuilt descriptor +0xc1c0
+        for (u32 i = 0; i < 6; ++i) {
+            Put64(0xc0a8 + 8 * i, base + kShaders + kShaderBytes * i);
+        }
+        if (rng() % 10 == 0) {
+            Put64(0xc0a8, 0);
+        }
+        Put64(0xc1c0, rng() % 2 ? 0 : base + kShaders); // only passed on (0x624cb0 is recorded)
+        // the six stage layouts +0xc188..+0xc1b0: snapshot dwords, user-data slots, offsets inside the snapshot
+        for (u32 i = 0; i < 6; ++i) {
+            const u64 at = kLayouts - 6 * kLayoutBytes + kLayoutBytes * i; // 0x26400..
+            u8* t = mem.data() + at;
+            const u16 count = static_cast<u16>(1 + rng() % 0x600);
+            std::memcpy(t, &count, 2);
+            for (u32 b = 4; b < 0x10; ++b) {
+                t[b] = rng() % 3 == 0 ? 0xff : static_cast<u8>(rng() % 16);
+            }
+            for (u32 o = 0x16; o <= 0x20; o += 2) {
+                const u16 v = static_cast<u16>(rng() % count);
+                std::memcpy(t + o, &v, 2);
+            }
+            // the 16-byte entry it writes for a shadow slot: inside the stage's window (0x600 dwords) as in the game
+            // - an index beyond it would overwrite the CUE's own pointers (case 1984 of an earlier run)
+            u16 w;
+            switch (rng() % 4) {
+            case 0: w = 0xffff; break;
+            case 1: w = static_cast<u16>(0x8000 | (rng() % 0x5fc)); break;
+            default: w = static_cast<u16>(rng() % 0x5fc); break;
+            }
+            std::memcpy(t + 0x108, &w, 2);
+            Put64(0xc188 + 8 * i, base + at);
+        }
+        // the dirty flags and switches 0 / 1, the stage masks
+        for (u64 f = 0xc1c9; f <= 0xc1de; ++f) {
+            mem[f] = static_cast<u8>(rng() % 2);
+        }
+        mem[0x88] = static_cast<u8>(rng() % 2);
+        mem[0xc70e] = static_cast<u8>(rng() % 2);
+        const u32 stages = static_cast<u32>(rng() % 4 == 0 ? rng() : (rng() % 2 ? 0x20u : 0u) | (rng() % 2 ? 1u : 0u));
+        std::memcpy(mem.data() + 0xc1e0, &stages, 4);
+        const u32 alt = rng() % 2 ? 0 : static_cast<u32>(rng());
+        std::memcpy(mem.data() + 0xc6e4, &alt, 4);
+    }
+};
+
+/// A wrong implementation: the recompiled commit, then a dirty flag it clears set again (verification must see it).
+Reconstructed::CueCommit::Fn g_broken_commit_inner = nullptr;
+SSPC_SYSV_ABI void BrokenCommit(u64 cue) {
+    g_broken_commit_inner(cue);
+    *reinterpret_cast<u8*>(cue + 0xc1d1) = 1;
+}
+
+void TestCueCommitRecompiled(const Image& image, HMODULE m, u64 cases) {
+    const void* recompiled = m ? reinterpret_cast<const void*>(GetProcAddress(m, "recomp_14ad0")) : nullptr;
+    if (recompiled == nullptr) {
+        std::printf("CUE commit 0x14ad0: no recomp_14ad0 in the module, skipped\n");
+        return;
+    }
+    std::printf("CUE commit 0x14ad0 (R5-D), recompiled vs the eboot, every side effect recorded:\n");
+    const void* original = PristineCopy(image, {0x14ad0, 0x1184, 0x8bb6e7985e565584ull});
+    CHECK(original != nullptr);
+    if (original == nullptr) {
+        return;
+    }
+    GetCurrentThreadStackLimits(&g_stack_lo, &g_stack_hi);
+    if (g_trace_commit) {
+        std::printf("    [image %#llx, original clone %p]\n", static_cast<unsigned long long>(image.base), original);
+    }
+    // the stack guard: eboot+0xd9de00 holds its address (unrelocated in the mapped image)
+    static u64 guard = 0x5ec0de5ec0de5ec0ull;
+    u64* got = reinterpret_cast<u64*>(image.base + 0xd9de00);
+    const u64 got_saved = *got;
+    *got = reinterpret_cast<u64>(&guard);
+    std::vector<std::unique_ptr<ImagePatch>> patches;
+    const auto patch = [&](u64 rva, const void* fn) { patches.push_back(std::make_unique<ImagePatch>(image, rva, fn)); };
+#define SSPC_COMMIT_RECORD(rva) patch(rva, reinterpret_cast<const void*>(&CommitRecorder<rva>))
+    SSPC_COMMIT_RECORD(0x123d0);
+    SSPC_COMMIT_RECORD(0x9843a0);
+    SSPC_COMMIT_RECORD(0x984360);
+    SSPC_COMMIT_RECORD(0x626400);
+    SSPC_COMMIT_RECORD(0x626520);
+    SSPC_COMMIT_RECORD(0x623630);
+    SSPC_COMMIT_RECORD(0x624cb0);
+    SSPC_COMMIT_RECORD(0x625100);
+    SSPC_COMMIT_RECORD(0x6251c0);
+    SSPC_COMMIT_RECORD(0x625220);
+    SSPC_COMMIT_RECORD(0x625300);
+    SSPC_COMMIT_RECORD(0x625370);
+    SSPC_COMMIT_RECORD(0x6253e0);
+    SSPC_COMMIT_RECORD(0x625510);
+    SSPC_COMMIT_RECORD(0x6256a0);
+    SSPC_COMMIT_RECORD(0x625a40);
+    SSPC_COMMIT_RECORD(0x625aa0);
+    SSPC_COMMIT_RECORD(0x638540);
+#undef SSPC_COMMIT_RECORD
+    std::mt19937_64 rng{0x14ad0};
+    CommitWorld w;
+    g_commit_arena = w.mem.data() + CommitWorld::kArena;
+    g_commit_arena_size = CommitWorld::kArenaBytes;
+    std::vector<u8> before, after_original;
+    u64 bad = 0, calls = 0, allocations = 0;
+    std::string first;
+    for (u64 n = 0; n < cases; ++n) {
+        w.Generate(rng);
+        before = w.mem;
+        CallFrame f{};
+        f.gpr[0] = reinterpret_cast<u64>(w.cue());
+        for (int k = 1; k < 6; ++k) {
+            f.gpr[k] = rng();
+        }
+        const auto run = [&](const void* fn, CallFrame& frame) {
+            g_commit_calls.clear();
+            g_commit_arena_used = 0;
+            WipeStackBelow();
+            return CallAsGuest(fn, frame);
+        };
+        CallFrame fo = f, fr = f;
+        if (g_trace_commit) {
+            std::printf("    [case %llu original]\n", static_cast<unsigned long long>(n));
+        }
+        const u64 vo = run(original, fo);
+        if (g_trace_commit) {
+            std::printf("    [case %llu recompiled]\n", static_cast<unsigned long long>(n));
+        }
+        const std::vector<CommitCall> calls_original = g_commit_calls;
+        after_original = w.mem;
+        w.mem = before;
+        const u64 vr = run(recompiled, fr);
+        std::string d;
+        if (vo != 0 || vr != 0) {
+            d = fmt::format("ABI violations: original {:#x}, recompiled {:#x}", vo, vr);
+        } else if (std::memcmp(after_original.data() + CommitWorld::kShaders, before.data() + CommitWorld::kShaders,
+                               CommitWorld::kArena - CommitWorld::kShaders) != 0) {
+            d = "the original wrote the shader structures or the layouts (outside the CUE and the arena)";
+        } else if (calls_original.size() != g_commit_calls.size()) {
+            d = fmt::format("calls: original {}, recompiled {}", calls_original.size(), g_commit_calls.size());
+        } else {
+            for (size_t i = 0; d.empty() && i < calls_original.size(); ++i) {
+                if (!(calls_original[i] == g_commit_calls[i])) {
+                    d = fmt::format("call {} (to {:#x}) differs", i, calls_original[i].target);
+                }
+            }
+            for (size_t k = 0; d.empty() && k < w.mem.size(); ++k) {
+                if (w.mem[k] != after_original[k]) {
+                    d = fmt::format("memory +{:#x}: original {:#04x}, recompiled {:#04x}", k, after_original[k], w.mem[k]);
+                }
+            }
+        }
+        calls += calls_original.size();
+        for (const CommitCall& c : calls_original) {
+            allocations += c.target == 0x123d0 ? 1 : 0;
+        }
+        if (!d.empty() && bad++ == 0) {
+            first = fmt::format("case {}: {}", n, d);
+        }
+    }
+    std::printf("  recomp_14ad0 vs eboot 0x14ad0: %llu cases (%llu recorded calls, %llu snapshots), %llu different%s%s\n",
+                static_cast<unsigned long long>(cases), static_cast<unsigned long long>(calls),
+                static_cast<unsigned long long>(allocations), static_cast<unsigned long long>(bad),
+                first.empty() ? "" : "; first: ", first.c_str());
+    CHECK(bad == 0 && calls > cases && allocations > 0);
+
+    // installed on the mapped image (the recompiled implementation; there is no hand-written one): the install's
+    // self-check, then every mode through the jump against the reference on a copy of the world
+    namespace CC = Reconstructed::CueCommit;
+    const FunctionSpec& spec = Reconstructed::kCueCommitSpec;
+    auto* redirect = reinterpret_cast<void (*)(u64, u64)>(GetProcAddress(m, "recomp_set_redirect"));
+    CHECK(redirect != nullptr);
+    std::string error;
+    CC::UseImplementation(nullptr, "none", nullptr);
+    CHECK(!InstallFunction(image.base, spec, Mode::Native, error)); // no implementation: refused
+    std::printf("  without an implementation: refused (%s)\n", error.c_str());
+    CC::UseImplementation(reinterpret_cast<CC::Fn>(const_cast<void*>(recompiled)), "recompiled (test)", redirect);
+    error.clear();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool installed = InstallFunction(image.base, spec, Mode::Native, error);
+    std::printf("  install with recomp_14ad0: %s%s (self-check of 300 generated CUEs, %.1f ms)\n",
+                installed ? "passed" : "FAILED: ", error.c_str(),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    CHECK(installed);
+    if (installed) {
+        const auto entry = reinterpret_cast<CC::Fn>(image.base + spec.function.rva);
+        // both on the same world (restored in between): the snapshots' addresses the builders put into descriptors
+        // are then the same
+        const auto run_live = [&](CC::Fn fn, std::vector<CommitCall>& out) {
+            g_commit_calls.clear();
+            g_commit_arena = w.mem.data() + CommitWorld::kArena;
+            g_commit_arena_used = 0;
+            WipeStackBelow();
+            fn(reinterpret_cast<u64>(w.cue()));
+            out = g_commit_calls;
+        };
+        for (const Mode mode : {Mode::Native, Mode::Verify, Mode::Guarded, Mode::Bench, Mode::Original}) {
+            spec.slot->mode.store(static_cast<u8>(mode));
+            spec.slot->sample_period = 3;
+            u64 differ = 0;
+            for (int n = 0; n < 1000; ++n) {
+                w.Generate(rng);
+                before = w.mem;
+                std::vector<CommitCall> a, b;
+                run_live(entry, a);
+                after_original = w.mem; // (the installed path's result)
+                w.mem = before;
+                run_live(reinterpret_cast<CC::Fn>(const_cast<void*>(original)), b);
+                std::string why;
+                if (a.size() != b.size()) {
+                    why = fmt::format("calls {} / {}", a.size(), b.size());
+                }
+                for (size_t i = 0; why.empty() && i < a.size(); ++i) {
+                    if (!(a[i] == b[i])) {
+                        why = fmt::format("call {} to {:#x} differs", i, a[i].target);
+                    }
+                }
+                for (u64 k = 0; why.empty() && k < w.mem.size(); ++k) {
+                    if (after_original[k] != w.mem[k]) {
+                        why = fmt::format("memory +{:#x}: {:#04x} / {:#04x}", k, after_original[k], w.mem[k]);
+                    }
+                }
+                if (!why.empty() && differ++ == 0) {
+                    std::printf("    first difference (case %d): %s\n", n, why.c_str());
+                }
+            }
+            std::printf("  cue_commit %-8s: 1000 calls through the jump, different from the original %llu\n",
+                        ModeName(mode), static_cast<unsigned long long>(differ));
+            CHECK(differ == 0);
+        }
+        const Slot& s = *spec.slot;
+        std::printf("  cue_commit: verified %llu, mismatches %llu, skipped %llu, bench samples %llu\n",
+                    static_cast<unsigned long long>(s.verified.load()),
+                    static_cast<unsigned long long>(s.mismatches.load()),
+                    static_cast<unsigned long long>(s.skipped.load()),
+                    static_cast<unsigned long long>(s.bench_samples.load()));
+        CHECK(s.verified.load() > 0 && s.mismatches.load() == 0 && s.skipped.load() == 0 &&
+              s.bench_samples.load() > 0);
+        // a wrong implementation (the recompiled one, then a dirty flag set again): guarded sees it and falls back
+        g_broken_commit_inner = reinterpret_cast<CC::Fn>(const_cast<void*>(recompiled));
+        CC::UseImplementation(&BrokenCommit, "broken (test)", redirect);
+        Slot& g = *spec.slot;
+        g.mode.store(static_cast<u8>(Mode::Guarded));
+        g.sample_period = 1;
+        const u64 mismatches = g.mismatches.load(), fallbacks = g.fallbacks.load();
+        w.Generate(rng);
+        std::vector<CommitCall> a;
+        run_live(entry, a);
+        const bool caught = g.mismatches.load() == mismatches + 1 && g.fallbacks.load() == fallbacks + 1 &&
+                            static_cast<Mode>(g.mode.load()) == Mode::Original;
+        std::printf("  a wrong implementation under guarded: mismatch %s, fallback %s\n",
+                    g.mismatches.load() > mismatches ? "seen" : "MISSED",
+                    g.fallbacks.load() > fallbacks ? "done" : "MISSING");
+        CHECK(caught);
+        CC::UseImplementation(reinterpret_cast<CC::Fn>(const_cast<void*>(recompiled)), "recompiled (test)", redirect);
+        g.mode.store(static_cast<u8>(Mode::Original));
+    }
+    patches.clear();
+    *got = got_saved;
+}
+
+// --- the material setup 0x448640 (R5-D): reconstruction, recording clone, installed below an entry probe ----------
+
+/// A pass and a material as 0x448640 reads them: 16 texture entries (+0x2c), 4 sampler entries (+0x70) and the
+/// counts after them, a descriptor block whose first V# has an address or not, sometimes no material.
+struct MaterialCase {
+    std::vector<u8> pass = std::vector<u8>(0x100);
+    std::vector<u8> material = std::vector<u8>(0x40);
+    std::vector<u8> block = std::vector<u8>(0x4000);
+    u64 context = 0;
+    bool none = false;
+
+    void Generate(std::mt19937_64& rng, u64 n) {
+        for (auto& x : pass) {
+            x = static_cast<u8>(rng());
+        }
+        for (auto& x : block) {
+            x = static_cast<u8>(rng());
+        }
+        for (u32 i = 0; i < 16; ++i) {
+            const u16 ti = static_cast<u16>(rng() % 0x100);
+            pass[0x2c + 4 * i + 1] = static_cast<u8>(rng() % 8);
+            std::memcpy(pass.data() + 0x2c + 4 * i + 2, &ti, 2);
+            if (i < 4) {
+                const u16 si = static_cast<u16>(rng() % 0x100);
+                pass[0x70 + 4 * i + 1] = static_cast<u8>(rng() % 8);
+                std::memcpy(pass.data() + 0x70 + 4 * i + 2, &si, 2);
+            }
+        }
+        const u32 samplers = static_cast<u32>(rng() % 5), textures = static_cast<u32>(rng() % 17);
+        const s32 base = static_cast<s32>(rng() % 9) - 4;
+        std::memcpy(pass.data() + 0x80, &samplers, 4);
+        std::memcpy(pass.data() + 0x84, &base, 4);
+        std::memcpy(pass.data() + 0x6c, &textures, 4);
+        if (n % 3 == 0) {
+            std::memset(block.data() + 0x400, 0, 4);
+            block[0x404] = 0;
+            block[0x405] &= 0xf0;
+        }
+        const u64 d = reinterpret_cast<u64>(block.data()) + 0x400;
+        std::memcpy(material.data() + 0x28, &d, 8);
+        context = rng();
+        none = n % 50 == 7;
+    }
+    u64 Material() const {
+        return none ? 0 : reinterpret_cast<u64>(material.data());
+    }
+    CallFrame Frame(std::mt19937_64& rng) const {
+        CallFrame f{};
+        f.gpr[0] = reinterpret_cast<u64>(pass.data());
+        f.gpr[1] = context;
+        f.gpr[2] = Material();
+        f.gpr[3] = rng();
+        f.gpr[4] = rng();
+        f.gpr[5] = rng();
+        return f;
+    }
+};
+
+// a probe on 0x448640 like CITY-OPT's draw_runs: counts the calls, calls the original through its slot
+using Fn6 = SSPC_SYSV_ABI void (*)(u64, u64, u64, u64, u64, u64);
+void* g_material_probe_original = nullptr;
+u64 g_material_probe_calls = 0;
+SSPC_SYSV_ABI void MaterialProbe(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    ++g_material_probe_calls;
+    reinterpret_cast<Fn6>(g_material_probe_original)(a, b, c, d, e, f);
+}
+
+// a wrong implementation for guarded: it binds the constants to slot 14, and only those (its setter call goes
+// through the redirection the verification sets up, like a recompiled module's)
+thread_local u64 t_mb_from[4], t_mb_to[4];
+thread_local u32 t_mb_redirects = 0;
+void TestRedirect(u64 from, u64 to) {
+    if (from == 0) {
+        t_mb_redirects = 0;
+    } else if (t_mb_redirects < 4) {
+        t_mb_from[t_mb_redirects] = from;
+        t_mb_to[t_mb_redirects++] = to;
+    }
+}
+u64 g_mb_image = 0;
+SSPC_SYSV_ABI void BrokenMaterialBind(u64 pass, u64 context, u64 material) {
+    (void)pass;
+    if (material == 0) {
+        return;
+    }
+    u64 target = g_mb_image + MB::kSetterRva[MB::kConstantBuffers];
+    for (u32 i = 0; i < t_mb_redirects; ++i) {
+        target = t_mb_from[i] == target ? t_mb_to[i] : target;
+    }
+    reinterpret_cast<MB::SetterFn>(target)(context + 0x128, 1, 0xe, 1, *reinterpret_cast<const u64*>(material + 0x28));
+}
+
+void TestMaterialBind(const Image& image, HMODULE m, u64 cases) {
+    std::printf("material setup 0x448640 (R5-D):\n");
+    std::mt19937_64 rng{0x4486};
+    const FunctionSpec& spec = Reconstructed::kMaterialBindSpec;
+    void* reference = PristineCopy(image, spec.function);
+    std::string error;
+    CHECK(reference != nullptr);
+    CHECK(MB::Prepare(image.base, error) && MB::RecordingOriginal() != nullptr);
+    if (reference == nullptr || MB::RecordingOriginal() == nullptr) {
+        std::printf("  prepare: %s\n", error.c_str());
+        return;
+    }
+    g_mb_image = image.base;
+    auto* redirect = m ? reinterpret_cast<void (*)(u64, u64)>(GetProcAddress(m, "recomp_set_redirect")) : nullptr;
+    auto* recompiled = m ? reinterpret_cast<MB::Fn>(GetProcAddress(m, "recomp_448640")) : nullptr;
+    struct Variant {
+        const char* name;
+        MB::Fn fn;
+        void (*redirect)(u64, u64);
+    };
+    std::vector<Variant> variants{{"hand-written", &MB::Native, nullptr}};
+    if (m != nullptr) {
+        CHECK(redirect != nullptr && recompiled != nullptr);
+        if (redirect != nullptr && recompiled != nullptr) {
+            variants.push_back({"recompiled", recompiled, redirect});
+        }
+    }
+    // the install self-check (2000 generated cases, recording clone vs implementation)
+    for (const Variant& v : variants) {
+        MB::UseImplementation(v.fn, v.name, v.redirect);
+        error.clear();
+        const bool ok = spec.self_check(nullptr, error);
+        std::printf("  %s: install self-check %s%s%s\n", v.name, ok ? "passed" : "FAILED", ok ? "" : ": ",
+                    error.c_str());
+        CHECK(ok);
+    }
+    // against the eboot through the guest-like caller, the three setters recorded
+    const ImagePatch p1(image, 0x169d0, reinterpret_cast<const void*>(&Recorder<0x169d0>));
+    const ImagePatch p2(image, 0x16eb0, reinterpret_cast<const void*>(&Recorder<0x16eb0>));
+    const ImagePatch p3(image, 0x16d10, reinterpret_cast<const void*>(&Recorder<0x16d10>));
+    MaterialCase c;
+    for (const Variant& v : variants) {
+        u64 bad = 0, calls = 0;
+        std::string first;
+        for (u64 n = 0; n < cases; ++n) {
+            c.Generate(rng, n);
+            const std::string d = RunBoth(reference, reinterpret_cast<const void*>(v.fn), c.Frame(rng),
+                                          {{c.pass.data(), c.pass.size()}, {c.block.data(), c.block.size()}}, false);
+            calls += g_calls.size();
+            if (!d.empty() && bad++ == 0) {
+                first = fmt::format("case {}: {}", n, d);
+            }
+        }
+        std::printf("  %s vs eboot 0x448640: %llu cases (%llu setter calls), %llu different%s%s\n", v.name,
+                    static_cast<unsigned long long>(cases), static_cast<unsigned long long>(calls),
+                    static_cast<unsigned long long>(bad), first.empty() ? "" : "; first: ", first.c_str());
+        CHECK(bad == 0 && calls > cases);
+    }
+
+    // installed below an entry probe on the mapped image (as with CITY-OPT Phase 6 in the game)
+    MB::UseImplementation(&MB::Native, "hand-written reconstruction", nullptr);
+    const Engine::ProbeSite site{spec.function, 17};
+    g_material_probe_original = Engine::InstallEntryProbe(image.base, site, reinterpret_cast<const void*>(&MaterialProbe),
+                                                          error, &g_material_probe_original);
+    CHECK(g_material_probe_original != nullptr);
+    error.clear();
+    const bool installed = InstallFunction(image.base, spec, Mode::Native, error);
+    if (!installed) {
+        std::printf("  install below the probe: %s\n", error.c_str());
+    }
+    CHECK(installed && InstalledBelowProbe(spec) && g_material_probe_original == spec.entry);
+    if (!installed) {
+        return;
+    }
+    const auto entry = reinterpret_cast<MB::Fn>(image.base + spec.function.rva);
+    const auto ref = reinterpret_cast<MB::Fn>(reference);
+    for (const Variant& v : variants) {
+        MB::UseImplementation(v.fn, v.name, v.redirect);
+        for (const Mode mode : {Mode::Native, Mode::Verify, Mode::Guarded, Mode::Bench, Mode::Original}) {
+            spec.slot->mode.store(static_cast<u8>(mode));
+            spec.slot->sample_period = 3;
+            const u64 probe_before = g_material_probe_calls;
+            u64 differ = 0;
+            for (int n = 0; n < 2000; ++n) {
+                c.Generate(rng, n);
+                g_calls.clear();
+                entry(reinterpret_cast<u64>(c.pass.data()), c.context, c.Material());
+                const std::vector<CallRecord> calls = g_calls;
+                g_calls.clear();
+                ref(reinterpret_cast<u64>(c.pass.data()), c.context, c.Material());
+                bool same = calls.size() == g_calls.size();
+                for (size_t i = 0; same && i < calls.size(); ++i) {
+                    same = calls[i] == g_calls[i];
+                }
+                differ += same ? 0 : 1;
+            }
+            const u64 probed = g_material_probe_calls - probe_before;
+            CallFrame f = c.Frame(rng);
+            const u64 abi = CallAsGuest(reinterpret_cast<const void*>(entry), f);
+            std::printf("  %s %-8s: 2000 calls through the probe, different from the original %llu, the probe saw "
+                        "%llu; guest-like caller: violations %#llx\n",
+                        v.name, ModeName(mode), static_cast<unsigned long long>(differ),
+                        static_cast<unsigned long long>(probed), static_cast<unsigned long long>(abi));
+            CHECK(differ == 0 && probed == 2000 && abi == 0);
+        }
+    }
+    const Slot& s = *spec.slot;
+    std::printf("  material_bind: verified %llu, mismatches %llu, skipped %llu, bench samples %llu\n",
+                static_cast<unsigned long long>(s.verified.load()), static_cast<unsigned long long>(s.mismatches.load()),
+                static_cast<unsigned long long>(s.skipped.load()),
+                static_cast<unsigned long long>(s.bench_samples.load()));
+    CHECK(s.verified.load() > 0 && s.mismatches.load() == 0 && s.skipped.load() == 0 && s.bench_samples.load() > 0);
+
+    // a wrong implementation: guarded sees it on its first sample, falls back and the result is the original's
+    {
+        Slot& g = *spec.slot;
+        MB::UseImplementation(&BrokenMaterialBind, "broken (test)", &TestRedirect);
+        g.mode.store(static_cast<u8>(Mode::Guarded));
+        g.sample_period = 1;
+        const u64 mismatches = g.mismatches.load(), fallbacks = g.fallbacks.load(), recorded = CasesRecorded();
+        c.Generate(rng, 1);
+        g_calls.clear();
+        entry(reinterpret_cast<u64>(c.pass.data()), c.context, c.Material());
+        const std::vector<CallRecord> calls = g_calls;
+        g_calls.clear();
+        ref(reinterpret_cast<u64>(c.pass.data()), c.context, c.Material());
+        const bool same = calls.size() == g_calls.size() && std::equal(calls.begin(), calls.end(), g_calls.begin());
+        const bool caught = g.mismatches.load() == mismatches + 1 && g.fallbacks.load() == fallbacks + 1 &&
+                            static_cast<Mode>(g.mode.load()) == Mode::Original && CasesRecorded() == recorded + 1;
+        std::printf("  a wrong implementation under guarded: mismatch %s, fallback %s, result the original's %s\n",
+                    g.mismatches.load() > mismatches ? "seen" : "MISSED",
+                    g.fallbacks.load() > fallbacks ? "done" : "MISSING", same ? "yes" : "NO");
+        CHECK(caught && same);
+    }
+    MB::UseImplementation(&MB::Native, "hand-written reconstruction", nullptr);
+    spec.slot->mode.store(static_cast<u8>(Mode::Native));
+}
+
 void TestModes() {
     std::printf("modes and switches:\n");
     Mode m = Mode::Original;
@@ -1399,7 +2019,7 @@ void TestModes() {
     CHECK(ParseMode("bench", m) && m == Mode::Bench);
     CHECK(ParseMode("off", m) && m == Mode::Original);
     CHECK(!ParseMode("fast", m));
-    CHECK(FunctionCount() == 4);
+    CHECK(FunctionCount() == 9);
     u32 hits = 0;
     for (int i = 0; i < 1000; ++i) {
         hits += SampleThisCall(1, 10) ? 1 : 0;
@@ -1410,6 +2030,17 @@ void TestModes() {
 } // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0); // a crash in a test keeps everything printed before it
+    if (g_trace_commit) {
+        AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* e) -> LONG {
+            if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+                std::printf("    access violation at %p (%s %#llx)\n", e->ExceptionRecord->ExceptionAddress,
+                            e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                            static_cast<unsigned long long>(e->ExceptionRecord->ExceptionInformation[1]));
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        });
+    }
     std::string eboot, replay, recomp, lift;
     u64 cases = 1'000'000, lift_trials = 200;
     bool bench = false;
@@ -1484,6 +2115,8 @@ int main(int argc, char** argv) {
                 }
                 // last: it installs the setters' jumps on the mapped image
                 TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
+                // after the setters: installs 0x448640 below an entry probe on the mapped image
+                TestMaterialBind(image, recomp_module, std::max<u64>(cases / 10, 1000));
             }
         }
     } else {

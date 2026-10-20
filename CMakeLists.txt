@@ -46,6 +46,8 @@ add_library(sspc_runtime STATIC
     src/native_engine/native_function_registry.cpp
     src/native_engine/native_measure.cpp
     src/native_engine/reconstructed/cue_set_buffers.cpp
+    src/native_engine/reconstructed/cue_commit.cpp
+    src/native_engine/reconstructed/material_bind.cpp
     src/native_engine/reconstructed/frame_scratch.cpp
     src/native_engine/reconstructed/object_constants.cpp
     src/input/keyboard_mouse.cpp
@@ -337,9 +339,12 @@ add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
     src/native_engine/native_function_registry.cpp
     src/native_engine/native_measure.cpp
     src/native_engine/reconstructed/cue_set_buffers.cpp
+    src/native_engine/reconstructed/cue_commit.cpp
+    src/native_engine/reconstructed/material_bind.cpp
     src/native_engine/reconstructed/frame_scratch.cpp
     src/native_engine/reconstructed/object_constants.cpp
     src/engine/guest_hooks.cpp
+    src/engine/guest_probe.cpp
     src/loader/image_file.cpp
     src/base/log.cpp
 )

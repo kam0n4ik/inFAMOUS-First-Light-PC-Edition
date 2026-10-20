@@ -8,10 +8,13 @@
 #include <fmt/format.h>
 
 #include "engine/guest_hooks.h"
+#include "engine/guest_probe.h"
 #include "native_engine/guest_code_clone.h"
 #include "native_engine/native_dispatch.h"
+#include "native_engine/reconstructed/cue_commit.h"
 #include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/frame_scratch.h"
+#include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
 
 namespace SecondSon::NativeEngine {
@@ -23,6 +26,13 @@ const FunctionSpec* const kFunctions[] = {
     &Reconstructed::kFrameScratchAllocSpec,
     &Reconstructed::kCueSetVertexBuffersSpec,
     &Reconstructed::kCueSetBuffersSpec,
+    // R5-D: the CUE setters of the material setup, and the material setup 0x448640 itself
+    &Reconstructed::kCueSetConstantBuffersSpec,
+    &Reconstructed::kCueSetTexturesSpec,
+    &Reconstructed::kCueSetSamplersSpec,
+    &Reconstructed::kMaterialBindSpec,
+    // R5-D: the CUE commit 0x14ad0 (its recompiled implementation only; explicit_only)
+    &Reconstructed::kCueCommitSpec,
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);
@@ -117,13 +127,41 @@ void Fallback(Slot& slot) {
     }
 }
 
+static const Engine::ProbeRecord* ProbeBelow(u64 module_base, const Engine::GuestFunction& f) {
+    const Engine::ProbeRecord* p = Engine::FindEntryProbe(module_base + f.rva);
+    return p != nullptr && p->function.rva == f.rva && p->function.size == f.size &&
+                   p->function.fnv1a64 == f.fnv1a64
+               ? p
+               : nullptr;
+}
+
+const u8* OriginalBytes(u64 module_base, const Engine::GuestFunction& f, std::vector<u8>& storage) {
+    const u8* at = reinterpret_cast<const u8*>(module_base + f.rva);
+    const Engine::ProbeRecord* p = ProbeBelow(module_base, f);
+    if (p == nullptr) {
+        return at;
+    }
+    storage.assign(at, at + f.size);
+    std::memcpy(storage.data(), p->replaced, p->prologue);
+    return storage.data();
+}
+
+bool InstalledBelowProbe(const FunctionSpec& spec) {
+    return spec.slot != nullptr && spec.slot->below_probe;
+}
+
 bool InstallFunction(u64 module_base, const FunctionSpec& spec, Mode mode, std::string& error) {
     const auto fail = [&](const std::string& why) {
         error = fmt::format("{} (eboot+{:#x}): {}", spec.name, spec.function.rva, why);
         return false;
     };
     std::string why;
-    if (!Engine::VerifyGuestFunction(module_base, spec.function, why)) {
+    // an entry probe on the function (verified when it went in) takes the reconstruction below it
+    const Engine::ProbeRecord* probe = ProbeBelow(module_base, spec.function);
+    if (probe != nullptr && probe->original_slot == nullptr) {
+        return fail("an entry probe is on it without a slot for the original (guest_probe.h)");
+    }
+    if (probe == nullptr && !Engine::VerifyGuestFunction(module_base, spec.function, why)) {
         return fail(why);
     }
     for (u32 i = 0; i < spec.assumed_count; ++i) {
@@ -140,8 +178,9 @@ bool InstallFunction(u64 module_base, const FunctionSpec& spec, Mode mode, std::
         }
     }
     const u64 entry = module_base + spec.function.rva;
+    std::vector<u8> bytes;
     const CloneResult clone =
-        CloneGuestFunction(entry, reinterpret_cast<const u8*>(entry), spec.function.size, why);
+        CloneGuestFunction(entry, OriginalBytes(module_base, spec.function, bytes), spec.function.size, why);
     if (clone.code == nullptr) {
         return fail("clone: " + why);
     }
@@ -159,6 +198,12 @@ bool InstallFunction(u64 module_base, const FunctionSpec& spec, Mode mode, std::
         }
     }
     slot.mode.store(static_cast<u8>(mode), std::memory_order_release);
+    if (probe != nullptr) {
+        // the loader's window (no guest thread yet): the probe calls the dispatcher from now on
+        *probe->original_slot = const_cast<void*>(spec.entry);
+        slot.below_probe = true;
+        return true;
+    }
     if (!Engine::InstallJump(entry, spec.entry, why)) {
         return fail(why);
     }

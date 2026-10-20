@@ -1,6 +1,8 @@
-// SecondSonPC — reconstruction of eboot 0x16aa0 / 0x16b70, the CUE's buffer setters (see cue_set_buffers.h).
+// SecondSonPC — reconstruction of the CUE's resource setters 0x16aa0 / 0x16b70 / 0x169d0 / 0x16d10 / 0x16eb0 (see
+// cue_set_buffers.h).
 #include "native_engine/reconstructed/cue_set_buffers.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <random>
@@ -27,18 +29,24 @@ constexpr u64 kShadow = 0x90;          ///< + stage * 0x1800: the stage's resour
 constexpr u64 kWindow = 0x1800;
 constexpr u64 kTailBegin = 0xc080, kTailEnd = 0xc1e0; ///< context, table pointers and changed bytes
 constexpr u32 kMaxStage = 7;
-/// A shadow copy: CUE offsets up to the farthest entry of stage 7 (0x90 + 7 * 0x1800 + 0x3fff * 4 + 16 = 0x1a8a0).
+/// A shadow copy: CUE offsets up to the farthest entry of stage 7 (0x90 + 7 * 0x1800 + 0x3fff * 4 + 32 = 0x1a8b0).
 constexpr u64 kShadowBytes = 0x1b000;
 
 constexpr Engine::GuestFunction kFunction[CSB::kKinds] = {
     {0x16aa0, 0xc6, 0xf6c333198de2deedull},
     {0x16b70, 0xc6, 0x713c9f7b4b870c4dull},
+    {0x169d0, 0xc6, 0x01bd288a9d982d39ull},
+    {0x16d10, 0xc6, 0x722df3b62820c187ull},
+    {0x16eb0, 0xc6, 0xe7d4270a2029dbecull},
 };
 
 std::atomic<u64> g_callee{0};
 CSB::Fn g_recording[CSB::kKinds] = {};
-CSB::Fn g_impl[CSB::kKinds] = {&CSB::NativeVertexBuffers, &CSB::NativeBuffers};
-const char* g_impl_source[CSB::kKinds] = {"hand-written reconstruction", "hand-written reconstruction"};
+CSB::Fn g_impl[CSB::kKinds] = {&CSB::NativeVertexBuffers, &CSB::NativeBuffers, &CSB::NativeConstantBuffers,
+                               &CSB::NativeTextures, &CSB::NativeSamplers};
+const char* g_impl_source[CSB::kKinds] = {"hand-written reconstruction", "hand-written reconstruction",
+                                          "hand-written reconstruction", "hand-written reconstruction",
+                                          "hand-written reconstruction"};
 CSB::RedirectFn g_redirect[CSB::kKinds] = {};
 
 thread_local CSB::Recording* t_recording = nullptr;
@@ -48,7 +56,7 @@ inline u64 ShadowOffset(u32 stage) {
     return static_cast<u64>(static_cast<s64>(static_cast<s32>(stage * 0x600u)) * 4) + kShadow;
 }
 
-template <u32 kTable>
+template <u32 kTable, u32 kBytes>
 inline u64 Run(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
     const u64 st = static_cast<u64>(static_cast<s64>(static_cast<s32>(stage)));
     if (count != 0) {
@@ -63,14 +71,14 @@ inline u64 Run(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
                                                      ? t_callee
                                                      : reinterpret_cast<CSB::CalleeFn>(
                                                            g_callee.load(std::memory_order_relaxed));
-                    callee(GuestLoad<u64>(cue + kContext), stage, index, src, 4);
+                    callee(GuestLoad<u64>(cue + kContext), stage, index, src, kBytes / 4);
                 } else {
-                    u8 v[16]; // read whole, then written (the original's vmovups pair)
-                    std::memcpy(v, reinterpret_cast<const void*>(src), 16);
-                    std::memcpy(reinterpret_cast<void*>(shadow + static_cast<u64>(index) * 4), v, 16);
+                    u8 v[kBytes]; // read whole, then written (the original's vmovups pair)
+                    std::memcpy(v, reinterpret_cast<const void*>(src), kBytes);
+                    std::memcpy(reinterpret_cast<void*>(shadow + static_cast<u64>(index) * 4), v, kBytes);
                 }
             }
-            src += 16;
+            src += kBytes;
             ++slot;
         } while (--count != 0);
     }
@@ -78,8 +86,13 @@ inline u64 Run(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
     return cue;
 }
 
-bool HandWritten(CSB::Fn fn) {
-    return fn == &CSB::NativeVertexBuffers || fn == &CSB::NativeBuffers;
+bool IsHandWritten(CSB::Fn fn) {
+    for (u32 k = 0; k < CSB::kKinds; ++k) {
+        if (fn == CSB::HandWritten(static_cast<CSB::Kind>(k))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // --- shadow comparison ---------------------------------------------------------------------------------------------
@@ -97,7 +110,7 @@ struct Plan {
 };
 
 /// False when the call cannot be shadowed (stage outside 0..7, slots beyond the 64 entries): the original runs.
-template <u32 kTable>
+template <u32 kTable, u32 kBytes>
 bool MakePlan(u64 cue, u32 stage, u32 slot, u32 count, Plan& p) {
     const s32 st = static_cast<s32>(stage);
     if (st < 0 || st > static_cast<s32>(kMaxStage) || count > CSB::kMaxSlots || slot > CSB::kMaxSlots ||
@@ -114,8 +127,8 @@ bool MakePlan(u64 cue, u32 stage, u32 slot, u32 count, Plan& p) {
             const u32 entry = GuestLoad<u16>(table + kTable + static_cast<u64>(slot + i) * 2);
             if (entry != 0xffff && (entry & 0x8000) == 0) {
                 const u64 d = so + static_cast<u64>(entry & 0x3fff) * 4;
-                if (d + 16 > so + kWindow) {
-                    p.Add(d, d + 16);
+                if (d + kBytes > so + kWindow) {
+                    p.Add(d, d + kBytes);
                 }
             }
         }
@@ -173,8 +186,8 @@ bool LiveDiff(const Plan& p, u64 cue, const ShadowSet& s) {
     return false;
 }
 
-/// A mismatch case: everything the call's result depends on (the descriptors overwrite whole 16-byte slots, the
-/// changed byte is set unconditionally), replayable against the eboot (Replay).
+/// A mismatch case: everything the call's result depends on (the descriptors overwrite whole slots, the changed
+/// byte is set unconditionally), replayable against the eboot (Replay). Descriptors are packed at the kind's size.
 struct Case {
     u32 kind;
     u32 stage;
@@ -183,7 +196,7 @@ struct Case {
     u64 cue;
     u64 context;
     u16 entries[CSB::kMaxSlots]; ///< table entries of API slots 0..63 (those of slot..slot+count-1 are read)
-    u8 descriptors[CSB::kMaxSlots][16];
+    u8 descriptors[CSB::kMaxSlots * CSB::kMaxDescriptorBytes];
 };
 static_assert(sizeof(Case) <= kCaseBytes);
 
@@ -198,8 +211,8 @@ void RecordMismatch(u32 index, CSB::Kind kind, u64 cue, u32 stage, u32 slot, u32
     const u64 table = count != 0 ? GuestLoad<u64>(cue + kTablePointers + static_cast<u64>(stage) * 8) : 0;
     for (u32 i = 0; i < count; ++i) {
         c.entries[slot + i] = GuestLoad<u16>(table + CSB::kTableOffset[kind] + static_cast<u64>(slot + i) * 2);
-        std::memcpy(c.descriptors[i], reinterpret_cast<const void*>(src + 16 * i), 16);
     }
+    std::memcpy(c.descriptors, reinterpret_cast<const void*>(src), count * CSB::kDescriptorBytes[kind]);
     RecordCase(index, {reinterpret_cast<const u8*>(&c), sizeof(c)});
 }
 
@@ -211,7 +224,7 @@ bool CompareWhole(CSB::Kind kind, const Case& c, std::vector<u8>& a, std::vector
     std::memcpy(a.data() + kTablePointers + static_cast<u64>(c.stage) * 8, &table_address, 8);
     std::memcpy(a.data() + kContext, &c.context, 8);
     b = a;
-    const u64 src = reinterpret_cast<u64>(c.descriptors[0]);
+    const u64 src = reinterpret_cast<u64>(c.descriptors);
     CSB::Recording ra, rb;
     const u64 pa = reinterpret_cast<u64>(a.data()), pb = reinterpret_cast<u64>(b.data());
     const u64 ret_a = CSB::RunRecorded(kind, g_recording[kind], true, pa, c.stage, c.slot, c.count, src, ra);
@@ -233,6 +246,8 @@ bool CompareWhole(CSB::Kind kind, const Case& c, std::vector<u8>& a, std::vector
 
 template <CSB::Kind K>
 struct Impl {
+    static constexpr u32 kTable = CSB::kTableOffset[K];
+    static constexpr u32 kBytes = CSB::kDescriptorBytes[K];
     static Slot slot;
 
     static CSB::Fn Original() {
@@ -258,7 +273,7 @@ struct Impl {
     static SSPC_SYSV_ABI u64 Verify(u64 cue, u32 stage, u32 s, u32 count, u64 src) {
         const CSB::Fn original = Original();
         Plan p;
-        if (!MakePlan<CSB::kTableOffset[K]>(cue, stage, s, count, p)) {
+        if (!MakePlan<kTable, kBytes>(cue, stage, s, count, p)) {
             slot.skipped.fetch_add(1, std::memory_order_relaxed);
             Count(slot.index, kCallsOriginal);
             return original(cue, stage, s, count, src);
@@ -273,7 +288,7 @@ struct Impl {
 
     static SSPC_SYSV_ABI u64 Guarded(u64 cue, u32 stage, u32 s, u32 count, u64 src) {
         Plan p;
-        if (SampleThisCall(slot.index, slot.sample_period) && MakePlan<CSB::kTableOffset[K]>(cue, stage, s, count, p) &&
+        if (SampleThisCall(slot.index, slot.sample_period) && MakePlan<kTable, kBytes>(cue, stage, s, count, p) &&
             !Check(p, cue, stage, s, count, src)) {
             Fallback(slot); // the original from now on, on every thread
             Count(slot.index, kCallsOriginal);
@@ -286,7 +301,7 @@ struct Impl {
     static SSPC_SYSV_ABI u64 Bench(u64 cue, u32 stage, u32 s, u32 count, u64 src) {
         const CSB::Fn original = Original();
         Plan p;
-        if (SampleThisCall(slot.index, slot.sample_period) && MakePlan<CSB::kTableOffset[K]>(cue, stage, s, count, p)) {
+        if (SampleThisCall(slot.index, slot.sample_period) && MakePlan<kTable, kBytes>(cue, stage, s, count, p)) {
             ShadowSet& set = Shadows();
             for (u32 i = 0; i < p.n; ++i) {
                 std::memcpy(set.a + p.lo[i], reinterpret_cast<const void*>(cue + p.lo[i]), p.hi[i] - p.lo[i]);
@@ -356,10 +371,8 @@ bool SelfCheck(void* /*original*/, std::string& error) {
                 : pick == 2 ? static_cast<u16>(rng() & 0x7fff)              // anywhere the 14 bits reach
                             : static_cast<u16>((rng() % 0x5fc) & ~3ull);    // inside the stage's window
         }
-        for (auto& d : c.descriptors) {
-            for (u8& x : d) {
-                x = static_cast<u8>(rng());
-            }
+        for (u8& x : c.descriptors) {
+            x = static_cast<u8>(rng());
         }
         if (!CompareWhole(K, c, a, b, error)) {
             error = fmt::format("case {}: {}", n, error);
@@ -369,14 +382,47 @@ bool SelfCheck(void* /*original*/, std::string& error) {
     return true;
 }
 
+template <CSB::Kind K>
+FunctionSpec MakeSpec(const char* key, const char* name) {
+    return FunctionSpec{key,
+                        name,
+                        kFunction[K],
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        reinterpret_cast<const void*>(&D::Entry<Impl<K>>),
+                        &Impl<K>::slot,
+                        &SelfCheck<K>,
+                        &PrepareKind<K>};
+}
+
 } // namespace
 
 SSPC_SYSV_ABI u64 CSB::NativeVertexBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
-    return Run<kTableOffset[kVertexBuffers]>(cue, stage, slot, count, src);
+    return Run<kTableOffset[kVertexBuffers], kDescriptorBytes[kVertexBuffers]>(cue, stage, slot, count, src);
 }
 
 SSPC_SYSV_ABI u64 CSB::NativeBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
-    return Run<kTableOffset[kBuffers]>(cue, stage, slot, count, src);
+    return Run<kTableOffset[kBuffers], kDescriptorBytes[kBuffers]>(cue, stage, slot, count, src);
+}
+
+SSPC_SYSV_ABI u64 CSB::NativeConstantBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    return Run<kTableOffset[kConstantBuffers], kDescriptorBytes[kConstantBuffers]>(cue, stage, slot, count, src);
+}
+
+SSPC_SYSV_ABI u64 CSB::NativeTextures(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    return Run<kTableOffset[kTextures], kDescriptorBytes[kTextures]>(cue, stage, slot, count, src);
+}
+
+SSPC_SYSV_ABI u64 CSB::NativeSamplers(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    return Run<kTableOffset[kSamplers], kDescriptorBytes[kSamplers]>(cue, stage, slot, count, src);
+}
+
+CSB::Fn CSB::HandWritten(Kind kind) {
+    static constexpr Fn kHand[kKinds] = {&NativeVertexBuffers, &NativeBuffers, &NativeConstantBuffers, &NativeTextures,
+                                         &NativeSamplers};
+    return kHand[kind];
 }
 
 SSPC_SYSV_ABI u64 CSB::Record(u64 context, u64 stage, u64 sgpr, u64 values, u64 count) {
@@ -390,7 +436,8 @@ SSPC_SYSV_ABI u64 CSB::Record(u64 context, u64 stage, u64 sgpr, u64 values, u64 
     }
     Call& c = r->call[r->calls++];
     c = Call{context, stage, sgpr, values, count, {}};
-    std::memcpy(c.data, reinterpret_cast<const void*>(values), 16);
+    std::memcpy(c.data, reinterpret_cast<const void*>(values),
+                std::min<u64>(static_cast<u32>(count) * 4ull, kMaxDescriptorBytes));
     return 0;
 }
 
@@ -403,10 +450,11 @@ u64 CSB::RunRecorded(Kind kind, Fn fn, bool recording_original, u64 cue, u32 sta
     u64 r;
     if (recording_original) {
         r = fn(cue, stage, slot, count, src);
-    } else if (HandWritten(fn)) {
+    } else if (IsHandWritten(fn)) {
+        const CalleeFn saved_callee = t_callee;
         t_callee = &Record;
         r = fn(cue, stage, slot, count, src);
-        t_callee = nullptr;
+        t_callee = saved_callee;
     } else if (g_redirect[kind] != nullptr) {
         g_redirect[kind](g_callee.load(std::memory_order_relaxed), reinterpret_cast<u64>(&Record));
         r = fn(cue, stage, slot, count, src);
@@ -431,8 +479,9 @@ bool CSB::Prepare(Kind kind, u64 module_base, std::string& error) {
     const u64 callee = module_base + kCalleeRva;
     g_callee.store(callee, std::memory_order_relaxed);
     const u64 entry = module_base + kFunction[kind].rva;
-    const CloneResult clone = CloneGuestFunction(entry, reinterpret_cast<const u8*>(entry), kFunction[kind].size, error,
-                                                 {{callee, reinterpret_cast<u64>(&Record)}});
+    std::vector<u8> bytes;
+    const CloneResult clone = CloneGuestFunction(entry, OriginalBytes(module_base, kFunction[kind], bytes),
+                                                 kFunction[kind].size, error, {{callee, reinterpret_cast<u64>(&Record)}});
     if (clone.code == nullptr) {
         error = "recording clone: " + error;
         return false;
@@ -474,32 +523,19 @@ const char* CSB::ImplementationSource(Kind kind) {
     return g_impl_source[kind];
 }
 
-const FunctionSpec kCueSetVertexBuffersSpec{
-    "cue_set_vertex_buffers",
-    "CUE::SetVertexBuffers",
-    kFunction[CSB::kVertexBuffers],
-    nullptr,
-    0,
-    nullptr,
-    0,
-    reinterpret_cast<const void*>(&D::Entry<Impl<CSB::kVertexBuffers>>),
-    &Impl<CSB::kVertexBuffers>::slot,
-    &SelfCheck<CSB::kVertexBuffers>,
-    &PrepareKind<CSB::kVertexBuffers>,
-};
+const FunctionSpec kCueSetVertexBuffersSpec =
+    MakeSpec<CSB::kVertexBuffers>("cue_set_vertex_buffers", "CUE::SetVertexBuffers");
+const FunctionSpec kCueSetBuffersSpec = MakeSpec<CSB::kBuffers>("cue_set_buffers", "CUE::SetBuffers");
+const FunctionSpec kCueSetConstantBuffersSpec =
+    MakeSpec<CSB::kConstantBuffers>("cue_set_constant_buffers", "CUE::SetConstantBuffers");
+const FunctionSpec kCueSetTexturesSpec = MakeSpec<CSB::kTextures>("cue_set_textures", "CUE::SetTextures");
+const FunctionSpec kCueSetSamplersSpec = MakeSpec<CSB::kSamplers>("cue_set_samplers", "CUE::SetSamplers");
 
-const FunctionSpec kCueSetBuffersSpec{
-    "cue_set_buffers",
-    "CUE::SetBuffers",
-    kFunction[CSB::kBuffers],
-    nullptr,
-    0,
-    nullptr,
-    0,
-    reinterpret_cast<const void*>(&D::Entry<Impl<CSB::kBuffers>>),
-    &Impl<CSB::kBuffers>::slot,
-    &SelfCheck<CSB::kBuffers>,
-    &PrepareKind<CSB::kBuffers>,
-};
+const FunctionSpec& CSB::Spec(Kind kind) {
+    static const FunctionSpec* const kSpecs[kKinds] = {&kCueSetVertexBuffersSpec, &kCueSetBuffersSpec,
+                                                       &kCueSetConstantBuffersSpec, &kCueSetTexturesSpec,
+                                                       &kCueSetSamplersSpec};
+    return *kSpecs[kind];
+}
 
 } // namespace SecondSon::NativeEngine::Reconstructed

@@ -16,7 +16,7 @@
 namespace SecondSon::NativeEngine {
 
 /// Serialised case: up to kCaseBytes of the function's own format (see each reconstruction's Case struct).
-inline constexpr u32 kCaseBytes = 2048;
+inline constexpr u32 kCaseBytes = 4096;
 
 /// Records a mismatch case (lock-free; dropped when the ring is full). Any thread, no allocation, no logging.
 void RecordCase(u32 function, std::span<const u8> bytes);

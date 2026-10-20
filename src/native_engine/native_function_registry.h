@@ -30,6 +30,7 @@
 #include <atomic>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "base/abi.h"
 #include "engine/guest_hooks.h"
@@ -63,6 +64,7 @@ struct Slot {
     std::atomic<u64> bench_original_ticks{0};
     std::atomic<u64> bench_native_ticks{0};
     std::atomic<u64> bench_empty_ticks{0}; ///< the timer's own cost per sample (an empty timed region)
+    bool below_probe = false;              ///< installed below an entry probe (InstallFunction)
 };
 
 /// A self-check run at install with the clone of the loaded original: false (with `error`) refuses the install.
@@ -83,6 +85,9 @@ struct FunctionSpec {
     Slot* slot;
     SelfCheckFn self_check;
     PrepareFn prepare = nullptr;
+    /// Installed only when SSPC_NATIVE_ENGINE_FUNCS names it, never as part of "all functions" (a reconstruction
+    /// without an implementation of its own, e.g. cue_commit: only a recompiled module provides one).
+    bool explicit_only = false;
 };
 
 /// Every reconstruction SecondSonPC has (registry.cpp lists them).
@@ -121,6 +126,17 @@ void Fallback(Slot& slot);
 bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_dir);
 
 /// For tests: installs one function over code at `module_base` with `mode` (the same steps as above).
+///
+/// A function with an entry probe on it (engine/guest_probe.h, e.g. CITY-OPT's draw_runs on 0x448640) is installed
+/// below the probe: the probe's verified record stands for the hash check, the clone is made from the bytes the
+/// probe's jump replaced, and the probe's original variable is pointed at the dispatcher instead of a second entry
+/// jump - the probe still sees every call, the reconstruction (or the clone) runs where the original ran.
 bool InstallFunction(u64 module_base, const FunctionSpec& spec, Mode mode, std::string& error);
+
+/// The function's code as the eboot has it, an entry probe's jump undone (in `storage` then): what clones copy.
+const u8* OriginalBytes(u64 module_base, const Engine::GuestFunction& f, std::vector<u8>& storage);
+
+/// True when the function was installed below an entry probe (InstallFunction), for the log.
+bool InstalledBelowProbe(const FunctionSpec& spec);
 
 } // namespace SecondSon::NativeEngine

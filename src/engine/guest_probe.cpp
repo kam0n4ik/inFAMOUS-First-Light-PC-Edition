@@ -35,6 +35,11 @@ u8* Allocate(u32 bytes, std::string& error) {
     return at;
 }
 
+/// Installed probes (a handful; written in the loader's window, read by later installs in the same window).
+constexpr u32 kMaxProbes = 32;
+ProbeRecord g_probes[kMaxProbes];
+u32 g_probe_count = 0;
+
 bool Protect(u8* page, DWORD protection, std::string& error) {
     DWORD old = 0;
     if (!VirtualProtect(page, kPage, protection, &old)) {
@@ -54,8 +59,9 @@ u32 BuildTrampoline(const u8* entry, u32 prologue, u64 resume, u8* out) {
     return TrampolineSize(prologue);
 }
 
-void* InstallEntryProbe(u64 module_base, const ProbeSite& site, const void* target, std::string& error) {
-    if (site.prologue < 14 || site.prologue > site.function.size) {
+void* InstallEntryProbe(u64 module_base, const ProbeSite& site, const void* target, std::string& error,
+                        void** original_slot) {
+    if (site.prologue < 14 || site.prologue > site.function.size || site.prologue > sizeof(ProbeRecord::replaced)) {
         error = fmt::format("eboot+{:#x}: prologue of {} bytes", site.function.rva, site.prologue);
         return nullptr;
     }
@@ -77,10 +83,29 @@ void* InstallEntryProbe(u64 module_base, const ProbeSite& site, const void* targ
         return nullptr;
     }
     FlushInstructionCache(GetCurrentProcess(), trampoline, TrampolineSize(site.prologue));
+    ProbeRecord record;
+    record.entry = entry;
+    record.function = site.function;
+    record.prologue = site.prologue;
+    std::memcpy(record.replaced, reinterpret_cast<const void*>(entry), site.prologue);
+    record.original_slot = original_slot;
     if (!InstallJump(entry, target, error)) {
         return nullptr;
     }
+    if (g_probe_count < kMaxProbes) {
+        g_probes[g_probe_count++] = record;
+    }
     return trampoline;
+}
+
+const ProbeRecord* FindEntryProbe(u64 entry) {
+    std::lock_guard guard(g_arena.lock);
+    for (u32 i = 0; i < g_probe_count; ++i) {
+        if (g_probes[i].entry == entry) {
+            return &g_probes[i];
+        }
+    }
+    return nullptr;
 }
 
 } // namespace SecondSon::Engine

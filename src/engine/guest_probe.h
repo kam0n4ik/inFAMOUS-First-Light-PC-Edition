@@ -36,6 +36,23 @@ constexpr u32 TrampolineSize(u32 prologue) {
 /// Verifies the function (guest_hooks.h), writes its trampoline into executable memory SecondSonPC owns and installs
 /// the entry jump to `target`. Returns the trampoline (the original function), or nullptr with `error`. Call before any
 /// thread can run the code, like InstallJump.
-void* InstallEntryProbe(u64 module_base, const ProbeSite& site, const void* target, std::string& error);
+///
+/// `original_slot`: the variable the probe calls the original through (the caller stores the returned trampoline in
+/// it). Recorded with the site: a replacement of the same function installed later (Native Engine R5-D) goes in
+/// below the probe by storing its own entry there instead of a second entry jump (FindEntryProbe).
+void* InstallEntryProbe(u64 module_base, const ProbeSite& site, const void* target, std::string& error,
+                        void** original_slot = nullptr);
+
+/// An installed probe: the verified function, the entry bytes its jump replaced and the probe's original variable.
+struct ProbeRecord {
+    u64 entry = 0;
+    GuestFunction function{};
+    u32 prologue = 0;
+    u8 replaced[32]{}; ///< the first `prologue` bytes as they were before the probe's jump (pristine, verified)
+    void** original_slot = nullptr;
+};
+
+/// The probe installed at `entry` (absolute), nullptr when there is none.
+const ProbeRecord* FindEntryProbe(u64 entry);
 
 } // namespace SecondSon::Engine

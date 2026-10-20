@@ -20,7 +20,9 @@
 #include "native_engine/native_function_registry.h"
 #include "native_engine/native_measure.h"
 #include "native_engine/reconstructed/cue_set_buffers.h"
+#include "native_engine/reconstructed/cue_commit.h"
 #include "native_engine/reconstructed/frame_scratch.h"
+#include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/gpu/native_videoout.h"
@@ -263,7 +265,9 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         }
     } else if (global_mode != Mode::Original) {
         for (u32 i = 0; i < FunctionCount(); ++i) {
-            wanted.push_back({i, global_mode});
+            if (!Function(i).explicit_only) {
+                wanted.push_back({i, global_mode});
+            }
         }
     }
     u32 period = 0;
@@ -272,8 +276,9 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
     }
 
     // Static recompilation (docs/NATIVE_RECOMP_COMPILER.md): SSPC_NATIVE_ENGINE_RECOMP=<dll> - each function the module
-    // exports (recomp_1f0870 FrameScratch::Alloc, recomp_11c890 ObjectConstants::Update, recomp_16aa0 / recomp_16b70
-    // the CUE setters) replaces the hand-written one
+    // exports (recomp_1f0870 FrameScratch::Alloc, recomp_11c890 ObjectConstants::Update, recomp_16aa0 / recomp_16b70 /
+    // recomp_169d0 / recomp_16d10 / recomp_16eb0 the CUE setters, recomp_448640 Material::Bind) replaces the
+    // hand-written one
     // as that reconstruction's implementation; the install's self-check and the verify/guarded modes judge it the
     // same way. Which functions are installed at all stays SSPC_NATIVE_ENGINE / SSPC_NATIVE_ENGINE_FUNCS.
     if (const std::string dll = Env("SSPC_NATIVE_ENGINE_RECOMP"); !dll.empty()) {
@@ -291,16 +296,39 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         auto* redirect = m ? reinterpret_cast<Reconstructed::CueSetBuffers::RedirectFn>(
                                  GetProcAddress(m, "recomp_set_redirect"))
                            : nullptr;
-        auto* vb = m && redirect && selected(Reconstructed::kCueSetVertexBuffersSpec) ? GetProcAddress(m, "recomp_16aa0")
-                                                                                       : nullptr;
-        auto* sb = m && redirect && selected(Reconstructed::kCueSetBuffersSpec) ? GetProcAddress(m, "recomp_16b70")
-                                                                                 : nullptr;
-        if (base == nullptr || (fs == nullptr && oc == nullptr && vb == nullptr && sb == nullptr)) {
-            SSPC_LOG(Engine, Error, "SSPC_NATIVE_ENGINE_RECOMP={}: no recompiled function of a selected reconstruction "
-                     "(recomp_image_base, recomp_1f0870 / recomp_11c890 / recomp_16aa0 / recomp_16b70 with "
-                     "recomp_set_redirect); the hand-written reconstructions stay", dll);
+        namespace CSB = Reconstructed::CueSetBuffers;
+        namespace MB = Reconstructed::MaterialBind;
+        FARPROC cue[CSB::kKinds] = {};
+        std::string cue_names[CSB::kKinds];
+        bool any = fs != nullptr || oc != nullptr;
+        for (u32 k = 0; k < CSB::kKinds; ++k) {
+            cue_names[k] = fmt::format("recomp_{:x}", CSB::kRva[k]);
+            cue[k] = m && redirect && selected(CSB::Spec(static_cast<CSB::Kind>(k)))
+                         ? GetProcAddress(m, cue_names[k].c_str())
+                         : nullptr;
+            any = any || cue[k] != nullptr;
+        }
+        // the material setup's three setter calls are recorded the same way (recomp_set_redirect, up to 32 targets)
+        auto* mb = m && redirect && selected(Reconstructed::kMaterialBindSpec) ? GetProcAddress(m, "recomp_448640")
+                                                                                : nullptr;
+        any = any || mb != nullptr;
+        // the CUE commit has no hand-written reconstruction: recomp_14ad0 is its only implementation (18 recorded
+        // callees through recomp_set_redirect, up to 32)
+        auto* cc = m && redirect && selected(Reconstructed::kCueCommitSpec) ? GetProcAddress(m, "recomp_14ad0")
+                                                                             : nullptr;
+        any = any || cc != nullptr;
+        if (base == nullptr) {
+            SSPC_LOG(Engine, Error, "SSPC_NATIVE_ENGINE_RECOMP={}: not a recompiler module (no recomp_image_base); the "
+                     "hand-written reconstructions stay", dll);
         } else {
+            // set even when none of the selected functions has a recompiled one here: a reconstruction that calls the
+            // module itself (recomp_set_redirect, a recomp_* of its own) needs the image base too
             *base = eboot_base;
+            if (!any) {
+                SSPC_LOG(Engine, Warning, "SSPC_NATIVE_ENGINE_RECOMP={}: no recompiled function of a selected "
+                         "reconstruction here (recomp_1f0870 / recomp_11c890 / recomp_<CUE setter> / recomp_448640 / "
+                         "recomp_14ad0 with recomp_set_redirect); the hand-written reconstructions stay", dll);
+            }
             constexpr const char* kSource = "static recompilation (P-code -> C++ -> clang)";
             if (fs != nullptr) {
                 Reconstructed::FrameScratch::UseImplementation(reinterpret_cast<Reconstructed::FrameScratch::Fn>(fs),
@@ -318,26 +346,34 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
                          reinterpret_cast<void*>(Reconstructed::ObjectConstants::Implementation()), dll,
                          reinterpret_cast<void*>(&Reconstructed::ObjectConstants::Native));
             }
-            namespace CSB = Reconstructed::CueSetBuffers;
-            const struct {
-                FARPROC fn;
-                CSB::Kind kind;
-                const char* key;
-                const char* export_name;
-                CSB::Fn hand;
-            } cue[] = {{vb, CSB::kVertexBuffers, Reconstructed::kCueSetVertexBuffersSpec.key, "recomp_16aa0",
-                        &CSB::NativeVertexBuffers},
-                       {sb, CSB::kBuffers, Reconstructed::kCueSetBuffersSpec.key, "recomp_16b70", &CSB::NativeBuffers}};
-            for (const auto& c : cue) {
-                if (c.fn == nullptr) {
+            for (u32 k = 0; k < CSB::kKinds; ++k) {
+                if (cue[k] == nullptr) {
                     continue;
                 }
-                CSB::UseImplementation(c.kind, reinterpret_cast<CSB::Fn>(c.fn), kSource, redirect);
+                const CSB::Kind kind = static_cast<CSB::Kind>(k);
+                CSB::UseImplementation(kind, reinterpret_cast<CSB::Fn>(cue[k]), kSource, redirect);
                 SSPC_LOG(Engine, Warning,
                          "STATIC RECOMPILATION: {}'s implementation is {} ({}) from {} (hand-written: {}); its calls "
                          "to setUserDataRegion are recorded in verification through recomp_set_redirect",
-                         c.key, c.export_name, reinterpret_cast<void*>(CSB::Implementation(c.kind)), dll,
-                         reinterpret_cast<void*>(c.hand));
+                         CSB::Spec(kind).key, cue_names[k], reinterpret_cast<void*>(CSB::Implementation(kind)), dll,
+                         reinterpret_cast<void*>(CSB::HandWritten(kind)));
+            }
+            if (mb != nullptr) {
+                MB::UseImplementation(reinterpret_cast<MB::Fn>(mb), kSource, redirect);
+                SSPC_LOG(Engine, Warning,
+                         "STATIC RECOMPILATION: {}'s implementation is recomp_448640 ({}) from {} (hand-written: {}); "
+                         "its calls to the CUE setters are recorded in verification through recomp_set_redirect",
+                         Reconstructed::kMaterialBindSpec.key, reinterpret_cast<void*>(MB::Implementation()), dll,
+                         reinterpret_cast<void*>(&MB::Native));
+            }
+            if (cc != nullptr) {
+                Reconstructed::CueCommit::UseImplementation(reinterpret_cast<Reconstructed::CueCommit::Fn>(cc), kSource,
+                                                            redirect);
+                SSPC_LOG(Engine, Warning,
+                         "STATIC RECOMPILATION: {}'s implementation is recomp_14ad0 ({}) from {} (no hand-written "
+                         "reconstruction); its 18 calls with side effects are recorded in verification through "
+                         "recomp_set_redirect",
+                         Reconstructed::kCueCommitSpec.key, reinterpret_cast<void*>(cc), dll);
             }
         }
     }
@@ -360,8 +396,10 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         g_installed.push_back(w);
         SSPC_LOG(Engine, Warning,
                  "NATIVE ENGINE: {} (eboot+{:#x}, {} bytes) replaced by SecondSonPC's reconstruction, mode {} "
-                 "(hashes, clone and self-check passed in {:.1f} ms; sample period {})",
-                 spec.name, spec.function.rva, spec.function.size, ModeName(w.mode), ms, spec.slot->sample_period);
+                 "(hashes, clone and self-check passed in {:.1f} ms; sample period {}){}",
+                 spec.name, spec.function.rva, spec.function.size, ModeName(w.mode), ms, spec.slot->sample_period,
+                 InstalledBelowProbe(spec) ? "; below the entry probe already on it (the probe still sees every call)"
+                                           : "");
     }
 
     if (!measure.empty() && measure != "0") {
