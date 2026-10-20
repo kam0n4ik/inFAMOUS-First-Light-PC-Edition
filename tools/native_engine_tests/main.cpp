@@ -49,6 +49,7 @@
 namespace SecondSon::NativeEngine::Tests {
 int LiftCheck(u64 image_base, u64 image_size, const std::string& dll, u64 trials); // lift_check.cpp
 int GBufferTests(u64 image_base, const std::string& recomp_dll, u64 cases);       // gbuffer_tests.cpp (R5-E)
+int ShadowTests(u64 image_base, u64 cases, void* recomp_module);                   // shadow_tests.cpp (R5-F)
 }
 
 using namespace SecondSon;
@@ -2027,7 +2028,7 @@ void TestModes() {
     CHECK(ParseMode("bench", m) && m == Mode::Bench);
     CHECK(ParseMode("off", m) && m == Mode::Original);
     CHECK(!ParseMode("fast", m));
-    CHECK(FunctionCount() == 10); // R5-C 4, R5-D 5, R5-E draw_constants_set
+    CHECK(FunctionCount() == 11); // R5-C 4, R5-D 5, R5-E draw_constants_set, R5-F shadow_instance_uv
     u32 hits = 0;
     for (int i = 0; i < 1000; ++i) {
         hits += SampleThisCall(1, 10) ? 1 : 0;
@@ -2122,6 +2123,9 @@ int main(int argc, char** argv) {
                     }
                 }
                 g_failures += Tests::GBufferTests(image.base, recomp, cases); // R5-E
+                // R5-F shadow subsystem (append-only): before TestCueSetters patches the image's setters
+                g_failures += Tests::ShadowTests(image.base, std::max<u64>(cases / 10, 1000), recomp_module);
+                g_checks += 1;
                 // last: it installs the setters' jumps on the mapped image
                 TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
                 // after the setters: installs 0x448640 below an entry probe on the mapped image

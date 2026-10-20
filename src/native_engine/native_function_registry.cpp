@@ -17,6 +17,7 @@
 #include "native_engine/reconstructed/gbuffer_draw_constants.h"
 #include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
+#include "native_engine/reconstructed/shadow_instance_uv.h"
 
 namespace SecondSon::NativeEngine {
 
@@ -36,6 +37,8 @@ const FunctionSpec* const kFunctions[] = {
     &Reconstructed::kCueCommitSpec,
     // R5-E: the G-buffer draws' constants 0x11e5d0
     &Reconstructed::kDrawConstantsSetSpec,
+    // R5-F: the shadow instances' atlas UV 0x451700
+    &Reconstructed::kShadowInstanceUvSpec,
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);
