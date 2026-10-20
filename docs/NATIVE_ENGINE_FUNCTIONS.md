@@ -20,18 +20,21 @@
 
 | Адрес | Размер | Наше имя | Статус | Ключ / файл | Проверено |
 |---|---|---|---|---|---|
-| `0x11c890` | 0x507 | ObjectConstants::Update — константы объекта draw-контекста (`R+0xd190`) с флагом изменения `+0x158` | **VERIFIED** (офлайн, 1 млн случаев, 0 расхождений); в игре не установлен: нет памяти для клона рядом с eboot — исправление не собрано (§7) | `object_constants`, `src/native_engine/reconstructed/object_constants.*` | §5.2, §7, §8.1 |
-| `0x1f0870` | 0x73 | FrameScratch::Alloc — lock-free bump-аллокатор памяти кадра (две арены) | **INTEGRATED** (в игре: 1104 вызова за 10 с — все в реконструкцию); офлайн VERIFIED (1 млн + 6×100 тыс. под конкуренцией); verify в игре и A/B FPS не выполнены | `frame_alloc`, `src/native_engine/reconstructed/frame_scratch.*` | §5.2, §7, §8.2 |
+| `0x11c890` | 0x507 | ObjectConstants::Update — константы объекта draw-контекста (`R+0xd190`) с флагом изменения `+0x158` | **BENCHMARKED** — в игре verify: 19 046 190 вызовов, 0 расхождений; native в 3 прогонах A/B (~4400 вызовов/кадр); стоимость ≤ 0,19 мс/кадр; FPS: изменение не измерено | `object_constants`, `src/native_engine/reconstructed/object_constants.*` | §3, §5.2, §5.3, §6, §8.1 |
+| `0x1f0870` | 0x73 | FrameScratch::Alloc — lock-free bump-аллокатор памяти кадра (две арены) | **BENCHMARKED** — в игре verify: 21 244 573 вызова, 0 расхождений (live-diff 2 799 392); native в 3 прогонах A/B (~6900 вызовов/кадр); стоимость ≤ 0,09 мс/кадр | `frame_alloc`, `src/native_engine/reconstructed/frame_scratch.*` | §3, §5.2, §5.3, §6, §8.2 |
 
 Ранее (P5.1, `docs/native-reconstruction/JOB_SYSTEM_RECONSTRUCTION.md`, своя система установки, не этот реестр):
 `0x243f30` NextJob, `0x243d70` TryNextJob, `0x243c50` WaitBatch — INTEGRATED (`SSPC_NATIVE_JOBS=1`), сверка — тесты
 и A/B, без побитового verify в игре.
 
 Машинно переведённые (статическая рекомпиляция, §9; код не в репозитории, `recomp_build.ps1`):
-`0x1f0870`, `0x61e260`, `0x61f430` — VERIFIED офлайн (по 1 млн случаев, 0 расхождений); `0x11c890` — REJECTED
-рекомпилятором (AVX CALLOTHER, 16-байтовые векторы).
+`0x1f0870` — VERIFIED офлайн (1 млн случаев) и в игре (verify, `SSPC_NATIVE_ENGINE_RECOMP`: 24 420 099 вызовов, 0
+расхождений); `0x61e260`, `0x61f430` — VERIFIED офлайн (по 1 млн случаев, 0 расхождений), в игру не ставятся;
+`0x11c890` — REJECTED рекомпилятором (AVX CALLOTHER, 16-байтовые векторы).
 
 ## Проанализированные кандидаты (ANALYZED, не реконструированы)
+
+Стоимость каждой в игре (вызовов и мкс на кадр, `SSPC_NATIVE_ENGINE_MEASURE`, 20.10.2026) — `NATIVE_ENGINE_RECONSTRUCTION.md` §3.
 
 | Адрес | Размер | Что [A] | Почему не пилот |
 |---|---|---|---|
