@@ -8,8 +8,10 @@
 #include <array>
 #include <atomic>
 #include <string>
+#include <vector>
 
 #include "base/abi.h"
+#include "runtime/gpu/command_processor.h"
 
 namespace SecondSon::Gpu::Native::R6 {
 
@@ -22,6 +24,11 @@ struct Options {
     bool prefetch_skip = false;
     /// SSPC_R6_CP_DIAG=1: counters only (the records that closed a held run, by kind; DMA reports by kind).
     bool diag = false;
+    /// SSPC_R6_CP_RUN_POOL=1: a long run's member vector (over 32 members) is not freed by thread 2 after its run and
+    /// grown again from nothing by thread 1 for the next long run: thread 2 gives it to a small pool (TakeMembers /
+    /// GiveMembers), thread 1 takes one when a run outgrows its slot's vector. The members are the same; only where
+    /// their memory comes from changes.
+    bool run_pool = false;
 };
 const Options& Opt();
 
@@ -42,6 +49,10 @@ struct Counters {
     /// output not (a sanity count: should be 0); flattened dwords compared
     std::array<std::atomic<u64>, 2> walks{}, walk_same_prog{}, walk_eq_prev{}, walk_eq_last{}, walk_ud_same_flat_diff{},
         walk_dwords{};
+    /// NoteTimelineRead by site: reads that drained, of them waited for the GPU, their time (TSC)
+    std::array<std::atomic<u64>, 5> tread_drained{}, tread_synced{}, tread_ticks{};
+    /// SSPC_R6_CP_RUN_POOL: vectors taken from the pool (thread 1), the pool empty then, given back / freed (thread 2)
+    std::atomic<u64> pool_taken{0}, pool_empty{0}, pool_given{0}, pool_freed{0};
 };
 Counters& Count();
 
@@ -49,6 +60,20 @@ Counters& Count();
 /// user data registers) compared with the last walk output of the same program - equal past the registers: the engine
 /// gave the same resources through another table copy (the CUE copies its tables at each commit). `stage`: 0 VS, 1 PS.
 void NoteWalk(u32 stage, u64 program_address, const u32* user_data, const u32* flat, size_t flat_size);
+
+/// SSPC_R6_CP_RUN_POOL=1. Thread 1, before a member is appended to a full vector: its members moved into a pooled
+/// vector of more capacity (false: none pooled - the vector grows as before). Thread 2, after the run's draws: the
+/// vector's memory pooled (at most kPooled kept, else freed); `v` is left empty without capacity either way.
+inline constexpr size_t kPooled = 16;
+bool TakeMembers(std::vector<Cp::RunMember>& v);
+void GiveMembers(std::vector<Cp::RunMember>& v);
+
+/// The processor's own guest memory reads, by site (set by the processor before each read; its thread only).
+enum ReadSite : u8 { kReadOther, kReadSubmission, kReadIndirect, kReadDma, kReadWait, kReadSites };
+inline u8 g_read_site = kReadOther;
+/// SSPC_R6_CP_DIAG=1 (native_backend.cpp Memory::Read): a read over a write still on the GPU's timeline - the queue
+/// drained, and `synced`: the executor then waited for the GPU too; `ticks`: the whole wait (TSC).
+void NoteTimelineRead(u64 addr, u64 bytes, bool synced, u64 ticks);
 
 inline void Bump(std::atomic<u64>& a, u64 v = 1) {
     a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed);

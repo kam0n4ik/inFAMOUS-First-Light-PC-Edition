@@ -14,6 +14,7 @@
 
 #include "base/log.h"
 #include "engine/render/draw_runs.h"
+#include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
@@ -419,7 +420,10 @@ CommandProcessor::NextResult CommandProcessor::Next(Queue& q, u64& addr, std::sp
             Frame& f = q.frames[0];
             f = Frame{.addr = s.addr, .data = s.data, .size = s.dwords, .ring = s.ring, .ring_offset = s.ring_offset};
             if (f.data == nullptr) {
-                if (!Fetch(q.buffers[0], s.addr, s.dwords)) {
+                Native::R6::g_read_site = Native::R6::kReadSubmission;
+                const bool fetched = Fetch(q.buffers[0], s.addr, s.dwords);
+                Native::R6::g_read_site = Native::R6::kReadOther;
+                if (!fetched) {
                     Fail(q, CpErrorKind::IndirectUnreadable, s.addr, 0, s.dwords, "submission");
                     continue;
                 }
@@ -1978,9 +1982,12 @@ StepStatus CommandProcessor::DmaData(Queue& q, u64 addr, std::span<const u32> p)
     switch (d.kind) {
     case DmaKind::MemoryToMemory:
     case DmaKind::MemoryToGds:
+        Native::R6::g_read_site = Native::R6::kReadDma;
         if (!options_.memory->Read(src, d.kind == DmaKind::MemoryToGds ? gds_ptr_ + gds_off : tmp, bytes)) {
+            Native::R6::g_read_site = Native::R6::kReadOther;
             return Fail(q, CpErrorKind::MemoryUnreadable, addr, op, n, fmt::format("{} bytes at {:#x}", bytes, src));
         }
+        Native::R6::g_read_site = Native::R6::kReadOther;
         break;
     case DmaKind::DataToMemory:
         fill(tmp);
@@ -2252,7 +2259,10 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
     u32 value = 0;
     if (memory) {
         const u64 poll = (u64{b[2]} << 32) | (b[1] & ~3u);
-        if (!options_.memory->Read(poll, &value, sizeof(value))) {
+        Native::R6::g_read_site = Native::R6::kReadWait;
+        const bool read = options_.memory->Read(poll, &value, sizeof(value));
+        Native::R6::g_read_site = Native::R6::kReadOther;
+        if (!read) {
             return Fail(q, CpErrorKind::MemoryUnreadable, addr, op, n, fmt::format("poll address {:#x}", poll));
         }
     } else {
@@ -2405,7 +2415,10 @@ StepStatus CommandProcessor::IndirectBuffer(Queue& q, u64 addr, std::span<const 
     }
     // Read into a buffer nobody points at: for a chain the current frame's buffer still holds this packet.
     std::vector<u32>& target = chain ? q.spare : q.buffers[slot];
-    if (!Fetch(target, ib, size)) {
+    Native::R6::g_read_site = Native::R6::kReadIndirect;
+    const bool fetched = Fetch(target, ib, size);
+    Native::R6::g_read_site = Native::R6::kReadOther;
+    if (!fetched) {
         return Fail(q, CpErrorKind::IndirectUnreadable, addr, op, n, fmt::format("{} dwords at {:#x}", size, ib));
     }
     if (chain) {

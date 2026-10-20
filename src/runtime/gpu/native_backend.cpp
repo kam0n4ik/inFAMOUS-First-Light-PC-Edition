@@ -1,5 +1,6 @@
 // SecondSonPC — SecondSonPC's own GPU backend (P4.4). See native_backend.h.
 #include <windows.h>
+#include <intrin.h>
 
 #include "runtime/gpu/native_backend.h"
 
@@ -33,6 +34,7 @@
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/cpu_sampler.h"
+#include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
@@ -90,9 +92,14 @@ public:
             // (the executor's list is the recording thread's while records are queued: the queued copies and what it
             // held when the queue was last empty decide; a possible overlap drains, then the executor decides)
             if (parallel->TimelinePending(addr, bytes)) {
+                const u64 t0 = R6::Opt().diag ? __rdtsc() : 0; // (R6-P diagnostics)
                 parallel->Drain(DrainReason::MemoryRead);
-                if (executor->TimelineWritePending(addr, bytes)) {
+                const bool sync = executor->TimelineWritePending(addr, bytes);
+                if (sync) {
                     executor->SyncFromMemoryRead();
+                }
+                if (t0 != 0) {
+                    R6::NoteTimelineRead(addr, bytes, sync, __rdtsc() - t0);
                 }
             }
         } else if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {

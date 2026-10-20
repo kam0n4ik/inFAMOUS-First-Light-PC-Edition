@@ -3,12 +3,15 @@
 
 #include "runtime/gpu/cp_r6_opt.h"
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
 #include "base/log.h"
+#include "runtime/kernel/clock.h"
 
 namespace SecondSon::Gpu::Native::R6 {
 namespace {
@@ -24,6 +27,10 @@ Options Parse() {
     const std::string pf = Env("SSPC_R6_CP_PREFETCH");
     o.prefetch_skip = pf == "skip" || pf == "1";
     o.diag = Env("SSPC_R6_CP_DIAG") == "1";
+    o.run_pool = Env("SSPC_R6_CP_RUN_POOL") == "1";
+    if (o.run_pool) {
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R6_CP_RUN_POOL=1 - long runs' member vectors pooled between the threads");
+    }
     if (o.prefetch_skip) {
         SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R6_CP_PREFETCH=skip - Gnm's L2 prefetches (CP_DMA_READ_TAGS) are not "
                                "queued to the recording thread");
@@ -93,9 +100,79 @@ void NoteWalk(u32 stage, u64 program_address, const u32* user_data, const u32* f
     m.prev_program = program_address;
 }
 
+namespace {
+std::mutex g_pool_mutex;
+std::vector<std::vector<Cp::RunMember>> g_pool; // (empty vectors with their capacity)
+} // namespace
+
+bool TakeMembers(std::vector<Cp::RunMember>& v) {
+    std::vector<Cp::RunMember> p;
+    {
+        std::scoped_lock lock{g_pool_mutex};
+        if (g_pool.empty()) {
+            Bump(Count().pool_empty);
+            return false;
+        }
+        p = std::move(g_pool.back());
+        g_pool.pop_back();
+    }
+    if (p.capacity() <= v.capacity()) {
+        Bump(Count().pool_empty);
+        std::scoped_lock lock{g_pool_mutex};
+        g_pool.push_back(std::move(p)); // (back: not larger than this one; the counters stay single-writer)
+        return false;
+    }
+    p.assign(v.begin(), v.end());
+    v.swap(p);
+    Bump(Count().pool_taken);
+    return true;
+}
+
+void GiveMembers(std::vector<Cp::RunMember>& v) {
+    v.clear();
+    {
+        std::scoped_lock lock{g_pool_mutex};
+        if (g_pool.size() < kPooled) {
+            g_pool.push_back(std::move(v));
+            v = {};
+            Bump(Count().pool_given);
+            return;
+        }
+    }
+    std::vector<Cp::RunMember>().swap(v);
+    Bump(Count().pool_freed);
+}
+
+namespace {
+struct ReadAt {
+    u64 drained = 0, synced = 0, ticks = 0, bytes = 0;
+    u8 site = 0;
+};
+std::mutex g_reads_mutex; // (the processor's thread writes, the report reads)
+std::unordered_map<u64, ReadAt> g_reads;
+constexpr std::string_view kSiteNames[5] = {"other", "submission", "indirect buffer", "DMA source", "wait poll"};
+} // namespace
+
+void NoteTimelineRead(u64 addr, u64 bytes, bool synced, u64 ticks) {
+    Counters& c = Count();
+    const u32 site = g_read_site < kReadSites ? g_read_site : 0;
+    Bump(c.tread_drained[site]);
+    Bump(c.tread_synced[site], synced ? 1 : 0);
+    Bump(c.tread_ticks[site], ticks);
+    std::scoped_lock lock{g_reads_mutex};
+    if (g_reads.size() < 4096 || g_reads.contains(addr)) {
+        ReadAt& r = g_reads[addr];
+        ++r.drained;
+        r.synced += synced ? 1 : 0;
+        r.ticks += ticks;
+        r.bytes = bytes;
+        r.site = static_cast<u8>(site);
+    }
+}
+
 std::string Report() {
     const Options& o = Opt();
-    if (!o.prefetch_skip && !o.diag) {
+    if (!o.prefetch_skip && !o.diag && !o.run_pool) {
         return {};
     }
     Counters& c = Count();
@@ -104,6 +181,11 @@ std::string Report() {
                                   "(SSPC_R6_CP_PREFETCH={}) {} (while a run was held {})\n",
                                   o.prefetch_skip ? "skip" : "off", get(c.prefetch_skipped),
                                   get(c.prefetch_skipped_run_open));
+    if (o.run_pool) {
+        out += fmt::format("  long runs' member vectors (SSPC_R6_CP_RUN_POOL=1): taken from the pool {} (none larger there "
+                           "{}), given back {}, freed (the pool full) {}\n",
+                           get(c.pool_taken), get(c.pool_empty), get(c.pool_given), get(c.pool_freed));
+    }
     if (o.diag) {
         out += "  held runs published by a record of kind:";
         for (u32 k = 0; k < kKinds; ++k) {
@@ -126,6 +208,27 @@ std::string Report() {
                                get(c.walks[s]) != 0 ? static_cast<double>(get(c.walk_dwords[s])) / get(c.walks[s]) : 0.0,
                                get(c.walk_same_prog[s]), get(c.walk_eq_prev[s]), get(c.walk_eq_last[s]),
                                get(c.walk_ud_same_flat_diff[s]));
+        }
+        const double ms_per_tick = 1000.0 / static_cast<double>(Kernel::Clock::TscFrequency());
+        out += "  the processor's reads over a write on the GPU's timeline (drained / then waited for the GPU / ms):";
+        for (u32 s = 0; s < kReadSites; ++s) {
+            if (get(c.tread_drained[s]) != 0) {
+                out += fmt::format(" {} {}/{}/{:.0f};", kSiteNames[s], get(c.tread_drained[s]), get(c.tread_synced[s]),
+                                   static_cast<double>(get(c.tread_ticks[s])) * ms_per_tick);
+            }
+        }
+        out += "\n";
+        std::vector<std::pair<u64, ReadAt>> top;
+        {
+            std::scoped_lock lock{g_reads_mutex};
+            top.assign(g_reads.begin(), g_reads.end());
+        }
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+        for (size_t i = 0; i < top.size() && i < 12; ++i) {
+            const ReadAt& r = top[i].second;
+            out += fmt::format("    {:#x} ({} bytes, {}): drained {}, waited for the GPU {}, {:.0f} ms\n", top[i].first,
+                               r.bytes, kSiteNames[r.site], r.drained, r.synced,
+                               static_cast<double>(r.ticks) * ms_per_tick);
         }
     }
     return out;
