@@ -22,6 +22,8 @@ function OtherBench {
     (Test-Path $bench) -and -not ((Get-Content "$bench\owner.txt" -ErrorAction SilentlyContinue) -match "^$Owner ")
 }
 $lock = "E:\research\sspc_game.lock"
+# a build of any worktree (E:\research\sspc_build.ps1) holds this one; a run never starts during it
+$build = "E:\research\sspc_build.lock"
 $exe = "$Worktree\build\bin\SecondSonPC.exe"
 $run = Join-Path $Out $Tag
 New-Item -ItemType Directory -Force $run | Out-Null
@@ -31,7 +33,8 @@ New-Item -ItemType Directory -Force $run | Out-Null
 # game lock is taken only after neither lock has existed for -QuietSeconds.
 $quiet = $null
 while ($true) {
-    if ((OtherBench) -or (Test-Path $lock) -or (Get-Process SecondSonPC -ErrorAction SilentlyContinue)) {
+    if ((OtherBench) -or (Test-Path $lock) -or (Test-Path $build) -or
+        (Get-Process SecondSonPC -ErrorAction SilentlyContinue)) {
         $quiet = $null; Start-Sleep -Seconds 30; continue
     }
     if ($null -eq $quiet) { $quiet = Get-Date }

@@ -190,10 +190,31 @@ struct CallIO { // a call out of recompiled code
 };
 static_assert(sizeof(CallIO) == 0x100, "CallIO layout is shared with recomp_call");
 // Verification on the host records a function's calls instead of making them: for the calling thread, a call to
-// `from` goes to `to` (recomp_set_redirect(0, 0) clears). One TLS read per call made.
-static thread_local u64 t_redirect_from = 0, t_redirect_to = 0;
-extern "C" __declspec(dllexport) void recomp_set_redirect(u64 from, u64 to) { t_redirect_from = from; t_redirect_to = to; }
-INL u64 call_target(u64 t) { return t_redirect_from != 0 && t == t_redirect_from ? t_redirect_to : t; }
+// `from` goes to `to` (up to 32 targets - the CUE commit 0x14ad0 has 22; recomp_set_redirect(from, 0) drops one, (0, 0)
+// clears all). One TLS read per call made when none is set.
+static thread_local u32 t_redirects = 0;
+static thread_local u64 t_redirect_from[32] = {}, t_redirect_to[32] = {};
+extern "C" __declspec(dllexport) void recomp_set_redirect(u64 from, u64 to) {
+    if (from == 0) { t_redirects = 0; return; }
+    for (u32 i = 0; i < t_redirects; ++i) {
+        if (t_redirect_from[i] != from) continue;
+        if (to != 0) { t_redirect_to[i] = to; return; }
+        --t_redirects; t_redirect_from[i] = t_redirect_from[t_redirects]; t_redirect_to[i] = t_redirect_to[t_redirects];
+        return;
+    }
+    if (to != 0 && t_redirects < 32) { t_redirect_from[t_redirects] = from; t_redirect_to[t_redirects++] = to; }
+}
+// The whole table at once (R5-E): replaces what was set; n = 0 clears; more than 32 - refused (returns 0), unchanged.
+extern "C" __declspec(dllexport) int recomp_set_redirects(const u64* from, const u64* to, u32 n) {
+    if (n > 32) return 0;
+    for (u32 i = 0; i < n; ++i) { t_redirect_from[i] = from[i]; t_redirect_to[i] = to[i]; }
+    t_redirects = n;
+    return 1;
+}
+INL u64 call_target(u64 t) {
+    for (u32 i = 0; i < t_redirects; ++i) if (t == t_redirect_from[i]) return t_redirect_to[i];
+    return t;
+}
 // System V call with every argument register, XMM0-7 and 32 stack slots copied from the private stack; the callee runs
 // on the real stack. System V callee-saved registers are kept by the callee itself.
 extern "C" __attribute__((naked, sysv_abi)) void recomp_call(CallIO*) {
@@ -339,6 +360,10 @@ class Emitter:
             for name in (fix[:2] if fix else ()):  # the scalar fix reads src1 and writes dst whole
                 off = self.regoff(name)[0]
                 regs.add((off, off + 16))
+            m = re.match(r"V?CVTT?S[SD]2SI (E[A-Z]{2}|R\d+D),", ins["text"])
+            if m and m.group(1) in self.GPR32:  # R5-E: the zero-extension writes the 64-bit register
+                off = self.regoff(self.GPR32[m.group(1)])[0]
+                regs.add((off, off + 8))
             for o in ins["pcode"]:
                 for v in [o["out"]] + o["in"]:
                     if v is None:
@@ -361,6 +386,8 @@ class Emitter:
         if space == "const":
             if n > 8:
                 raise blocked("INSTRUCTION", "a %d-byte constant" % n)
+            if n == 8 and getattr(self, "lea_target", None) is not None and off == self.lea_target:
+                return "(B + 0x%xull)" % off
             return "0x%xull" % (off & ((1 << (8 * n)) - 1))
         if space in ("register", "unique"):
             a, o = self.acc(v)
@@ -509,17 +536,23 @@ class Emitter:
             return self.write(out, "(static_cast<u64>(sx(%s, %d) >> ((%s) >= %d ? %d : (%s))) & mask(%d))"
                               % (self.read(ins_[0]), ins_[0][2], self.read(ins_[1]), 8 * ins_[0][2],
                                  8 * ins_[0][2] - 1, self.read(ins_[1]), n))
+        # DIV / IDIV r8-r32: SLEIGH divides the double-width dividend (AX, DX:AX, EDX:EAX) and truncates the quotient;
+        # the CPU raises #DE when it does not fit the operand size (r64: udiv128 / sdiv128 check it)
+        half = ins_[0][2] // 2 if getattr(self, "cur_mnemonic", None) in ("DIV", "IDIV") and ins_[0][2] in (2, 4, 8) else 0
         if name in ("INT_DIV", "INT_REM"):
             sym = "/" if name == "INT_DIV" else "%"
-            return self.write(out, "[&]{ const u64 a_ = %s & mask(%d), b_ = %s & mask(%d); if (b_ == 0) recomp_fault(); "
+            fits = " if (((a_ / b_) >> %d) != 0) recomp_fault();" % (8 * half) if half else ""
+            return self.write(out, "[&]{ const u64 a_ = %s & mask(%d), b_ = %s & mask(%d); if (b_ == 0) recomp_fault();%s "
                                    "return (a_ %s b_) & mask(%d); }()" % (self.read(ins_[0]), ins_[0][2], self.read(ins_[1]),
-                                                                        ins_[1][2], sym, n))
+                                                                        ins_[1][2], fits, sym, n))
         if name in ("INT_SDIV", "INT_SREM"):
             sym = "/" if name == "INT_SDIV" else "%"
             m = ins_[0][2]
+            fits = " if (a_ / b_ != sx(static_cast<u64>(a_ / b_) & mask(%d), %d)) recomp_fault();" % (half, half) \
+                if half else ""
             return self.write(out, "[&]{ const s64 a_ = sx(%s, %d), b_ = sx(%s, %d); if (b_ == 0 || (b_ == -1 && a_ == "
-                                   "sx(1ull << (8 * %d - 1), %d))) recomp_fault(); return static_cast<u64>(a_ %s b_) & mask(%d); }()"
-                              % (self.read(ins_[0]), m, self.read(ins_[1]), m, m, m, sym, n))
+                                   "sx(1ull << (8 * %d - 1), %d))) recomp_fault();%s return static_cast<u64>(a_ %s b_) & mask(%d); }()"
+                              % (self.read(ins_[0]), m, self.read(ins_[1]), m, m, m, fits, sym, n))
         if name == "INT_NEGATE":
             return self.write(out, "((~%s) & mask(%d))" % (self.read(ins_[0]), n))
         if name == "INT_2COMP":
@@ -752,16 +785,53 @@ class Emitter:
 
     # --- the stack frame: private stack depth and the caller's stack arguments ---------------------------------
     def frame(self):
+        """R5-E: `AND RSP, -2^k` (an aligned frame, 0x1a2030) moves RSP down by 0..2^k-1 bytes, unknown statically.
+        The analysis runs twice, with the AND moving RSP by 0 and by 2^k-1 (every real case lies between and the
+        checks are monotonic in the offset); the frame is the deeper, the arguments the farther of the two."""
+        self.and_shift = False
+        d0, a0 = self.frame_pass()
+        if not self.saw_and:
+            return d0, a0
+        self.and_shift = True
+        d1, a1 = self.frame_pass()
+        self.stats["aligned_frame"] = 1
+        return max(d0, d1), max(a0, a1)
+
+    def frame_pass(self):
+        self.saw_and = False
         rsp = ("register",) + tuple(self.regoff("RSP"))
         rbp = ("register",) + tuple(self.regoff("RBP"))
         at = {self.entry: (0, None)}
-        lowest, arg_end = 0, 0
-        cur = (0, None)
         key = lambda v: tuple(v) if v else None
-        for ins in self.f["instructions"]:
-            state = at.get(ins["addr"], cur)
-            if state is None:
-                raise blocked("ABI", "stack depth unknown at %#x" % ins["addr"])
+        # R5-E: repeated linear passes until no new block state appears (a block reached only by a later backward
+        # jump, 0x1a2030 at 0x1a2eb7, is known from the second pass on)
+        for _round in range(256):
+            n_known = len(at)
+            unknown = None
+            lowest, arg_end = 0, 0
+            cur = (0, None)
+            for ins in self.f["instructions"]:
+                state = at.get(ins["addr"], cur)
+                if state is None:
+                    unknown = unknown or ins["addr"]
+                    cur = None
+                    continue
+                r = self.frame_insn(ins, state, at, rsp, rbp, key)
+                lowest = min(lowest, r[0])
+                arg_end = max(arg_end, r[1])
+                cur = r[2]
+            if unknown is None or len(at) == n_known:
+                break
+        if unknown is not None:
+            raise blocked("ABI", "stack depth unknown at %#x" % unknown)
+        if self.arg_escape:
+            arg_end = max(arg_end, 256)  # the caller's arguments may be read through an address not followed
+        return -lowest, (arg_end + 7) & ~7
+
+    def frame_insn(self, ins, state, at, rsp, rbp, key):
+        """One instruction of frame_pass: (lowest depth seen, end of the argument bytes read, the fall-through state)."""
+        lowest, arg_end = 0, 0
+        if True:
             d, frame_ptr = state
             env = {rsp: d}
             if frame_ptr is not None:
@@ -778,6 +848,13 @@ class Emitter:
                 elif o["op"] == "INT_ADD" and key(ins_[1]) in env and ins_[0][0] == "const":  # [RSP + d]: #d first
                     c = signed(ins_[0][1]) if ins_[0][2] == 8 else ins_[0][1]
                     val = env[key(ins_[1])] + c
+                elif o["op"] == "INT_AND" and key(ins_[0]) == rsp and ins_[1][0] == "const" and ins_[1][2] == 8 and \
+                        out is not None and key(out) == rsp:
+                    m = signed(ins_[1][1])
+                    if m >= 0 or (-m) & (-m - 1) or -m > 4096:
+                        raise blocked("ABI", "RSP masked by %#x at %#x" % (ins_[1][1], ins["addr"]))
+                    self.saw_and = True  # aligned frame: RSP moves down by 0 .. -m-1 (see frame())
+                    val = env[rsp] - ((-m - 1) if self.and_shift else 0)
                 elif o["op"] in ("LOAD", "STORE") and key(ins_[1]) in env:
                     a = env[key(ins_[1])]
                     size = out[2] if o["op"] == "LOAD" else ins_[2][2]
@@ -816,12 +893,15 @@ class Emitter:
                     if t in at and at[t][0] != d_end:
                         raise blocked("ABI", "stack depth differs at %#x" % t)
                     at[t] = (d_end, fp_end)
+                if o["op"] == "BRANCHIND":  # R5-E: a switch's targets inherit the depth (0x451440, 0x612150)
+                    for t in ins.get("targets", []):
+                        if t in self.addrs:
+                            if t in at and at[t][0] != d_end:
+                                raise blocked("ABI", "stack depth differs at %#x" % t)
+                            at[t] = (d_end, fp_end)
             ends = any(o["op"] in ("RETURN", "BRANCH", "BRANCHIND") for o in ins["pcode"]) and \
                 not any(o["op"] == "CBRANCH" for o in ins["pcode"])
-            cur = None if ends else (d_end, fp_end)
-        if self.arg_escape:
-            arg_end = max(arg_end, 256)  # the caller's arguments may be read through an address not followed
-        return -lowest, (arg_end + 7) & ~7
+            return lowest, arg_end, (None if ends else (d_end, fp_end))
 
     def note_escape(self, offset):
         """A stack address leaves the analysis. Below the entry rsp it points into the private frame (S, real memory):
@@ -900,9 +980,18 @@ class Emitter:
         return af is not None and any(v and v[0] == "register" and v[1] == af[0]
                                       for ins in self.f["instructions"] for o in ins["pcode"] for v in o["in"])
 
+    GPR32 = {"EAX": "RAX", "EBX": "RBX", "ECX": "RCX", "EDX": "RDX", "ESI": "RSI", "EDI": "RDI", "EBP": "RBP",
+             "ESP": "RSP", **{"R%dD" % i: "R%d" % i for i in range(8, 16)}}
+
     def emit_instruction(self, ins):
         fix = self.scalar_fix(ins)
         body = self.emit_ops(ins)
+        # R5-E: SLEIGH's (V)CVT(T)SS2SI / SD2SI with a 32-bit destination writes the 32-bit register only; x86 zeroes
+        # bits 63:32 of the 64-bit register (generator_issues/cvt_gpr32)
+        m = re.match(r"V?CVTT?S[SD]2SI (E[A-Z]{2}|R\d+D),", ins["text"])
+        if m and m.group(1) in self.GPR32:
+            o = self.reg(self.GPR32[m.group(1)], 8)
+            body = body + ["    st(R, %d, 8, ld(R, %d, 4));  // zero-extend %s" % (o, o, m.group(1))]
         if fix is None:
             return body
         d, s1, n = self.reg(fix[0], 16), self.reg(fix[1], 16), fix[2]
@@ -911,6 +1000,11 @@ class Emitter:
 
     def emit_ops(self, ins):
         L = []
+        # R5-E: LEA of an absolute / RIP-relative operand is a COPY of the eboot-relative address in P-code: that
+        # constant is an address of the image and is rebased like a ram varnode (generator_issues/lea_rip)
+        m = re.match(r"LEA \w+,\[0x([0-9a-f]+)\]$", ins["text"]) if ins["mnemonic"] == "LEA" else None
+        self.lea_target = int(m.group(1), 16) if m else None
+        self.cur_mnemonic = ins["mnemonic"]
         ops = ins["pcode"]
         self.stats["pcode"] += len(ops)
         internal = set()

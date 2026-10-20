@@ -360,7 +360,17 @@ int LiftCheck(u64 image_base, u64 image_size, const std::string& dll, u64 trials
         bool skip = false;
         for (u8 i = 0; i < insn.operand_count; ++i) {
             const ZydisDecodedOperand& op = ops[i];
-            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || op.mem.type == ZYDIS_MEMOP_TYPE_AGEN) {
+            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+                continue;
+            }
+            if (op.mem.type == ZYDIS_MEMOP_TYPE_AGEN) {
+                // LEA reg, [rip + d]: no memory read, but the stub's copy must compute the same image address (R5-E)
+                if (op.mem.base == ZYDIS_REGISTER_RIP) {
+                    ZyanU64 t = 0;
+                    ZydisCalcAbsoluteAddress(&insn, &op, image_base + le.addr, &t);
+                    rip_target = t;
+                    disp_offset = insn.raw.disp.offset;
+                }
                 continue;
             }
             if (op.mem.type != ZYDIS_MEMOP_TYPE_MEM || op.mem.segment == ZYDIS_REGISTER_FS ||
