@@ -1,10 +1,14 @@
 // SecondSonPC — standalone tests of the PC settings and screenshots of the menu, without the game and without the
 // bridge (docs/PC_SETTINGS_IMPLEMENTATION.md §8). Builds from SecondSonPC's own sources only.
-//   sspc_settings_tests [--out <dir>] [--no-shots] [--demo <seconds>]
+//   sspc_settings_tests [--out <dir>] [--no-shots] [--demo <seconds>] [--stress <cycles>]
 //     checks        the same checks as --selftest group Settings/Input/Ui -> stdout, exit code = failures
-//     screenshots   the menu rendered by the Win32 overlay's renderer at 720p..4K, Russian/English -> <out>\*.png
+//     screenshots   the window rendered by the Win32 overlay's renderer: every page, 720p..4K, 21:9, Russian/English,
+//                   the three hint styles, lists, dialogs -> <out>\*.png; build+render times (1080p, 4K)
 //     --demo <s>    a real window with the overlay over it for <s> seconds (keyboard/mouse drive the menu), then a
 //                   screen capture of the window area -> <out>\demo_window.png (DWM composites the layered windows)
+//     --stress <n>  a real window: the settings window opened, drawn and closed n times; GDI/USER objects, handles
+//                   and private memory before and after (leaks)
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -15,6 +19,7 @@
 #include <SDL3/SDL.h>
 #include <windows.h>
 #include <objbase.h>
+#include <psapi.h>
 #include <wincodec.h>
 
 #include "app/config.h"
@@ -87,8 +92,44 @@ App::Config TestConfig() {
     return c;
 }
 
-constexpr u32 kAllCaps = Settings::Capability::Window | Settings::Capability::BridgePresenter |
-                         Settings::Capability::LiveVolume | Settings::Capability::RealController;
+// the native backend (the default) on a GPU with DLSS and FSR frame generation; the bridge's presenter for comparison
+constexpr u32 kNative = Settings::Capability::Window | Settings::Capability::LiveVolume |
+                        Settings::Capability::RealController | Settings::Capability::RenderScale |
+                        Settings::Capability::FrameLimiter | Settings::Capability::FpsCounter |
+                        Settings::Capability::Dlss | Settings::Capability::FsrFrameGen | Settings::Capability::Reflex;
+constexpr u32 kNoRtx = kNative & ~(Settings::Capability::Dlss | Settings::Capability::Reflex);
+constexpr u32 kBridge = Settings::Capability::Window | Settings::Capability::BridgePresenter |
+                        Settings::Capability::LiveVolume | Settings::Capability::RealController |
+                        Settings::Capability::FpsCounter;
+
+Ui::MenuEnv ShotEnv(float w, float h, bool ru, u32 caps, Input::PromptStyle prompts) {
+    Ui::MenuEnv env;
+    env.width = w;
+    env.height = h;
+    env.ru = ru;
+    env.prompts = prompts;
+    env.device_label = prompts == Input::PromptStyle::PlayStation ? "Wireless Controller (DualShock 4)"
+                       : prompts == Input::PromptStyle::Xbox      ? "Xbox Wireless Controller"
+                       : ru                                       ? "Клавиатура и мышь"
+                                                                  : "Keyboard and mouse";
+    env.backend_label = (caps & Settings::Capability::BridgePresenter) != 0
+                            ? (ru ? "мост shadPS4 (--gpu-backend bridge)" : "shadPS4 bridge (--gpu-backend bridge)")
+                            : (ru ? "собственный Vulkan SecondSonPC" : "SecondSonPC's own Vulkan");
+    env.displays = {"DELL U2720Q", "Generic PnP Monitor"};
+    env.audio_devices = {"Динамики (Realtek High Definition Audio)", "Наушники (HyperX Cloud II)"};
+    env.window_sizes = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}};
+    env.shader_cache_size = "25 + 17 MiB (vulkan.bin) / 2048 MiB"; // (P4.14: as the host shows it)
+    env.shader_cache_content = ru ? "шейдеров: 833, конвейеров: 585" : "833 shaders, 585 pipelines";
+    env.shader_cache_run = ru ? "заранее 546 из 546 (0,9 с), из кэша: 793, новых: 39"
+                              : "prepared 546 of 546 (0.9 s), read 793, new 39";
+    env.settings_file = "C:\\Users\\player\\AppData\\Local\\SecondSonPC\\settings.toml";
+    env.render_label = ru ? "1920 × 1080 (без масштабирования)" : "1920 × 1080 (native)";
+    if ((caps & Settings::Capability::Dlss) == 0) {
+        env.dlss_why = "no NGX device";
+    }
+    env.now_ns = 1'000'000'000;
+    return env;
+}
 
 int Shots(const fs::path& out) {
     Ui::Win32Overlay overlay;
@@ -98,50 +139,38 @@ int Shots(const fs::path& out) {
         return 1;
     }
     int failures = 0;
-    bool game_page = false; // the PC Edition's "Additional settings" page over the game's Settings panel
-    const auto shot = [&](const char* name, float w, float h, bool ru, Settings::Category cat, u32 caps,
-                          Input::PromptStyle prompts, const char* focus, int action) {
+    enum Action { None, Accept, Conflict, ListDown, Restart };
+    const auto shot = [&](const char* name, float w, float h, bool ru, Ui::Page page, u32 caps,
+                          Input::PromptStyle prompts, const char* focus, Action action, float dpi = 1.0f) {
         Settings::Service s;
         const auto c = TestConfig();
         s.Init(c, {}, c, {}, caps);
         Ui::SettingsMenu menu(s);
-        Ui::MenuEnv env;
-        env.width = w;
-        env.height = h;
-        env.ru = ru;
-        env.prompts = prompts;
-        env.device_label = prompts == Input::PromptStyle::PlayStation ? "PS4 Controller"
-                           : ru                                      ? "Клавиатура и мышь"
-                                                                     : "Keyboard and mouse";
-        env.backend_label = (caps & Settings::Capability::BridgePresenter) != 0
-                                ? (ru ? "мост shadPS4 (по умолчанию)" : "shadPS4 bridge (default)")
-                                : (ru ? "собственный SecondSonPC (экспериментальный)" : "SecondSonPC's own (experimental)");
-        env.displays = {"DELL U2720Q", "Generic PnP Monitor"};
-        env.window_sizes = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}};
-        env.shader_cache_size = "25 + 17 MiB (vulkan.bin) / 2048 MiB"; // (P4.14: as the host shows it)
-        env.shader_cache_content = ru ? "шейдеров: 833, конвейеров: 585" : "833 shaders, 585 pipelines";
-        env.shader_cache_run = ru ? "заранее 546 из 546 (0.9 с), из кэша: 793, новых: 39"
-                                  : "prepared 546 of 546 (0.9 s), read 793, new 39";
-        env.now_ns = 1'000'000'000;
-        if (game_page) {
-            const float k = w / 1920.0f;
-            env.game_panel = {315.0f * k, 92.0f * k, 742.0f * k, 895.0f * k};
-        }
+        auto env = ShotEnv(w, h, ru, caps, prompts);
+        env.dpi_scale = dpi;
         menu.SetEnv(env);
         menu.Open();
-        if (!game_page) {
-            menu.SelectCategory(cat);
+        menu.SelectPage(page);
+        if (action == Restart) {
+            menu.Focus("game.enterButton");
+            menu.OnNav(Ui::Nav::Right); // a restart setting changed (the header's notice, the row's badge)
+            menu.Focus("game.language");
+            menu.OnNav(Ui::Nav::Right);
         }
         if (focus != nullptr) {
             menu.Focus(focus);
         }
-        if (action == 1) {
-            menu.OnNav(Ui::Nav::Accept); // capture / confirmation dialog
-        } else if (action == 2) {
+        if (action == Accept || action == ListDown) {
+            menu.OnNav(Ui::Nav::Accept); // a key capture, a dialog or a drop-down list
+            if (action == ListDown) {
+                menu.OnNav(Ui::Nav::Down);
+            }
+        } else if (action == Conflict) {
             menu.OnNav(Ui::Nav::Accept);
             menu.OnCaptureInput({Input::InputCode::Kind::Key, static_cast<u16>(SDL_SCANCODE_E)}); // a conflict
         }
         Ui::DrawList list;
+        menu.Build(overlay.Measure(), list); // (layout: the second build has the scroll in place)
         const auto t0 = std::chrono::steady_clock::now();
         menu.Build(overlay.Measure(), list);
         std::vector<std::uint32_t> px;
@@ -151,42 +180,70 @@ int Shots(const fs::path& out) {
         unsigned fw = 0, fh = 0;
         const auto full = Composite(list, px, sw, sh, fw, fh);
         const bool saved = rendered && SavePng(out / name, full, fw, fh);
-        std::printf("%s  shot %-34s %4.0fx%-4.0f surface %ux%u, build+render %.1f ms\n", saved ? "PASS" : "FAIL", name, w,
-                    h, sw, sh, ms);
+        std::printf("%s  shot %-36s %4.0fx%-4.0f surface %ux%u, %zu commands, build+render %.1f ms\n",
+                    saved ? "PASS" : "FAIL", name, w, h, sw, sh, list.Commands().size(), ms);
         failures += saved ? 0 : 1;
     };
-    using C = Settings::Category;
+    using G = Ui::Page;
     using P = Input::PromptStyle;
-    shot("ru_1080_display.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_1080_graphics.png", 1920, 1080, true, C::Graphics, kAllCaps, P::Keyboard, "graphics.fsr", 0);
-    shot("ru_1080_graphics_sspc.png", 1920, 1080, true, C::Graphics,
-         Settings::Capability::Window | Settings::Capability::LiveVolume | Settings::Capability::RealController,
-         P::Keyboard, "graphics.fsr", 0);
-    shot("ru_1080_audio.png", 1920, 1080, true, C::Audio, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_1080_mouse.png", 1920, 1080, true, C::Controls, kAllCaps, P::Keyboard, "input.mouseSensitivity", 0);
-    shot("ru_1080_keys.png", 1920, 1080, true, C::Keyboard, kAllCaps, P::Keyboard, "keyboard.touchTwoFingers", 0);
-    shot("ru_1080_keys_capture.png", 1920, 1080, true, C::Keyboard, kAllCaps, P::Keyboard, "keyboard.cross", 1);
-    shot("ru_1080_keys_conflict.png", 1920, 1080, true, C::Keyboard, kAllCaps, P::Keyboard, "keyboard.cross", 2);
-    shot("ru_1080_gamepad_ps.png", 1920, 1080, true, C::Gamepad, kAllCaps, P::PlayStation, nullptr, 0);
-    shot("ru_1080_interface_xbox.png", 1920, 1080, true, C::Interface, kAllCaps, P::Xbox, nullptr, 0);
-    shot("ru_1080_game.png", 1920, 1080, true, C::Game, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_1080_shaders.png", 1920, 1080, true, C::Shaders, kAllCaps, P::Keyboard, "cmd.clear_shaders", 0);
-    shot("ru_1080_upscaling.png", 1920, 1080, true, C::Upscaling, kAllCaps | Settings::Capability::RenderScale | Settings::Capability::Dlss |
-             Settings::Capability::FsrFrameGen, P::Keyboard,
-         "upscaling.upscaler", 0);
-    shot("ru_1080_confirm_display.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, "display.fullscreen", 1);
-    shot("en_1080_display.png", 1920, 1080, false, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_720_display.png", 1280, 720, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_1440_mouse.png", 2560, 1440, true, C::Controls, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_2160_keys.png", 3840, 2160, true, C::Keyboard, kAllCaps, P::PlayStation, nullptr, 0);
-    game_page = true;
-    shot("ru_1080_page.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, nullptr, 0);
-    shot("ru_1080_page_upscaling.png", 1920, 1080, true, C::Upscaling, kAllCaps | Settings::Capability::Dlss,
-         P::Keyboard, "upscaling.sharpness", 0);
-    shot("ru_1080_page_keys.png", 1920, 1080, true, C::Keyboard, kAllCaps, P::Keyboard, "keyboard.cross", 1);
-    shot("ru_1080_page_confirm.png", 1920, 1080, true, C::Display, kAllCaps, P::Keyboard, "display.fullscreen", 1);
-    shot("en_900_page.png", 1600, 900, false, C::Display, kAllCaps, P::Keyboard, "audio.volume", 0);
-    game_page = false;
+    // every page at 1080p (Russian, keyboard hints), with its typical focus
+    shot("ru_1080_graphics.png", 1920, 1080, true, G::Graphics, kNative, P::Keyboard, "upscaling.quality", None);
+    shot("ru_1080_graphics_list.png", 1920, 1080, true, G::Graphics, kNoRtx, P::Keyboard, "upscaling.upscaler", ListDown);
+    shot("ru_1080_graphics_bridge.png", 1920, 1080, true, G::Graphics, kBridge, P::Keyboard, "graphics.fsr", None);
+    shot("ru_1080_display.png", 1920, 1080, true, G::Display, kNative, P::Keyboard, "display.frameRateLimit", None);
+    shot("ru_1080_display_confirm.png", 1920, 1080, true, G::Display, kNative, P::Keyboard, "display.fullscreen", Accept);
+    shot("ru_1080_display_sizes.png", 1920, 1080, true, G::Display, kNative, P::Keyboard, "window.size", Accept);
+    shot("ru_1080_controls.png", 1920, 1080, true, G::Controls, kNative, P::Keyboard, "input.mouseSensitivity", None);
+    shot("ru_1080_controls_ps.png", 1920, 1080, true, G::Controls, kNative, P::PlayStation, "gamepad.vibration", None);
+    shot("ru_1080_keys.png", 1920, 1080, true, G::Keys, kNative, P::Keyboard, "keyboard.cross", None);
+    shot("ru_1080_keys_capture.png", 1920, 1080, true, G::Keys, kNative, P::Keyboard, "keyboard.cross", Accept);
+    shot("ru_1080_keys_conflict.png", 1920, 1080, true, G::Keys, kNative, P::Keyboard, "keyboard.cross", Conflict);
+    shot("ru_1080_audio.png", 1920, 1080, true, G::Audio, kNative, P::Keyboard, "audio.volume", None);
+    shot("ru_1080_game.png", 1920, 1080, true, G::Game, kNative, P::Xbox, "interface.prompts", Restart);
+    shot("ru_1080_advanced.png", 1920, 1080, true, G::Advanced, kNative, P::Keyboard, "display.showFps", None);
+    shot("ru_1080_advanced_cache.png", 1920, 1080, true, G::Advanced, kNative, P::Keyboard, "cmd.clear_shaders", None);
+    shot("ru_1080_reset.png", 1920, 1080, true, G::Audio, kNative, P::Keyboard, "reset.page", Accept);
+    // English, other sizes and proportions, display scale
+    shot("en_1080_graphics.png", 1920, 1080, false, G::Graphics, kNative, P::Keyboard, "upscaling.frameGeneration", None);
+    shot("en_1080_keys.png", 1920, 1080, false, G::Keys, kNative, P::Xbox, "keyboard.l3", None);
+    shot("ru_720_graphics.png", 1280, 720, true, G::Graphics, kNative, P::Keyboard, nullptr, None);
+    shot("ru_720_controls.png", 1280, 720, true, G::Controls, kNative, P::PlayStation, "gamepad.menuButton", None);
+    shot("ru_1440_display.png", 2560, 1440, true, G::Display, kNative, P::Keyboard, nullptr, None);
+    shot("ru_2160_keys.png", 3840, 2160, true, G::Keys, kNative, P::PlayStation, "keyboard.touchTwoFingers", None);
+    shot("ru_2160_graphics_dpi150.png", 3840, 2160, true, G::Graphics, kNative, P::Keyboard, nullptr, None, 1.5f);
+    shot("ru_2560x1080_display.png", 2560, 1080, true, G::Display, kNative, P::Keyboard, nullptr, None);
+    shot("ru_1024x768_advanced.png", 1024, 768, true, G::Advanced, kNative, P::Keyboard, nullptr, None);
+    shot("ru_800x600_graphics.png", 800, 600, true, G::Graphics, kNative, P::Keyboard, nullptr, None);
+
+    // cost: a build + a render of one picture (what the host does per input / timer step), 1080p and 4K
+    for (const auto& [w, h] : {std::pair{1920.0f, 1080.0f}, std::pair{3840.0f, 2160.0f}}) {
+        Settings::Service s;
+        const auto c = TestConfig();
+        s.Init(c, {}, c, {}, kNative);
+        Ui::SettingsMenu menu(s);
+        menu.SetEnv(ShotEnv(w, h, true, kNative, P::Keyboard));
+        menu.Open();
+        Ui::DrawList list;
+        std::vector<std::uint32_t> px;
+        unsigned sw = 0, sh = 0;
+        double total = 0, worst = 0, build_total = 0;
+        constexpr int kRuns = 120;
+        for (int i = 0; i < kRuns; ++i) {
+            menu.SelectPage(static_cast<Ui::Page>(i % static_cast<int>(Ui::kPageCount)));
+            menu.OnNav(Ui::Nav::Down);
+            const auto t0 = std::chrono::steady_clock::now();
+            menu.Build(overlay.Measure(), list);
+            const auto t1 = std::chrono::steady_clock::now();
+            overlay.RenderToPixels(list, px, sw, sh);
+            const auto t2 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+            build_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            total += ms;
+            worst = std::max(worst, ms);
+        }
+        std::printf("PASS  cost %4.0fx%-4.0f: %d pictures, build %.2f ms + render, average %.2f ms, slowest %.2f ms\n",
+                    w, h, kRuns, build_total / kRuns, total / kRuns, worst);
+    }
     return failures;
 }
 
@@ -206,18 +263,15 @@ int Demo(const fs::path& out, int seconds) {
     }
     Settings::Service s;
     const auto c = TestConfig();
-    s.Init(c, {}, c, {}, kAllCaps);
+    s.Init(c, {}, c, {}, kNative);
     Ui::SettingsMenu menu(s);
     menu.Open();
     const auto env = [&] {
-        Ui::MenuEnv e;
         RECT cr{};
         GetClientRect(hwnd, &cr);
-        e.width = static_cast<float>(cr.right);
-        e.height = static_cast<float>(cr.bottom);
-        e.device_label = "Клавиатура и мышь";
+        Ui::MenuEnv e = ShotEnv(static_cast<float>(cr.right), static_cast<float>(cr.bottom), true, kNative,
+                                Input::PromptStyle::Keyboard);
         e.backend_label = "демонстрация без игры";
-        e.window_sizes = {{1280, 720}, {1600, 900}};
         e.now_ns = SDL_GetTicksNS();
         return e;
     };
@@ -244,6 +298,9 @@ int Demo(const fs::path& out, int seconds) {
                 case SDL_SCANCODE_RETURN: menu.OnNav(Ui::Nav::Accept); break;
                 case SDL_SCANCODE_ESCAPE: menu.OnNav(Ui::Nav::Back); break;
                 case SDL_SCANCODE_TAB: menu.OnNav(Ui::Nav::NextTab); break;
+                case SDL_SCANCODE_DELETE: menu.OnNav(Ui::Nav::Reset); break;
+                case SDL_SCANCODE_PAGEUP: menu.OnNav(Ui::Nav::PageUp); break;
+                case SDL_SCANCODE_PAGEDOWN: menu.OnNav(Ui::Nav::PageDown); break;
                 default:
                     if (menu.Capturing()) {
                         menu.OnCaptureInput({Input::InputCode::Kind::Key, static_cast<u16>(e.key.scancode)});
@@ -302,6 +359,82 @@ int Demo(const fs::path& out, int seconds) {
     return saved ? 0 : 1;
 }
 
+/// Opens, draws and closes the settings window `cycles` times over a real window (as the host does), then reports what
+/// the process holds before and after: GDI and USER objects, handles, private memory.
+int Stress(int cycles) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        std::printf("STRESS FAIL: SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    SDL_Window* window = SDL_CreateWindow("SecondSonPC settings stress (no game)", 1920, 1080, 0);
+    const auto hwnd = static_cast<HWND>(
+        SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    Ui::Win32Overlay overlay;
+    std::string error;
+    if (window == nullptr || hwnd == nullptr || !overlay.Init(error)) {
+        std::printf("STRESS FAIL: window/overlay %s\n", error.c_str());
+        return 1;
+    }
+    Settings::Service s;
+    const auto c = TestConfig();
+    s.Init(c, {}, c, {}, kNative);
+    Ui::SettingsMenu menu(s);
+    const auto usage = [] {
+        PROCESS_MEMORY_COUNTERS_EX pm{};
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof(pm));
+        DWORD handles = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &handles);
+        return std::array<double, 4>{static_cast<double>(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS)),
+                                     static_cast<double>(GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS)),
+                                     static_cast<double>(handles), static_cast<double>(pm.PrivateUsage) / 1048576.0};
+    };
+    const auto pump = [] {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    };
+    const auto cycle = [&](int i) {
+        auto e = ShotEnv(1920, 1080, true, kNative, Input::PromptStyle::Keyboard);
+        e.now_ns = SDL_GetTicksNS();
+        menu.SetEnv(e);
+        menu.Open();
+        menu.SelectPage(static_cast<Ui::Page>(i % static_cast<int>(Ui::kPageCount)));
+        for (int k = 0; k < 3; ++k) {
+            menu.OnNav(Ui::Nav::Down);
+            Ui::DrawList list;
+            menu.Build(overlay.Measure(), list);
+            overlay.Present(hwnd, list);
+        }
+        pump();
+        menu.Close();
+        overlay.Hide();
+        pump();
+    };
+    for (int i = 0; i < 20; ++i) {
+        cycle(i); // warm-up: the fonts, the text formats, the windows
+    }
+    const auto before = usage();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < cycles; ++i) {
+        cycle(i);
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto after = usage();
+    const bool ok = after[0] <= before[0] + 2 && after[1] <= before[1] + 2 && after[2] <= before[2] + 4 &&
+                    after[3] <= before[3] + 4.0;
+    const auto st = overlay.GetStats();
+    std::printf("%s  stress: %d open/draw x3/close cycles in %.0f ms (%.2f ms per cycle); GDI %g -> %g, USER %g -> %g, "
+                "handles %g -> %g, private %.1f -> %.1f MiB; renders %llu, average %.2f ms, slowest %.2f ms\n",
+                ok ? "PASS" : "FAIL", cycles, ms, ms / cycles, before[0], after[0], before[1], after[1], before[2],
+                after[2], before[3], after[3], static_cast<unsigned long long>(st.frames),
+                st.frames != 0 ? st.total_ms / static_cast<double>(st.frames) : 0.0, st.max_ms);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -309,6 +442,7 @@ int main(int argc, char** argv) {
     fs::path out = fs::current_path() / "settings_tests";
     bool shots = true;
     int demo = 0;
+    int stress = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--out" && i + 1 < argc) {
@@ -317,6 +451,8 @@ int main(int argc, char** argv) {
             shots = false;
         } else if (a == "--demo" && i + 1 < argc) {
             demo = std::atoi(argv[++i]);
+        } else if (a == "--stress" && i + 1 < argc) {
+            stress = std::atoi(argv[++i]);
         }
     }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -337,6 +473,9 @@ int main(int argc, char** argv) {
     }
     if (demo > 0) {
         failures += Demo(out, demo);
+    }
+    if (stress > 0) {
+        failures += Stress(stress);
     }
     std::printf("RESULT %s (%d failure(s))\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures;

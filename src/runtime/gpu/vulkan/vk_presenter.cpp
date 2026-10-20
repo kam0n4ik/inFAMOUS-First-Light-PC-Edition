@@ -146,7 +146,13 @@ void DrawOverlay(u8* px, std::string_view text) {
     }
 }
 
+std::atomic<bool> g_fps_counter_shown{true};
+
 } // namespace
+
+void SetFpsCounterShown(bool shown) {
+    g_fps_counter_shown.store(shown, std::memory_order_relaxed);
+}
 
 /// An image of the presenter's own (frame generation inputs), recreated for a size or format.
 struct OwnImage {
@@ -1169,7 +1175,8 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     }();
     const bool byte_format = m.swap_format == VK_FORMAT_B8G8R8A8_UNORM || m.swap_format == VK_FORMAT_B8G8R8A8_SRGB ||
                              m.swap_format == VK_FORMAT_R8G8B8A8_UNORM || m.swap_format == VK_FORMAT_R8G8B8A8_SRGB;
-    if (overlay_env && m.overlay_on && byte_format && m.extent.width >= kOverlayW + 8 &&
+    if (overlay_env && g_fps_counter_shown.load(std::memory_order_relaxed) && m.overlay_on && byte_format &&
+        m.extent.width >= kOverlayW + 8 &&
         m.extent.height >= kOverlayH + 8) {
         const auto now = std::chrono::steady_clock::now();
         if (show) {

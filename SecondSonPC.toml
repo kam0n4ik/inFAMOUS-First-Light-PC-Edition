@@ -81,7 +81,7 @@ shake = "X"                        # shakes the controller while held (spray can
 touchDrag = "T"                    # while held the mouse drags a finger on the touch pad
 touchTwoFingers = "C"              # while held: two fingers on the touch pad + its click (two-finger actions)
                                    # Mouse X1/X2 and "Wheel Up"/"Wheel Down" (a notch = one press) can be bound too;
-                                   # F1 (settings menu), F10 and F11 are SecondSonPC's and cannot be.
+                                   # F10 (FPS counter) and F11 (full screen) are SecondSonPC's and cannot be.
 
 [Graphics]                         # the bridge's presenter (with --gpu-backend sspc: P4.6)
 fsr = false                        # FSR 1.0 scaling of the game's 1920x1080 frame to a larger window
@@ -95,13 +95,14 @@ invertCameraX = false
 invertCameraY = false
 menuButton = "off"                 # PC settings are in the game's Settings screen (Esc / Options); a shortcut besides: "guide" (PS button) | "l3r3" (held 1 s) | "off"
 
-[Interface]                        # SecondSonPC's settings menu (F1)
+[Interface]                        # SecondSonPC's settings window (the game's Settings -> "Additional Settings")
 language = "auto"                  # "auto" (as [Language] system) | "ru" | "en"
-scale = 100                        # 75..200 %, relative to the window height / 1080
+scale = 100                        # 75..200 %: 100 = 900x700 at a 1080-pixel tall window (or the display scale)
 prompts = "auto"                   # button hints: "auto" | "playstation" | "xbox" | "keyboard"
 
-# The in-game menu (F1) saves the user's changes to %LOCALAPPDATA%\SecondSonPC\settings.toml, which overrides this
-# file; delete a line there (or the file) to come back to the values here (docs\PC_SETTINGS_IMPLEMENTATION.md).
+# The settings window (the game's Settings -> "Additional Settings") saves the user's changes to
+# %LOCALAPPDATA%\SecondSonPC\settings.toml, which overrides this file; delete a line there (or the file) to come back
+# to the values here (docs\PC_SETTINGS_UI.md).
 
 [Log]
 level = "info"                    # trace | debug | info | warning | error | critical

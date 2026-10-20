@@ -4,6 +4,11 @@ Stage 1 of the PC Edition (2026-10-16). The PC settings (display, graphics, DLSS
 keyboard, controller, interface, shaders) are a page of the game's own Settings screen (Esc / Options during play),
 drawn as the game draws that screen; the F1 menu is gone (F1 only with `SSPC_DEV_F1=1`, for development).
 
+> **2026-10-20: the page described in "The page is ours, drawn as the game's" below is replaced** by the PC Settings
+> window (`docs/PC_SETTINGS_UI.md`, branch `feature/pc-settings-redesign`): the same entry of the game's Settings
+> screen opens it, the storage is the same; the layout over the game's panel (`BuildGame`, `MenuEnv::game_panel`) is
+> gone. The rest of this document (the game's entry, the mouse in the game's menus, stage 2) is still current.
+
 ## Why not a new entry in the game's menu itself
 
 The game's menus are compiled bytecode of Sucker Punch's own script VM (`art/cache/core_common.sprig.xpps`, names by

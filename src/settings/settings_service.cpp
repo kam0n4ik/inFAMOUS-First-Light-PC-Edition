@@ -16,10 +16,11 @@ constexpr std::string_view kWhyRu = "Недоступно в этом режим
 } // namespace
 
 void Service::Init(const App::Config& defaults, Overrides overrides, const App::Config& started,
-                   std::filesystem::path file, u32 capabilities) {
+                   std::filesystem::path file, u32 capabilities, KeptKeys kept) {
     std::scoped_lock lock{mutex_};
     defaults_ = defaults;
     overrides_ = std::move(overrides);
+    kept_ = std::move(kept);
     current_ = started;
     started_ = started;
     capabilities_ = capabilities;
@@ -180,7 +181,7 @@ void Service::AddApplier(Applier applier) {
 
 void Service::SaveLocked() {
     if (writer_ != nullptr) {
-        writer_->Save(SerializeUserFile(overrides_));
+        writer_->Save(SerializeUserFile(overrides_, kept_));
     }
 }
 

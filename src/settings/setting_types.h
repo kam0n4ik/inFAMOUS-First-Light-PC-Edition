@@ -44,12 +44,12 @@ enum class Apply : u8 {
 namespace Capability {
 constexpr u32 Window = 1u << 0;         // an SDL window (absent in self-tests): mode, size, display
 constexpr u32 BridgePresenter = 1u << 1; // the bridge's Vulkan presenter shows the frames: FSR/RCAS, FPS counter
-constexpr u32 LiveVolume = 1u << 2;     // the audio output reads the volume per buffer (the bridge's AudioOut)
+constexpr u32 LiveVolume = 1u << 2;     // the bridge's audio output (SDL): the volume per buffer, the device by name
 constexpr u32 RealController = 1u << 3; // libScePad is SecondSonPC's (stick tuning, rumble scale)
 // P4.6 contract (docs/PC_SETTINGS_IMPLEMENTATION.md §9): bits the native backend will report when it can.
 constexpr u32 RenderScale = 1u << 8;
 constexpr u32 FrameLimiter = 1u << 9;
-constexpr u32 NativeFpsOverlay = 1u << 10;
+constexpr u32 FpsCounter = 1u << 10; // a presenter that draws the FPS counter and switches it while running (either)
 // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): what this GPU and its driver can do, found when the backend started
 constexpr u32 Dlss = 1u << 11;         // DLSS Super Resolution (GeForce RTX, NGX)
 constexpr u32 FsrFrameGen = 1u << 12;  // FSR 3.1 frame generation (amd_fidelityfx_vk.dll)

@@ -21,6 +21,16 @@ namespace SecondSon::Settings {
 /// Settings changed by the user: id -> value (settings with a SecondSonPC.toml key only).
 using Overrides = std::map<std::string, Value, std::less<>>;
 
+/// Keys of the user file this version does not take (a key it does not know, a setting it does not store, a value of
+/// the wrong type or range): kept as they were written and written back by every save, so a file from a newer version
+/// or edited by hand loses nothing. A setting the user changes in the menu replaces its kept line.
+struct KeptKey {
+    std::string table, key;
+    std::string text; // the value as TOML text
+    bool operator==(const KeptKey&) const = default;
+};
+using KeptKeys = std::vector<KeptKey>;
+
 /// %LOCALAPPDATA%\SecondSonPC\settings.toml; empty if LOCALAPPDATA is unknown.
 std::filesystem::path DefaultUserFile();
 
@@ -33,14 +43,15 @@ struct LoadReport {
 };
 
 /// Reads the user file into `out` (cleared first). See the file comment.
-LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out);
+LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out, KeptKeys* kept = nullptr);
 
 /// The parsing half of LoadUserFile (tests): false + `parse_error` if the text is not TOML.
 bool ParseUserText(std::string_view text, Overrides& out, std::vector<std::string>& warnings,
-                   std::string& parse_error);
+                   std::string& parse_error, KeptKeys* kept = nullptr);
 
-/// The file's text for these overrides, in registry order, with a header comment.
-std::string SerializeUserFile(const Overrides& overrides);
+/// The file's text for these overrides, in registry order, with a header comment; the kept keys in their tables
+/// (tables this version does not know at the end).
+std::string SerializeUserFile(const Overrides& overrides, const KeptKeys& kept = {});
 
 /// Writes `text` to `file` atomically: <file>.tmp written and flushed, then it replaces the file (the previous
 /// version kept as <file>.bak). The folder is created. false + `error`: the old file is untouched.
