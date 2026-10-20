@@ -50,6 +50,13 @@ namespace SecondSon::NativeEngine::Tests {
 int LiftCheck(u64 image_base, u64 image_size, const std::string& dll, u64 trials); // lift_check.cpp
 int GBufferTests(u64 image_base, const std::string& recomp_dll, u64 cases);       // gbuffer_tests.cpp (R5-E)
 int ShadowTests(u64 image_base, u64 cases, void* recomp_module);                   // shadow_tests.cpp (R5-F)
+// R6: one entry per subsystem, each in its branch's own file (r6_<subsystem>_tests.cpp)
+int R6GBufferTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                   int& checks);
+int R6ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                   int& checks);
+int R6CoreTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                int& checks);
 }
 
 using namespace SecondSon;
@@ -2126,6 +2133,10 @@ int main(int argc, char** argv) {
                 // R5-F shadow subsystem (append-only): before TestCueSetters patches the image's setters
                 g_failures += Tests::ShadowTests(image.base, std::max<u64>(cases / 10, 1000), recomp_module);
                 g_checks += 1;
+                // R6 subsystems (each its own file), before anything installs jumps on the mapped image
+                g_failures += Tests::R6GBufferTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R6ShadowsTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R6CoreTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 // last: it installs the setters' jumps on the mapped image
                 TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
                 // after the setters: installs 0x448640 below an entry probe on the mapped image

@@ -18,6 +18,10 @@
 #include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
 #include "native_engine/reconstructed/shadow_instance_uv.h"
+// R6: one extension point per subsystem, each owned by one branch (docs/NATIVE_RENDER_R6_CORE.md §3)
+#include "native_engine/r6/r6_core.h"
+#include "native_engine/r6/r6_gbuffer.h"
+#include "native_engine/r6/r6_shadows.h"
 
 namespace SecondSon::NativeEngine {
 
@@ -39,6 +43,10 @@ const FunctionSpec* const kFunctions[] = {
     &Reconstructed::kDrawConstantsSetSpec,
     // R5-F: the shadow instances' atlas UV 0x451700
     &Reconstructed::kShadowInstanceUvSpec,
+    // R6 (r6/r6_*.h): the geometry engine, the shadow engine, the render bridge
+    SSPC_R6_GBUFFER_SPECS
+    SSPC_R6_SHADOWS_SPECS
+    SSPC_R6_CORE_SPECS
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);

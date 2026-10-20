@@ -189,6 +189,13 @@ target_link_libraries(sspc_runtime PRIVATE xbyak::xbyak)
 set_source_files_properties(src/native_engine/reconstructed/object_constants.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
 set_source_files_properties(src/native_engine/reconstructed/gbuffer_draw_constants.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
 set_source_files_properties(src/native_engine/reconstructed/shadow_instance_uv.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+# R6 (docs/NATIVE_RENDER_R6_CORE.md §3): each subsystem's sources in a list of its own (cmake/r6/<subsystem>.cmake),
+# owned by one branch, so the parallel branches never edit the same lines here
+foreach(_r6 core gbuffer shadows cp)
+    include(${CMAKE_SOURCE_DIR}/cmake/r6/${_r6}.cmake)
+endforeach()
+target_sources(sspc_runtime PRIVATE ${SSPC_R6_CORE_SOURCES} ${SSPC_R6_GBUFFER_SOURCES} ${SSPC_R6_SHADOWS_SOURCES}
+               ${SSPC_R6_CP_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
@@ -356,6 +363,8 @@ add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
     src/loader/image_file.cpp
     src/base/log.cpp
 )
+target_sources(sspc_native_engine_tests PRIVATE ${SSPC_R6_CORE_TEST_SOURCES} ${SSPC_R6_GBUFFER_TEST_SOURCES}
+               ${SSPC_R6_SHADOWS_TEST_SOURCES})
 target_include_directories(sspc_native_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(sspc_native_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(sspc_native_engine_tests PRIVATE /utf-8 /W4)
