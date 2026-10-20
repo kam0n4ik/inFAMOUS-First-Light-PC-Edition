@@ -56,7 +56,7 @@
 
 - **Сборка** — только `E:\research\sspc_build.ps1 -Worktree <свой> -Owner <r6-x> -Log E:\research\r6\<x>\build.log`
   (ждёт, пока нет `sspc_bench.lock` и `sspc_game.lock`; берёт `sspc_build.lock` атомарно через `mkdir`; освобождает в
-  `finally`). Никаких `cmake --build` в обход. На ПК нет файла подкачки: одна сборка за раз, `-Jobs 3..4`.
+  `finally`). Цели: `shadps4` (это `SecondSonPC.exe`, OUTPUT_NAME), `sspc_native_engine_tests`. Никаких `cmake --build` в обход. На ПК нет файла подкачки: одна сборка за раз, `-Jobs 3..4`.
 - **Игра** — только `tools\native-reconstruction\run_native_engine.ps1 -Worktree <свой> -Out E:\research\r6\<x>\runs
   -LogsDir E:\research\r6\<x>\logs -Owner r6-<x> -Scene city|beach|harbor|village -Tag <тег>`. Скрипт ждёт, пока нет
   чужого `sspc_bench.lock`, `sspc_game.lock`, `sspc_build.lock` и процесса `SecondSonPC`, затем 300 с тишины, берёт
