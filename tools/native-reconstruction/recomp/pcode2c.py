@@ -983,7 +983,34 @@ class Emitter:
     GPR32 = {"EAX": "RAX", "EBX": "RBX", "ECX": "RCX", "EDX": "RDX", "ESI": "RSI", "EDI": "RDI", "EBP": "RBP",
              "ESP": "RSP", **{"R%dD" % i: "R%d" % i for i in range(8, 16)}}
 
+    @staticmethod
+    def pinsr_fix(ins):
+        """R6-S: SLEIGH lifts (V)PINSR{B,W,D,Q} dst, src1, r/m, imm as one lane-select per destination lane, but wires
+        every lane's select to the FIRST lane's predicate (imm & mask == 0): with imm != 0 no lane takes the new value
+        (--lift-check at 0x450df8 vpinsrd xmm0,xmm0,edx,1: 1493/1500). Lane k's select must use the k-th predicate
+        (imm & mask == k). Rewires it and returns a copy; any other shape is returned unchanged (and then refused or
+        caught by --lift-check)."""
+        if not re.match(r"^V?PINSR[BWDQ]$", ins["mnemonic"].upper()):
+            return ins
+        ops = ins["pcode"]
+        preds = [o["out"] for o in ops if o["op"] == "INT_EQUAL" and o["out"] and o["out"][0] == "unique"]
+        lanes = [i for i, o in enumerate(ops) if o["op"] == "INT_OR" and o["out"] and o["out"][0] == "register"]
+        if len(preds) < 2 or len(preds) != len(lanes):
+            return ins
+        first = tuple(preds[0])
+        fixed, start = [], 0
+        for k, end in enumerate(lanes):
+            for o in ops[start:end + 1]:
+                ins_ = [list(preds[k]) if v and tuple(v) == first else v for v in o["in"]]
+                fixed.append(dict(o, **{"in": ins_}))
+            start = end + 1
+        fixed.extend(ops[start:])
+        # lane 0's group also holds the predicates' own computations: they never read the first predicate, so the
+        # rewiring touches only the lane selects
+        return dict(ins, pcode=fixed)
+
     def emit_instruction(self, ins):
+        ins = self.pinsr_fix(ins)
         fix = self.scalar_fix(ins)
         body = self.emit_ops(ins)
         # R5-E: SLEIGH's (V)CVT(T)SS2SI / SD2SI with a 32-bit destination writes the 32-bit register only; x86 zeroes
