@@ -51,5 +51,12 @@ bool Compare(Fn original, const float* world, const float* previous, const float
 /// A recorded case (native_engine_verify.h) replayed against `original`: true when the reconstruction matches.
 bool Replay(Fn original, const std::string& bytes, std::string& report);
 
+/// The implementation the dispatcher, the comparisons and the self-check use: the hand-written reconstruction
+/// (Native) by default; the static recompiler's (SSPC_NATIVE_ENGINE_RECOMP) is put here before the install, so the
+/// same self-check, verify and guarded modes judge it.
+void UseImplementation(Fn fn, const char* source);
+Fn Implementation();
+const char* ImplementationSource();
+
 } // namespace ObjectConstants
 } // namespace SecondSon::NativeEngine::Reconstructed

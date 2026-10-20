@@ -821,7 +821,7 @@ void Replay(const Image& image, const std::string& path) {
 
 /// The static recompilation PoC: functions machine-translated from Ghidra P-code (tools/native-reconstruction/recomp)
 /// against the eboot's own code, and the recompiled allocator through the registry.
-void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::Fn fs_original) {
+void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::Fn fs_original, OC::Fn oc_original) {
     std::printf("static recompilation PoC (%s):\n", dll.c_str());
     HMODULE m = LoadLibraryA(dll.c_str());
     CHECK(m != nullptr);
@@ -876,8 +876,42 @@ void TestRecompiled(const Image& image, const std::string& dll, u64 cases, FS::F
         CHECK(Reconstructed::kFrameScratchAllocSpec.self_check(reinterpret_cast<void*>(o), error));
         FS::UseImplementation(before, "hand-written reconstruction");
     }
-    // 0x11c890 is AVX code: the PoC refuses it (pcode2c report), nothing to load
-    CHECK(GetProcAddress(m, "recomp_11c890") == nullptr);
+    // 0x11c890 (ObjectConstants::Update: AVX, 8 arguments, two on the stack) - the same differential as the
+    // hand-written one, the System V boundary through the guest-like caller, the install's self-check
+    if (auto* r = reinterpret_cast<OC::Fn>(GetProcAddress(m, "recomp_11c890"))) {
+        const OC::Fn before = OC::Implementation();
+        OC::UseImplementation(r, "recompiled");
+        TestObjectConstantsDifferential(oc_original, cases);
+        Matrices mx{};
+        std::mt19937_64 rng2{3};
+        Plausible(rng2, mx.world, false);
+        Plausible(rng2, mx.previous, false);
+        Plausible(rng2, mx.vp, true);
+        Plausible(rng2, mx.extra, false);
+        alignas(16) u8 block[OC::kBlockBytes] = {}, expect[OC::kBlockBytes] = {};
+        oc_original(mx.world, mx.previous, mx.vp, reinterpret_cast<u64>(mx.object), mx.extra, 77, 0xff, expect);
+        CallFrame f{};
+        f.gpr[0] = reinterpret_cast<u64>(mx.world);
+        f.gpr[1] = reinterpret_cast<u64>(mx.previous);
+        f.gpr[2] = reinterpret_cast<u64>(mx.vp);
+        f.gpr[3] = reinterpret_cast<u64>(mx.object);
+        f.gpr[4] = reinterpret_cast<u64>(mx.extra);
+        f.gpr[5] = 77;
+        f.stack[0] = 0xffffffff000000ffull;
+        f.stack[1] = reinterpret_cast<u64>(block);
+        const u64 violations = CallAsGuest(reinterpret_cast<const void*>(r), f);
+        std::printf("  recomp_11c890 through the guest-like caller: violations %#llx, block %s\n",
+                    static_cast<unsigned long long>(violations),
+                    std::memcmp(block, expect, sizeof(block)) == 0 ? "identical" : "DIFFERENT");
+        CHECK(violations == 0);
+        CHECK(std::memcmp(block, expect, sizeof(block)) == 0);
+        std::string error;
+        CHECK(Reconstructed::kObjectConstantsSpec.self_check(reinterpret_cast<void*>(oc_original), error));
+        if (!error.empty()) {
+            std::printf("  self-check: %s\n", error.c_str());
+        }
+        OC::UseImplementation(before, "hand-written reconstruction");
+    }
 }
 
 void TestModes() {
@@ -949,7 +983,7 @@ int main(int argc, char** argv) {
                     Replay(image, replay);
                 }
                 if (!recomp.empty()) {
-                    TestRecompiled(image, recomp, cases, fs_ref);
+                    TestRecompiled(image, recomp, cases, fs_ref, oc_ref);
                 }
             }
         }

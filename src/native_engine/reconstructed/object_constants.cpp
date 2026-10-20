@@ -250,6 +250,9 @@ namespace {
 
 constexpr u32 N = OC::kBlockBytes;
 
+OC::Fn g_impl = &OC::Native;
+const char* g_impl_source = "hand-written reconstruction";
+
 /// The case format (native_engine_verify.h): what the original read and wrote, both results.
 struct Case {
     u32 flags;
@@ -324,7 +327,7 @@ struct Impl {
 
     static SSPC_SYSV_ABI void Native(const float* world, const float* previous, const float* vp, u64 object,
                                      const float* extra, s32 value, u32 flags, u8* block) {
-        OC::Native(world, previous, vp, object, extra, value, flags, block);
+        g_impl(world, previous, vp, object, extra, value, flags, block);
     }
 
     static SSPC_SYSV_ABI void Verify(const float* world, const float* previous, const float* vp, u64 object,
@@ -372,7 +375,7 @@ struct Impl {
             }
         }
         Count(slot.index, kCallsNative);
-        OC::Native(world, previous, vp, object, extra, value, flags, block);
+        g_impl(world, previous, vp, object, extra, value, flags, block);
     }
 
     static SSPC_SYSV_ABI void Bench(const float* world, const float* previous, const float* vp, u64 object,
@@ -394,7 +397,7 @@ struct Impl {
                     to = TimerTicks() - t0;
                 } else {
                     const u64 t0 = TimerTicks();
-                    OC::Native(world, previous, vp, object, extra, value, flags, s.b);
+                    g_impl(world, previous, vp, object, extra, value, flags, s.b);
                     tn = TimerTicks() - t0;
                 }
             }
@@ -485,8 +488,21 @@ bool OC::Compare(Fn original, const float* world, const float* previous, const f
     std::memcpy(a, block, N);
     std::memcpy(b, block, N);
     original(world, previous, view_projection, object, extra, value, flags, a);
-    Native(world, previous, view_projection, object, extra, value, flags, b);
+    g_impl(world, previous, view_projection, object, extra, value, flags, b);
     return std::memcmp(a, b, N) == 0;
+}
+
+void OC::UseImplementation(Fn fn, const char* source) {
+    g_impl = fn;
+    g_impl_source = source;
+}
+
+OC::Fn OC::Implementation() {
+    return g_impl;
+}
+
+const char* OC::ImplementationSource() {
+    return g_impl_source;
 }
 
 bool OC::Replay(Fn original, const std::string& bytes, std::string& report) {
