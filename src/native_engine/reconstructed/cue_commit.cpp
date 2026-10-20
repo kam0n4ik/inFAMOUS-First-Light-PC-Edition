@@ -163,6 +163,44 @@ bool Compare(u64 cue, Shadow& s, u64& first) {
     return true;
 }
 
+/// The first difference of the calls or the arena, for the self-check's error (original / implementation).
+std::string DescribeDifference(const Shadow& s) {
+    const u32 n = std::min(s.rec[0].calls, s.rec[1].calls);
+    for (u32 i = 0; i < n; ++i) {
+        const CC::Call& a = s.rec[0].call[i];
+        const CC::Call& b = s.rec[1].call[i];
+        if (a.target != b.target) {
+            return fmt::format("; call {}: target {:#x} / {:#x}", i, CC::kRecorded[a.target].rva,
+                               CC::kRecorded[b.target].rva);
+        }
+        for (u32 k = 0; k < 6; ++k) {
+            if (a.a[k] != b.a[k]) {
+                return fmt::format("; call {} to {:#x}: argument {} {:#x} / {:#x}", i, CC::kRecorded[a.target].rva, k,
+                                   a.a[k], b.a[k]);
+            }
+            for (u32 j = 0; j < sizeof(a.content[k]); ++j) {
+                if (a.content[k][j] != b.content[k][j]) {
+                    u64 x = 0, y = 0;
+                    std::memcpy(&x, a.content[k] + (j & ~7u), 8);
+                    std::memcpy(&y, b.content[k] + (j & ~7u), 8);
+                    return fmt::format("; call {} to {:#x}: argument {} (a stack pointer) content +{:#x}: {:#018x} / "
+                                       "{:#018x}",
+                                       i, CC::kRecorded[a.target].rva, k, j & ~7u, x, y);
+                }
+            }
+        }
+    }
+    if (s.arena_used != s.arena_original_used) {
+        return fmt::format("; arena used {:#x} / {:#x}", s.arena_original_used, s.arena_used);
+    }
+    for (u64 i = 0; i < s.arena_used; ++i) {
+        if (s.arena_original[i] != s.arena[i]) {
+            return fmt::format("; arena +{:#x}: {:#04x} / {:#04x}", i, s.arena_original[i], s.arena[i]);
+        }
+    }
+    return {};
+}
+
 /// A mismatch case: the CUE's flags and switches, both recordings' sizes and the first differing call or offset.
 struct Case {
     u64 cue;
@@ -368,8 +406,9 @@ bool SelfCheck(void* /*original*/, std::string& error) {
         std::memcpy(mem.data() + 0xc6e4, &alt, 4);
         u64 first;
         if (!Compare(base, s, first) || s.rec[0].overflow || s.rec[1].overflow) {
-            error = fmt::format("case {}: calls {} / {}, first copy difference {:#x}{}", n, s.rec[0].calls,
-                                s.rec[1].calls, first, s.rec[0].overflow || s.rec[1].overflow ? " (overflow)" : "");
+            error = fmt::format("case {}: calls {} / {}, first copy difference {:#x}{}{}", n, s.rec[0].calls,
+                                s.rec[1].calls, first, s.rec[0].overflow || s.rec[1].overflow ? " (overflow)" : "",
+                                DescribeDifference(s));
             return false;
         }
     }

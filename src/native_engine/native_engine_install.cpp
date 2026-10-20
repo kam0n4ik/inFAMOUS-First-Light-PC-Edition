@@ -22,8 +22,10 @@
 #include "native_engine/reconstructed/cue_set_buffers.h"
 #include "native_engine/reconstructed/cue_commit.h"
 #include "native_engine/reconstructed/frame_scratch.h"
+#include "native_engine/reconstructed/gbuffer_draw_constants.h"
 #include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
+#include "native_engine/reconstructed/shadow_instance_uv.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/gpu/native_videoout.h"
 
@@ -291,6 +293,9 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         };
         auto* fs = m && selected(Reconstructed::kFrameScratchAllocSpec) ? GetProcAddress(m, "recomp_1f0870") : nullptr;
         auto* oc = m && selected(Reconstructed::kObjectConstantsSpec) ? GetProcAddress(m, "recomp_11c890") : nullptr;
+        // R5-E / R5-F leaves (no calls out): the recompiled function is the implementation as is
+        auto* dc = m && selected(Reconstructed::kDrawConstantsSetSpec) ? GetProcAddress(m, "recomp_11e5d0") : nullptr;
+        auto* su = m && selected(Reconstructed::kShadowInstanceUvSpec) ? GetProcAddress(m, "recomp_451700") : nullptr;
         // the CUE setters call setUserDataRegion: verification records those calls, so the module must be able to
         // redirect them (recomp_set_redirect); without it they keep the hand-written implementation
         auto* redirect = m ? reinterpret_cast<Reconstructed::CueSetBuffers::RedirectFn>(
@@ -300,7 +305,7 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
         namespace MB = Reconstructed::MaterialBind;
         FARPROC cue[CSB::kKinds] = {};
         std::string cue_names[CSB::kKinds];
-        bool any = fs != nullptr || oc != nullptr;
+        bool any = fs != nullptr || oc != nullptr || dc != nullptr || su != nullptr;
         for (u32 k = 0; k < CSB::kKinds; ++k) {
             cue_names[k] = fmt::format("recomp_{:x}", CSB::kRva[k]);
             cue[k] = m && redirect && selected(CSB::Spec(static_cast<CSB::Kind>(k)))
@@ -326,8 +331,9 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
             *base = eboot_base;
             if (!any) {
                 SSPC_LOG(Engine, Warning, "SSPC_NATIVE_ENGINE_RECOMP={}: no recompiled function of a selected "
-                         "reconstruction here (recomp_1f0870 / recomp_11c890 / recomp_<CUE setter> / recomp_448640 / "
-                         "recomp_14ad0 with recomp_set_redirect); the hand-written reconstructions stay", dll);
+                         "reconstruction here (recomp_1f0870 / recomp_11c890 / recomp_11e5d0 / recomp_451700 / "
+                         "recomp_<CUE setter> / recomp_448640 / recomp_14ad0 with recomp_set_redirect); the "
+                         "hand-written reconstructions stay", dll);
             }
             constexpr const char* kSource = "static recompilation (P-code -> C++ -> clang)";
             if (fs != nullptr) {
@@ -336,6 +342,22 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
                 SSPC_LOG(Engine, Warning,
                          "STATIC RECOMPILATION: frame_alloc's implementation is recomp_1f0870 ({}) from {}",
                          reinterpret_cast<void*>(Reconstructed::FrameScratch::Implementation()), dll);
+            }
+            if (dc != nullptr) {
+                Reconstructed::DrawConstantsSet::UseImplementation(
+                    reinterpret_cast<Reconstructed::DrawConstantsSet::Fn>(dc), kSource);
+                SSPC_LOG(Engine, Warning,
+                         "STATIC RECOMPILATION: {}'s implementation is recomp_11e5d0 ({}) from {} (hand-written: {})",
+                         Reconstructed::kDrawConstantsSetSpec.key, reinterpret_cast<void*>(dc), dll,
+                         reinterpret_cast<void*>(&Reconstructed::DrawConstantsSet::Native));
+            }
+            if (su != nullptr) {
+                Reconstructed::ShadowInstanceUv::UseImplementation(
+                    reinterpret_cast<Reconstructed::ShadowInstanceUv::Fn>(su), kSource);
+                SSPC_LOG(Engine, Warning,
+                         "STATIC RECOMPILATION: {}'s implementation is recomp_451700 ({}) from {} (hand-written: {})",
+                         Reconstructed::kShadowInstanceUvSpec.key, reinterpret_cast<void*>(su), dll,
+                         reinterpret_cast<void*>(&Reconstructed::ShadowInstanceUv::Native));
             }
             if (oc != nullptr) {
                 Reconstructed::ObjectConstants::UseImplementation(

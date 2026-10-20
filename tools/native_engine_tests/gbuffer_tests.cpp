@@ -213,17 +213,29 @@ void TestDrawConstants(u64 image_base, HMODULE recomp, u64 cases) {
         DCS::UseImplementation(&BrokenDrawConstants, "broken (test)");
         m.mode.store(static_cast<u8>(Mode::Guarded));
         m.sample_period = 1;
-        const u64 mismatches = m.mismatches.load(), fallbacks = m.fallbacks.load(), recorded = CasesRecorded();
-        c.Generate(rng, 1);
+        // (the case ring keeps the run's first 64: in the full suite the earlier tests may have filled it, the case is
+        // then counted as dropped)
+        const u64 mismatches = m.mismatches.load(), fallbacks = m.fallbacks.load(), recorded = CasesRecorded(),
+                  dropped = CasesDropped();
+        // n = 13: count <= 0, the span is the dirty byte - a case that always fits the case record (a large span is
+        // counted but not recorded, RecordMismatch; which case n = 1 gives depends on the rng's earlier use)
+        c.Generate(rng, 13);
         a = c.block;
         b = c.block;
         entry(reinterpret_cast<u64>(a.data()), c.offset, c.src_address, static_cast<u32>(c.count));
         ref(reinterpret_cast<u64>(b.data()), c.offset, c.src_address, static_cast<u32>(c.count));
         const bool caught = m.mismatches.load() == mismatches + 1 && m.fallbacks.load() == fallbacks + 1 &&
-                            static_cast<Mode>(m.mode.load()) == Mode::Original && CasesRecorded() == recorded + 1;
+                            static_cast<Mode>(m.mode.load()) == Mode::Original &&
+                            (CasesRecorded() == recorded + 1 || CasesDropped() == dropped + 1);
         std::printf("  a wrong implementation under guarded: mismatch %s, fallback %s, result the original's %s\n",
                     m.mismatches.load() > mismatches ? "seen" : "MISSED", m.fallbacks.load() > fallbacks ? "done" : "MISSING",
                     a == b ? "yes" : "NO");
+        std::printf("    (mismatches +%llu, fallbacks +%llu, mode %s, cases recorded +%llu, dropped +%llu)\n",
+                    static_cast<unsigned long long>(m.mismatches.load() - mismatches),
+                    static_cast<unsigned long long>(m.fallbacks.load() - fallbacks),
+                    ModeName(static_cast<Mode>(m.mode.load())),
+                    static_cast<unsigned long long>(CasesRecorded() - recorded),
+                    static_cast<unsigned long long>(CasesDropped() - dropped));
         GB_CHECK(caught && a == b);
     }
     DCS::UseImplementation(&DCS::Native, "hand-written reconstruction");
