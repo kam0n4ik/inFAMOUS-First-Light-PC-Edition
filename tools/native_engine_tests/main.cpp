@@ -2035,7 +2035,8 @@ void TestModes() {
     CHECK(ParseMode("bench", m) && m == Mode::Bench);
     CHECK(ParseMode("off", m) && m == Mode::Original);
     CHECK(!ParseMode("fast", m));
-    CHECK(FunctionCount() == 11); // R5-C 4, R5-D 5, R5-E draw_constants_set, R5-F shadow_instance_uv
+    // R5-C 4, R5-D 5, R5-E draw_constants_set, R5-F shadow_instance_uv; then the R6 branches' own (r6/r6_*.h)
+    CHECK(FunctionCount() >= 11 && FunctionCount() <= kMaxFunctions);
     u32 hits = 0;
     for (int i = 0; i < 1000; ++i) {
         hits += SampleThisCall(1, 10) ? 1 : 0;
