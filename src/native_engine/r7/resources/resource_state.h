@@ -89,6 +89,8 @@ struct Stats {
     u64 snapshots = 0;         ///< stage snapshots taken (VS / PS / others)
     u64 binding_kept = 0;      ///< ... whose binding version stayed (content, layout and user data unchanged)
     u64 binding_new = 0;
+    u64 stage_snapshots[8] = {}; ///< snapshots by CUE stage (Gnm: 1 PS, 2 VS, ...)
+    u64 stage_kept[8] = {};
     u64 changed_dwords = 0;    ///< sum over snapshots of the dwords changed since the stage's previous one
     u64 table_dwords = 0;      ///< sum over snapshots of the table's dwords
     u64 delta_known = 0;       ///< snapshots with a previous one of the same layout (changed_dwords counted)

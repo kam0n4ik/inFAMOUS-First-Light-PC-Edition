@@ -564,8 +564,10 @@ void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
         const bool kept = s.bind_version != 0 && s.bind_cv == s.cv && s.bind_layout == layout && s.dwords == n &&
                           s.bind_direct_mask == s.direct_mask &&
                           std::memcmp(s.bind_direct, s.direct, sizeof(s.direct)) == 0;
+        c.stage_snapshots[st]++;
         if (kept) {
             c.binding_kept++;
+            c.stage_kept[st]++;
         } else {
             c.binding_new++;
             s.bind_version = NextVersion();
@@ -707,16 +709,23 @@ std::string Report(const Stats& s, double seconds) {
     for (u32 k = 0; k < 7; ++k) {
         kinds += fmt::format(" {} {}/{}", kName[k], s.kind_redundant[k], s.kind_calls[k]);
     }
+    std::string stages;
+    for (u32 st = 0; st < kStages; ++st) {
+        if (s.stage_snapshots[st] != 0) {
+            stages += fmt::format(" {} {}/{}", st, s.stage_kept[st], s.stage_snapshots[st]);
+        }
+    }
     return fmt::format(
         "{:.0f} s, mode {}, tracking {}; setters {} (changing {}, redundant {} = {:.1f} %; slots {}, same {}, direct {}, "
         "outside {}, untracked {}; redundant/calls by kind:{}); commits {}, snapshots {} (binding kept {} = {:.1f} %, "
-        "new {}), changed dwords {:.2f} % of {} ({} snapshots with a delta), shape checked {} mismatched {}, other "
+        "new {}; kept/snapshots by stage:{}), changed dwords {} = {:.2f} % of {} ({} snapshots with a delta), shape checked {} mismatched {}, other "
         "copies {}, resets {}; fills {} present {} versioned {} stale {}; verify: same-version {} violations {}, new "
         "version with equal bytes {}, shadow checked {} violations {}, fill checked {} mismatches {}",
         seconds, Mode() == StateMode::Verify ? "verify" : "on", TrackingValid() ? "valid" : "NOT VALID", s.setter_calls,
         s.setter_changing, s.setter_redundant, pct(s.setter_redundant, s.setter_calls), s.setter_slots,
         s.setter_slots_same, s.setter_direct, s.setter_outside, s.setter_untracked, kinds, s.commits, s.snapshots,
-        s.binding_kept, pct(s.binding_kept, s.snapshots), s.binding_new, pct(s.changed_dwords, s.table_dwords),
+        s.binding_kept, pct(s.binding_kept, s.snapshots), s.binding_new, stages, s.changed_dwords,
+        pct(s.changed_dwords, s.table_dwords),
         s.table_dwords, s.delta_known, s.shape_checked, s.shape_mismatch, s.other_copies, s.resets, s.fills,
         s.fills_present, s.fills_versioned, s.fills_stale, s.verify_same_version, s.verify_violations,
         s.verify_new_same_bytes, s.verify_shadow_checked, s.verify_shadow_violations, s.verify_fill_checked,
