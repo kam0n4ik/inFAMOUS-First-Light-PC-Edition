@@ -29,7 +29,17 @@ struct Options {
     /// GiveMembers), thread 1 takes one when a run outgrows its slot's vector. The members are the same; only where
     /// their memory comes from changes.
     bool run_pool = false;
+    /// SSPC_R6_CP_POLL_TRIVIAL=1|verify: a memory WAIT_REG_MEM whose compare holds for every value (TrivialPoll:
+    /// function 0 "always", ">= 0", "<= x" with x >= the mask) does not read the memory. Its outcome is the same
+    /// whatever the read returns; the read was not free: over a write still on the GPU's timeline (the city: the
+    /// game's occlusion query records, polled ">= 0" right after the query's begin) it drained the queue and waited
+    /// for the GPU - a bubble on both threads, 0.3 ms each. verify: read as before, the outcome checked.
+    u8 poll_trivial = 0; ///< 0 off, 1 on, 2 verify
 };
+/// The compare of WAIT_REG_MEM ((value & mask) <function> ref) holds for every value.
+inline bool TrivialPoll(u32 function, u32 ref, u32 mask) {
+    return function == 0 || (function == 5 && ref == 0) || (function == 2 && ref >= mask);
+}
 const Options& Opt();
 
 /// Record kinds as ParallelCp's (parallel_cp.h Kind), for the counters; 14: a tagged draw that could not join.
@@ -50,9 +60,12 @@ struct Counters {
     std::array<std::atomic<u64>, 2> walks{}, walk_same_prog{}, walk_eq_prev{}, walk_eq_last{}, walk_ud_same_flat_diff{},
         walk_dwords{};
     /// NoteTimelineRead by site: reads that drained, of them waited for the GPU, their time (TSC)
-    std::array<std::atomic<u64>, 5> tread_drained{}, tread_synced{}, tread_ticks{};
+    std::array<std::atomic<u64>, 6> tread_drained{}, tread_synced{}, tread_ticks{}; ///< (kReadSites)
     /// SSPC_R6_CP_RUN_POOL: vectors taken from the pool (thread 1), the pool empty then, given back / freed (thread 2)
     std::atomic<u64> pool_taken{0}, pool_empty{0}, pool_given{0}, pool_freed{0};
+    /// SSPC_R6_CP_POLL_TRIVIAL (thread 1): memory polls whose compare always holds - not read (on) / read (verify), of
+    /// them the read was over a pending timeline write; verify: the outcome not met (impossible: 0)
+    std::atomic<u64> trivial_polls{0}, trivial_over_timeline{0}, trivial_not_met{0};
 };
 Counters& Count();
 
@@ -69,8 +82,14 @@ bool TakeMembers(std::vector<Cp::RunMember>& v);
 void GiveMembers(std::vector<Cp::RunMember>& v);
 
 /// The processor's own guest memory reads, by site (set by the processor before each read; its thread only).
-enum ReadSite : u8 { kReadOther, kReadSubmission, kReadIndirect, kReadDma, kReadWait, kReadSites };
-inline u8 g_read_site = kReadOther;
+enum ReadSite : u8 { kReadOther, kReadSubmission, kReadIndirect, kReadDma, kReadWait, kReadWaitAgain, kReadSites };
+inline thread_local u8 g_read_site = kReadOther; // (thread_local: thread 2's fallbacks read memory too)
+/// SSPC_R6_CP_DIAG=1: the WAIT_REG_MEM being polled (function, reference, mask), set by the processor before its read
+inline thread_local u32 g_poll_function = 0, g_poll_ref = 0, g_poll_mask = 0;
+/// SSPC_R6_CP_POLL_TRIVIAL=verify: the poll's read went over a pending timeline write (Memory::Read sets it)
+inline thread_local bool g_read_over_timeline = false;
+/// SSPC_R6_CP_DIAG=1 (native_backend.cpp Memory::Read): the value a timeline read returned (after NoteTimelineRead)
+void NoteTimelineValue(u64 addr, u32 value);
 /// SSPC_R6_CP_DIAG=1 (native_backend.cpp Memory::Read): a read over a write still on the GPU's timeline - the queue
 /// drained, and `synced`: the executor then waited for the GPU too; `ticks`: the whole wait (TSC).
 void NoteTimelineRead(u64 addr, u64 bytes, bool synced, u64 ticks);

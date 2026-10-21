@@ -28,6 +28,13 @@ Options Parse() {
     o.prefetch_skip = pf == "skip" || pf == "1";
     o.diag = Env("SSPC_R6_CP_DIAG") == "1";
     o.run_pool = Env("SSPC_R6_CP_RUN_POOL") == "1";
+    const std::string pt = Env("SSPC_R6_CP_POLL_TRIVIAL");
+    o.poll_trivial = pt == "1" ? 1 : pt == "verify" ? 2 : 0;
+    if (o.poll_trivial != 0) {
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R6_CP_POLL_TRIVIAL={} - a memory wait whose compare holds for every "
+                               "value does not read the memory{}",
+                 pt, o.poll_trivial == 2 ? " (verify: read as before, the outcome checked)" : "");
+    }
     if (o.run_pool) {
         SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R6_CP_RUN_POOL=1 - long runs' member vectors pooled between the threads");
     }
@@ -147,10 +154,13 @@ namespace {
 struct ReadAt {
     u64 drained = 0, synced = 0, ticks = 0, bytes = 0;
     u8 site = 0;
+    u32 function = 0, ref = 0, mask = 0; ///< the last poll's
+    u32 value = 0, values_seen = 0;      ///< the last value read; how many reads gave a value other than the one before
 };
 std::mutex g_reads_mutex; // (the processor's thread writes, the report reads)
 std::unordered_map<u64, ReadAt> g_reads;
-constexpr std::string_view kSiteNames[5] = {"other", "submission", "indirect buffer", "DMA source", "wait poll"};
+constexpr std::string_view kSiteNames[kReadSites] = {"other",      "submission", "indirect buffer",
+                                                     "DMA source", "wait poll",  "wait poll again"};
 } // namespace
 
 void NoteTimelineRead(u64 addr, u64 bytes, bool synced, u64 ticks) {
@@ -167,12 +177,23 @@ void NoteTimelineRead(u64 addr, u64 bytes, bool synced, u64 ticks) {
         r.ticks += ticks;
         r.bytes = bytes;
         r.site = static_cast<u8>(site);
+        r.function = g_poll_function;
+        r.ref = g_poll_ref;
+        r.mask = g_poll_mask;
+    }
+}
+
+void NoteTimelineValue(u64 addr, u32 value) {
+    std::scoped_lock lock{g_reads_mutex};
+    if (const auto it = g_reads.find(addr); it != g_reads.end()) {
+        it->second.values_seen += it->second.value != value ? 1 : 0;
+        it->second.value = value;
     }
 }
 
 std::string Report() {
     const Options& o = Opt();
-    if (!o.prefetch_skip && !o.diag && !o.run_pool) {
+    if (!o.prefetch_skip && !o.diag && !o.run_pool && o.poll_trivial == 0) {
         return {};
     }
     Counters& c = Count();
@@ -185,6 +206,12 @@ std::string Report() {
         out += fmt::format("  long runs' member vectors (SSPC_R6_CP_RUN_POOL=1): taken from the pool {} (none larger there "
                            "{}), given back {}, freed (the pool full) {}\n",
                            get(c.pool_taken), get(c.pool_empty), get(c.pool_given), get(c.pool_freed));
+    }
+    if (o.poll_trivial != 0) {
+        out += fmt::format("  memory waits whose compare always holds (SSPC_R6_CP_POLL_TRIVIAL={}): {} {}; verify: the "
+                           "read was over a write on the GPU's timeline {}, the compare did not hold {}\n",
+                           o.poll_trivial == 2 ? "verify" : "1", o.poll_trivial == 2 ? "read" : "not read",
+                           get(c.trivial_polls), get(c.trivial_over_timeline), get(c.trivial_not_met));
     }
     if (o.diag) {
         out += "  held runs published by a record of kind:";
@@ -226,9 +253,11 @@ std::string Report() {
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
         for (size_t i = 0; i < top.size() && i < 12; ++i) {
             const ReadAt& r = top[i].second;
-            out += fmt::format("    {:#x} ({} bytes, {}): drained {}, waited for the GPU {}, {:.0f} ms\n", top[i].first,
-                               r.bytes, kSiteNames[r.site], r.drained, r.synced,
-                               static_cast<double>(r.ticks) * ms_per_tick);
+            out += fmt::format("    {:#x} ({} bytes, {}): drained {}, waited for the GPU {}, {:.0f} ms; last poll function "
+                               "{} ref {:#x} mask {:#x}, last value {:#x}, value changes {}\n",
+                               top[i].first, r.bytes, kSiteNames[r.site], r.drained, r.synced,
+                               static_cast<double>(r.ticks) * ms_per_tick, r.function, r.ref, r.mask, r.value,
+                               r.values_seen);
         }
     }
     return out;
