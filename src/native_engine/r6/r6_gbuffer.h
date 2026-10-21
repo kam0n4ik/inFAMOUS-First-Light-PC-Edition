@@ -4,5 +4,7 @@
 #pragma once
 
 #include "native_engine/native_function_registry.h"
+#include "native_engine/reconstructed/gbuffer_draw.h"
 
-#define SSPC_R6_GBUFFER_SPECS
+// 0x1a1770 the mesh pass's instanced draw, 0x1a1960 its mesh draw (explicit_only until GAME_VERIFIED)
+#define SSPC_R6_GBUFFER_SPECS &Reconstructed::kGBufferInstancedDrawSpec, &Reconstructed::kGBufferMeshDrawSpec,
