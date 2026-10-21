@@ -45,6 +45,7 @@
 #include "native_engine/reconstructed/frame_scratch.h"
 #include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
+#include "native_engine/r6/cue_dedup.h"
 
 namespace SecondSon::NativeEngine::Tests {
 int LiftCheck(u64 image_base, u64 image_size, const std::string& dll, u64 trials); // lift_check.cpp
@@ -1584,6 +1585,324 @@ SSPC_SYSV_ABI void BrokenCommit(u64 cue) {
     *reinterpret_cast<u8*>(cue + 0xc1d1) = 1;
 }
 
+// --- R6-Core: snapshot reuse in the commit (SSPC_R6_CUE_DEDUP, src/native_engine/r6/cue_dedup.h) ----------------
+
+/// A recorded copy of a stage's shadow (cue + 0x90 + stage * 0x1800) into a snapshot; its stage, or -1.
+int ShadowCopyStage(const CommitCall& c, u64 cue) {
+    if (c.target != 0x9843a0 || c.a[1] < cue + 0x90 || (c.a[1] - cue - 0x90) % 0x1800 != 0 ||
+        (c.a[1] - cue - 0x90) / 0x1800 >= 8) {
+        return -1;
+    }
+    return static_cast<int>((c.a[1] - cue - 0x90) / 0x1800);
+}
+
+/// `calls` against `reference` (the eboot's commit on the same CUE state): the same calls apart from the copies of
+/// shadows; a user-data pointer (0x626400) to the same bytes up to the end of the reference's snapshot; any other
+/// argument into the arena to the same 32 bytes. Empty when equal.
+std::string SameCommitByContent(const std::vector<CommitCall>& calls, const std::vector<CommitCall>& reference, u64 cue,
+                                u64 lo, u64 hi) {
+    std::vector<const CommitCall*> a, b;
+    std::vector<std::pair<u64, u64>> snapshots;
+    for (const CommitCall& c : calls) {
+        if (ShadowCopyStage(c, cue) < 0) {
+            a.push_back(&c);
+        }
+    }
+    for (const CommitCall& c : reference) {
+        if (ShadowCopyStage(c, cue) < 0) {
+            b.push_back(&c);
+        } else {
+            snapshots.emplace_back(c.a[0], c.a[0] + c.a[2]);
+        }
+    }
+    if (a.size() != b.size()) {
+        return fmt::format("calls without the shadow copies {} / {}", a.size(), b.size());
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        const CommitCall& x = *a[i];
+        const CommitCall& y = *b[i];
+        if (x.target != y.target || std::memcmp(x.content, y.content, sizeof(x.content)) != 0) {
+            return fmt::format("call {} (to {:#x} / {:#x}) differs", i, x.target, y.target);
+        }
+        for (u32 k = 0; k < CommitArity(x.target); ++k) {
+            const u64 u = x.a[k], v = y.a[k];
+            if (x.target == 0x626400 && k == 3) {
+                const auto s = std::find_if(snapshots.begin(), snapshots.end(),
+                                            [&](const auto& r) { return v >= r.first && v < r.second; });
+                if (s == snapshots.end() ? u != v
+                                         : u < lo || u + (s->second - v) > hi ||
+                                               std::memcmp(reinterpret_cast<const void*>(u),
+                                                           reinterpret_cast<const void*>(v), s->second - v) != 0) {
+                    return fmt::format("call {} to 0x626400: the user-data pointer's bytes differ ({:#x} / {:#x})", i,
+                                       u, v);
+                }
+            } else if (v >= lo && v < hi) {
+                const u64 n = std::min<u64>(32, hi - std::max(u, v));
+                if (u < lo || u >= hi ||
+                    std::memcmp(reinterpret_cast<const void*>(u), reinterpret_cast<const void*>(v), n) != 0) {
+                    return fmt::format("call {} to {:#x}: argument {} into the arena differs", i, x.target, k);
+                }
+            } else if (u != v) {
+                return fmt::format("call {} to {:#x}: argument {} {:#x} / {:#x}", i, x.target, k, u, v);
+            }
+        }
+    }
+    return {};
+}
+
+void TestCueDedup(const Image& image, Reconstructed::CueCommit::Fn recompiled, Reconstructed::CueCommit::Fn original,
+                  void (*redirect)(u64, u64), CommitWorld& w, std::mt19937_64& rng, u64 cases) {
+    namespace D = R6::CueDedup;
+    std::printf("R6-Core snapshot reuse in the commit (SSPC_R6_CUE_DEDUP):\n");
+    std::vector<u8> arena(0x80000);
+    g_commit_arena = arena.data();
+    g_commit_arena_size = arena.size();
+    const u64 lo = reinterpret_cast<u64>(arena.data()), hi = lo + arena.size();
+    const u64 cue = reinterpret_cast<u64>(w.cue());
+    u64 run_start = 0; // the arena's position at the last run's start
+    const auto run = [&](Reconstructed::CueCommit::Fn fn, bool dedup) {
+        run_start = g_commit_arena_used;
+        g_commit_calls.clear();
+        WipeStackBelow();
+        if (dedup) {
+            // the allocator's cur as the real one would hold it (the recorded allocator does not keep it); put back
+            // after, the commit does not write it
+            u64 cur = 0;
+            std::memcpy(&cur, w.mem.data() + 0x20, 8);
+            w.Put64(0x20, lo + g_commit_arena_used);
+            D::Commit(fn, cue);
+            w.Put64(0x20, cur);
+        } else {
+            fn(cue);
+        }
+        return g_commit_calls;
+    };
+
+    // 1. where the eboot's commit passes a snapshot's address: only to its copy (memcpy's destination) and to
+    // setPointerInUserData (0x626400, the pointer) - no other call's argument or stack values, nothing kept in the CUE
+    u64 leaks = 0, pointers = 0, snapshots = 0, kept_other = 0;
+    std::string first;
+    std::vector<u8> before;
+    for (u64 n = 0; n < cases; ++n) {
+        w.Generate(rng);
+        before = w.mem;
+        g_commit_arena_used = 0;
+        const std::vector<CommitCall> calls = run(original, false);
+        std::vector<std::pair<u64, u64>> ranges;
+        for (const CommitCall& c : calls) {
+            if (ShadowCopyStage(c, cue) >= 0) {
+                ranges.emplace_back(c.a[0], c.a[0] + c.a[2]);
+            }
+        }
+        snapshots += ranges.size();
+        const auto inside = [&](u64 v) {
+            return std::any_of(ranges.begin(), ranges.end(), [&](const auto& r) { return v >= r.first && v < r.second; });
+        };
+        const auto leak = [&](std::string what) {
+            if (leaks++ == 0) {
+                first = fmt::format("case {}: {}", n, what);
+            }
+        };
+        for (size_t i = 0; i < calls.size(); ++i) {
+            const CommitCall& c = calls[i];
+            for (u32 k = 0; k < CommitArity(c.target); ++k) {
+                if (inside(c.a[k])) {
+                    if (c.target == 0x626400 && k == 3) {
+                        ++pointers;
+                    } else if (!(k == 0 && ShadowCopyStage(c, cue) >= 0)) {
+                        leak(fmt::format("call {} to {:#x}, argument {}", i, c.target, k));
+                    }
+                }
+                for (u32 off = 0; off + 8 <= sizeof(c.content[k]); off += 4) {
+                    u64 v;
+                    std::memcpy(&v, c.content[k] + off, 8);
+                    if (inside(v)) {
+                        leak(fmt::format("call {} to {:#x}, stack values of argument {} +{}", i, c.target, k, off));
+                    }
+                }
+            }
+        }
+        // kept in the world: as a pointer, or as a descriptor's 44-bit base (a V#/T# the commit writes into a shadow);
+        // which allocation it is: the n-th 0x123d0 (the recorded allocator hands them out in order, 16-byte rounded)
+        std::vector<std::tuple<u64, u64, bool>> allocations; // start, end, a shadow's snapshot
+        u64 at = lo;
+        for (const CommitCall& c : calls) {
+            if (c.target == 0x123d0) {
+                const u64 bytes = (u64{static_cast<u32>(c.a[1])} * 4 + 15) & ~15ull;
+                allocations.emplace_back(at, at + bytes, false);
+                at += bytes;
+            } else if (ShadowCopyStage(c, cue) >= 0) {
+                for (auto& [s, e, shadow] : allocations) {
+                    shadow = shadow || s == c.a[0];
+                }
+            }
+        }
+        for (u64 off = 0; off + 8 <= CommitWorld::kArena; off += 4) {
+            u64 v, was;
+            std::memcpy(&v, w.mem.data() + off, 8);
+            std::memcpy(&was, before.data() + off, 8);
+            if (v == was) {
+                continue;
+            }
+            // a pointer, a 44-bit descriptor base, the low dword of an address (the ES/GS ring state +0xc6e4...)
+            for (const u64 x : {v, v & ((u64{1} << 44) - 1), (lo & ~0xffffffffull) | (v & 0xffffffffull)}) {
+                for (size_t i = 0; i < allocations.size(); ++i) {
+                    const auto& [s, e, shadow] = allocations[i];
+                    if (x >= s && x < e) {
+                        if (shadow) {
+                            leak(fmt::format("kept at world +{:#x} ({:#018x}): snapshot allocation {} +{:#x}", off, v,
+                                             i, x - s));
+                        } else {
+                            ++kept_other;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::printf("  (words kept in the world that address a non-snapshot allocation of the commit: %llu)\n",
+                static_cast<unsigned long long>(kept_other));
+    std::printf("  the eboot's commit, %llu cases: %llu snapshots, %llu user-data pointers into them, %llu other "
+                "uses%s%s\n",
+                static_cast<unsigned long long>(cases), static_cast<unsigned long long>(snapshots),
+                static_cast<unsigned long long>(pointers), static_cast<unsigned long long>(leaks),
+                first.empty() ? "" : "; first: ", first.c_str());
+    CHECK(leaks == 0 && pointers > 0);
+
+    // 2. a commit (cold: copies, remembered), the same CUE state again (every dirty stage's snapshot reused), then
+    // one byte of one copied stage's shadow changed (that stage copied again, the others reused) - each against the
+    // eboot's commit on the same state, by content
+    D::Prepare(image.base, redirect);
+    const D::Stats s0 = D::Totals();
+    // (the reuse makes its copies itself: they are not recorded calls - what it did is read from its counters)
+    u64 bad = 0, again_copies = 0, changed_missing = 0, changed_cases = 0;
+    first.clear();
+    std::vector<u8> state, after, after_reference;
+    std::vector<CommitCall> reference;
+    for (u64 n = 0; n < cases; ++n) {
+        w.Generate(rng);
+        w.Put64(0x28, lo); // the allocator's chunk start (the recorded allocator hands out the arena from it)
+        g_commit_arena_used = 0;
+        state = w.mem;
+        const auto compare = [&](const char* what, const std::vector<CommitCall>& got) {
+            after = w.mem;
+            w.mem = state;
+            // the eboot's commit from the same arena position: the reuse allocates as the game does, so both take
+            // the same addresses (descriptors the commit builds carry them) - the reference's copies overwrite the
+            // checked run's new ones (the same bytes when equal), the earlier snapshots it reused stay below
+            g_commit_arena_used = run_start;
+            reference = run(original, false);
+            after_reference = w.mem;
+            std::string d = SameCommitByContent(got, reference, cue, lo, hi);
+            // the world: equal, or (a pointer the commit keeps, e.g. to a descriptor it allocated) both words into
+            // the arena with the same 32 bytes there
+            for (u64 off = 0; d.empty() && off < after.size(); ++off) {
+                if (after[off] == after_reference[off]) {
+                    continue;
+                }
+                const u64 at = off & ~7ull;
+                u64 u = 0, v = 0;
+                std::memcpy(&u, after.data() + at, 8);
+                std::memcpy(&v, after_reference.data() + at, 8);
+                // two addresses into the arena with the same 32 bytes there
+                const auto same = [&](u64 x, u64 y) {
+                    return x >= lo && x < hi && y >= lo && y < hi &&
+                           std::memcmp(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(y),
+                                       std::min<u64>(32, hi - std::max(x, y))) == 0;
+                };
+                constexpr u64 kBase = (u64{1} << 44) - 1; // a descriptor's base address field
+                const u64 page = lo & ~0xffffffffull;     // the low dword of an address (the ES/GS ring state)
+                const auto dword = [&](u32 x, u32 y) { return x == y || same(page | x, page | y); };
+                const bool ok = same(u, v) ||
+                                ((u & ~kBase) == (v & ~kBase) && same(u & kBase, v & kBase)) ||
+                                (dword(static_cast<u32>(u), static_cast<u32>(v)) &&
+                                 dword(static_cast<u32>(u >> 32), static_cast<u32>(v >> 32)));
+                if (ok) {
+                    off = at + 7;
+                } else {
+                    d = fmt::format("the world after it differs at +{:#x}: {:#018x} / {:#018x}", at, u, v);
+                }
+            }
+            if (!d.empty() && bad++ == 0) {
+                first = fmt::format("case {} ({}): {}", n, what, d);
+            }
+            w.mem = state;
+        };
+        const auto delta = [](const D::Stats& a, const D::Stats& b) {
+            return std::pair<u64, u64>{b.snapshots - a.snapshots, b.reused - a.reused};
+        };
+        const std::vector<CommitCall> cold = run(recompiled, true);
+        compare("cold", cold);
+        const std::vector<CommitCall> cold_reference = reference;
+        // the stages a later commit must reuse: those whose snapshot in the eboot's commit is byte-equal to the cold
+        // one's (the commit may write a shadow before copying it - a deterministic entry, or in the ES/GS path a
+        // descriptor of a new allocation); the others must be copied
+        const auto expected_misses = [&](const std::vector<CommitCall>& ref) {
+            u64 misses = 0;
+            for (const CommitCall& c : ref) {
+                const int s = ShadowCopyStage(c, cue);
+                if (s < 0) {
+                    continue;
+                }
+                const bool equal = std::any_of(cold_reference.begin(), cold_reference.end(), [&](const CommitCall& o) {
+                    return ShadowCopyStage(o, cue) == s && o.a[2] == c.a[2] &&
+                           std::memcmp(reinterpret_cast<const void*>(o.a[0]), reinterpret_cast<const void*>(c.a[0]),
+                                       c.a[2]) == 0;
+                });
+                misses += equal ? 0 : 1;
+            }
+            return misses;
+        };
+        const D::Stats before_again = D::Totals();
+        const std::vector<CommitCall> again = run(recompiled, true);
+        const auto [again_snapshots, again_reused] = delta(before_again, D::Totals());
+        compare("again", again);
+        if (again_snapshots - again_reused != expected_misses(reference)) {
+            if (again_copies++ == 0) {
+                std::printf("    first repeated commit not as expected (case %llu): snapshots %llu, reused %llu, "
+                            "expected misses %llu\n",
+                            static_cast<unsigned long long>(n), static_cast<unsigned long long>(again_snapshots),
+                            static_cast<unsigned long long>(again_reused),
+                            static_cast<unsigned long long>(expected_misses(reference)));
+            }
+        }
+        const auto copied = std::find_if(cold_reference.begin(), cold_reference.end(),
+                                         [&](const CommitCall& c) { return ShadowCopyStage(c, cue) >= 0; });
+        if (copied == cold_reference.end()) {
+            continue;
+        }
+        const int stage = ShadowCopyStage(*copied, cue);
+        w.mem[0x90 + 0x1800 * static_cast<u64>(stage) + rng() % copied->a[2]] ^= 0x5a;
+        state = w.mem;
+        ++changed_cases;
+        const D::Stats before_changed = D::Totals();
+        const std::vector<CommitCall> changed = run(recompiled, true);
+        const auto [changed_snapshots, changed_reused] = delta(before_changed, D::Totals());
+        compare("changed", changed);
+        // the changed stage copied again, the others as their bytes say
+        if (changed_snapshots - changed_reused != expected_misses(reference)) {
+            ++changed_missing;
+        }
+    }
+    const D::Stats s = D::Totals();
+    std::printf("  recomp_14ad0 with the reuse, %llu cases x 3 commits against the eboot's: %llu different%s%s; "
+                "snapshots %llu, reused %llu, missed (cold %llu, chunk %llu, bytes %llu), pointers moved %llu; "
+                "repeated commits not as their snapshots' bytes say %llu, changed commits not so %llu of %llu\n",
+                static_cast<unsigned long long>(cases), static_cast<unsigned long long>(bad),
+                first.empty() ? "" : "; first: ", first.c_str(),
+                static_cast<unsigned long long>(s.snapshots - s0.snapshots),
+                static_cast<unsigned long long>(s.reused - s0.reused),
+                static_cast<unsigned long long>(s.miss_cold - s0.miss_cold),
+                static_cast<unsigned long long>(s.miss_chunk - s0.miss_chunk),
+                static_cast<unsigned long long>(s.miss_bytes - s0.miss_bytes),
+                static_cast<unsigned long long>(s.moved_pointers - s0.moved_pointers),
+                static_cast<unsigned long long>(again_copies), static_cast<unsigned long long>(changed_missing),
+                static_cast<unsigned long long>(changed_cases));
+    CHECK(bad == 0 && again_copies == 0 && changed_missing == 0 && changed_cases > 0 && s.reused > s0.reused);
+    g_commit_arena = w.mem.data() + CommitWorld::kArena;
+    g_commit_arena_size = CommitWorld::kArenaBytes;
+}
+
 void TestCueCommitRecompiled(const Image& image, HMODULE m, u64 cases) {
     const void* recompiled = m ? reinterpret_cast<const void*>(GetProcAddress(m, "recomp_14ad0")) : nullptr;
     if (recompiled == nullptr) {
@@ -1791,6 +2110,10 @@ void TestCueCommitRecompiled(const Image& image, HMODULE m, u64 cases) {
         CHECK(caught);
         CC::UseImplementation(reinterpret_cast<CC::Fn>(const_cast<void*>(recompiled)), "recompiled (test)", redirect);
         g.mode.store(static_cast<u8>(Mode::Original));
+    }
+    if (redirect != nullptr) {
+        TestCueDedup(image, reinterpret_cast<CC::Fn>(const_cast<void*>(recompiled)),
+                     reinterpret_cast<CC::Fn>(const_cast<void*>(original)), redirect, w, rng, cases);
     }
     patches.clear();
     *got = got_saved;

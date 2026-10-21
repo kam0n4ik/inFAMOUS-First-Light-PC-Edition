@@ -16,6 +16,7 @@
 #include "native_engine/guest_code_clone.h"
 #include "native_engine/native_dispatch.h"
 #include "native_engine/native_engine_verify.h"
+#include "native_engine/r6/cue_dedup.h"
 
 namespace SecondSon::NativeEngine::Reconstructed {
 
@@ -281,7 +282,16 @@ struct Impl {
     }
 
     static SSPC_SYSV_ABI void Native(u64 cue) { // counted by the dispatcher
-        g_impl(cue);
+        Run(cue);
+    }
+
+    /// The implementation's real call: with R6's snapshot reuse when it is on (r6/cue_dedup.h).
+    static void Run(u64 cue) {
+        if (R6::CueDedup::Enabled()) {
+            R6::CueDedup::Commit(g_impl, cue);
+        } else {
+            g_impl(cue);
+        }
     }
 
     /// The original stays authoritative; every Nth call is compared first (a shadow run costs two CUE copies).
@@ -310,7 +320,7 @@ struct Impl {
             }
         }
         Count(slot.index, kCallsNative);
-        g_impl(cue);
+        Run(cue);
     }
 
     static SSPC_SYSV_ABI void Bench(u64 cue) {
@@ -346,6 +356,13 @@ bool PrepareInstall(u64 module_base, std::string& error) {
         error = "no implementation: cue_commit has no hand-written reconstruction, it needs SSPC_NATIVE_ENGINE_RECOMP "
                 "with recomp_14ad0 and recomp_set_redirect";
         return false;
+    }
+    if (R6::CueDedup::Enabled()) {
+        if (g_redirect == nullptr) {
+            error = "SSPC_R6_CUE_DEDUP=1 needs recomp_set_redirect";
+            return false;
+        }
+        R6::CueDedup::Prepare(module_base, g_redirect);
     }
     return CC::Prepare(module_base, error);
 }

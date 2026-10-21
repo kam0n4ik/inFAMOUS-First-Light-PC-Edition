@@ -26,6 +26,7 @@
 #include "native_engine/reconstructed/material_bind.h"
 #include "native_engine/reconstructed/object_constants.h"
 #include "native_engine/reconstructed/shadow_instance_uv.h"
+#include "native_engine/r6/cue_dedup.h"
 #include "runtime/cpu/fs_patcher.h"
 #include "runtime/gpu/native_videoout.h"
 
@@ -121,6 +122,17 @@ void Reporter() {
             summary += line + "\n";
             prev[in.index] = Total(in.index, kCallsNative) + Total(in.index, kCallsOriginal) +
                              (in.mode == Mode::Verify ? Total(in.index, kCallsChecked) : 0);
+        }
+        if (R6::CueDedup::Enabled()) {
+            const R6::CueDedup::Stats d = R6::CueDedup::Totals();
+            const std::string line = fmt::format(
+                "R6 snapshot reuse (SSPC_R6_CUE_DEDUP, totals): commits {}, shadow snapshots {}, reused {} ({:.1f} %, "
+                "{} MiB not copied), missed: cold {}, other chunk {}, other bytes {}; user-data pointers moved {}; "
+                "other copies {}",
+                d.commits, d.snapshots, d.reused, d.snapshots ? 100.0 * d.reused / d.snapshots : 0.0,
+                d.bytes_saved >> 20, d.miss_cold, d.miss_chunk, d.miss_bytes, d.moved_pointers, d.other_copies);
+            SSPC_LOG(Engine, Info, "native engine/10s: {}", line);
+            summary += line + "\n";
         }
         const u32 sites = Measure::SiteCount();
         if (sites > 1) {

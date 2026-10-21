@@ -104,7 +104,8 @@ try {
     $extra = "--loader sspc --user-data $saveCopy --shader-cache $ShaderCache --press $Press"
     & "$Worktree\tools\run_phase0.ps1" -Seconds $Seconds -Tag $Tag -NoReport -ExtraArgs $extra -Exe $exe `
         -LogsDir $LogsDir | Tee-Object "$run\console.txt"
-    foreach ($f in "SecondSonPC.log", "gpu_frames.csv", "gpu_native.txt", "bridge_shadps4.log") {
+    foreach ($f in "SecondSonPC.log", "gpu_frames.csv", "gpu_native.txt", "bridge_shadps4.log", "gpu_cpu_profile.txt",
+                   "gpu_cpu_profile_game.txt") {
         if (Test-Path "$Worktree\logs\$f") { Copy-Item "$Worktree\logs\$f" $run }
     }
     if (Test-Path "$Worktree\logs\native_engine") { Copy-Item "$Worktree\logs\native_engine" $run -Recurse }
