@@ -142,10 +142,10 @@ private:
 
 /// The executor's view of a prepared stage (what parallel_cp's CopyStage copies: status, program, module, runtime
 /// parameters, bindings, the resource plan - not the specialization key), field by field. true: equal.
-bool CompareStageView(const Shader::StageView& expected, const Shader::StageView& actual, Diff& d);
+bool CompareStageView(const Gpu::Shader::StageView& expected, const Gpu::Shader::StageView& actual, Diff& d);
 /// A stage's resource plan: the flattened user data, every buffer/image/sampler/vertex binding field, the status
 /// counts, the SRT walk's error (not its read statistics: a reused plan did not walk). true: equal.
-bool ComparePlan(const Shader::ResourceBindingPlan& expected, const Shader::ResourceBindingPlan& actual, Diff& d);
+bool ComparePlan(const Gpu::Shader::ResourceBindingPlan& expected, const Gpu::Shader::ResourceBindingPlan& actual, Diff& d);
 /// A draw command as the native stream carries it (engine/render/native_render_ops.h DrawOp: pass, index count and
 /// base, the VS/PS registers, the stage tables' shape and hashes), field by field. true: equal.
 bool CompareDrawOp(const Engine::Render::DrawOp& expected, const Engine::Render::DrawOp& actual, Diff& d);

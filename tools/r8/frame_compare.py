@@ -170,17 +170,21 @@ def judge(res, noise, k, slack_mae, slack_changed):
     return sorted(set(fails))
 
 
-def det_frames(path):
-    """flip -> game frame (the deterministic mode's frame log: frame,flip,...)."""
+def det_frames(path, key, offset=0):
+    """flip -> the game frame or world frame whose clock call saw that flip next (the deterministic mode's frame log:
+    frame,flip,...,world). `offset`: the image of a frame is shown that many flips later (pipelining)."""
     out = {}
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            out.setdefault(int(row["flip"]), int(row["frame"]))
+            v = int(row[key])
+            if v >= 0:
+                out.setdefault(int(row["flip"]) + offset, v)
     return out
 
 
 def series_pairs(args):
-    fa, fb = det_frames(args.frames_a), det_frames(args.frames_b)
+    fa = det_frames(args.frames_a, args.align, args.flip_offset)
+    fb = det_frames(args.frames_b, args.align, args.flip_offset)
     shots_a = {int(p.stem.split("_")[1]): p for p in Path(args.series[0]).glob("flip_*.png")}
     shots_b = {int(p.stem.split("_")[1]): p for p in Path(args.series[1]).glob("flip_*.png")}
     by_frame_a = {fa[f]: p for f, p in shots_a.items() if f in fa}
@@ -213,7 +217,10 @@ def main():
     ap.add_argument("--series", nargs=2, metavar=("DIR_A", "DIR_B"))
     ap.add_argument("--frames-a")
     ap.add_argument("--frames-b")
-    ap.add_argument("--at", help="series: only these game frames")
+    ap.add_argument("--at", help="series: only these game/world frames")
+    ap.add_argument("--align", choices=("world", "frame"), default="world",
+                    help="series: pair the shots by world frame (the anchor's mode) or by game frame")
+    ap.add_argument("--flip-offset", type=int, default=0, help="series: a frame's image is that many flips later")
     ap.add_argument("--heatmap", help="the difference as an image (series: a directory)")
     ap.add_argument("--grid", default="8x6")
     ap.add_argument("--region", action="append", default=[])

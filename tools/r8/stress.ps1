@@ -5,8 +5,9 @@
 #       -Scenario long|camera|traverse|combat|menus|beach|harbor|village|validate -Tag <tag> [-Env "A=1;B=2"]
 #       [-MoreArgs "..."] [-Seconds N] [-RefValidation <run dir>]
 # The routes start like the stand's city route (space@12 continue, space@22 load) and act from 40 s on (the world is
-# there by then on the stand's save). Keys: the PC defaults (input/settings.cpp): w/a/s/d move, (Left Shift, L3, has no name without a space - not scripted),
-# Space jump (cross), mouse left/right fire/aim (R2/L2), Return pause (options), Tab map (touch pad).
+# there by then on the stand's save). Keys: the PC defaults (input/settings.cpp): w/a/s/d move, Space jump (cross),
+# mouse left/right fire/aim (R2/L2), Return pause (options), Tab map (touch pad); sprint (Left Shift, L3) is not
+# scripted: its SDL name has a space, and the route is one command-line argument.
 param(
     [Parameter(Mandatory)] [string]$Worktree,
     [Parameter(Mandatory)] [string]$Out,
