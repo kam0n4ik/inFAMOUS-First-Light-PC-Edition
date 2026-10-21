@@ -712,6 +712,8 @@ struct ModeCounts {
     u8 mode_after;
 };
 
+int RegistryModes(u64 image_base, std::mt19937_64& rng, int& checks, const char* label);
+
 int RegistryTests(u64 image_base, const std::string& recomp_dll, std::mt19937_64& rng, int& checks) {
     int failures = 0;
     const auto check = [&](bool ok, const std::string& what) {
@@ -752,7 +754,23 @@ int RegistryTests(u64 image_base, const std::string& recomp_dll, std::mt19937_64
     const std::string faulted = SL::SelfCheckDraw(200, 7);
     SL::InjectFault(0);
     check(!faulted.empty(), "a fault in the implementation found (" + faulted + ")");
+    failures += RegistryModes(image_base, rng, checks, "");
+    return failures;
+}
 
+/// The specs' modes through their dispatchers with the implementation set now (recompiled: R6-S; hand-written: R7-S).
+int RegistryModes(u64 image_base, std::mt19937_64& rng, int& checks, const char* label) {
+    int failures = 0;
+    const auto check = [&](bool ok, const std::string& what) {
+        ++checks;
+        failures += ok ? 0 : 1;
+        std::printf("  %s%s: %s\n", label, what.c_str(), ok ? "ok" : "FAILED");
+    };
+    const FunctionSpec& loop = Reconstructed::kShadowCastersLoopSpec;
+    const FunctionSpec& draw = Reconstructed::kShadowInstancedDrawSpec;
+    std::string error;
+    const std::vector<u8> entry_before(reinterpret_cast<const u8*>(image_base + draw.function.rva),
+                                       reinterpret_cast<const u8*>(image_base + draw.function.rva) + 16);
     // the modes through the dispatchers: the callees' entries aimed at stand-ins (the original's run makes them);
     // the generator 0x612110 and the constant blocks run for real (the image's generator state saved and restored)
     std::vector<EntryPatch*> patches;
@@ -828,14 +846,18 @@ int RegistryTests(u64 image_base, const std::string& recomp_dll, std::mt19937_64
         c = run_draw(Mode::Guarded, 2000);
         check(c.verified == 2000 && c.mismatches == 0 && c.fallbacks == 0 && c.mode_after == static_cast<u8>(Mode::Guarded),
               text("shadow_instanced_draw", "guarded", c));
-        // a wrong implementation: every verify call a mismatch; guarded falls back to the original at the first
-        SL::InjectFault(1);
-        c = run_draw(Mode::Verify, 50);
-        check(c.verified == 50 && c.mismatches == 50, text("shadow_instanced_draw (fault)", "verify", c));
-        c = run_draw(Mode::Guarded, 50);
-        check(c.mismatches == 1 && c.fallbacks == 1 && c.mode_after == static_cast<u8>(Mode::Original),
-              text("shadow_instanced_draw (fault)", "guarded", c));
-        SL::InjectFault(0);
+        // a wrong implementation: every verify call a mismatch; guarded falls back to the original at the first.
+        // Once per process (the R6 run, label ""): every mismatch takes one of the verifier's 64 recorded cases
+        // (native_engine_verify.cpp kRing), and the later tests need one free.
+        if (label[0] == '\0') {
+            SL::InjectFault(1);
+            c = run_draw(Mode::Verify, 50);
+            check(c.verified == 50 && c.mismatches == 50, text("shadow_instanced_draw (fault)", "verify", c));
+            c = run_draw(Mode::Guarded, 50);
+            check(c.mismatches == 1 && c.fallbacks == 1 && c.mode_after == static_cast<u8>(Mode::Original),
+                  text("shadow_instanced_draw (fault)", "guarded", c));
+            SL::InjectFault(0);
+        }
         loop.slot->mode.store(static_cast<u8>(Mode::Original));
         draw.slot->mode.store(static_cast<u8>(Mode::Original));
     }
@@ -847,6 +869,55 @@ int RegistryTests(u64 image_base, const std::string& recomp_dll, std::mt19937_64
 }
 
 } // namespace
+
+// --- R7-S: the same differentials for the hand-written implementation (r7_shadows_tests.cpp) -----------------------
+
+u64 R6ShadowLoopDifferential(void* original, void* impl, int (*redirects)(const u64*, const u64*, u32), u64 image_base,
+                             u64 cases, std::mt19937_64& rng, std::string& first, u64& calls, u64& instanced_cases,
+                             bool perturb) {
+    return LoopDifferential(reinterpret_cast<Fn2>(original), reinterpret_cast<Fn2>(impl), redirects, image_base, cases,
+                            rng, first, calls, instanced_cases, perturb);
+}
+
+u64 R6ShadowDrawDifferential(void* original, void* impl, int (*redirects)(const u64*, const u64*, u32), u64 image_base,
+                             u64 cases, std::mt19937_64& rng, std::string& first, u64& calls) {
+    return DrawDifferential(reinterpret_cast<Fn6>(original), reinterpret_cast<Fn6>(impl), redirects, image_base, cases,
+                            rng, first, calls);
+}
+
+/// The recording clones of 0x43d590 / 0x43d480 over the mapped image (the offline tables above); nullptr on failure.
+void* R6ShadowRecordingClone(u64 image_base, bool loop) {
+    std::vector<CodeRedirect> to_thunks;
+    const ST::CalleeSpec* callees = loop ? kLoopCallees : kDrawCallees;
+    const u32 n = loop ? kLoopCalleeCount : kDrawCalleeCount;
+    for (u32 i = 0; i < n; ++i) {
+        to_thunks.push_back({image_base + callees[i].rva, ST::ThunkAddress(i)});
+    }
+    std::string error;
+    const u64 rva = loop ? 0x43d590 : 0x43d480;
+    const CloneResult c = CloneGuestFunction(image_base + rva, reinterpret_cast<const u8*>(image_base + rva),
+                                             loop ? 0xdb9 : 0x106, error, to_thunks);
+    if (c.code == nullptr) {
+        std::printf("  recording clone of %#llx: %s\n", static_cast<unsigned long long>(rva), error.c_str());
+    }
+    return c.code;
+}
+
+/// The registry specs' verify / guarded / fault checks through the dispatchers with the implementation set now.
+int R6ShadowRegistryModes(u64 image_base, std::mt19937_64& rng, int& checks, const char* label) {
+    return RegistryModes(image_base, rng, checks, label);
+}
+
+/// The per-callee coverage of the loop differentials so far (kLoopCallees order); returns the callee count.
+u32 R6ShadowLoopCoverage(const u64*& calls, const u64*& rvas) {
+    static u64 rva[kLoopCalleeCount];
+    for (u32 i = 0; i < kLoopCalleeCount; ++i) {
+        rva[i] = kLoopCallees[i].rva;
+    }
+    calls = g_loop_callee_calls;
+    rvas = rva;
+    return kLoopCalleeCount;
+}
 
 int R6ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases, int& checks) {
     std::printf("R6-S shadow loop leaves (recompiled vs the eboot's code):\n");
