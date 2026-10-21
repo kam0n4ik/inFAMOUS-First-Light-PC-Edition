@@ -50,6 +50,8 @@ struct CalleeSpec;
 /// function reads back. nullptr: returns 0.
 using EffectFn = u64 (*)(Trace& t, const CalleeSpec& callee, CallIn& in, const u64* stack);
 
+inline constexpr u32 kSnaps = 4; ///< pointer arguments snapshotted per call
+
 struct CalleeSpec {
     u64 rva;
     const char* name;
@@ -57,16 +59,18 @@ struct CalleeSpec {
     u8 widths; ///< bit i: argument register i is 32-bit (only its low half compared, for a hand-written caller)
     u8 xmm;    ///< XMM argument registers compared
     u8 stack;  ///< stack arguments (qwords) compared
-    Snap snap[2];
+    Snap snap[kSnaps];
     EffectFn effect = nullptr;
     bool record = true; ///< false: the effect runs, nothing is recorded (a pure callee the caller needs, e.g. memmove)
+    u8 ignore = 0;       ///< bit i: argument register i below `gpr` is not an argument (the callee never reads it)
+    u8 stack_widths = 0; ///< bit k: stack argument k is 32-bit (low half compared, for a hand-written caller)
 };
 
 struct Call {
     u32 callee;
     u32 flags; ///< 1: a snapshot exceeded its max
-    u32 snap_off[2];
-    u32 snap_len[2];
+    u32 snap_off[kSnaps];
+    u32 snap_len[kSnaps];
     u64 gpr[8];
     u64 stack[4];
     alignas(16) u8 xmm[8][16];

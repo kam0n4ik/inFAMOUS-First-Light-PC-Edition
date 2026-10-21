@@ -110,7 +110,7 @@ SSPC_SYSV_ABI u64 Record(u64 index, GT::CallIn* in, const u64* stack) {
             for (u32 k = 0; k < 4; ++k) {
                 c.stack[k] = k < spec.stack ? stack[k] : 0;
             }
-            for (u32 s = 0; s < 2; ++s) {
+            for (u32 s = 0; s < GT::kSnaps; ++s) {
                 c.snap_off[s] = 0;
                 c.snap_len[s] = 0;
                 const GT::Snap& sn = spec.snap[s];
@@ -213,6 +213,9 @@ std::string Compare(const Trace& a, const Trace& b, bool exact) {
         }
         const CalleeSpec& s = a.callees[x.callee];
         for (u32 r = 0; r < s.gpr; ++r) {
+            if ((s.ignore >> r & 1) != 0) {
+                continue;
+            }
             u64 u = Normal(a, x.gpr[r]), v = Normal(b, y.gpr[r]);
             if (!exact && (s.widths >> r & 1) != 0) {
                 u &= 0xffffffffull;
@@ -229,12 +232,17 @@ std::string Compare(const Trace& a, const Trace& b, bool exact) {
             }
         }
         for (u32 k = 0; k < s.stack && k < 4; ++k) {
-            if (Normal(a, x.stack[k]) != Normal(b, y.stack[k])) {
+            u64 u = Normal(a, x.stack[k]), v = Normal(b, y.stack[k]);
+            if (!exact && (s.stack_widths >> k & 1) != 0) {
+                u &= 0xffffffffull;
+                v &= 0xffffffffull;
+            }
+            if (u != v) {
                 return fmt::format("call {} ({}): stack argument {}: {:#x} vs {:#x}", i, s.name, k, x.stack[k],
                                    y.stack[k]);
             }
         }
-        for (u32 n = 0; n < 2; ++n) {
+        for (u32 n = 0; n < GT::kSnaps; ++n) {
             if (x.snap_len[n] != y.snap_len[n] ||
                 std::memcmp(a.snap + x.snap_off[n], b.snap + y.snap_off[n], x.snap_len[n]) != 0) {
                 u32 k = 0;
