@@ -1,5 +1,6 @@
 // SecondSonPC — SecondSonPC's own GPU backend (P4.4). See native_backend.h.
 #include <windows.h>
+#include <intrin.h>
 
 #include "runtime/gpu/native_backend.h"
 
@@ -33,6 +34,7 @@
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/cpu_sampler.h"
+#include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
@@ -86,13 +88,21 @@ public:
         if (VideoOut::LabelRead(addr, dst, bytes)) {
             return true;
         }
+        bool timeline_noted = false; // (R6-P SSPC_R6_CP_DIAG: the value read too)
         if (parallel != nullptr) {
             // (the executor's list is the recording thread's while records are queued: the queued copies and what it
             // held when the queue was last empty decide; a possible overlap drains, then the executor decides)
             if (parallel->TimelinePending(addr, bytes)) {
+                R6::g_read_over_timeline = true; // (R6-P SSPC_R6_CP_POLL_TRIVIAL=verify)
+                const u64 t0 = R6::Opt().diag ? __rdtsc() : 0; // (R6-P diagnostics)
                 parallel->Drain(DrainReason::MemoryRead);
-                if (executor->TimelineWritePending(addr, bytes)) {
+                const bool sync = executor->TimelineWritePending(addr, bytes);
+                if (sync) {
                     executor->SyncFromMemoryRead();
+                }
+                if (t0 != 0) {
+                    R6::NoteTimelineRead(addr, bytes, sync, __rdtsc() - t0);
+                    timeline_noted = bytes == 4;
                 }
             }
         } else if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {
@@ -104,6 +114,11 @@ public:
             return false;
         }
         gm->CopySparse(addr, static_cast<u8*>(dst), bytes);
+        if (timeline_noted) {
+            u32 v = 0;
+            std::memcpy(&v, dst, sizeof(v));
+            R6::NoteTimelineValue(addr, v);
+        }
         return true;
     }
     bool unordered_labels = true; ///< P4.6 (SSPC_P46_SYNC=0: off)
