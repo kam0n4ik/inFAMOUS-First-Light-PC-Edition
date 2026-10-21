@@ -11,6 +11,8 @@
 #include <random>
 #include <vector>
 
+#include <intrin.h>
+
 #include <fmt/format.h>
 #include <windows.h>
 
@@ -20,6 +22,9 @@
 #include "native_engine/guest_code_clone.h"
 #include "native_engine/native_dispatch.h"
 #include "native_engine/native_engine_verify.h"
+#include "native_engine/r7/shadows/shadow_draw_command.h"
+#include "native_engine/r7/shadows/shadow_stats.h"
+#include "native_engine/reconstructed/shadow_casters.h"
 
 namespace SecondSon::NativeEngine::Reconstructed {
 
@@ -51,6 +56,8 @@ constexpr u64 kPrngRva = 0x612110;
 constexpr u32 kPrngBytes = 0x810;
 
 std::atomic<u64> g_module{0};
+std::atomic<u64> g_command_checks{0};     ///< R7-S: NativeDrawCommand vs the original's calls (verify of 0x43d480)
+std::atomic<u64> g_command_mismatches{0};
 SL::LoopFn g_loop_impl = nullptr;
 SL::DrawFn g_draw_impl = nullptr;
 SL::RedirectsFn g_redirects = nullptr;
@@ -331,6 +338,12 @@ struct LoopImpl {
         return reinterpret_cast<SL::LoopFn>(slot.original);
     }
     static SSPC_SYSV_ABI void Native(u64 pass, u64 args) {
+        if (R7Shadows::Stats::TimingOn()) { // R7-S: the loop's inclusive cost (native: the implementation)
+            const u64 t0 = __rdtsc();
+            g_loop_impl(pass, args);
+            R7Shadows::Stats::Time(true, __rdtsc() - t0);
+            return;
+        }
         g_loop_impl(pass, args);
     }
     static bool Check(u64 pass, u64 args) {
@@ -355,6 +368,12 @@ struct LoopImpl {
     }
     static SSPC_SYSV_ABI void Bench(u64 pass, u64 args) {
         Count(slot.index, kCallsOriginal);
+        if (R7Shadows::Stats::TimingOn()) { // R7-S: the original's inclusive cost through the same dispatcher
+            const u64 t0 = __rdtsc();
+            Original()(pass, args);
+            R7Shadows::Stats::Time(false, __rdtsc() - t0);
+            return;
+        }
         Original()(pass, args);
     }
 };
@@ -370,7 +389,26 @@ struct DrawImpl {
     }
     static bool Check(u64 pass, u64 r, u64 records, u64 n, u64 mesh) {
         bool skipped = false;
+        // R7-S: the Native Render Layer command built at the entry (before anything runs), checked against the calls
+        // the original then made (its recording run)
+        Engine::Render::R7::NativeRenderContext ctx;
+        Engine::Render::R7::NativeDrawCommand cmd;
+        R7Shadows::ShadowDrawInputs inputs;
+        R7Shadows::BuildInstancedDraw(g_module.load(std::memory_order_relaxed), pass, r, records, n, mesh, ctx, cmd,
+                                      inputs);
         const std::string what = SL::CheckDraw(pass, r, records, n, mesh, skipped);
+        if (!skipped) {
+            const std::string c = R7Shadows::CheckAgainstTrace(ctx, cmd, inputs, SL::LastTrace(0));
+            g_command_checks.fetch_add(1, std::memory_order_relaxed);
+            if (!c.empty() && g_command_mismatches.fetch_add(1, std::memory_order_relaxed) < 8) {
+                SSPC_LOG(Engine, Error, "R7-S: NativeDrawCommand of 0x43d480 differs from its calls: {}", c);
+            }
+            const u64 k = g_command_checks.load(std::memory_order_relaxed);
+            if ((k & (k - 1)) == 0 && k >= 1024) {
+                SSPC_LOG(Engine, Info, "R7-S: NativeDrawCommand checks {}, mismatches {}", k,
+                         g_command_mismatches.load(std::memory_order_relaxed));
+            }
+        }
         return CheckCounted(slot, "shadow_instanced_draw (0x43d480)", what, skipped, {pass, r, records, n, mesh});
     }
     static SSPC_SYSV_ABI void Verify(u64 pass, u64 r, u64 records, u64 n, u64 mesh) {
@@ -430,7 +468,20 @@ private:
     bool ok_ = false;
 };
 
-/// Both specs: the recompiled implementations from SSPC_NATIVE_ENGINE_RECOMP (there is no hand-written one).
+/// R7-S: which implementation the specs install (SSPC_R7_SHADOWS_IMPL): "hand" - the hand-written reconstruction
+/// (shadow_casters.h); "recomp" - the recompiled functions of SSPC_NATIVE_ENGINE_RECOMP (R6-S); unset - the recompiled
+/// ones when SSPC_NATIVE_ENGINE_RECOMP is set (R6-S behaviour), else the hand-written one.
+bool UseHand() {
+    char v[16] = {};
+    const DWORD n = GetEnvironmentVariableA("SSPC_R7_SHADOWS_IMPL", v, sizeof(v));
+    if (n > 0 && n < sizeof(v)) {
+        return std::strcmp(v, "recomp") != 0;
+    }
+    char path[8] = {};
+    return GetEnvironmentVariableA("SSPC_NATIVE_ENGINE_RECOMP", path, sizeof(path)) == 0;
+}
+
+/// Both specs: the hand-written implementation (R7-S) or the recompiled functions from SSPC_NATIVE_ENGINE_RECOMP.
 bool PrepareCommon(u64 module_base, std::string& error) {
     static std::mutex mu;
     static bool done = false;
@@ -443,6 +494,13 @@ bool PrepareCommon(u64 module_base, std::string& error) {
     }
     done = true;
     ok = SL::Prepare(module_base, saved);
+    if (ok && (g_loop_impl == nullptr || g_draw_impl == nullptr) && UseHand()) {
+        ok = SL::UseHandImplementation(module_base, saved);
+        if (ok) {
+            SSPC_LOG(Engine, Warning, "R7-S: the shadow loop's implementation: the hand-written 0x43d590 / 0x43d480 "
+                                      "(shadow_casters.cpp)");
+        }
+    }
     if (ok && (g_loop_impl == nullptr || g_draw_impl == nullptr)) {
         char path[260] = {};
         const DWORD n = GetEnvironmentVariableA("SSPC_NATIVE_ENGINE_RECOMP", path, sizeof(path));
@@ -541,6 +599,18 @@ void SL::UseImplementation(LoopFn loop, DrawFn draw, RedirectsFn redirects) {
     g_loop_impl = loop;
     g_draw_impl = draw;
     g_redirects = redirects;
+}
+
+bool SL::UseHandImplementation(u64 module_base, std::string& error) {
+    if (!ShadowCasters::Prepare(module_base, error)) {
+        return false;
+    }
+    UseImplementation(&ShadowCasters::Loop, &ShadowCasters::Draw, &ShadowCasters::Redirects);
+    return true;
+}
+
+const ST::Trace& SL::LastTrace(u32 run) {
+    return Shadows().t[run & 1];
 }
 
 void SL::InjectFault(u32 fault) {

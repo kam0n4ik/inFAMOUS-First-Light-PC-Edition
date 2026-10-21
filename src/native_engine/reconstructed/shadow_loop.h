@@ -1,9 +1,10 @@
 // SecondSonPC — the shadow pass's orchestrators in the registry (R6-S; docs/NATIVE_RENDER_R6_SHADOWS.md §2, §4.3, §10):
 // eboot 0x43d590 "Shadow::CastersLoop" and 0x43d480 "Shadow::InstancedDraw" (our names; no symbols in the eboot).
 //
-// There is no hand-written reconstruction: the implementation is the recompiled function (recomp_43d590 /
-// recomp_43d480 of the module SSPC_NATIVE_ENGINE_RECOMP names), as with cue_commit. Without that module the install
-// is refused. explicit_only: installed only when SSPC_NATIVE_ENGINE_FUNCS names them; off by default.
+// The implementation (R7-S, SSPC_R7_SHADOWS_IMPL): the hand-written reconstruction (shadow_casters.h, "hand") or the
+// recompiled functions (recomp_43d590 / recomp_43d480 of the module SSPC_NATIVE_ENGINE_RECOMP names, "recomp"; the
+// default when that variable is set - R6-S behaviour). explicit_only: installed only when SSPC_NATIVE_ENGINE_FUNCS
+// names them; off by default.
 //
 // 0x43d480 is installed only below CITY-OPT's entry probe on it (shadow draw runs, guest_probe.h): its prepare refuses
 // the install when no probe is there - never a second jump on that entry.
@@ -46,6 +47,10 @@ inline constexpr u64 kShadowBytes = 0xde80;
 bool Prepare(u64 module_base, std::string& error);
 /// The implementations (the recompiled functions) and the module's redirection.
 void UseImplementation(LoopFn loop, DrawFn draw, RedirectsFn redirects);
+/// R7-S: the hand-written reconstruction (shadow_casters.h) as the implementation of both.
+bool UseHandImplementation(u64 module_base, std::string& error);
+/// The calling thread's last recording run (0: the original's, 1: the implementation's) of CheckLoop / CheckDraw.
+const STrace::Trace& LastTrace(u32 run);
 
 /// One comparison on the calling thread: "" when equal, else the first difference; `skipped` when not comparable
 /// (a trace or arena overflow).
