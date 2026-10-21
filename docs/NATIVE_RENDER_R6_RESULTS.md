@@ -21,6 +21,8 @@
 
 Слитое дерево: офлайн-пакет `sspc_native_engine_tests` с DLL R6-S (`E:\research\r6\shadows\recomp\recomp.dll`) —
 **279 проверок, 0 ошибок** (с DLL recomp7 — 6 ошибок «not in recomp.dll»: в ней нет экспортов теневого цикла).
+После последнего слияния R6-S (`e753167`, сборка `f37b0ed`) — **291 проверка, 0 ошибок**
+(`E:\research\r6\core\tests_final.txt`).
 
 ## 2. Итоговые A/B
 
