@@ -16,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include <windows.h>
+
 #include "base/abi.h"
 #include "engine/render/native_render_ops.h"
 #include "native_engine/native_engine_verify.h"
@@ -328,7 +330,34 @@ void DetClock(u64 image_base, u64 image_size) {
         }
     }
     R8V_CHECK(clamp30 == 1.0f / 30.0f || std::fabs(clamp30 - 1.0f / 30.0f) < 1e-7f);
+    R8V_CHECK(clamp15 == 1.0f / 15.0f || std::fabs(clamp15 - 1.0f / 15.0f) < 1e-7f);
     R8V_CHECK(exact);
+    // SSPC_R8_VERIFY_DET_STEP (Frame::SetClampStep): one step in both constants - dt is that step under either flag
+    {
+        DWORD old = 0;
+        void* page = reinterpret_cast<void*>(image_base + kClamp15);
+        const bool writable = VirtualProtect(page, 8, PAGE_READWRITE, &old) != 0;
+        R8V_CHECK(writable);
+        if (writable) {
+            bool step_exact = true;
+            for (float step : {1.0f / 30.0f, 1.0f / 15.0f}) {
+                std::memcpy(reinterpret_cast<void*>(image_base + kClamp15), &step, 4);
+                std::memcpy(reinterpret_cast<void*>(image_base + kClamp30), &step, 4);
+                for (u8 flag : {u8{0}, u8{1}}) {
+                    std::memcpy(reinterpret_cast<void*>(image_base + kFlag), &flag, 1);
+                    std::memset(obj + 0x1b0, 0, 8);
+                    clock(image_base + kObject);
+                    std::memcpy(&dt, obj, 4);
+                    step_exact &= dt == step;
+                }
+            }
+            R8V_CHECK(step_exact);
+            std::memcpy(reinterpret_cast<void*>(image_base + kClamp15), &clamp15, 4);
+            std::memcpy(reinterpret_cast<void*>(image_base + kClamp30), &clamp30, 4);
+            DWORD unused = 0;
+            VirtualProtect(page, 8, old, &unused);
+        }
+    }
     // the game's own way: two calls in a row measure the time between them (well under the clamp)
     const u8 zero = 0;
     std::memcpy(reinterpret_cast<void*>(image_base + kFlag), &zero, 1);

@@ -6,20 +6,26 @@
 // §8). Here the game's time and the scripted input both follow the game's frames:
 //
 // SSPC_R8_VERIFY_DET=1
-//   - every frame's dt is the clock's own clamp (1/30 s; 1/15 under the game's flag): an entry probe on 0x12a160 (the
-//     object's +0x1b0 "last TSC" set to 0 before the clock runs, so the measured dt is over the clamp; the function
-//     then stores the TSC as always). The game advances by its frames, not by wall time.
+//   - every frame's dt is the clock's clamp: an entry probe on 0x12a160 (the object's +0x1b0 "last TSC" set to 0
+//     before the clock runs, so the measured dt is over the clamp; the function then stores the TSC as always). The
+//     game advances by its frames, not by wall time.
+//   - SSPC_R8_VERIFY_DET_STEP=30 (default) | 15 | game: the clamp. The game selects 1/15 s (0x9944ec) under its flag
+//     [eboot+0x7d3bd72] - set on the stand - else 1/30 s (0x9944f0); 30/15 write that step to both constants (only
+//     0x12a160 reads them), game keeps them (on the stand the world then runs 1/15 s per frame).
 //   - <logs>\r8_det_frames.csv: per game frame its index, the next flip at the clock's call, wall ms, dt, the four
 //     clocks (whole ticks of 1/1440 s) and the world frame (below). At most kMaxRows rows (bounded on long sessions).
-// SSPC_R8_VERIFY_DET_ANCHOR=<seconds> (wall, from the script's start): the scripted events before it keep their wall
-//   time (the menus, the load); the events at or after it are due at world frame round((t - anchor) * 30), counted
-//   from the world start: the first frame after the anchor at which clock SSPC_R8_VERIFY_DET_CLOCK (0..3, default 0)
-//   advanced. Each such frame waits (at its clock call, bounded) until the script has pushed every event due by then
-//   and the window's queue took them: the frame an event reaches is the same in every run.
+//   - the world start (world frame 0): the first frame of the session at which clock SSPC_R8_VERIFY_DET_CLOCK (0..3,
+//     default 3 - it stands until the loaded world runs and while the game is paused) moved.
+// SSPC_R8_VERIFY_DET_ANCHOR=<seconds> (of the script): the scripted events before it keep their wall time (the menus,
+//   the load); the events at or after it are due at world frame round((t - anchor) / step) - the anchor is the
+//   script's second that stands for the world start; set it at or before the world start's wall time. Each such
+//   frame waits (at its clock call, at most ~10 s) until the script has pushed every event due by then and the
+//   window's queue took them: the frame an event reaches is the same in every run.
 //   Without an anchor every event keeps its wall time (the dt is still fixed).
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 #include "base/abi.h"
 
@@ -43,6 +49,9 @@ void WaitWorldFrame(double seconds);
 /// An event after the anchor is pushed and the window's queue took it; `next_seconds`: the script's next event (< 0:
 /// none). The frames waiting for it go on unless the next event is due in the same world frame.
 void Delivered(double next_seconds);
+
+/// Writes `step` to both clamp constants of 0x12a160 (after checking they are the game's: 1/15, 1/30 or `step`).
+bool SetClampStep(u64 eboot_base, float step, std::string& error);
 
 /// Game frames seen (clock calls), and the current world frame (-1 before the world start).
 u64 GameFrames();

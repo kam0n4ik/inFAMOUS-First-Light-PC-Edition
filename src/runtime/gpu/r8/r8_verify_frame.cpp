@@ -33,9 +33,11 @@ namespace {
 constexpr Engine::ProbeSite kClockSite = {{0x12a160, 0x3f0, 0x1a5eedc1e99b3cebull}, 14};
 constexpr u64 kLastTsc = 0x1b0;
 constexpr u64 kWholeTicks[4] = {0x04, 0x14, 0x24, 0x34}; ///< s32 ticks of 1/1440 s
-constexpr double kWorldFps = 30.0;                         ///< world frames per scripted second (the dt clamp)
+// the clamp: [eboot+0x7d3bd70 +2] != 0 (set in the game, R8 VERIFICATION §4) selects 0x9944ec (1/15 s), else 0x9944f0
+// (1/30 s); only 0x12a160 reads them (0x12a1a8 / 0x12a1b2: the only rip-relative references in the eboot)
+constexpr u64 kClamp15 = 0x9944ec, kClamp30 = 0x9944f0;
 constexpr s64 kNoWorld = -1;
-constexpr u64 kWaitLimitTicks = 3'000'000'000ull; ///< ~1 s at 3 GHz: a frame never waits longer for the script
+constexpr u64 kWaitLimitTicks = 30'000'000'000ull; ///< ~10 s at 3 GHz: a frame never waits longer for the script
 
 using Fn = SSPC_SYSV_ABI u64 (*)(u64, u64, u64, u64, u64, u64);
 Fn g_orig = nullptr;
@@ -50,12 +52,14 @@ struct Row {
 std::unique_ptr<Row[]> g_rows;
 std::atomic<u64> g_frames{0};
 std::atomic<s64> g_world{kNoWorld};
-std::atomic<bool> g_armed{false};      ///< the script reached its anchor: the world start is looked for
+std::atomic<bool> g_armed{false};      ///< the script reached its anchor (logged once)
 std::atomic<s64> g_delivered{std::numeric_limits<s64>::max()}; ///< world frames the script has served
 std::atomic<u32> g_pending{0};         ///< scripted events after the anchor not pushed yet
 std::atomic<u64> g_wait_timeouts{0};
-u32 g_clock_index = 0;
-s32 g_armed_ticks = 0;
+std::atomic<float> g_step{0.0f};         ///< the dt of every frame (set, or the first frame's under "game")
+u32 g_clock_index = 3;
+s32 g_last_ticks = 0;                    ///< the chosen clock at the previous frame (before the world start)
+bool g_have_last = false;
 double g_anchor = -1.0;
 std::chrono::steady_clock::time_point g_t0;
 
@@ -79,13 +83,21 @@ SSPC_SYSV_ABI u64 ClockProbe(u64 clock, u64 b, u64 c, u64 d, u64 e, u64 f) {
     if (world != kNoWorld) {
         world = world + 1;
         g_world.store(world, std::memory_order_release);
-    } else if (g_armed.load(std::memory_order_acquire)) {
-        if (Ticks(clock, g_clock_index) != g_armed_ticks) {
+    } else {
+        // the world start: the first frame of the session at which the chosen clock moved (a game event - the
+        // world clock starts when the loaded world does - not a wall time)
+        const s32 ticks = Ticks(clock, g_clock_index);
+        if (g_have_last && ticks != g_last_ticks) {
             world = 0;
             g_world.store(0, std::memory_order_release);
         }
-    } else {
-        g_armed_ticks = Ticks(clock, g_clock_index);
+        g_last_ticks = ticks;
+        g_have_last = true;
+    }
+    if (g_step.load(std::memory_order_relaxed) == 0.0f) {
+        float dt = 0;
+        std::memcpy(&dt, reinterpret_cast<const void*>(clock), sizeof(dt));
+        g_step.store(dt, std::memory_order_release);
     }
     u64 waited = 0;
     if (world != kNoWorld && g_pending.load(std::memory_order_acquire) != 0) {
@@ -152,7 +164,7 @@ void Writer(std::filesystem::path path) {
         }
         std::fflush(f);
         if (const u64 t = g_wait_timeouts.load(std::memory_order_relaxed); t != last_timeouts) {
-            SSPC_LOG(GPU, Warning, "R8 deterministic mode: {} frames went on without the script's input (1 s)", t);
+            SSPC_LOG(GPU, Warning, "R8 deterministic mode: {} frames went on without the script's input (10 s)", t);
             last_timeouts = t;
         }
         if (written + 1 >= kMaxRows) {
@@ -164,10 +176,37 @@ void Writer(std::filesystem::path path) {
 }
 
 s64 DueWorldFrame(double seconds) {
-    return static_cast<s64>(std::llround((seconds - g_anchor) * kWorldFps));
+    const float step = g_step.load(std::memory_order_acquire);
+    const double rate = step > 0.0f ? 1.0 / static_cast<double>(step) : 30.0;
+    return static_cast<s64>(std::llround((seconds - g_anchor) * rate));
+}
+
+bool WriteFloat(u64 at, float value, std::string& error) {
+    DWORD old = 0;
+    void* p = reinterpret_cast<void*>(at);
+    if (!VirtualProtect(p, sizeof(value), PAGE_READWRITE, &old)) {
+        error = fmt::format("VirtualProtect {:#x} failed ({})", at, GetLastError());
+        return false;
+    }
+    std::memcpy(p, &value, sizeof(value));
+    DWORD unused = 0;
+    VirtualProtect(p, sizeof(value), old, &unused);
+    return true;
 }
 
 } // namespace
+
+bool SetClampStep(u64 eboot_base, float step, std::string& error) {
+    float c15 = 0, c30 = 0;
+    std::memcpy(&c15, reinterpret_cast<const void*>(eboot_base + kClamp15), sizeof(c15));
+    std::memcpy(&c30, reinterpret_cast<const void*>(eboot_base + kClamp30), sizeof(c30));
+    const auto known = [&](float v) { return v == 1.0f / 15.0f || v == 1.0f / 30.0f || v == step; };
+    if (!known(c15) || !known(c30)) {
+        error = fmt::format("the clamps are not the game's ({} at {:#x}, {} at {:#x})", c15, kClamp15, c30, kClamp30);
+        return false;
+    }
+    return WriteFloat(eboot_base + kClamp15, step, error) && WriteFloat(eboot_base + kClamp30, step, error);
+}
 
 bool Enabled() {
     static const bool on = ReadEnabled();
@@ -185,11 +224,23 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
     if (GetEnvironmentVariableA("SSPC_R8_VERIFY_DET_ANCHOR", v, sizeof(v)) > 0) {
         g_anchor = std::strtod(v, nullptr);
     }
+    // the step: 30 (default) - 1/30 s, the game's pace at 30 FPS; 15 - 1/15 s; game - the game's own clamp (1/15 s on
+    // the stand: its flag is set, so the world would run at 1/15 s per frame - 2.4x the wall time at 36 FPS)
+    float step = 1.0f / 30.0f;
+    if (GetEnvironmentVariableA("SSPC_R8_VERIFY_DET_STEP", v, sizeof(v)) > 0) {
+        const std::string s = v;
+        step = s == "game" ? 0.0f : s == "15" ? 1.0f / 15.0f : 1.0f / 30.0f;
+    }
     std::string error;
     if (!Engine::VerifyGuestFunction(eboot_base, kClockSite.function, error)) {
         SSPC_LOG(GPU, Error, "R8 deterministic mode not installed (the game's clock): {}", error);
         return false;
     }
+    if (step > 0.0f && !SetClampStep(eboot_base, step, error)) {
+        SSPC_LOG(GPU, Error, "R8 deterministic mode not installed (the clamp): {}", error);
+        return false;
+    }
+    g_step.store(step, std::memory_order_release);
     g_rows = std::make_unique<Row[]>(kMaxRows);
     g_t0 = std::chrono::steady_clock::now();
     void* original = Engine::InstallEntryProbe(eboot_base, kClockSite, reinterpret_cast<const void*>(&ClockProbe), error);
@@ -200,9 +251,10 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
     g_orig = reinterpret_cast<Fn>(original);
     const std::filesystem::path path = logs_dir / "r8_det_frames.csv";
     SSPC_LOG(GPU, Warning,
-             "VERIFICATION: SSPC_R8_VERIFY_DET=1 - every frame's dt is the game clock's clamp (0x12a160); input after "
-             "the anchor {} s by world frames (clock {}); frame log {}",
-             g_anchor, g_clock_index, path.string());
+             "VERIFICATION: SSPC_R8_VERIFY_DET=1 - every frame's dt is the game clock's clamp (0x12a160), {}; the world "
+             "start is clock {}'s first move; input from {} s of the script by world frames; frame log {}",
+             step > 0.0f ? fmt::format("set to {:.6f} s", step) : std::string("the game's own"), g_clock_index,
+             g_anchor, path.string());
     std::thread(Writer, path).detach();
     return true;
 }
@@ -221,8 +273,8 @@ void ScriptStart(u32 events_after_anchor) {
 
 void WaitWorldFrame(double seconds) {
     if (!g_armed.exchange(true, std::memory_order_acq_rel)) {
-        SSPC_LOG(GPU, Info, "R8 deterministic mode: anchor reached at game frame {}; looking for the world start",
-                 g_frames.load(std::memory_order_relaxed));
+        SSPC_LOG(GPU, Info, "R8 deterministic mode: anchor reached at game frame {}, world frame {}",
+                 g_frames.load(std::memory_order_relaxed), g_world.load(std::memory_order_relaxed));
     }
     const s64 due = DueWorldFrame(seconds);
     const auto since = std::chrono::steady_clock::now();
@@ -234,7 +286,7 @@ void WaitWorldFrame(double seconds) {
         }
         if (!said && w == kNoWorld && std::chrono::steady_clock::now() - since > std::chrono::seconds(60)) {
             SSPC_LOG(GPU, Warning, "R8 deterministic mode: no world start 60 s after the anchor (clock {} did not "
-                                   "advance); the script waits", g_clock_index);
+                                   "move); the script waits", g_clock_index);
             said = true;
         }
         // nothing is due before `due`: the frames until then need not wait for the script
