@@ -17,6 +17,8 @@
 // Modes: verify / guarded / native / bench as every reconstruction (native_function_registry.h); explicit_only.
 //
 // SSPC_R7G_STATS=1: the native pass counts its branches (coverage) and what G3 asks about, reported every 10 s.
+// native / guarded: calls that may take a branch the game has not verified (pass 0x1d, M + 0x126, the dither) run the
+// original; SSPC_R7G_PASS_ALL=1 lets the native pass take them too (verified offline only).
 // SSPC_R7G_PREFETCH=<n>: the native pass prefetches instances n keys ahead (G4 experiment; off by default).
 #pragma once
 

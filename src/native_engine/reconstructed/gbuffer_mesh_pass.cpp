@@ -182,9 +182,9 @@ const GT::CalleeSpec kSpecs[kCallees] = {
 // --- verification ---------------------------------------------------------------------------------------------------
 
 constexpr u64 kShadowBegin = 0xd190, kShadowEnd = 0xde90; ///< the context's fields the pass and its run callees touch
-constexpr u32 kMaxCalls = 8192;
-constexpr u32 kSnapBytes = 2u << 20;
-constexpr u64 kArenaBytes = 1u << 20;
+constexpr u32 kMaxCalls = 65536;
+constexpr u32 kSnapBytes = 16u << 20;
+constexpr u64 kArenaBytes = 8u << 20;
 
 struct Run {
     GT::Trace t;
@@ -225,7 +225,7 @@ Shadow* Shadows() {
     return t_shadow;
 }
 
-GT::Trace& BeginRun(Shadow& s, u32 k, u64 r, u64 chunk, u64 stack_top) {
+GT::Trace& BeginRun(Shadow& s, u32 k, u64 r, u64 chunk, u64 stack_top, u64 seed) {
     Run& x = s.run[k];
     x.t.callees = kSpecs;
     x.t.ncallees = kCallees;
@@ -240,7 +240,7 @@ GT::Trace& BeginRun(Shadow& s, u32 k, u64 r, u64 chunk, u64 stack_top) {
     std::memcpy(x.r + kShadowBegin, reinterpret_cast<const void*>(r + kShadowBegin), kShadowEnd - kShadowBegin);
     std::memcpy(x.chunk, reinterpret_cast<const void*>(chunk), sizeof(x.chunk));
     x.chunk[0] = reinterpret_cast<u64>(x.r);
-    x.t.Begin(0x5237474d50415353ull, stack_top);
+    x.t.Begin(seed, stack_top);
     return x.t;
 }
 
@@ -307,8 +307,11 @@ std::string MP::Check(u64 m, u64 chunk, bool& skipped) {
     }
     Shadow& s = *sp;
     const u64 r = *reinterpret_cast<const u64*>(chunk);
+    // the effects' sequence: one per check (both runs draw the same), different between checks
+    static thread_local u64 t_checks = 0;
+    const u64 seed = GT::Mix(0x5237474d50415353ull ^ (++t_checks << 20) ^ *reinterpret_cast<const u64*>(chunk + 0x18));
     for (u32 k = 0; k < 2; ++k) {
-        GT::Trace& t = BeginRun(s, k, r, chunk, reinterpret_cast<u64>(&top));
+        GT::Trace& t = BeginRun(s, k, r, chunk, reinterpret_cast<u64>(&top), seed);
         const u64 ch = reinterpret_cast<u64>(s.run[k].chunk);
         WipeStackBelow();
         GT::Trace* const saved = GT::Active();
@@ -364,12 +367,35 @@ struct Case {
 };
 static_assert(sizeof(Case) <= kCaseBytes);
 
+/// The branches the game verified (docs/NATIVE_ENGINE_R7_GBUFFER.md §3.4): a call that may take another one runs the
+/// original in native / guarded mode, unless SSPC_R7G_PASS_ALL=1 (verified offline only): pass 0x1d (the previous
+/// frame's transform 0x1a1b90, the vertex streams), the second skinning buffer (M + 0x126), the dither.
+bool g_pass_all = false;
+bool Covered(u64 m) {
+    if (g_pass_all) {
+        return true;
+    }
+    const u64 module = g_module.load(std::memory_order_relaxed);
+    const s32 idx = *reinterpret_cast<const s32*>(module + R7G::kFrameObject + R7G::kFrameDitherIndex);
+    const s32 dither = *reinterpret_cast<const s32*>(module + R7G::kDitherTable + 0x10 + 0x14 * static_cast<s64>(idx));
+    if (dither != 0 || *reinterpret_cast<const s32*>(m + 0x110) == 0x1d) {
+        return false;
+    }
+    return *reinterpret_cast<const u8*>(m + 0x1f) != 0 || *reinterpret_cast<const u8*>(m + 0x126) == 0xff;
+}
+
 struct PassImpl {
     static Slot slot;
     static MP::PassFn Original() {
         return reinterpret_cast<MP::PassFn>(slot.original);
     }
     static SSPC_SYSV_ABI void Native(u64 m, u64 chunk) {
+        if (!Covered(m)) {
+            Count(slot.index, kCallsOriginal);
+            Original()(m, chunk);
+            return;
+        }
+        Count(slot.index, kCallsNative);
         RunNative(g_real, m, chunk);
     }
     static bool CheckOne(u64 m, u64 chunk) {
@@ -402,7 +428,6 @@ struct PassImpl {
             Original()(m, chunk);
             return;
         }
-        Count(slot.index, kCallsNative);
         Native(m, chunk);
     }
     static SSPC_SYSV_ABI void Bench(u64 m, u64 chunk) {
@@ -441,6 +466,11 @@ bool PrepareInstall(u64 module_base, std::string& error) {
             g_options.prefetch = static_cast<u32>(std::strtoul(v, nullptr, 10));
             SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_R7G_PREFETCH={} - the native geometry pass prefetches "
                                       "instances {} keys ahead", g_options.prefetch, g_options.prefetch);
+        }
+        if (ok && EnvValue("SSPC_R7G_PASS_ALL", v, sizeof(v)) && v[0] != '0') {
+            g_pass_all = true;
+            SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_R7G_PASS_ALL=1 - the native geometry pass takes the branches "
+                                      "verified offline only too");
         }
         if (ok && EnvValue("SSPC_R7G_STATS", v, sizeof(v)) && v[0] != '0') {
             g_stats = true;
