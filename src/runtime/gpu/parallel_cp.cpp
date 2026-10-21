@@ -989,6 +989,13 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
         r.stage_shared = frontend_->SharedStage(GS::HwStage::Vs);
         r.ps_shared = frontend_->SharedStage(GS::HwStage::Ps);
+        // R8-A2 K1a: the PS reuse's shared preparation is copied like an own view (run leaders, GEOFAST's template and
+        // FB-6 take a record's own views only); the copy's registers are then the draw's own (CopyStage does not carry
+        // native_shared: the executor would keep those of the draw that made it)
+        const bool r8_ps = frontend_->R8PsShared();
+        if (r8_ps) {
+            r.ps_shared.reset();
+        }
         // FB-6: a view the frontend did not change since the last copy is not copied again (stage_reuse_)
         const auto copy = [&](GS::HwStage hw, GS::StageView& dst, bool shared, u64& copied, bool& same) {
             same = false;
@@ -1006,6 +1013,14 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         };
         copy(GS::HwStage::Vs, r.stage, r.stage_shared != nullptr, copied_gen_vs_, r.vs_same);
         copy(GS::HwStage::Ps, r.ps, r.ps_shared != nullptr, copied_gen_ps_, r.ps_same);
+        if (r8_ps) {
+            if (r.ps_same) { // (cannot be: the frontend's generation moved; kept safe)
+                CopyStage(r.ps, frontend_->Stage(GS::HwStage::Ps));
+                r.ps_same = false;
+            }
+            const auto& ud = r.draw.user_data[static_cast<size_t>(Cp::Stage::Ps)];
+            std::copy_n(ud.begin(), std::min<size_t>(ud.size(), r.ps.plan.flat.size()), r.ps.plan.flat.begin());
+        }
         r.state = prep.ready ? frontend_->Pipelines().Graphics(prep.pipeline) : nullptr;
         t_copy = srt_diag_ ? __rdtsc() - tc : 0;
     }

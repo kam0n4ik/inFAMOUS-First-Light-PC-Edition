@@ -39,8 +39,13 @@ constexpr u32 kSlotBits = 17; // 128 Ki entries, 8 MiB: a city frame commits ~18
 constexpr u32 kSlots = 1u << kSlotBits;
 
 std::unique_ptr<Slot[]> g_slots;
-std::atomic<u64> g_lo{~0ull}, g_hi{0}; ///< the published snapshots' address bounds (Find's cheap filter)
-std::atomic<u64> g_published{0}, g_lookups{0}, g_found{0}, g_torn{0};
+// (each on its own cache line: the game threads count every publish, thread 1 every lookup - K1a looks up at every PS)
+alignas(64) std::atomic<u64> g_lo{~0ull}; ///< the published snapshots' address bounds (Find's cheap filter)
+std::atomic<u64> g_hi{0};
+alignas(64) std::atomic<u64> g_published{0};
+alignas(64) std::atomic<u64> g_lookups{0};
+std::atomic<u64> g_found{0};
+alignas(64) std::atomic<u64> g_torn{0};
 std::atomic<bool> g_tests{false};
 
 inline u32 Index(u64 base) {
