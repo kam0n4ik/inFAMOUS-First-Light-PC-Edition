@@ -531,7 +531,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     case NextResult::Ok:
         break;
     }
-    R8_CP_PROF_DECODED(pk.opcode);
+    R8_CP_PROF_DECODED(pk.opcode, p);
     Frame& f = q.frames[q.depth - 1];
     q.budget += pk.dwords;
     if (q.budget > options_.max_dwords_per_submission) {
