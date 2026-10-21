@@ -177,6 +177,68 @@ u32 ClassOf(u8 op) {
     }
 }
 
+/// A NOP's kind by its payload (the packet, header included): 0 padding (no payload), 1 the driver's setUserDataRegion
+/// marker 0x6875000D (before a SET_SH_REG of user data), 2 a V#/T#/S# in user data marker (0x68750004..6), 3 a
+/// CITY-OPT draw tag ("SSPR"), 4 SecondSonPC's engine operation / stream token ("SSPC" / "SSPS"), 5 another driver
+/// marker 0x6875xxxx (debug, flip), 6 one unknown payload dword, 7 another payload.
+u32 NopKind(std::span<const u32> p) {
+    if (p.size() < 2) {
+        return 0;
+    }
+    const u32 v = p[1];
+    if (v == 0x6875000Du) {
+        return 1;
+    }
+    if (v >= 0x68750004u && v <= 0x68750006u) {
+        return 2;
+    }
+    if (v == 0x52505353u) {
+        return 3;
+    }
+    if (v == 0x43505353u || v == 0x53505353u) {
+        return 4;
+    }
+    if ((v >> 16) == 0x6875u) {
+        return 5;
+    }
+    return p.size() == 2 ? 6 : 7;
+}
+constexpr std::string_view kNopNames[kNopKinds] = {
+    "padding (no payload)", "0x6875000D (setUserDataRegion)", "V#/T#/S# in user data (0x68750004..6)",
+    "CITY-OPT draw tag (SSPR)", "engine operation / stream token (SSPC/SSPS)", "other driver marker 0x6875xxxx",
+    "one unknown dword", "other payload"};
+
+/// A SET_SH_REG's range by its first register (offset from 0x2C00): 0 USER_DATA_PS, 1 USER_DATA_VS, 2 USER_DATA of
+/// GS/ES/HS/LS, 3 COMPUTE_USER_DATA, 4 other PS registers, 5 other VS registers, 6 other compute registers, 7 other.
+u32 ShRange(u32 off) {
+    if (off >= 0x0C && off < 0x1C) {
+        return 0;
+    }
+    if (off >= 0x4C && off < 0x5C) {
+        return 1;
+    }
+    if ((off >= 0x8C && off < 0x9C) || (off >= 0xCC && off < 0xDC) || (off >= 0x10C && off < 0x11C) ||
+        (off >= 0x14C && off < 0x15C)) {
+        return 2;
+    }
+    if (off >= 0x240 && off < 0x250) {
+        return 3;
+    }
+    if (off < 0x0C) {
+        return 4;
+    }
+    if (off >= 0x40 && off < 0x4C) {
+        return 5;
+    }
+    if (off >= 0x200 && off < 0x280) {
+        return 6;
+    }
+    return 7;
+}
+constexpr std::string_view kShNames[kShRanges] = {
+    "USER_DATA_PS", "USER_DATA_VS", "USER_DATA GS/ES/HS/LS", "COMPUTE_USER_DATA", "other PS registers",
+    "other VS registers", "other compute registers", "other SH registers"};
+
 /// SSPC_R8_CP_PROFILE=2: the repetition census of a frame (thread 1 only).
 struct Census {
     /// draws the frontend prepared, by class (0 both stages repeated, 1 PS only, 2 VS only, 3 none) and engine tag
@@ -197,8 +259,8 @@ struct Row {
     u32 calls[kSections];
     u64 light_ticks[kLights];
     u32 light_n[kLights];
-    u64 packet_ticks[kPacketClasses];
-    u32 packet_n[kPacketClasses];
+    u64 packet_ticks[kPacketSlots];
+    u32 packet_n[kPacketSlots];
     u64 overflow;
     Census census;
 };
@@ -220,6 +282,25 @@ struct LastPrep {
     u64 result = 0, regs = 0;
 };
 std::unordered_map<u64, LastPrep> g_last; ///< (stage, program address) -> its last preparation (thread 1)
+
+/// SSPC_R8_CP_PROFILE=2: every 32nd draw the frontend prepared inside the window - its time and each stage's inputs to
+/// the resource part (SRT loads, flattened dwords, bindings), for a regression of the time on them
+/// (logs\r8_cp_prep_samples.csv with SSPC_R8_CP_PROFILE_CSV=1; docs/NATIVE_ENGINE_R8_CP_PROFILE.md §5).
+struct StageFeat {
+    u16 srt_reads, flat;
+    u8 buffers, images, samplers, vertices;
+    u8 ready, regs_same, result_same, pad;
+};
+struct PrepSample {
+    u64 tsc;
+    u32 ticks;
+    u8 tag, pad[3];
+    StageFeat st[2];
+};
+std::vector<PrepSample> g_samples;
+u32 g_sample_n = 0;
+u64 g_sample_from = 0, g_sample_to = 0; ///< the window in TSC (0: not yet known)
+constexpr size_t kMaxSamples = 400'000;
 
 inline u64 Mix(u64 h, u64 v) {
     h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -287,7 +368,7 @@ void Flush(ThreadAcc& t, Row& row, Row& total, std::array<u64, kSections>& incl)
         total.light_ticks[i] += t.light_ticks[i];
         total.light_n[i] += t.light_n[i];
     }
-    for (u32 i = 0; i < kPacketClasses; ++i) {
+    for (u32 i = 0; i < kPacketSlots; ++i) {
         total.packet_ticks[i] += t.packet_ticks[i];
         total.packet_n[i] += t.packet_n[i];
     }
@@ -421,7 +502,7 @@ void PacketSample::Begin() {
     active_ = true;
 }
 
-void PacketSample::OnDecoded(u8 opcode) {
+void PacketSample::OnDecoded(u8 opcode, std::span<const u32> packet) {
     ThreadAcc& t = t_acc;
     if (t.flushes != flushes_ || t.stack[t.depth] != static_cast<u8>(Sec::Packets)) {
         active_ = false;
@@ -432,6 +513,13 @@ void PacketSample::OnDecoded(u8 opcode) {
     t.packet_ticks[0] += b_ - a_;
     ++t.packet_n[0];
     cls_ = static_cast<u8>(ClassOf(opcode));
+    sub_ = 0;
+    if (cls_ == 4) {
+        sub_ = static_cast<u8>(kNopSlot + NopKind(packet));
+    } else if (cls_ == 1 && packet.size() >= 2) {
+        sub_ = static_cast<u8>(kShSlot + ShRange(packet[1] & 0xFFFF));
+        dw_ = static_cast<u16>(std::min<size_t>(packet.size() - 2, 0xFFFF));
+    }
     decoded_ = true;
 }
 
@@ -444,6 +532,13 @@ void PacketSample::End() {
     const u64 c = t.self[static_cast<u32>(Sec::Packets)] + (__rdtsc() - t.last);
     t.packet_ticks[cls_] += c - b_;
     ++t.packet_n[cls_];
+    if (sub_ != 0) {
+        t.packet_ticks[sub_] += c - b_;
+        ++t.packet_n[sub_];
+        if (sub_ >= kShSlot) {
+            t.packet_n[sub_ + kShRanges] += dw_;
+        }
+    }
 }
 
 void NotePreparedSlow(const Cp::DrawDescriptor& draw, const Gpu::Shader::StageView& vs, const Gpu::Shader::StageView& ps) {
@@ -453,6 +548,7 @@ void NotePreparedSlow(const Cp::DrawDescriptor& draw, const Gpu::Shader::StageVi
     }
     const u64 ticks = t.last_incl; // (the frontend's PrepareDraw: the section just left)
     bool same[2] = {false, false};
+    StageFeat feat[2]{};
     const Gpu::Shader::StageView* views[2] = {&vs, &ps};
     for (u32 s = 0; s < 2; ++s) {
         const Gpu::Shader::StageView& v = *views[s];
@@ -474,7 +570,37 @@ void NotePreparedSlow(const Cp::DrawDescriptor& draw, const Gpu::Shader::StageVi
             c[3] += same[s] && last.regs != regs ? 1 : 0;
             c[4] += !same[s] && last.regs == regs ? 1 : 0;
         }
+        feat[s] = {static_cast<u16>(std::min<u32>(v.plan.srt.reads, 0xFFFF)),
+                   static_cast<u16>(std::min<size_t>(v.plan.flat.size(), 0xFFFF)),
+                   static_cast<u8>(std::min<size_t>(v.plan.buffers.size(), 255)),
+                   static_cast<u8>(std::min<size_t>(v.plan.images.size(), 255)),
+                   static_cast<u8>(std::min<size_t>(v.plan.samplers.size(), 255)),
+                   static_cast<u8>(std::min<size_t>(v.plan.vertices.size(), 255)),
+                   1,
+                   static_cast<u8>(last.regs == regs ? 1 : 0),
+                   static_cast<u8>(same[s] ? 1 : 0),
+                   0};
         last = {result, regs};
+    }
+    if (++g_sample_n % 32 == 0 && g_samples.size() < kMaxSamples) {
+        if (g_sample_from == 0 && FrameLog::StartTsc() != 0) {
+            const auto [from, to] = Window();
+            g_sample_from = FrameLog::StartTsc() + static_cast<u64>(from * Freq());
+            g_sample_to = FrameLog::StartTsc() + static_cast<u64>(std::min(to, 1e6) * Freq());
+        }
+        const u64 now = __rdtsc();
+        if (g_sample_from != 0 && now >= g_sample_from && now <= g_sample_to) {
+            if (g_samples.capacity() == 0) {
+                g_samples.reserve(kMaxSamples);
+            }
+            PrepSample x{};
+            x.tsc = now;
+            x.ticks = static_cast<u32>(std::min<u64>(ticks, 0xFFFFFFFFull));
+            x.tag = static_cast<u8>(draw.engine_run & 3);
+            x.st[0] = feat[0];
+            x.st[1] = feat[1];
+            g_samples.push_back(x);
+        }
     }
     const u32 cls = same[0] && same[1] ? 0 : same[1] ? 1 : same[0] ? 2 : 3;
     const u32 tag = draw.engine_run & 3;
@@ -528,7 +654,7 @@ u32 SumWindow(u32 role, double from, double to, Row& out) {
             out.light_ticks[k] += r.light_ticks[k];
             out.light_n[k] += r.light_n[k];
         }
-        for (u32 k = 0; k < kPacketClasses; ++k) {
+        for (u32 k = 0; k < kPacketSlots; ++k) {
             out.packet_ticks[k] += r.packet_ticks[k];
             out.packet_n[k] += r.packet_n[k];
         }
@@ -610,6 +736,26 @@ std::string Table(const Row& w, u32 frames, bool t2) {
                                kLightNames[k], ms(w.light_ticks[k] * g_every), ms(w.light_ticks[k] * g_every) * norm,
                                static_cast<double>(w.light_n[k]) * g_every / f,
                                static_cast<double>(w.light_ticks[k]) * ms_per_tick * 1e6 / w.light_n[k]);
+        }
+        for (u32 k = 0; k < kNopKinds; ++k) {
+            const u32 i = kNopSlot + k;
+            if (w.packet_n[i] != 0) {
+                out += fmt::format("      NOP: {:<58} {:>9.3f} ms/frame (share {:>7.3f}) {:>9.0f} packets/frame {:>7.0f} ns\n",
+                                   kNopNames[k], ms(w.packet_ticks[i] * g_every), ms(w.packet_ticks[i] * g_every) * norm,
+                                   static_cast<double>(w.packet_n[i]) * g_every / f,
+                                   static_cast<double>(w.packet_ticks[i]) * ms_per_tick * 1e6 / w.packet_n[i]);
+            }
+        }
+        for (u32 k = 0; k < kShRanges; ++k) {
+            const u32 i = kShSlot + k;
+            if (w.packet_n[i] != 0) {
+                out += fmt::format("      SET_SH_REG: {:<51} {:>9.3f} ms/frame (share {:>7.3f}) {:>9.0f} packets/frame "
+                                   "{:>7.0f} ns, {:.1f} dwords/packet\n",
+                                   kShNames[k], ms(w.packet_ticks[i] * g_every), ms(w.packet_ticks[i] * g_every) * norm,
+                                   static_cast<double>(w.packet_n[i]) * g_every / f,
+                                   static_cast<double>(w.packet_ticks[i]) * ms_per_tick * 1e6 / w.packet_n[i],
+                                   static_cast<double>(w.packet_n[i + kShRanges]) / w.packet_n[i]);
+            }
         }
     }
     return out;
@@ -755,6 +901,22 @@ void WriteCsv(const std::filesystem::path& dir) {
         std::fprintf(f, "%s\n", line.c_str());
     }
     std::fclose(f);
+    if (!g_samples.empty() && _wfopen_s(&f, (dir / "r8_cp_prep_samples.csv").c_str(), L"w") == 0 && f != nullptr) {
+        std::fprintf(f, "t_s,front_ns,tag,vs_ready,vs_srt,vs_flat,vs_buf,vs_img,vs_smp,vs_vtx,vs_regs_same,vs_same,"
+                        "ps_ready,ps_srt,ps_flat,ps_buf,ps_img,ps_smp,ps_vtx,ps_regs_same,ps_same\n");
+        const double ns_per_tick = 1e9 / Freq();
+        const u64 t0 = FrameLog::StartTsc();
+        for (const PrepSample& x : g_samples) {
+            std::fprintf(f, "%.4f,%.0f,%u", static_cast<double>(x.tsc - t0) / Freq(), x.ticks * ns_per_tick,
+                         static_cast<u32>(x.tag));
+            for (const StageFeat& st : x.st) {
+                std::fprintf(f, ",%u,%u,%u,%u,%u,%u,%u,%u,%u", st.ready, st.srt_reads, st.flat, st.buffers, st.images,
+                             st.samplers, st.vertices, st.regs_same, st.result_same);
+            }
+            std::fprintf(f, "\n");
+        }
+        std::fclose(f);
+    }
 }
 
 } // namespace SecondSon::Gpu::CpProfile
