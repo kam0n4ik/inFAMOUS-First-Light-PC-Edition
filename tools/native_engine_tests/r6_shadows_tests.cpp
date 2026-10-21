@@ -14,6 +14,8 @@
 // docs/NATIVE_RENDER_R6_SHADOWS.md §4.
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <random>
@@ -404,6 +406,243 @@ u64 DrawDifferential(Fn6 original, Fn6 recompiled, RedirectsFn redirects, u64 im
     return bad;
 }
 
+// --- 0x43d590 (shadow casters loop): an orchestrator over a generated world, judged by its calls and memory -------
+
+// Recorded (not run): the context's DCB allocations, the CUE/Gnm calls, the draws and the parameter writers (verified
+// on their own above). Run for real in both runs: 0x11c890 / 0x11cde0 (the object constants into the context, R5),
+// 0x61e260 (a V# into the loop's frame), 0x612110 (the generator, image state saved and restored around each run).
+constexpr u64 kPrngState = 0x7f92020;
+constexpr u64 kQualityIndex = 0xf39978; // s32: the row of the quality table 0xda08d0 (stride 0x14): the drop threshold
+constexpr u64 kQualityTable = 0xda08d0;
+
+u64 DcbAllocEffect(ST::Trace& t, const ST::CalleeSpec&, ST::CallIn& in, const u64*) {
+    // 0x11be90(dst, context, bytes): a DCB allocation stored at *dst, the V# of it at dst + 8
+    const u64 p = t.Allocate(static_cast<u32>(in.gpr[2]), 16);
+    auto* dst = reinterpret_cast<u64*>(in.gpr[0]);
+    dst[0] = p;
+    dst[1] = ST::Next(t);
+    dst[2] = ST::Next(t);
+    return 0;
+}
+
+u64 ScratchAllocEffect(ST::Trace& t, const ST::CalleeSpec&, ST::CallIn& in, const u64*) {
+    // 0x1f0870(state, bytes, alignment): the frame scratch; null now and then (the loop skips the group)
+    if (ST::Next(t) % 16 == 0) {
+        return 0;
+    }
+    return t.Allocate(static_cast<u32>(in.gpr[1]), in.gpr[2]);
+}
+
+constexpr ST::CalleeSpec kLoopCallees[] = {
+    {0x11be90, "DCB alloc 0x11be90", 3, 0, 0, 0, {}, &DcbAllocEffect},
+    {0x11bed0, "bind constants 0x11bed0", 4, 0, 0, 0, {}, nullptr},
+    {0x120280, "commit draw constants 0x120280", 1, 0, 0, 0, {}, nullptr},
+    {0x16b70, "set buffers 0x16b70", 5, 0, 0, 0, {ST::Snap{4, -1, 16, 16}, {}}, nullptr},
+    {0x1a1960, "mesh draw 0x1a1960", 3, 0, 0, 0, {}, nullptr},
+    {0x1f0870, "frame scratch 0x1f0870", 3, 0, 0, 0, {}, &ScratchAllocEffect},
+    {0x43d480, "instanced shadow draw 0x43d480", 5, 0, 0, 0, {}, nullptr},
+    {0x448640, "material bind 0x448640", 3, 0, 0, 0, {}, nullptr},
+    {0x450460, "parameter writer 0x450460", 6, 0, 0, 1, {}, nullptr},
+    {0x451290, "parameter writer 0x451290", 6, 0, 0, 0, {}, nullptr},
+    {0x451700, "instance UV 0x451700", 6, 0, 0, 0, {}, nullptr},
+};
+constexpr u32 kLoopCalleeCount = static_cast<u32>(std::size(kLoopCallees));
+
+/// The world one call of 0x43d590 sees, in one buffer (every pointer the loop follows points inside it).
+struct LoopWorld {
+    static constexpr u32 kPass = 0x0, kArgs = 0x400, kContext = 0x1000, kScene = 0x10000, kView = 0x15000,
+                         kItems = 0x16000, kKeys = 0x18000, kObjects = 0x19000, kMeshes = 0x1a000,
+                         kMaterials = 0x1b000, kBuffers = 0x1c000, kMatrices = 0x1d000, kBytes = 0x20000;
+    static constexpr u32 kMaxItems = 48;
+    std::vector<u8> mem = std::vector<u8>(kBytes);
+    u64 base() const {
+        return reinterpret_cast<u64>(mem.data());
+    }
+    template <typename T>
+    void Put(u32 at, T x) {
+        std::memcpy(mem.data() + at, &x, sizeof(T));
+    }
+
+    void Generate(std::mt19937_64& rng) {
+        for (u32 i = 0; i + 4 <= kBytes; i += 4) {
+            Put(i, RandomFloat(rng));
+        }
+        const u64 b = base();
+        // the pass
+        Put(kPass + 0x1f, static_cast<u8>(rng() % 2));                 // instanced
+        Put(kPass + 0x21, static_cast<u8>(rng()));                     // bit 1: the other view matrix; bit 2: identity
+        Put(kPass + 0x90, static_cast<s32>(rng() % 3) - 1);            // the parameter records (0x451290 when > 0)
+        Put(kPass + 0x94, static_cast<s32>(rng() % 3) - 1);            // (0x451700 when > 0)
+        // object constants flags: 0x43d590 passes 0x11c890 no `extra` (r8 = 0), so never bit 3 (its block from extra)
+        Put(kPass + 0x118, static_cast<s32>(rng() % 2 ? 0 : rng() & ~u64{8}));
+        Put(kPass + 0x11c, static_cast<s32>(rng() % 2 ? 0 : rng()));
+        Put(kPass + 0x120, static_cast<u8>(rng() % 3 == 0 ? 0xff : rng() % 16));
+        // the context: the two constant blocks' "changed" flags (u16: low byte = changed, high byte = bound before)
+        static constexpr u16 kFlags[] = {0, 1, 0x100, 0x101, 0x1ff};
+        Put(kContext + 0xd2e8, kFlags[rng() % 5]);
+        Put(kContext + 0xd388, kFlags[rng() % 5]);
+        // the scene: the view, the item array and the sort keys
+        Put(kScene + 0, b + kView);
+        Put(kScene + 0x9b7 * 8, b + kItems);
+        Put(kScene + 0x9b8 * 8, b + kKeys);
+        const u32 n = 1 + static_cast<u32>(rng() % kMaxItems);
+        const u32 lo = static_cast<u32>(rng() % 4);
+        const u32 hi = (rng() % 8 == 0) ? lo : lo + static_cast<u32>(rng() % (n + 1));
+        Put(kArgs + 0, b + kContext);
+        Put(kArgs + 8, b + kScene);
+        Put(kArgs + 0x10, rng());
+        Put(kArgs + 0x18, static_cast<u64>(lo) | static_cast<u64>(hi) << 32);
+        // keys: an item index in the low 16 bits; equal upper bits form an instancing group
+        u64 group = rng() & 0xffff'ffffull;
+        for (u32 i = 0; i < kMaxItems + 8; ++i) {
+            if (rng() % 3 == 0) {
+                group += 1 + rng() % 3;
+            }
+            Put(kKeys + i * 8, group << 16 | (rng() % kMaxItems));
+        }
+        for (u32 i = 0; i < kMaxItems; ++i) {
+            const u32 item = kItems + i * 0x80;
+            const u32 k = static_cast<u32>(rng() % 8); // objects, meshes, materials shared among items
+            Put(item + 0x10, b + kBuffers + k * 0x80);
+            Put(item + 0x18, b + kObjects + k * 0x40);
+        }
+        for (u32 k = 0; k < 8; ++k) {
+            Put(kObjects + k * 0x40, b + kMeshes + k * 0x80);
+            Put(kObjects + k * 0x40 + 8, b + kMaterials + (rng() % 8) * 0x80);
+            Put(kMeshes + k * 0x80 + 0x18, static_cast<u16>(rng() % 4 == 0 ? 0 : 1 + rng() % 100)); // index count
+            Put(kMeshes + k * 0x80 + 0x38, b + kMatrices + k * 0x80);
+            Put(kMaterials + k * 0x80 + 0x28, b + kMatrices + 0x800 + k * 0x40);
+            Put(kBuffers + k * 0x80 + 0x54, static_cast<u16>(rng() % 64));
+        }
+    }
+};
+
+struct LoopRecording {
+    ST::Trace t;
+    ST::Call calls[1024];
+    u8 snap[0x4000];
+    void Begin(u64 top, const LoopWorld& w, u8* arena, u64 arena_bytes) {
+        t.callees = kLoopCallees;
+        t.ncallees = kLoopCalleeCount;
+        t.calls = calls;
+        t.max_calls = 1024;
+        t.snap = snap;
+        t.snap_cap = sizeof(snap);
+        t.arena = arena;
+        t.arena_cap = arena_bytes;
+        t.nregions = 0;
+        t.Begin(0x43d590, top);
+        t.AddRegion(w.base(), LoopWorld::kBytes);
+    }
+};
+
+using Fn2 = SSPC_SYSV_ABI void (*)(u64, u64);
+
+u64 g_loop_callee_calls[kLoopCalleeCount] = {}; // coverage: the original's recorded calls per callee
+
+u64 g_diag_image = 0, g_diag_clone = 0;
+LONG CALLBACK DiagnoseFault(EXCEPTION_POINTERS* e) {
+    const u64 rip = e->ContextRecord->Rip;
+    std::fprintf(stderr, "fault %#lx at rip %#llx (exe +%#llx, image +%#llx, clone +%#llx), address %#llx, rsp %#llx\n",
+                 e->ExceptionRecord->ExceptionCode, static_cast<unsigned long long>(rip),
+                 static_cast<unsigned long long>(rip - reinterpret_cast<u64>(GetModuleHandleA(nullptr))),
+                 static_cast<unsigned long long>(rip - g_diag_image), static_cast<unsigned long long>(rip - g_diag_clone),
+                 static_cast<unsigned long long>(e->ExceptionRecord->NumberParameters > 1
+                                                     ? e->ExceptionRecord->ExceptionInformation[1]
+                                                     : 0),
+                 static_cast<unsigned long long>(e->ContextRecord->Rsp));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+u64 LoopDifferential(Fn2 original, Fn2 recompiled, RedirectsFn redirects, u64 image_base, u64 cases,
+                     std::mt19937_64& rng, std::string& first, u64& calls, u64& instanced_cases,
+                     bool perturb = false) {
+    u64 from[kLoopCalleeCount], to[kLoopCalleeCount];
+    for (u32 i = 0; i < kLoopCalleeCount; ++i) {
+        from[i] = image_base + kLoopCallees[i].rva;
+        to[i] = ST::ThunkAddress(i);
+    }
+    static LoopWorld w;
+    static LoopRecording a, b;
+    std::vector<u8> arena(0x40000), arena_a, before, after_a;
+    u8* const prng = reinterpret_cast<u8*>(image_base + kPrngState);
+    std::vector<u8> prng_before(kPrngBytes), prng_a(kPrngBytes);
+    auto* quality_index = reinterpret_cast<s32*>(image_base + kQualityIndex);
+    auto* quality = reinterpret_cast<s32*>(image_base + kQualityTable);
+    const s32 saved_index = *quality_index, saved_quality = *quality;
+    std::memcpy(prng_before.data(), prng, kPrngBytes);
+    const std::vector<u8> prng_saved = prng_before;
+    volatile u8 top = 0;
+    const u64 stack_top = reinterpret_cast<u64>(&top);
+    u64 bad = 0;
+    for (u64 n = 0; n < cases; ++n) {
+        w.Generate(rng);
+        *quality_index = 0;
+        *quality = rng() % 2 ? 0 : static_cast<s32>(rng() % 0x480); // 0: nothing dropped
+        for (u8& x : prng_before) {
+            x = static_cast<u8>(rng());
+        }
+        const u32 counter = static_cast<u32>(rng() % 0x101);
+        std::memcpy(prng_before.data() + 0x40c, &counter, 4);
+        before = w.mem;
+        const auto run = [&](LoopRecording& rec, Fn2 fn) {
+            if (std::getenv("SSPC_R6S_TRACE_CASES") != nullptr) { // diagnosis of a crash: the case and the run
+                std::fprintf(stderr, "43d590 case %llu %s\n", static_cast<unsigned long long>(n),
+                             &rec == &a ? "original" : "recompiled");
+            }
+            std::memcpy(prng, prng_before.data(), kPrngBytes);
+            std::fill(arena.begin(), arena.end(), 0);
+            rec.Begin(stack_top, w, arena.data(), arena.size());
+            ST::SetActive(&rec.t);
+            fn(w.base() + LoopWorld::kPass, w.base() + LoopWorld::kArgs);
+            ST::SetActive(nullptr);
+        };
+        run(a, original);
+        after_a = w.mem;
+        arena_a = arena;
+        std::memcpy(prng_a.data(), prng, kPrngBytes);
+        w.mem = before;
+        if (redirects(from, to, kLoopCalleeCount) == 0) {
+            first = "recomp_set_redirects refused";
+            return cases;
+        }
+        if (perturb) { // the sensitivity check: the second run sees another buffer slot of the pass
+            w.mem[LoopWorld::kPass + 0x120] ^= 1;
+        }
+        run(b, recompiled);
+        redirects(nullptr, nullptr, 0);
+        if (perturb) {
+            w.mem[LoopWorld::kPass + 0x120] ^= 1;
+        }
+        calls += a.t.ncalls;
+        for (u32 k = 0; k < a.t.ncalls; ++k) {
+            ++g_loop_callee_calls[a.calls[k].callee];
+        }
+        instanced_cases += w.mem[LoopWorld::kPass + 0x1f] != 0 && a.t.ncalls != 0 ? 1 : 0;
+        std::string d = ST::Compare(a.t, b.t, true);
+        if (d.empty() && after_a != w.mem) {
+            u32 at = 0;
+            while (after_a[at] == w.mem[at]) {
+                ++at;
+            }
+            d = "world +" + std::to_string(at);
+        }
+        if (d.empty() && arena_a != arena) {
+            d = "allocations differ";
+        }
+        if (d.empty() && std::memcmp(prng_a.data(), prng, kPrngBytes) != 0) {
+            d = "generator state differs";
+        }
+        if (!d.empty() && bad++ == 0) {
+            first = "case " + std::to_string(n) + ": " + d;
+        }
+    }
+    std::memcpy(prng, prng_saved.data(), kPrngBytes);
+    *quality_index = saved_index;
+    *quality = saved_quality;
+    return bad;
+}
+
 /// Restores a GOT slot of the mapped image on scope exit.
 struct SlotOverride {
     u64* slot;
@@ -519,6 +758,68 @@ int R6ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const st
                         bad ? "; first: " : "", first.c_str());
             ++checks;
             failures += bad != 0 || orphaned != 0 || calls != cases * kDrawCalleeCount ? 1 : 0;
+        }
+    }
+
+    // 0x43d590 (shadow casters loop): recording clone vs recompiled on generated worlds, calls + memory compared
+    {
+        auto* r = reinterpret_cast<Fn2>(GetProcAddress(m, "recomp_43d590"));
+        auto* redirects = reinterpret_cast<RedirectsFn>(GetProcAddress(m, "recomp_set_redirects"));
+        std::vector<CodeRedirect> to_thunks;
+        for (u32 i = 0; i < kLoopCalleeCount; ++i) {
+            to_thunks.push_back({image_base + kLoopCallees[i].rva, ST::ThunkAddress(i)});
+        }
+        std::string error;
+        const CloneResult c = CloneGuestFunction(image_base + 0x43d590, reinterpret_cast<const u8*>(image_base + 0x43d590),
+                                                 0xdb9, error, to_thunks);
+        if (r == nullptr || redirects == nullptr || c.code == nullptr) {
+            std::printf("  recomp_43d590: %s%s\n", r == nullptr || redirects == nullptr ? "not in recomp.dll" : "clone: ",
+                        error.c_str());
+            ++checks;
+            ++failures;
+        } else {
+            if (std::getenv("SSPC_R6S_TRACE_CASES") != nullptr) {
+                g_diag_image = image_base;
+                g_diag_clone = reinterpret_cast<u64>(c.code);
+                AddVectoredExceptionHandler(1, &DiagnoseFault);
+            }
+            const u32 host = _mm_getcsr();
+            for (const u32 mode : {host, 0x9fc0u, 0x7f80u}) {
+                _mm_setcsr(mode);
+                std::string first;
+                u64 calls = 0, instanced = 0;
+                const u64 orphans = ST::OrphanCalls();
+                const u64 n = mode == host ? std::max<u64>(cases / 10, 1000) : std::max<u64>(cases / 40, 1000);
+                const u64 bad = LoopDifferential(reinterpret_cast<Fn2>(c.code), r, redirects, image_base, n, rng, first,
+                                                 calls, instanced);
+                _mm_setcsr(host);
+                const u64 orphaned = ST::OrphanCalls() - orphans;
+                std::printf("  recomp_43d590 vs eboot 0x43d590 (recording clone, MXCSR %#x): %llu worlds (%llu with "
+                            "instancing), %llu recorded calls, %llu different, %llu orphan calls%s%s\n",
+                            mode, static_cast<unsigned long long>(n), static_cast<unsigned long long>(instanced),
+                            static_cast<unsigned long long>(calls), static_cast<unsigned long long>(bad),
+                            static_cast<unsigned long long>(orphaned), bad ? "; first: " : "", first.c_str());
+                ++checks;
+                failures += bad != 0 || orphaned != 0 || calls < n ? 1 : 0;
+            }
+            std::printf("    calls per callee (all modes):");
+            for (u32 k = 0; k < kLoopCalleeCount; ++k) {
+                std::printf(" %#llx %llu%s", static_cast<unsigned long long>(kLoopCallees[k].rva),
+                            static_cast<unsigned long long>(g_loop_callee_calls[k]), k + 1 < kLoopCalleeCount ? "," : "\n");
+                ++checks;
+                failures += g_loop_callee_calls[k] == 0 ? 1 : 0; // every callee's path reached
+            }
+            // the comparison's sensitivity: the recompiled run on a world one byte apart (the pass's +0x120 slot,
+            // used only when the pass binds its per-item buffer) must differ whenever that path ran
+            std::string first;
+            u64 calls = 0, instanced = 0;
+            const u64 differ = LoopDifferential(reinterpret_cast<Fn2>(c.code), r, redirects, image_base, 1000, rng,
+                                                first, calls, instanced, true);
+            std::printf("  sensitivity: 1000 worlds with the pass's slot changed for the recompiled run: %llu "
+                        "different\n",
+                        static_cast<unsigned long long>(differ));
+            ++checks;
+            failures += differ > 100 ? 0 : 1;
         }
     }
 
