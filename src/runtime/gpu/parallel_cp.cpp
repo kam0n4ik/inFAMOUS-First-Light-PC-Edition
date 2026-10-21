@@ -17,6 +17,7 @@
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/r8/cp_native_diag.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
@@ -254,6 +255,9 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         if (stage_reuse_ != 0) {
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_STAGE_REUSE={} - unchanged draw stages not copied", v);
         }
+    }
+    if (frontend_ != nullptr && !fthread_mode_ && R8::PrepDiag::On()) {
+        r8_diag_ = std::make_unique<R8::PrepDiag>();
     }
 }
 
@@ -961,7 +965,14 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     u64 t_copy = 0;
     {
         const GS::FineSample fine(front_fine_counter_);
+        if (r8_diag_ != nullptr) {
+            r8_diag_->Before(*frontend_);
+        }
+        const u64 tf = r8_diag_ != nullptr ? __rdtsc() : 0;
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
+        if (r8_diag_ != nullptr) {
+            r8_diag_->After(r.draw, *frontend_, reader_, __rdtsc() - tf); // (R8-A2: before the views are copied)
+        }
         const u64 tc = srt_diag_ ? __rdtsc() : 0;
         r.prep = prep;
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
@@ -2717,6 +2728,9 @@ std::string ParallelCp::Report() const {
     }
     out += "\n";
     out += R6::Report(); // (R6-P: docs/NATIVE_RENDER_R6_CP_OPTIMIZATION.md; empty when off)
+    if (r8_diag_ != nullptr) {
+        out += r8_diag_->Report(); // (R8-A2: docs/NATIVE_ENGINE_R8_CP_OPTIMIZATION.md)
+    }
     if (Failed()) {
         out += "  FAILED: " + failure_ + "\n";
     }
