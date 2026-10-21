@@ -1,0 +1,4 @@
+{
+ "VUID-VkWriteDescriptorSet-descriptorType-04152": "R6/R7 reference: a storage image pushed in SHADER_READ_ONLY_OPTIMAL (R7 RESULTS §3)",
+ "VUID-StandaloneSpirv-Flat-04744": "R6/R7 reference: SubgroupLocalInvocationId input of a fragment shader without Flat (R7 RESULTS §3)"
+}
