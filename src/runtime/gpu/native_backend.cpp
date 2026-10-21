@@ -38,6 +38,7 @@
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
+#include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/gcn/gcn_translator.h"
@@ -85,6 +86,7 @@ public:
         }
     }
     bool Read(u64 addr, void* dst, u64 bytes) override {
+        R8_CP_PROF(CpProfile::Sec::MemRead);
         if (VideoOut::LabelRead(addr, dst, bytes)) {
             return true;
         }
@@ -98,6 +100,7 @@ public:
                 parallel->Drain(DrainReason::MemoryRead);
                 const bool sync = executor->TimelineWritePending(addr, bytes);
                 if (sync) {
+                    R8_CP_PROF(CpProfile::Sec::MemSync);
                     executor->SyncFromMemoryRead();
                 }
                 if (t0 != 0) {
@@ -106,6 +109,7 @@ public:
                 }
             }
         } else if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {
+            R8_CP_PROF(CpProfile::Sec::MemSync);
             executor->SyncFromMemoryRead();
         }
         KeptBack(addr, bytes);
@@ -376,6 +380,7 @@ private:
     /// The guest's CPU wrote [addr, addr + size): the frontend's programs there are read again - on the frontend's
     /// own thread in stream order when it has one (P5.3D), else at once (it runs on this thread).
     void FrontendInvalidate(u64 addr, u64 size) {
+        R8_CP_PROF(CpProfile::Sec::FrontInvalidate);
         if (parallel_ && parallel_->FrontendThread()) {
             parallel_->FrontInvalidate(addr, size);
         } else {
@@ -1083,6 +1088,7 @@ void Backend::Apply(const Submission& s) {
 }
 
 bool Backend::DrainCpuWrites() {
+    R8_CP_PROF(CpProfile::Sec::CpuWrites);
     bool any = false;
     // the exact first write of each block given back: surely a write at that address (a small GPU-written image has no
     // whole block a coarse report could name; P4.5)
@@ -1170,6 +1176,7 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
     StallTrace::RegisterThread(StallTrace::Role::Cp);
+    R8_CP_PROF_THREAD(Cp);
     loop_tid_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     std::deque<Submission> local;
     auto rate_t0 = std::chrono::steady_clock::now();
@@ -1196,6 +1203,7 @@ void Backend::Loop() {
             compute_rung_.store(false, std::memory_order_relaxed); // (the doorbells rung so far are taken now)
         }
         for (const auto& s : local) {
+            R8_CP_PROF(CpProfile::Sec::LoopPre);
             Apply(s);
         }
         const size_t taken = local.size();
@@ -1364,6 +1372,7 @@ void Backend::Loop() {
             if (nodrain_ && executor_->CompletionsReady()) {
                 ApplyCompletions(); // (CP-9: completions thread 2 polled - labels written before the next slice)
             }
+            R8_CP_PROF(CpProfile::Sec::Packets);
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
@@ -1420,6 +1429,7 @@ void Backend::Loop() {
         // (=2: not while the game waits for its async compute - its labels come from the drained round end's poll)
         if (parallel_ && nodrain_ && progress && fp_ahead == 0 && !(nodrain_wait_ && CriticalCompute::Waiting()) &&
             parallel_->RoundEndQueued()) {
+            R8_CP_PROF(CpProfile::Sec::RoundEnd);
             ++nodrain_rounds_;
             const u64 round_ns = ns_since(cp_t0);
             prof_cp += round_ns;
@@ -1448,6 +1458,7 @@ void Backend::Loop() {
         tot_round_ns_ += round_ns;
         const auto poll_t0 = Clock::now();
         {
+            R8_CP_PROF(CpProfile::Sec::Poll);
             const StallTrace::Scope poll_span(StallTrace::Ev::Poll, round_packets, round_capped,
                                               graphics_capped ? 1 : 0);
             executor_->Poll(); // completed batches: the processor writes its held labels now
@@ -1632,6 +1643,7 @@ void Backend::Loop() {
                               GpuBacklog() < fp_ahead;
         fp_flushes_ += fp_flush ? 1 : 0;
         if (executor_->WantsFlush() || (!progress && executor_->HasOpenWork()) || fp_flush) {
+            R8_CP_PROF(CpProfile::Sec::Flush);
             const auto flush_t0 = Clock::now();
             executor_->FlushFromLoop();
             const u64 flush_ns = ns_since(flush_t0);
@@ -1669,6 +1681,7 @@ void Backend::Loop() {
         const auto idle_t0 = Clock::now();
         const u64 idle_tsc = StallTrace::On() ? StallTrace::Now() : 0; // (P4.12)
         const bool busy = executor_->Busy();
+        R8_CP_PROF(blocked ? CpProfile::Sec::IdleBlocked : busy ? CpProfile::Sec::IdleGpu : CpProfile::Sec::IdleEmpty);
         // SSPC_DIAG_BLOCK_SPIN_US=<n>: a WAIT_REG_MEM blocked on memory the game's CPU writes (no notification comes)
         // is polled again after n us instead of a 1 ms sleep (P4.6 experiment)
         static const u64 spin_ns = [] {
@@ -1858,6 +1871,7 @@ void Backend::Stop() {
     std::error_code ec;
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
+    CpProfile::WriteCsv(options_.logs_dir); // (SSPC_R8_CP_PROFILE_CSV=1)
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
     StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
     ShaderTrace::Stop(); // (P4.14)
@@ -2557,6 +2571,7 @@ std::string Backend::Report() {
                                t.watch_reads, t.watch_first, t.watch_last);
         }
     }
+    out += CpProfile::Report(); // (R8: SSPC_R8_CP_PROFILE; empty when off)
     if (presenter_) {
         const auto p = presenter_->GetStats();
         out += fmt::format("presented {} (black {}), copies {}, captures {}, swapchain recreated {}{}\n", p.presented,

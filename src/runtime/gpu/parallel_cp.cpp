@@ -18,6 +18,7 @@
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/r8/cp_native_diag.h"
+#include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
@@ -52,6 +53,7 @@ bool Overlaps(const std::vector<std::pair<u64, u64>>& ranges, u64 lo, u64 hi, u6
 
 /// What the executor reads of a stage the frontend prepared (not its specialization key).
 void CopyStage(GS::StageView& d, const GS::StageView& s) {
+    R8_CP_PROF(CpProfile::Sec::CopyStage);
     d.status = s.status;
     d.address = s.address;
     d.program = s.program;
@@ -366,6 +368,7 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
     if (h >= target) {
         return;
     }
+    R8_CP_PROF(full ? (why == kWhyJournal ? CpProfile::Sec::WaitJournal : CpProfile::Sec::WaitFull) : CpProfile::Drain(why));
     const u64 h0 = h;
     const u64 t0 = __rdtsc();
     while (h < target && __rdtsc() - t0 < spin_ticks_) {
@@ -402,6 +405,7 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
 }
 
 void ParallelCp::ApplyPending() {
+    R8_CP_PROF(CpProfile::Sec::ApplyPending);
     ApplyJournal(jtail_);
     if (has_deferred_.load(std::memory_order_acquire)) {
         ApplyDeferred(~0ull);
@@ -546,6 +550,7 @@ void ParallelCp::JournalReserve(u32 words) {
 }
 
 void ParallelCp::OnWrite(Cp::Space space, u32 offset, const u32* values, u32 count) {
+    R8_CP_PROF_LIGHT(CpProfile::Light::JournalWrite);
     const u32 words = 2 + count;
     JournalReserve(words);
     u32* w = JournalAt(jtail_);
@@ -690,6 +695,7 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
 
 bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
                                std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out) {
+    R8_CP_PROF(CpProfile::Sec::Redecode);
     // a stage without an SRT walk: its plan is the registers' decoding alone (ResolveResources with an empty walk);
     // CITY-OPT Phase 6 (resources_): one with a walk whose output stays - the registers it read are the same
     if (v.program == nullptr || v.module == nullptr || v.plan.flat.size() < 16 || !v.plan.error.empty() ||
@@ -771,6 +777,7 @@ bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> 
 }
 
 bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
+    R8_CP_PROF(CpProfile::Sec::GeoFast);
     const auto no = [&](u8 why) {
         geofast_why_ = why;
         return false;
@@ -934,6 +941,7 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
 }
 
 void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs) {
+    R8_CP_PROF(CpProfile::Sec::PrepDraw);
     r.prepared = false;
     r.census_key = 0;
     r.vs_same = r.ps_same = false;
@@ -969,10 +977,13 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
             r8_diag_->Before(*frontend_);
         }
         const u64 tf = r8_diag_ != nullptr ? __rdtsc() : 0;
+        R8_CP_PROF_ENTER(CpProfile::Front(r.draw.engine_run));
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
+        R8_CP_PROF_LEAVE();
         if (r8_diag_ != nullptr) {
             r8_diag_->After(r.draw, *frontend_, reader_, __rdtsc() - tf); // (R8-A2: before the views are copied)
         }
+        R8_CP_PROF_PREPARED(r.draw, frontend_->Stage(GS::HwStage::Vs), frontend_->Stage(GS::HwStage::Ps));
         const u64 tc = srt_diag_ ? __rdtsc() : 0;
         r.prep = prep;
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
@@ -989,6 +1000,7 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
             same = stage_reuse_ != 0 && gen == copied;
             if (!same || stage_reuse_ == 2) {
                 CopyStage(dst, frontend_->Stage(hw));
+                R8_CP_PROF_COPY(gen == copied);
             }
             copied = gen;
         };
@@ -1184,6 +1196,7 @@ void ParallelCp::PrepareDispatch(Record& r, u64 index) {
     }
     const u64 t0 = __rdtsc();
     {
+        R8_CP_PROF(CpProfile::Sec::FrontDispatch);
         const GS::FineSample fine(front_fine_counter_);
         r.prep = frontend_->PrepareDispatch(r.dispatch, std::span<const u32, Cp::kComputeCount>(r.cs.values), reader_);
         const u64 tc = GS::FineTicks();
@@ -1220,9 +1233,11 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
             Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
         }
     } else if (p_.Idle()) {
+        R8_CP_PROF(CpProfile::Sec::FrontSync);
         p_.ApplyPending();
         Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0); // (exact: TimelineReader's check)
     } else if (p_.MayBeGpuWritten(addr, bytes) || p_.exec_.KeptBack(addr, bytes)) { // (FB-7: kept back)
+        R8_CP_PROF(CpProfile::Sec::FrontSync);
         Bump(p_.fc_.read_hits);
         p_.Drain(DrainReason::FrontendRead);
         Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
@@ -1256,6 +1271,7 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
 // ---- either thread (never both at once: thread 1 only while the queue is drained)
 
 void ParallelCp::ApplyJournal(u64 end) {
+    R8_CP_PROF(CpProfile::Sec::Journal);
     u64 pos = jhead_.load(std::memory_order_relaxed);
     while (pos < end) {
         const u32* w = JournalAt(pos);
@@ -1472,6 +1488,7 @@ void ParallelCp::FrontLoop() {
 void ParallelCp::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuRecord");
     StallTrace::RegisterThread(StallTrace::Role::Record);
+    R8_CP_PROF_THREAD(Record);
     const bool trace_records = StallTrace::DeepRecords();
     u64 h = head_.load(std::memory_order_relaxed);
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
@@ -1487,6 +1504,7 @@ void ParallelCp::Loop() {
     for (;;) {
         u64 t = source.load(std::memory_order_acquire);
         if (t == h) {
+            R8_CP_PROF(CpProfile::Sec::T2Idle);
             const u64 w0 = __rdtsc();
             while (t == h && __rdtsc() - w0 < spin_ticks_) {
                 _mm_pause();
@@ -1508,6 +1526,7 @@ void ParallelCp::Loop() {
             StallTrace::Span(StallTrace::Ev::RecordWait, w0, w1, push_tsc_ != nullptr ? push_tsc_[h & (kRecRing - 1)] : 0,
                              static_cast<u32>(h));
         }
+        R8_CP_PROF_FRAME_POLL();
         const u64 b0 = __rdtsc();
         Record& r = slots_[h & (kSlots - 1)];
         const bool stop = r.kind == Kind::Stop;
@@ -1619,6 +1638,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
         return 0; // consumed, not executed: thread 1's drains still complete; the backend stops at its next check
     }
     try {
+        R8_CP_PROF(CpProfile::RecordSection(static_cast<u32>(r.kind)));
         // (stage 2: thread 1 tells the frontend about guest memory changes in stream order; nothing from here)
         exec_.SetMemoBumps(frontend_ == nullptr);
         ApplyJournal(r.journal_end);
@@ -1783,6 +1803,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
     const bool tagged = draw.engine_run != 0 &&
                         (draw.engine_run != static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) || GRunsNow());
     if (run_open_) {
+        R8_CP_PROF(CpProfile::Sec::JoinRun);
         const u64 tj = srt_diag_ ? __rdtsc() : 0;
         const bool joined = tagged && JoinRun(draw);
         if (srt_diag_ && tagged) {
@@ -1800,6 +1821,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
         }
         CloseRun();
     }
+    R8_CP_PROF(CpProfile::Sec::ParDraw);
     Record& r = BeginRecord(Kind::Draw);
     r.draw = draw;
     r.members.clear();
@@ -2219,6 +2241,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
 }
 
 void ParallelCp::Dispatch(const Cp::DispatchDescriptor& dispatch) {
+    R8_CP_PROF(CpProfile::Sec::ParDispatch);
     Record& r = BeginRecord(Kind::Dispatch);
     r.dispatch = dispatch;
     const Cp::ComputeRegisters* cs = cp_ != nullptr ? cp_->Compute(dispatch.queue) : nullptr;
@@ -2260,14 +2283,17 @@ void ParallelCp::Dispatch(const Cp::DispatchDescriptor& dispatch) {
     } while (false)
 
 void ParallelCp::CacheAction(const Cp::CacheActionOp& op) {
+    R8_CP_PROF(CpProfile::Sec::CbCache);
     SSPC_P410_QUEUED_CALL(Kind::CacheAction, kQCache, DrainReason::CacheAction, exec_.CacheAction(op), r.cache = op);
 }
 
 void ParallelCp::Fence(const Cp::FenceOp& op) {
+    R8_CP_PROF(CpProfile::Sec::CbFence);
     SSPC_P410_QUEUED_CALL(Kind::Fence, kQFence, DrainReason::Fence, exec_.Fence(op), r.fence = op);
 }
 
 void ParallelCp::Dma(const Cp::DmaOp& op) {
+    R8_CP_PROF(CpProfile::Sec::CbDma);
     // R6-P (SSPC_R6_CP_PREFETCH=skip): Gnm's L2 prefetch writes no memory - nothing for thread 2, no memory change
     if (const R6::Options& r6 = R6::Opt(); r6.diag || r6.prefetch_skip) {
         R6::Counters& c = R6::Count();
@@ -2285,11 +2311,13 @@ void ParallelCp::Dma(const Cp::DmaOp& op) {
 }
 
 void ParallelCp::WaitMetByHeldFence(u32 queue) {
+    R8_CP_PROF(CpProfile::Sec::CbWaitMet);
     SSPC_P410_QUEUED_CALL(Kind::WaitMet, kQWaitMet, DrainReason::WaitMet, exec_.WaitMetByHeldFence(queue),
                           r.queue = queue);
 }
 
 void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
+    R8_CP_PROF(CpProfile::Sec::CbAcquire);
     if (frontend_ != nullptr) {
         if (async_acquire_ && !Idle()) {
             // P4.11 (Options::async_acquire): the CPU writes applied here, the rest in stream order on thread 2
@@ -2321,6 +2349,7 @@ void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
 }
 
 bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
+    R8_CP_PROF(CpProfile::Sec::CbCopy);
     if (!async_copies_) {
         Drain(DrainReason::TimelineCopy);
         const bool ok = exec_.CopyOnTimeline(queue, seq, src, dst, bytes);
@@ -2366,6 +2395,7 @@ bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes)
 }
 
 void ParallelCp::Flip(const Cp::FlipMarker& marker) {
+    R8_CP_PROF(CpProfile::Sec::CbFlip);
     if (async_flip_ && started_ && !exec_.EvictionDue() && !StallTrace::On() && !Inspector::On()) {
         // Native CP: executed by thread 2 behind the frame's draws; the frontend's frame begins here (thread 1's order)
         Record& r = BeginRecord(Kind::Flip);
@@ -2399,12 +2429,14 @@ void ParallelCp::Interrupt(u32 queue, Cp::FenceKind kind) {
 }
 
 void ParallelCp::Synchronize(u32 queue) {
+    R8_CP_PROF(CpProfile::Sec::CbSync);
     Drain(DrainReason::Synchronize);
     exec_.Synchronize(queue);
     SnapshotTimeline();
 }
 
 bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) {
+    R8_CP_PROF(CpProfile::Sec::CbWrite);
     if (async_writes_ && !async_gds_only_ && started_ && !Idle()) {
         // CP-9: accepted by its shape, recorded in stream order (RunWrite: the CPU writes there after a refusal)
         if (!Vk::Executor::TimelineWriteShapeOk(dst, bytes)) {
@@ -2437,6 +2469,7 @@ bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, 
 }
 
 bool ParallelCp::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    R8_CP_PROF(CpProfile::Sec::CbZpass);
     // after the draws queued before it (the query's own draw among them), as the executor records it
     Drain(DrainReason::TimelineWrite);
     const bool ok = exec_.ZpassOnTimeline(queue, seq, dst, db_mask, stride);
@@ -2449,6 +2482,7 @@ bool ParallelCp::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 s
 
 bool ParallelCp::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                                u32 pattern) {
+    R8_CP_PROF(CpProfile::Sec::CbGds);
     if (async_writes_ && started_ && !Idle()) {
         if (!exec_.GdsShapeOk(kind, memory, gds_offset, bytes)) {
             return false;
