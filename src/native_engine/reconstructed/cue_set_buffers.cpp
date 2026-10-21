@@ -32,22 +32,33 @@ constexpr u32 kMaxStage = 7;
 /// A shadow copy: CUE offsets up to the farthest entry of stage 7 (0x90 + 7 * 0x1800 + 0x3fff * 4 + 32 = 0x1a8b0).
 constexpr u64 kShadowBytes = 0x1b000;
 
-constexpr Engine::GuestFunction kFunction[CSB::kKinds] = {
+constexpr Engine::GuestFunction kFunction[CSB::kAllKinds] = {
     {0x16aa0, 0xc6, 0xf6c333198de2deedull},
     {0x16b70, 0xc6, 0x713c9f7b4b870c4dull},
     {0x169d0, 0xc6, 0x01bd288a9d982d39ull},
     {0x16d10, 0xc6, 0x722df3b62820c187ull},
     {0x16eb0, 0xc6, 0xe7d4270a2029dbecull},
+    {0x16c40, 0xc6, 0xe44b61ff8aa2933bull}, // R7-R: read-write V#
+    {0x16de0, 0xc6, 0x10784ab701e6ed41ull}, // R7-R: read-write T#
 };
 
 std::atomic<u64> g_callee{0};
-CSB::Fn g_recording[CSB::kKinds] = {};
-CSB::Fn g_impl[CSB::kKinds] = {&CSB::NativeVertexBuffers, &CSB::NativeBuffers, &CSB::NativeConstantBuffers,
-                               &CSB::NativeTextures, &CSB::NativeSamplers};
-const char* g_impl_source[CSB::kKinds] = {"hand-written reconstruction", "hand-written reconstruction",
-                                          "hand-written reconstruction", "hand-written reconstruction",
-                                          "hand-written reconstruction"};
-CSB::RedirectFn g_redirect[CSB::kKinds] = {};
+CSB::Fn g_recording[CSB::kAllKinds] = {};
+CSB::Fn g_impl[CSB::kAllKinds] = {&CSB::NativeVertexBuffers, &CSB::NativeBuffers, &CSB::NativeConstantBuffers,
+                                  &CSB::NativeTextures,      &CSB::NativeSamplers, &CSB::NativeRwBuffers,
+                                  &CSB::NativeRwTextures};
+const char* g_impl_source[CSB::kAllKinds] = {
+    "hand-written reconstruction", "hand-written reconstruction", "hand-written reconstruction",
+    "hand-written reconstruction", "hand-written reconstruction", "hand-written reconstruction",
+    "hand-written reconstruction"};
+CSB::RedirectFn g_redirect[CSB::kAllKinds] = {};
+CSB::ObserverFn g_observer = nullptr; ///< R7-R resource state (set before the guest runs)
+
+inline void Observe(CSB::Kind kind, u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    if (g_observer != nullptr) {
+        g_observer(kind, cue, stage, slot, count, src);
+    }
+}
 
 thread_local CSB::Recording* t_recording = nullptr;
 thread_local CSB::CalleeFn t_callee = nullptr; ///< the hand-written reconstruction's callee in a recorded run
@@ -87,7 +98,7 @@ inline u64 Run(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
 }
 
 bool IsHandWritten(CSB::Fn fn) {
-    for (u32 k = 0; k < CSB::kKinds; ++k) {
+    for (u32 k = 0; k < CSB::kAllKinds; ++k) {
         if (fn == CSB::HandWritten(static_cast<CSB::Kind>(k))) {
             return true;
         }
@@ -267,10 +278,12 @@ struct Impl {
     }
 
     static SSPC_SYSV_ABI u64 Native(u64 cue, u32 stage, u32 s, u32 count, u64 src) { // counted by the dispatcher
+        Observe(K, cue, stage, s, count, src);
         return g_impl[K](cue, stage, s, count, src);
     }
 
     static SSPC_SYSV_ABI u64 Verify(u64 cue, u32 stage, u32 s, u32 count, u64 src) {
+        Observe(K, cue, stage, s, count, src);
         const CSB::Fn original = Original();
         Plan p;
         if (!MakePlan<kTable, kBytes>(cue, stage, s, count, p)) {
@@ -287,6 +300,7 @@ struct Impl {
     }
 
     static SSPC_SYSV_ABI u64 Guarded(u64 cue, u32 stage, u32 s, u32 count, u64 src) {
+        Observe(K, cue, stage, s, count, src);
         Plan p;
         if (SampleThisCall(slot.index, slot.sample_period) && MakePlan<kTable, kBytes>(cue, stage, s, count, p) &&
             !Check(p, cue, stage, s, count, src)) {
@@ -299,6 +313,7 @@ struct Impl {
     }
 
     static SSPC_SYSV_ABI u64 Bench(u64 cue, u32 stage, u32 s, u32 count, u64 src) {
+        Observe(K, cue, stage, s, count, src);
         const CSB::Fn original = Original();
         Plan p;
         if (SampleThisCall(slot.index, slot.sample_period) && MakePlan<kTable, kBytes>(cue, stage, s, count, p)) {
@@ -384,6 +399,7 @@ bool SelfCheck(void* /*original*/, std::string& error) {
 
 template <CSB::Kind K>
 FunctionSpec MakeSpec(const char* key, const char* name) {
+    // R7-R's read-write setters only when SSPC_NATIVE_ENGINE_FUNCS names them (not part of "all functions")
     return FunctionSpec{key,
                         name,
                         kFunction[K],
@@ -394,7 +410,8 @@ FunctionSpec MakeSpec(const char* key, const char* name) {
                         reinterpret_cast<const void*>(&D::Entry<Impl<K>>),
                         &Impl<K>::slot,
                         &SelfCheck<K>,
-                        &PrepareKind<K>};
+                        &PrepareKind<K>,
+                        K >= CSB::kKinds};
 }
 
 } // namespace
@@ -419,10 +436,23 @@ SSPC_SYSV_ABI u64 CSB::NativeSamplers(u64 cue, u32 stage, u32 slot, u32 count, u
     return Run<kTableOffset[kSamplers], kDescriptorBytes[kSamplers]>(cue, stage, slot, count, src);
 }
 
+SSPC_SYSV_ABI u64 CSB::NativeRwBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    return Run<kTableOffset[kRwBuffers], kDescriptorBytes[kRwBuffers]>(cue, stage, slot, count, src);
+}
+
+SSPC_SYSV_ABI u64 CSB::NativeRwTextures(u64 cue, u32 stage, u32 slot, u32 count, u64 src) {
+    return Run<kTableOffset[kRwTextures], kDescriptorBytes[kRwTextures]>(cue, stage, slot, count, src);
+}
+
 CSB::Fn CSB::HandWritten(Kind kind) {
-    static constexpr Fn kHand[kKinds] = {&NativeVertexBuffers, &NativeBuffers, &NativeConstantBuffers, &NativeTextures,
-                                         &NativeSamplers};
+    static constexpr Fn kHand[kAllKinds] = {&NativeVertexBuffers, &NativeBuffers,   &NativeConstantBuffers,
+                                            &NativeTextures,      &NativeSamplers,  &NativeRwBuffers,
+                                            &NativeRwTextures};
     return kHand[kind];
+}
+
+void CSB::SetObserver(ObserverFn fn) {
+    g_observer = fn;
 }
 
 SSPC_SYSV_ABI u64 CSB::Record(u64 context, u64 stage, u64 sgpr, u64 values, u64 count) {
@@ -530,11 +560,13 @@ const FunctionSpec kCueSetConstantBuffersSpec =
     MakeSpec<CSB::kConstantBuffers>("cue_set_constant_buffers", "CUE::SetConstantBuffers");
 const FunctionSpec kCueSetTexturesSpec = MakeSpec<CSB::kTextures>("cue_set_textures", "CUE::SetTextures");
 const FunctionSpec kCueSetSamplersSpec = MakeSpec<CSB::kSamplers>("cue_set_samplers", "CUE::SetSamplers");
+const FunctionSpec kCueSetRwBuffersSpec = MakeSpec<CSB::kRwBuffers>("cue_set_rw_buffers", "CUE::SetRwBuffers");
+const FunctionSpec kCueSetRwTexturesSpec = MakeSpec<CSB::kRwTextures>("cue_set_rw_textures", "CUE::SetRwTextures");
 
 const FunctionSpec& CSB::Spec(Kind kind) {
-    static const FunctionSpec* const kSpecs[kKinds] = {&kCueSetVertexBuffersSpec, &kCueSetBuffersSpec,
-                                                       &kCueSetConstantBuffersSpec, &kCueSetTexturesSpec,
-                                                       &kCueSetSamplersSpec};
+    static const FunctionSpec* const kSpecs[kAllKinds] = {
+        &kCueSetVertexBuffersSpec, &kCueSetBuffersSpec,  &kCueSetConstantBuffersSpec, &kCueSetTexturesSpec,
+        &kCueSetSamplersSpec,      &kCueSetRwBuffersSpec, &kCueSetRwTexturesSpec};
     return *kSpecs[kind];
 }
 

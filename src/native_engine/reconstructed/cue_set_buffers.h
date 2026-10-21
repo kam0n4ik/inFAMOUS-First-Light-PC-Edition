@@ -40,14 +40,28 @@ extern const FunctionSpec kCueSetBuffersSpec;         ///< 0x16b70, key cue_set_
 extern const FunctionSpec kCueSetConstantBuffersSpec; ///< 0x169d0, key cue_set_constant_buffers
 extern const FunctionSpec kCueSetTexturesSpec;        ///< 0x16d10, key cue_set_textures
 extern const FunctionSpec kCueSetSamplersSpec;        ///< 0x16eb0, key cue_set_samplers
+extern const FunctionSpec kCueSetRwBuffersSpec;       ///< 0x16c40, key cue_set_rw_buffers (R7-R)
+extern const FunctionSpec kCueSetRwTexturesSpec;      ///< 0x16de0, key cue_set_rw_textures (R7-R)
 
 namespace CueSetBuffers {
 
-enum Kind : u32 { kVertexBuffers = 0, kBuffers = 1, kConstantBuffers = 2, kTextures = 3, kSamplers = 4, kKinds = 5 };
+/// kKinds: the R5 setters (the recompiled module may carry recomp_* of these); R7-R added the read-write resource
+/// setters 0x16c40 (V#) and 0x16de0 (T#), table + 0xa2 (hand-written only): kAllKinds.
+enum Kind : u32 {
+    kVertexBuffers = 0,
+    kBuffers = 1,
+    kConstantBuffers = 2,
+    kTextures = 3,
+    kSamplers = 4,
+    kKinds = 5,
+    kRwBuffers = 5,
+    kRwTextures = 6,
+    kAllKinds = 7
+};
 
-inline constexpr u64 kRva[kKinds] = {0x16aa0, 0x16b70, 0x169d0, 0x16d10, 0x16eb0};
-inline constexpr u32 kTableOffset[kKinds] = {0x10a, 0x22, 0xe2, 0x22, 0xc2};
-inline constexpr u32 kDescriptorBytes[kKinds] = {16, 16, 16, 32, 16};
+inline constexpr u64 kRva[kAllKinds] = {0x16aa0, 0x16b70, 0x169d0, 0x16d10, 0x16eb0, 0x16c40, 0x16de0};
+inline constexpr u32 kTableOffset[kAllKinds] = {0x10a, 0x22, 0xe2, 0x22, 0xc2, 0xa2, 0xa2};
+inline constexpr u32 kDescriptorBytes[kAllKinds] = {16, 16, 16, 32, 16, 16, 32};
 inline constexpr u32 kMaxDescriptorBytes = 32;
 inline constexpr u64 kCalleeRva = 0x626520; ///< setUserDataRegion (GNMX_RECONSTRUCTION.md)
 inline constexpr u32 kMaxSlots = 64;        ///< verification: slot + count within the 64 resource entries
@@ -63,6 +77,13 @@ SSPC_SYSV_ABI u64 NativeBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src
 SSPC_SYSV_ABI u64 NativeConstantBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src);
 SSPC_SYSV_ABI u64 NativeTextures(u64 cue, u32 stage, u32 slot, u32 count, u64 src);
 SSPC_SYSV_ABI u64 NativeSamplers(u64 cue, u32 stage, u32 slot, u32 count, u64 src);
+SSPC_SYSV_ABI u64 NativeRwBuffers(u64 cue, u32 stage, u32 slot, u32 count, u64 src);
+SSPC_SYSV_ABI u64 NativeRwTextures(u64 cue, u32 stage, u32 slot, u32 count, u64 src);
+
+/// R7-R Native Resource State (r7/resources/resource_state.h): called by every setter's dispatcher path except Original,
+/// before the setter runs (kind, then the setter's arguments). Set once before the guest runs; null: nothing.
+using ObserverFn = void (*)(u32 kind, u64 cue, u32 stage, u32 slot, u32 count, u64 src);
+void SetObserver(ObserverFn fn);
 /// The hand-written implementation of `kind`.
 Fn HandWritten(Kind kind);
 /// The spec of `kind` (registry).
