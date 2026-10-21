@@ -196,6 +196,12 @@ foreach(_r6 core gbuffer shadows cp)
 endforeach()
 target_sources(sspc_runtime PRIVATE ${SSPC_R6_CORE_SOURCES} ${SSPC_R6_GBUFFER_SOURCES} ${SSPC_R6_SHADOWS_SOURCES}
                ${SSPC_R6_CP_SOURCES})
+# R7 (docs/NATIVE_ENGINE_R7_CORE.md §3): the same, one list per R7 branch (cmake/r7/<subsystem>.cmake)
+foreach(_r7 core gbuffer shadows resources)
+    include(${CMAKE_SOURCE_DIR}/cmake/r7/${_r7}.cmake)
+endforeach()
+target_sources(sspc_runtime PRIVATE ${SSPC_R7_CORE_SOURCES} ${SSPC_R7_GBUFFER_SOURCES} ${SSPC_R7_SHADOWS_SOURCES}
+               ${SSPC_R7_RESOURCES_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
@@ -364,7 +370,8 @@ add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
     src/base/log.cpp
 )
 target_sources(sspc_native_engine_tests PRIVATE ${SSPC_R6_CORE_TEST_SOURCES} ${SSPC_R6_GBUFFER_TEST_SOURCES}
-               ${SSPC_R6_SHADOWS_TEST_SOURCES})
+               ${SSPC_R6_SHADOWS_TEST_SOURCES} ${SSPC_R7_CORE_TEST_SOURCES} ${SSPC_R7_GBUFFER_TEST_SOURCES}
+               ${SSPC_R7_SHADOWS_TEST_SOURCES} ${SSPC_R7_RESOURCES_TEST_SOURCES})
 target_include_directories(sspc_native_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(sspc_native_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(sspc_native_engine_tests PRIVATE /utf-8 /W4)

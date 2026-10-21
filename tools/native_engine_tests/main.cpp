@@ -58,6 +58,15 @@ int R6ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const st
                    int& checks);
 int R6CoreTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
                 int& checks);
+// R7: the same, one entry per R7 branch (r7_<subsystem>_tests.cpp; docs/NATIVE_ENGINE_R7_CORE.md §3)
+int R7GBufferTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                   int& checks);
+int R7ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                   int& checks);
+int R7ResourcesTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                     int& checks);
+int R7CoreTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                int& checks);
 }
 
 using namespace SecondSon;
@@ -2461,6 +2470,10 @@ int main(int argc, char** argv) {
                 g_failures += Tests::R6GBufferTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 g_failures += Tests::R6ShadowsTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 g_failures += Tests::R6CoreTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R7GBufferTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R7ShadowsTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R7ResourcesTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R7CoreTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 // last: it installs the setters' jumps on the mapped image
                 TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
                 // after the setters: installs 0x448640 below an entry probe on the mapped image

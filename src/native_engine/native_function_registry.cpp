@@ -22,6 +22,11 @@
 #include "native_engine/r6/r6_core.h"
 #include "native_engine/r6/r6_gbuffer.h"
 #include "native_engine/r6/r6_shadows.h"
+// R7: the same per R7 branch (docs/NATIVE_ENGINE_R7_CORE.md §3)
+#include "native_engine/r7/r7_core.h"
+#include "native_engine/r7/r7_gbuffer.h"
+#include "native_engine/r7/r7_resources.h"
+#include "native_engine/r7/r7_shadows.h"
 
 namespace SecondSon::NativeEngine {
 
@@ -47,6 +52,11 @@ const FunctionSpec* const kFunctions[] = {
     SSPC_R6_GBUFFER_SPECS
     SSPC_R6_SHADOWS_SPECS
     SSPC_R6_CORE_SPECS
+    // R7 (r7/r7_*.h): the native geometry, shadow and resource engines, the Native Render Layer
+    SSPC_R7_GBUFFER_SPECS
+    SSPC_R7_SHADOWS_SPECS
+    SSPC_R7_RESOURCES_SPECS
+    SSPC_R7_CORE_SPECS
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);
