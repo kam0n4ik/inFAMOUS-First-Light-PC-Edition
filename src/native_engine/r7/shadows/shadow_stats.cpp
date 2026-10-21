@@ -205,9 +205,7 @@ void DrawState(u32 written, u32 skipped) {
 void Time(bool native, u64 ticks) {
     Add(native ? kTimedNative : kTimedOriginal);
     Add(native ? kTicksNative : kTicksOriginal, ticks);
-    if (!On()) {
-        Report();
-    }
+    Report(); // (bench: no live loop call reaches Begin)
 }
 
 } // namespace SecondSon::NativeEngine::R7Shadows::Stats
