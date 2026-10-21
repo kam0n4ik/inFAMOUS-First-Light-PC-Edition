@@ -5,4 +5,5 @@ set(SSPC_R6_SHADOWS_SOURCES
 )
 set(SSPC_R6_SHADOWS_TEST_SOURCES
     tools/native_engine_tests/r6_shadows_tests.cpp
+    src/native_engine/reconstructed/shadow_trace.cpp
 )
