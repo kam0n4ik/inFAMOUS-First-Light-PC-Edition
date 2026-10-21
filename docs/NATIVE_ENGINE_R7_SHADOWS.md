@@ -275,7 +275,7 @@ CP 30,53 → 30,10 (−0,42), тоже внутри. В серии 2 два пр
 |---|---|
 | `43a513d` | ручные `0x43d590`/`0x43d480`, NativeDrawCommand, stats/dedup/params, офлайн-тест веток `0x450460` |
 | `8a6f7c5` | отчёт stats из bench, документ (S1/S2) |
-| (этот) | S2 деревня, S3 замеры и вердикт, итог |
+| `f3c4990` | S2 деревня, S3 замеры и вердикт, итог |
 
 Прогоны: `E:\research\r7\shadows\runs\` — `r7s_hand_verify`, `r7s_hand_guarded_stats_params`,
 `r7s_hand_native_dedup_timing`, `r7s_bench_timing2`, `r7s_native_timing`, `r7s_ab1_*`, `r7s_ab2_*`,
