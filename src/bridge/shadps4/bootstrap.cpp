@@ -63,6 +63,7 @@
 #include "ui/menu_controller.h"
 #include "bridge/shadps4/track_diag.h"
 #include "engine/game_clock_probe.h"
+#include "runtime/gpu/r8/r8_verify_frame.h"
 #include "engine/guest_hooks.h"
 #include "engine/game_fixes.h"
 #include "engine/job_system.h"
@@ -862,6 +863,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::GameFixes::Install(linker.GetModule(eboot_index)->Base());
     Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (FrameBreak FB-3)
+    Gpu::R8::Verify::Frame::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (R8-V3)
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::DrawCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (CITY-OPT diagnostics)
     Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
@@ -1055,13 +1057,20 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
     }
     std::ranges::stable_sort(timeline, {}, &Event::at);
     const auto shots = logs_dir / "shots";
-    std::thread([timeline, shots] {
+    // R8 deterministic mode (SSPC_R8_VERIFY_DET_ANCHOR, runtime/gpu/r8/r8_verify_frame.h): the events from the anchor
+    // on are due at world frames, not at wall times
+    const double anchor = Gpu::R8::Verify::Frame::Anchor();
+    Gpu::R8::Verify::Frame::ScriptStart(
+        static_cast<u32>(std::ranges::count_if(timeline, [&](const Event& ev) { return anchor >= 0 && ev.at >= anchor; })));
+    std::thread([timeline, shots, anchor] {
         const auto t0 = std::chrono::steady_clock::now();
-        for (const auto& ev : timeline) {
+        for (size_t idx = 0; idx < timeline.size(); ++idx) {
+            const auto& ev = timeline[idx];
+            const bool by_frame = anchor >= 0 && ev.at >= anchor;
             // (P4.14: the time the start waited for the shader precompiler moves the script with the game - read
             // until it is due: the wait ends after the script started)
             while (true) {
-                const auto due = t0 + std::chrono::duration<double>(ev.at) +
+                const auto due = t0 + std::chrono::duration<double>(by_frame ? anchor : ev.at) +
                                  std::chrono::nanoseconds(Gpu::Native::StartupPauseNs());
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= due) {
@@ -1069,6 +1078,9 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 }
                 const auto left = std::chrono::duration_cast<std::chrono::microseconds>(due - now);
                 std::this_thread::sleep_for(std::min(left, std::chrono::microseconds(50'000)));
+            }
+            if (by_frame) {
+                Gpu::R8::Verify::Frame::WaitWorldFrame(ev.at);
             }
             SDL_Event e{};
             switch (ev.kind) {
@@ -1147,8 +1159,18 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 break;
             }
             }
+            if (by_frame) {
+                // the window's queue took the event (the main thread pumps it into the input state) before the
+                // world frame it is due in goes on
+                for (int k = 0; k < 500 && SDL_HasEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_MOUSE_WHEEL); ++k) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                Gpu::R8::Verify::Frame::Delivered(idx + 1 < timeline.size() ? timeline[idx + 1].at : -1.0);
+            }
             if (!ev.label.empty() && ev.kind != Kind::Shot) {
-                SSPC_LOG(App, Info, "test input: '{}' at {:.2f} s", ev.label, ev.at);
+                SSPC_LOG(App, Info, "test input: '{}' at {:.2f} s{}", ev.label, ev.at,
+                         by_frame ? fmt::format(" (world frame {})", Gpu::R8::Verify::Frame::WorldFrame())
+                                  : std::string());
             }
         }
     }).detach();
