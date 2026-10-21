@@ -844,6 +844,9 @@ bool SelfCheckMeshInstall(void* original, std::string& error) {
         return false;
     }
     g_mesh_original = reinterpret_cast<GD::MeshFn>(original);
+    SSPC_LOG(Engine, Info, "R6-G self-check: the GOT slots in the loader's window: stack guard {:#x}, defaults' global "
+                           "{:#x}, vertex-format entries {:#x} {:#x} (replaced while it runs)",
+             guard.saved(0), guard.saved(1), guard.saved(2), guard.saved(3));
     error = GD::SelfCheckMesh(2000, 0x5247314931393630ull);
     return error.empty();
 }
@@ -869,11 +872,11 @@ GD::GotForChecks::GotForChecks(u64 module) {
             return;
         }
     }
+    // (always replaced: before relocation a slot may hold a link-time value rather than 0 - the defaults' global did
+    // in the game's loader window, 21.10.2026)
     for (u32 k = 0; k < kSlots; ++k) {
         saved_[k] = *at_[k];
-        if (saved_[k] == 0) {
-            *at_[k] = values[k];
-        }
+        *at_[k] = values[k];
     }
     ok_ = true;
 }

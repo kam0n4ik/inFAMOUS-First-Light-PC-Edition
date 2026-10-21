@@ -106,7 +106,8 @@ std::string SelfCheckMesh(u32 cases, u64 seed);
 
 /// The GOT slots the functions read, while a check runs in the loader's window or on an unrelocated image (before
 /// relocation they are 0 - cue_commit.cpp): the stack guard (-> a guard value), the defaults' global (-> a zeroed
-/// block), the vertex-format table's two entries (-> 1). Restored on destruction; slots already set are left alone.
+/// block), the vertex-format table's two entries (-> 1). Restored on destruction. Only while nothing else runs the
+/// functions (the loader's window, the tests).
 class GotForChecks {
 public:
     explicit GotForChecks(u64 module);
@@ -115,6 +116,9 @@ public:
     GotForChecks& operator=(const GotForChecks&) = delete;
     bool ok() const {
         return ok_;
+    }
+    u64 saved(u32 k) const {
+        return k < kSlots ? saved_[k] : 0;
     }
 
 private:
