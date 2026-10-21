@@ -10,7 +10,7 @@
 //                    so a thread's sections sum to its wall time between two frames. Section 0 (Other) is what no
 //                    marker covers. The frontend's own steps are not marked (shader/* keeps the shader cache's
 //                    generation): its time is measured around the processor's calls into it.
-//   sampled packets  R8_CP_PROF_PACKET() / R8_CP_PROF_DECODED(op) in CommandProcessor::Step - every N-th packet
+//   sampled packets  R8_CP_PROF_PACKET() / R8_CP_PROF_DECODED(op, packet) in CommandProcessor::Step - every N-th packet
 //                    (SSPC_R8_CP_PROFILE_SAMPLE, 32): its decoding (Next) and its execution's own time (what the exact
 //                    sections inside it did not take), by opcode class, scaled by N. Too frequent for exact markers
 //                    (~60 k packets a frame): this splits the exact section Packets.
@@ -34,6 +34,7 @@
 #include <intrin.h>
 
 #include <filesystem>
+#include <span>
 #include <string>
 
 #include "base/abi.h"
@@ -131,6 +132,11 @@ enum class Light : u8 { BuildDraw, SetRegs, JournalWrite, Count };
 inline constexpr u32 kLights = static_cast<u32>(Light::Count);
 /// The sampled packets' classes (0: the decoding, Next).
 inline constexpr u32 kPacketClasses = 17;
+/// After the classes: 8 kinds of NOP, 8 ranges of SET_SH_REG (their sampled packets' ticks and counts), then the same
+/// 8 ranges' register dwords (packet_n only).
+inline constexpr u32 kNopKinds = 8, kShRanges = 8;
+inline constexpr u32 kNopSlot = kPacketClasses, kShSlot = kNopSlot + kNopKinds, kShDwordSlot = kShSlot + kShRanges;
+inline constexpr u32 kPacketSlots = kShDwordSlot + kShRanges;
 
 inline constexpr u32 kDepth = 32;
 
@@ -153,8 +159,8 @@ struct ThreadAcc {
     u32 calls[kSections];
     u64 light_ticks[kLights];
     u32 light_n[kLights];
-    u64 packet_ticks[kPacketClasses];
-    u32 packet_n[kPacketClasses];
+    u64 packet_ticks[kPacketSlots];
+    u32 packet_n[kPacketSlots];
 };
 extern thread_local constinit ThreadAcc t_acc;
 
@@ -239,9 +245,9 @@ public:
             Begin();
         }
     }
-    void Decoded(u8 opcode) {
+    void Decoded(u8 opcode, std::span<const u32> packet) {
         if (active_) {
-            OnDecoded(opcode);
+            OnDecoded(opcode, packet);
         }
     }
     ~PacketSample() {
@@ -254,7 +260,7 @@ public:
 
 private:
     void Begin();
-    void OnDecoded(u8 opcode);
+    void OnDecoded(u8 opcode, std::span<const u32> packet);
     void End();
     u64 a_ = 0;          ///< the Packets section's ticks at the packet's start (charged + pending)
     u64 b_ = 0;          ///< ... after its decoding
@@ -262,6 +268,8 @@ private:
     bool active_ = false;
     bool decoded_ = false;
     u8 cls_ = 0;
+    u8 sub_ = 0;  ///< the NOP kind's / SET_SH_REG range's slot (0: none)
+    u16 dw_ = 0;  ///< SET_SH_REG: its register dwords
 };
 
 /// The calling thread is `role`'s (the start of Backend::Loop / ParallelCp::Loop): its counts are kept from now on.
@@ -323,7 +331,7 @@ void WriteCsv(const std::filesystem::path& dir);
     const ::SecondSon::Gpu::CpProfile::LightScope SSPC_R8_PROF_CAT(r8_prof_light_, __LINE__)(l)
 /// CommandProcessor::Step: the packet's sample (before Next) and its opcode (after Next).
 #define R8_CP_PROF_PACKET() ::SecondSon::Gpu::CpProfile::PacketSample r8_prof_packet_
-#define R8_CP_PROF_DECODED(op) r8_prof_packet_.Decoded(op)
+#define R8_CP_PROF_DECODED(op, packet) r8_prof_packet_.Decoded(op, packet)
 #define R8_CP_PROF_THREAD(role)                                                                     \
     do {                                                                                            \
         if (::SecondSon::Gpu::CpProfile::On()) {                                                    \
