@@ -4,6 +4,7 @@
 set(SSPC_R8_VERIFY_SOURCES
     src/runtime/gpu/r8/r8_verify.cpp
     src/runtime/gpu/r8/r8_verify_stage.cpp
+    src/runtime/gpu/r8/r8_verify_frame.cpp
 )
 set(SSPC_R8_VERIFY_TEST_SOURCES
     tools/native_engine_tests/r8_verify_tests.cpp
