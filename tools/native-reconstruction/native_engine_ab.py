@@ -14,7 +14,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRAME_STATS = os.path.join(HERE, "..", "frame_stats.py")
-FIELDS = [("avg_fps", "avg FPS"), ("low1_fps", "1% low FPS"), ("ft_p99_ms", "frame p99 ms"),
+FIELDS = [("avg_fps", "avg FPS"), ("low1_fps", "1% low FPS"), ("ft_p95_ms", "frame p95 ms"), ("ft_p99_ms", "frame p99 ms"),
           ("mean_cp_ms", "CP (thread 1) ms"), ("mean_par_busy_ms", "recording thread ms"),
           ("mean_gpu_busy_ms", "GPU busy ms"), ("mean_draws", "draws / frame")]
 
