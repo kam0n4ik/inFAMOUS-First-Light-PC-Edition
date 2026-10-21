@@ -22,11 +22,14 @@
 #include <string>
 #include <vector>
 
+#include <fmt/format.h>
 #include <windows.h>
 #include <xmmintrin.h>
 
 #include "base/abi.h"
 #include "native_engine/guest_code_clone.h"
+#include "native_engine/native_function_registry.h"
+#include "native_engine/reconstructed/shadow_loop.h"
 #include "native_engine/reconstructed/shadow_trace.h"
 
 namespace SecondSon::NativeEngine::Tests {
@@ -655,10 +658,197 @@ struct SlotOverride {
     }
 };
 
+// --- the registry's specs shadow_casters_loop / shadow_instanced_draw (verify/guarded in the game) -----------------
+//
+// Nothing stays installed on the mapped image (R6-Core's tests run after these): the specs' prepare and self-checks
+// are run as the install runs them, the refusal of 0x43d480 without CITY-OPT's probe through InstallFunction (refused
+// before its jump), and the modes through the dispatchers with a clone as the original, the callees' entries in the
+// image aimed at stand-ins only while the calls run.
+
+namespace SL = Reconstructed::ShadowLoop;
+
+/// The image's entry of a function jumps to `fn` for the scope (mov rax, fn; jmp rax - as main.cpp's ImagePatch).
+struct EntryPatch {
+    u8* at;
+    u8 saved[12];
+    EntryPatch(u64 image_base, u64 rva, const void* fn) : at(reinterpret_cast<u8*>(image_base + rva)) {
+        std::memcpy(saved, at, 12);
+        u8 code[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+        const u64 target = reinterpret_cast<u64>(fn);
+        std::memcpy(code + 2, &target, 8);
+        std::memcpy(at, code, 12);
+    }
+    ~EntryPatch() {
+        std::memcpy(at, saved, 12);
+    }
+    EntryPatch(const EntryPatch&) = delete;
+    EntryPatch& operator=(const EntryPatch&) = delete;
+};
+
+SSPC_SYSV_ABI u64 StubZero() {
+    return 0;
+}
+alignas(64) u8 g_stub_dcb[0x1000];
+/// 0x11be90(dst, context, bytes): one buffer for every allocation (the original's run only writes into it)
+SSPC_SYSV_ABI u64 StubDcbAlloc(u64 dst, u64, u64 bytes) {
+    auto* d = reinterpret_cast<u64*>(dst);
+    d[0] = bytes <= sizeof(g_stub_dcb) ? reinterpret_cast<u64>(g_stub_dcb) : 0;
+    d[1] = 0;
+    d[2] = 0;
+    return 0;
+}
+
+u32 RegistryIndex(const FunctionSpec& spec) {
+    for (u32 i = 0; i < FunctionCount(); ++i) {
+        if (&Function(i) == &spec) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+struct ModeCounts {
+    u64 verified, mismatches, skipped, fallbacks;
+    u8 mode_after;
+};
+
+int RegistryTests(u64 image_base, const std::string& recomp_dll, std::mt19937_64& rng, int& checks) {
+    int failures = 0;
+    const auto check = [&](bool ok, const std::string& what) {
+        ++checks;
+        failures += ok ? 0 : 1;
+        std::printf("  %s: %s\n", what.c_str(), ok ? "ok" : "FAILED");
+    };
+    const FunctionSpec& loop = Reconstructed::kShadowCastersLoopSpec;
+    const FunctionSpec& draw = Reconstructed::kShadowInstancedDrawSpec;
+    check(loop.explicit_only && draw.explicit_only, "both specs explicit_only (never in \"all functions\")");
+
+    // 0x43d480 without an entry probe: refused in prepare, before any jump
+    std::string error;
+    const std::vector<u8> entry_before(reinterpret_cast<const u8*>(image_base + draw.function.rva),
+                                       reinterpret_cast<const u8*>(image_base + draw.function.rva) + 16);
+    const bool refused = !InstallFunction(image_base, draw, Mode::Verify, error);
+    const bool untouched =
+        std::memcmp(entry_before.data(), reinterpret_cast<const void*>(image_base + draw.function.rva), 16) == 0;
+    check(refused && untouched && error.find("probe") != std::string::npos,
+          "shadow_instanced_draw without CITY-OPT's probe refused, entry untouched (" + error + ")");
+
+    // prepare as the install runs it (the recompiled implementations through SSPC_NATIVE_ENGINE_RECOMP)
+    SetEnvironmentVariableA("SSPC_NATIVE_ENGINE_RECOMP", recomp_dll.c_str());
+    error.clear();
+    const bool prepared = loop.prepare(image_base, error);
+    SetEnvironmentVariableA("SSPC_NATIVE_ENGINE_RECOMP", nullptr);
+    check(prepared, "shadow_casters_loop prepare " + error);
+    if (!prepared) {
+        return failures;
+    }
+    // the install's self-checks (generated worlds / draws, recording clone vs recompiled)
+    error.clear();
+    check(loop.self_check(nullptr, error), "shadow_casters_loop install self-check " + error);
+    error.clear();
+    check(draw.self_check(nullptr, error), "shadow_instanced_draw install self-check " + error);
+    // the check sees a wrong implementation (the recompiled 0x43d480 given one instance more)
+    SL::InjectFault(1);
+    const std::string faulted = SL::SelfCheckDraw(200, 7);
+    SL::InjectFault(0);
+    check(!faulted.empty(), "a fault in the implementation found (" + faulted + ")");
+
+    // the modes through the dispatchers: the callees' entries aimed at stand-ins (the original's run makes them);
+    // the generator 0x612110 and the constant blocks run for real (the image's generator state saved and restored)
+    std::vector<EntryPatch*> patches;
+    for (const u64 rva : {0x11bed0ull, 0x120280ull, 0x16b70ull, 0x1a1960ull, 0x1f0870ull, 0x43d480ull, 0x448640ull,
+                          0x450460ull, 0x451290ull, 0x451700ull, 0x27530ull, 0x16aa0ull, 0x6250b0ull, 0x623740ull,
+                          0x624f80ull, 0x14ad0ull, 0x623c60ull}) {
+        patches.push_back(new EntryPatch(image_base, rva, reinterpret_cast<const void*>(&StubZero)));
+    }
+    patches.push_back(new EntryPatch(image_base, 0x11be90, reinterpret_cast<const void*>(&StubDcbAlloc)));
+    std::vector<u8> prng_saved(kPrngBytes);
+    std::memcpy(prng_saved.data(), reinterpret_cast<const void*>(image_base + 0x7f92020), kPrngBytes);
+    // (the plain clones are made from the image as it was: the draw's entry is patched above)
+    void* const loop_clone = Clone(image_base, loop.function.rva, loop.function.size);
+    std::vector<u8> draw_bytes(entry_before.begin(), entry_before.end());
+    draw_bytes.insert(draw_bytes.end(), reinterpret_cast<const u8*>(image_base + draw.function.rva + 16),
+                      reinterpret_cast<const u8*>(image_base + draw.function.rva + draw.function.size));
+    const CloneResult dc =
+        CloneGuestFunction(image_base + draw.function.rva, draw_bytes.data(), draw.function.size, error);
+    if (loop_clone == nullptr || dc.code == nullptr) {
+        check(false, "clones for the modes");
+    } else {
+        loop.slot->original = loop_clone;
+        loop.slot->index = RegistryIndex(loop);
+        draw.slot->original = dc.code;
+        draw.slot->index = RegistryIndex(draw);
+        static LoopWorld w;
+        std::vector<u8> pass(0x200), context(0x200), mesh(0x80), records(16 * 0x48);
+        const auto run_loop = [&](Mode mode, u32 n) {
+            Slot& s = *loop.slot;
+            s.mode.store(static_cast<u8>(mode));
+            s.sample_period = 1;
+            const ModeCounts before{s.verified.load(), s.mismatches.load(), s.skipped.load(), s.fallbacks.load(), 0};
+            for (u32 k = 0; k < n; ++k) {
+                w.Generate(rng);
+                reinterpret_cast<Fn2>(const_cast<void*>(loop.entry))(w.base() + LoopWorld::kPass, w.base() + LoopWorld::kArgs);
+            }
+            return ModeCounts{s.verified.load() - before.verified, s.mismatches.load() - before.mismatches,
+                              s.skipped.load() - before.skipped, s.fallbacks.load() - before.fallbacks,
+                              s.mode.load()};
+        };
+        const auto run_draw = [&](Mode mode, u32 n) {
+            Slot& s = *draw.slot;
+            s.mode.store(static_cast<u8>(mode));
+            s.sample_period = 1;
+            const ModeCounts before{s.verified.load(), s.mismatches.load(), s.skipped.load(), s.fallbacks.load(), 0};
+            for (u32 k = 0; k < n; ++k) {
+                for (auto* v : {&pass, &context, &mesh, &records}) {
+                    for (u8& x : *v) {
+                        x = static_cast<u8>(rng());
+                    }
+                }
+                using Fn5 = SSPC_SYSV_ABI void (*)(u64, u64, u64, u64, u64);
+                reinterpret_cast<Fn5>(const_cast<void*>(draw.entry))(reinterpret_cast<u64>(pass.data()),
+                                                  reinterpret_cast<u64>(context.data()),
+                                                  reinterpret_cast<u64>(records.data()), rng() % 64,
+                                                  reinterpret_cast<u64>(mesh.data()));
+            }
+            return ModeCounts{s.verified.load() - before.verified, s.mismatches.load() - before.mismatches,
+                              s.skipped.load() - before.skipped, s.fallbacks.load() - before.fallbacks,
+                              s.mode.load()};
+        };
+        const auto text = [](const char* name, const char* mode, const ModeCounts& c) {
+            return fmt::format("{} {}: verified {}, mismatches {}, skipped {}, fallbacks {}, mode after {}", name, mode,
+                               c.verified, c.mismatches, c.skipped, c.fallbacks, ModeName(static_cast<Mode>(c.mode_after)));
+        };
+        ModeCounts c = run_loop(Mode::Verify, 300);
+        check(c.verified == 300 && c.mismatches == 0 && c.skipped == 0, text("shadow_casters_loop", "verify", c));
+        c = run_loop(Mode::Guarded, 300);
+        check(c.verified == 300 && c.mismatches == 0 && c.fallbacks == 0 && c.mode_after == static_cast<u8>(Mode::Guarded),
+              text("shadow_casters_loop", "guarded", c));
+        c = run_draw(Mode::Verify, 2000);
+        check(c.verified == 2000 && c.mismatches == 0 && c.skipped == 0, text("shadow_instanced_draw", "verify", c));
+        c = run_draw(Mode::Guarded, 2000);
+        check(c.verified == 2000 && c.mismatches == 0 && c.fallbacks == 0 && c.mode_after == static_cast<u8>(Mode::Guarded),
+              text("shadow_instanced_draw", "guarded", c));
+        // a wrong implementation: every verify call a mismatch; guarded falls back to the original at the first
+        SL::InjectFault(1);
+        c = run_draw(Mode::Verify, 50);
+        check(c.verified == 50 && c.mismatches == 50, text("shadow_instanced_draw (fault)", "verify", c));
+        c = run_draw(Mode::Guarded, 50);
+        check(c.mismatches == 1 && c.fallbacks == 1 && c.mode_after == static_cast<u8>(Mode::Original),
+              text("shadow_instanced_draw (fault)", "guarded", c));
+        SL::InjectFault(0);
+        loop.slot->mode.store(static_cast<u8>(Mode::Original));
+        draw.slot->mode.store(static_cast<u8>(Mode::Original));
+    }
+    std::memcpy(reinterpret_cast<void*>(image_base + 0x7f92020), prng_saved.data(), kPrngBytes);
+    for (EntryPatch* p : patches) {
+        delete p;
+    }
+    return failures;
+}
+
 } // namespace
 
 int R6ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases, int& checks) {
-    (void)recomp_dll;
     std::printf("R6-S shadow loop leaves (recompiled vs the eboot's code):\n");
     if (recomp_module == nullptr) {
         std::printf("  (no --recomp: skipped)\n");
@@ -849,6 +1039,9 @@ int R6ShadowsTests(u64 image_base, u64 image_size, void* recomp_module, const st
         }
     }
     _mm_setcsr(host_csr);
+
+    std::printf("R6-S registry specs (shadow_casters_loop / shadow_instanced_draw):\n");
+    failures += RegistryTests(image_base, recomp_dll, rng, checks);
     return failures;
 }
 
