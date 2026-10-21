@@ -38,6 +38,7 @@
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
 #include "runtime/gpu/parallel_cp.h"
+#include "runtime/gpu/r8/r8_verify.h"
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/gcn/gcn_translator.h"
@@ -2565,6 +2566,7 @@ std::string Backend::Report() {
     if (frontend_) { // (P5.2: the shader frontend's own counters - programs read again per frame, fetch shaders, ...)
         out += "--- shader frontend ---\n" + frontend_->Report();
     }
+    out += ::SecondSon::Gpu::R8::Verify::Report(); // (R8: the verification sites, SSPC_R8_VERIFY; empty when not set)
     return out;
 }
 
