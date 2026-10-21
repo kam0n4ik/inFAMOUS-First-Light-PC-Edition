@@ -4,5 +4,7 @@
 #pragma once
 
 #include "native_engine/native_function_registry.h"
+#include "native_engine/reconstructed/gbuffer_mesh_pass.h"
 
-#define SSPC_R7_GBUFFER_SPECS
+// 0x1a2030 the geometry pass (the native pass, r7/gbuffer/geometry_pass.h; explicit_only until GAME_VERIFIED)
+#define SSPC_R7_GBUFFER_SPECS &Reconstructed::kGBufferMeshPassSpec,
