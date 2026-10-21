@@ -46,6 +46,19 @@ std::string Check(u64 m, u64 chunk, bool& skipped);
 /// its data writable (the light table, the dither globals are set per case and restored).
 std::string SelfCheck(u32 cases, u64 seed);
 
+/// The recorded callees as their specs declare them (the tests check them against the callees' own code:
+/// r7/gbuffer/arg_liveness.h).
+struct CalleeInfo {
+    u64 rva;
+    const char* name;
+    u8 gpr;    ///< argument registers RDI.. compared
+    u8 xmm;    ///< XMM arguments compared
+    u8 stack;  ///< stack arguments compared
+    u8 ignore; ///< bit i: register i below gpr is not an argument
+};
+u32 CalleeCount();
+CalleeInfo CalleeAt(u32 i);
+
 /// Tests only: 1 - the native pass skips the stencil cache; 2 - it writes a wrong record field; 0 - none.
 void InjectFault(u32 fault);
 

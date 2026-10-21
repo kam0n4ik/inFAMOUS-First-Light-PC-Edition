@@ -409,12 +409,13 @@ void Instanced(const PassFns& f, u64 module, const PassConstants& c, u64 m, u64 
             }
             const u64 inst = inst_base + u64{Ld<u16>(keys + 8 * j)} * 0x80;
             u8* rec = reinterpret_cast<u8*>(recs + u64{k} * kRecordBytes);
-            BuildRecord(rec, inst, Ld<u64>(inst + 0x18), pv.view, c);
+            const u64 mi = Ld<u64>(inst + 0x18);
+            BuildRecord(rec, inst, mi, pv.view, c);
             if (o.fault == 2) {
                 rec[0xac] ^= 1;
             }
             if (Ld<s32>(m + 0x94) > 0) {
-                f.record_451440(m + 0x90, reinterpret_cast<u64>(rec), m + 0x28, s + 0x44f0, Ld<u64>(mat + 0x28));
+                f.record_451440(m + 0x90, reinterpret_cast<u64>(rec), m + 0x28, s + 0x44f0, Ld<u64>(mat + 0x28), mi);
                 if (st) {
                     st->Add(kPs451440);
                 }

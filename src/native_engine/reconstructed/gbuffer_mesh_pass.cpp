@@ -173,7 +173,7 @@ const GT::CalleeSpec kSpecs[kCallees] = {
     {0x6270e0, "0x6270e0 render control", 2, 0x2, 0, 0, {kNo}},
     {0x1a1960, "0x1a1960 mesh draw", 3, 0, 0, 0, {kNo}},
     {0x1f0870, "0x1f0870 frame alloc", 3, 0x6, 0, 0, {kNo}, &FrameAlloc},
-    {0x451440, "0x451440 record", 5, 0, 0, 0, {kNo}},
+    {0x451440, "0x451440 record", 6, 0, 0, 0, {kNo}},
     {0x451290, "0x451290 group", 6, 0, 0, 0, {kNo}},
     {0x1a1770, "0x1a1770 instanced draw", 5, 0x8, 0, 0, {kRecords}},
     {0x984360, "0x984360 __stack_chk_fail", 0, 0, 0, 0, {kNo}, &StackFail},
@@ -538,6 +538,15 @@ bool MP::Prepare(u64 module_base, std::string& error) {
     }
     g_rec_pass = reinterpret_cast<PassFn>(clone.code);
     return true;
+}
+
+u32 MP::CalleeCount() {
+    return kCallees;
+}
+
+MP::CalleeInfo MP::CalleeAt(u32 i) {
+    const GT::CalleeSpec& s = kSpecs[i < kCallees ? i : 0];
+    return CalleeInfo{s.rva, s.name, s.gpr, s.xmm, s.stack, s.ignore};
 }
 
 MP::PassFn MP::RecordingPass() {

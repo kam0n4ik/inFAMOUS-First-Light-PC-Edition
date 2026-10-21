@@ -55,7 +55,8 @@ struct PassFns {
     SSPC_SYSV_ABI void (*render_control)(u64 gfx, u64 value);                    // 0x6270e0
     SSPC_SYSV_ABI void (*mesh_draw)(u64 m, u64 r, u64 inst);                     // 0x1a1960
     SSPC_SYSV_ABI u64 (*frame_alloc)(u64 frame, u64 bytes, u64 align);           // 0x1f0870
-    SSPC_SYSV_ABI void (*record_451440)(u64 m90, u64 rec, u64 m28, u64 lighting, u64 mat28); // 0x451440
+    SSPC_SYSV_ABI void (*record_451440)(u64 m90, u64 rec, u64 m28, u64 lighting, u64 mat28,
+                                         u64 mi); // 0x451440: R9 = the record's mesh instance (read at +0x11/+0x12)
     SSPC_SYSV_ABI void (*group_451290)(u64 m90, u64 block, u64 m28, u64 lighting, u64 mat28, u64 mesh); // 0x451290
     SSPC_SYSV_ABI void (*instanced_draw)(u64 m, u64 r, u64 records, u64 n, u64 mesh); // 0x1a1770
     // not recorded (pure: they write only memory the pass gives them)
