@@ -15,6 +15,7 @@
 #include "base/log.h"
 #include "engine/render/draw_runs.h"
 #include "runtime/gpu/cp_r6_opt.h"
+#include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
@@ -521,6 +522,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     u64 addr = 0;
     std::span<const u32> p;
     Pm4::Packet pk;
+    R8_CP_PROF_PACKET();
     switch (Next(q, addr, p, pk)) {
     case NextResult::None:
         return StepStatus::Idle;
@@ -529,6 +531,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     case NextResult::Ok:
         break;
     }
+    R8_CP_PROF_DECODED(pk.opcode);
     Frame& f = q.frames[q.depth - 1];
     q.budget += pk.dwords;
     if (q.budget > options_.max_dwords_per_submission) {
@@ -640,6 +643,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
             ++stats_.flips;
             Engine::Render::Control().flips.fetch_add(1, std::memory_order_relaxed); // (the A/B schedule's clock)
             options_.work->Flip(FlipMarker{.queue = q.id, .packet_addr = addr, .after_seq = q.work_seq});
+            R8_CP_PROF_FRAME(); // (R8: the profiler's frame row)
         } else if (m == Pm4::NopMarker::SetVsharpInUdata || m == Pm4::NopMarker::SetTsharpInUdata ||
                    m == Pm4::NopMarker::SetSsharpInUdata) {
             inline_marker_ = body[0];
@@ -935,6 +939,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
 }
 
 StepStatus CommandProcessor::SetRegs(Queue& q, Frame& f, u64 addr, std::span<const u32> p, Space space) {
+    R8_CP_PROF_LIGHT(CpProfile::Light::SetRegs);
     const u8 op = static_cast<u8>(p[0] >> 8);
     if (p.size() < 2) {
         return Fail(q, CpErrorKind::ShortPacket, addr, op, static_cast<u32>(p.size()), "no register offset");
@@ -1212,6 +1217,7 @@ void CommandProcessor::RunAhead(Queue& q) {
 }
 
 void CommandProcessor::BuildDraw(DrawDescriptor& d) {
+    R8_CP_PROF_LIGHT(CpProfile::Light::BuildDraw);
     const GroupMask changed = regs_.Dirty();
     regs_.ClearDirty(changed);
     d.changed = changed;
