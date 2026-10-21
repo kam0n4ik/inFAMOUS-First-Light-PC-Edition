@@ -12,6 +12,7 @@
 #include <string>
 
 #include "base/abi.h"
+#include "engine/render/native_render_layer.h"
 #include "engine/render/native_render_ops.h"
 
 namespace SecondSon::Engine::Render::NativeDraw {
@@ -63,5 +64,16 @@ CommitCheck CheckNativeCommit(u64 cue);
 /// with the game's allocator, the register writes the game's packets would make are returned in the same order (at
 /// most kMaxRegWrites), the CUE's dirty flags are cleared as the commit clears them. Call after CheckNativeCommit.
 u32 NativeCommit(u64 cue, const CommitEnv& env, RegWrite* out);
+
+// --- R7-Core C3: the Native Render Layer's writer (SSPC_R7_NATIVE_RENDER=gbuffer*, native_render_layer.h) -------------
+//
+// Inside a 0x1a1770 call (R7::InScope) the commit probe runs the native commit into the context's native
+// stream and the draw wrappers' probes hand the draw to R7::Submit, which writes it here: a StreamOp::Draw with the
+// call's CITY-OPT tag (and with `verify` a StreamOp::Verify before it). Outside the scope, and in every fallback
+// (predication, wrapper flags, a commit the native one does not reproduce, no stream room), the game's functions run.
+
+/// The draw `cmd` into the context's native stream at its DCB's write pointer. False: nothing written (the caller
+/// runs the game's wrapper).
+bool EmitNativeDraw(const R7::NativeRenderContext& ctx, const R7::NativeDrawCommand& cmd, bool verify);
 
 } // namespace SecondSon::Engine::Render::NativeDraw

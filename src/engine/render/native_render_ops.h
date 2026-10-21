@@ -247,12 +247,18 @@ bool DirectOn();
 
 // The native stream. A run in a block: {state: its operations' words | kRunTaken, the block's generation}, then the
 // operations, each {kind | payload words << 8, payload}. Registers / State: {reg, value} pairs (State with the kState*
-// pseudo registers); Draw: pass, bits (1: indexed), index count, index base lo, hi, VS shape id, PS shape id.
-enum class StreamOp : u8 { Registers = 1, State = 2, Draw = 3 };
+// pseudo registers); Draw: pass, bits (kStreamDraw*), index count, index base lo, hi, VS shape id, PS shape id.
+// R7: Verify - a kVerify draw marker (EncodeDrawMarker's packet, kDrawMarkerDwords) the run's next draw is compared with.
+enum class StreamOp : u8 { Registers = 1, State = 2, Draw = 3, Verify = 4 };
 inline constexpr u32 OpHeader(StreamOp kind, u32 payload_words) {
     return static_cast<u32>(kind) | (payload_words << 8);
 }
 inline constexpr u32 kStreamDrawWords = 7;
+inline constexpr u32 kStreamDrawIndexed = 1;
+/// R7: the CITY-OPT run hint of a native draw (DrawRuns::Source in bits 8..15, DrawRuns::kMaterialChanged at bit 16 -
+/// the tag a draw packet's trailing NOP would carry); 0: none
+inline constexpr u32 kStreamDrawRunShift = 8;
+inline constexpr u32 kStreamDrawRunMask = 0x1FF00;
 inline constexpr u32 kStreamMagic = 0x53505353u;    ///< "SSPS"
 inline constexpr u32 kStreamTokenDwords = 4;        ///< {NOP header (3 body dwords), magic, block | run << 16, generation}
 inline constexpr u32 kStreamTokenHeader = 0xC0021000u;

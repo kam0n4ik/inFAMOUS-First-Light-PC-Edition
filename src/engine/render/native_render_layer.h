@@ -96,10 +96,19 @@ enum class SubmitResult : u8 {
     Off,      ///< the layer is off (SSPC_R7_NATIVE_RENDER unset): the caller runs the game's path
 };
 
-/// SSPC_R7_NATIVE_RENDER (read once; off by default). R7-Core defines its values as the direct path grows.
+/// SSPC_R7_NATIVE_RENDER (read once; off by default; needs --gpu-backend sspc):
+///   0 / unset       off - the game's path everywhere
+///   gbuffer (1)     R7-Core C3: the G-buffer's instanced draw 0x1a1770 - its CUE commit and draw go to the native
+///                   stream (no PM4 of their own), its CITY-OPT run tag with the draw (needs SSPC_CITY_ENGINE_OPT and
+///                   SSPC_CITY_ENGINE_GBUFFER_RUNS: the probe on 0x1a1770 opens the scope; the stand's preset sets both)
+///   gbuffer-verify  the same, each native draw preceded in its run by the engine's description of it (StreamOp::
+///                   Verify): the processor compares the draw the native commit and draw built with it (P5.3B fields)
+enum class Mode : u8 { Off, GBuffer, GBufferVerify };
+Mode GetMode();
 bool Enabled();
 
 /// The draw in the context's native stream at the DCB's write pointer, or Fallback/Off - then nothing was written.
+/// (R7-Core C3: the stream's writer is engine/render/native_draw.cpp, EmitNativeDraw.)
 SubmitResult Submit(const NativeRenderContext& ctx, const NativeDrawCommand& cmd);
 
 /// A key of the state two draws must share to reuse one prepared draw state (shader registers, prim / index type, the
@@ -112,5 +121,36 @@ struct LayerCounters {
     std::atomic<u64> fallback[5]{};
 };
 LayerCounters& Counters();
+
+// --- R7-Core C3: the scope of an engine draw function's call ---------------------------------------------------------
+//
+// With the G-buffer path on (SetGBufferPath, by native_draw.cpp at install), the probe on 0x1a1770 (draw_runs.cpp) opens
+// a scope on its thread for the call: the context R and the CITY-OPT tag of its draw (DrawRuns::Source::GBuffer |
+// kMaterialChanged, decided before the call - 0x448640 runs before it). Inside the scope the commit and draw wrappers'
+// probes (native_draw.cpp) put the commit and the draw into the native stream with that tag instead of the game's PM4;
+// a draw that falls back is tagged in its NOP by the probe as before.
+
+struct DrawScope {
+    u64 r = 0;
+    u32 tag = 0;
+    u32 native = 0; ///< its draws that went to the native stream
+};
+void SetGBufferPath(bool on);
+bool GBufferPath();
+/// A scope for a call on `r`; returns the one it replaces (CloseScope restores it).
+DrawScope OpenScope(u64 r, u32 tag);
+/// The scope closed, `outer` restored; its native draws.
+u32 CloseScope(const DrawScope& outer);
+/// The thread is inside a scope on `r`: its tag.
+bool InScope(u64 r, u32& tag);
+/// A draw of the open scope went to the native stream.
+void ScopeNative();
+
+struct ScopeCounters {
+    std::atomic<u64> scopes{0};       ///< 0x1a1770 calls with the path on
+    std::atomic<u64> native_calls{0}; ///< ... that drew through the native stream
+    std::atomic<u64> native_draws{0};
+};
+ScopeCounters& ScopeStats();
 
 } // namespace SecondSon::Engine::Render::R7

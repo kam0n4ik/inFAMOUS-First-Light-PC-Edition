@@ -63,5 +63,7 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend);
 bool On();
 /// CITY-OPT Phase 6: 0x1a1770's draws are tagged too (Source::GBuffer).
 bool GBufferTagged();
+// (R7-Core C3: with the Native Render Layer's G-buffer path on, the probe on 0x1a1770 opens the layer's scope for the
+// call - native_render_layer.h, OpenScope)
 
 } // namespace SecondSon::Engine::Render::DrawRuns

@@ -1,17 +1,34 @@
-// SecondSonPC R7 — the Native Render Layer (native_render_layer.h). R7.0: the contract and its counters; Submit carries
-// nothing yet (every command falls back to the game's path) - R7-Core grows the direct path here.
+// SecondSonPC R7 — the Native Render Layer (native_render_layer.h). R7-Core C3: Submit carries the G-buffer's instanced
+// draw into the P5.3 native stream (native_draw.cpp writes it); everything else falls back to the game's path.
+#include <cstring>
+
 #include <windows.h>
 
+#include "base/log.h"
+#include "engine/render/native_draw.h"
 #include "engine/render/native_render_layer.h"
 
 namespace SecondSon::Engine::Render::R7 {
 namespace {
 
-bool ReadEnabled() {
-    char v[16] = {};
+Mode ReadMode() {
+    char v[32] = {};
     const DWORD n = GetEnvironmentVariableA("SSPC_R7_NATIVE_RENDER", v, sizeof(v));
-    return n > 0 && n < sizeof(v) && !(n == 1 && v[0] == '0');
+    if (n == 0 || n >= sizeof(v) || std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0) {
+        return Mode::Off;
+    }
+    if (std::strcmp(v, "gbuffer") == 0 || std::strcmp(v, "1") == 0) {
+        return Mode::GBuffer;
+    }
+    if (std::strcmp(v, "gbuffer-verify") == 0) {
+        return Mode::GBufferVerify;
+    }
+    SSPC_LOG(Engine, Error, "SSPC_R7_NATIVE_RENDER={}: want 0, gbuffer or gbuffer-verify - off", v);
+    return Mode::Off;
 }
+
+bool g_gbuffer_path = false;
+thread_local DrawScope t_scope;
 
 constexpr u64 kFnvBasis = 0xcbf29ce484222325ull;
 constexpr u64 kFnvPrime = 0x100000001b3ull;
@@ -24,9 +41,13 @@ void Mix(u64& h, u64 v) {
 
 } // namespace
 
+Mode GetMode() {
+    static const Mode mode = ReadMode();
+    return mode;
+}
+
 bool Enabled() {
-    static const bool on = ReadEnabled();
-    return on;
+    return GetMode() != Mode::Off;
 }
 
 LayerCounters& Counters() {
@@ -34,13 +55,61 @@ LayerCounters& Counters() {
     return c;
 }
 
+void SetGBufferPath(bool on) {
+    g_gbuffer_path = on;
+}
+
+bool GBufferPath() {
+    return g_gbuffer_path;
+}
+
+ScopeCounters& ScopeStats() {
+    static ScopeCounters c;
+    return c;
+}
+
+DrawScope OpenScope(u64 r, u32 tag) {
+    const DrawScope outer = t_scope;
+    t_scope = DrawScope{r, tag, 0};
+    ScopeStats().scopes.fetch_add(1, std::memory_order_relaxed);
+    return outer;
+}
+
+u32 CloseScope(const DrawScope& outer) {
+    const u32 native = t_scope.native;
+    t_scope = outer;
+    if (native != 0) {
+        ScopeCounters& s = ScopeStats();
+        s.native_calls.fetch_add(1, std::memory_order_relaxed);
+        s.native_draws.fetch_add(native, std::memory_order_relaxed);
+    }
+    return native;
+}
+
+bool InScope(u64 r, u32& tag) {
+    const DrawScope& s = t_scope;
+    if (s.r == 0 || s.r != r) {
+        return false;
+    }
+    tag = s.tag;
+    return true;
+}
+
+void ScopeNative() {
+    ++t_scope.native;
+}
+
 SubmitResult Submit(const NativeRenderContext& ctx, const NativeDrawCommand& cmd) {
-    (void)ctx;
     const u32 p = static_cast<u32>(cmd.producer) < 5 ? static_cast<u32>(cmd.producer) : 0;
     LayerCounters& c = Counters();
     c.submitted[p].fetch_add(1, std::memory_order_relaxed);
     if (!Enabled()) {
         return SubmitResult::Off;
+    }
+    // C3 carries the G-buffer's instanced draw only (the scope its probe opened: DrawRuns::GBufferScope)
+    if (cmd.fn == EngineFn::GBufferInstanced && NativeDraw::EmitNativeDraw(ctx, cmd, GetMode() == Mode::GBufferVerify)) {
+        c.native[p].fetch_add(1, std::memory_order_relaxed);
+        return SubmitResult::Native;
     }
     c.fallback[p].fetch_add(1, std::memory_order_relaxed);
     return SubmitResult::Fallback;
