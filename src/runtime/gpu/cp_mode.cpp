@@ -66,6 +66,10 @@ std::string ApplyCpMode(std::string mode, bool native_backend) {
         // Phase 6: the G-buffer's instanced draws (0x1a1770) in runs too, a member whose material changed (0x448640)
         // refused at once - docs/CITY_ENGINE_RESOURCES.md
         preset.push_back({"SSPC_CITY_ENGINE_GBUFFER_RUNS", "1"});
+        // R6-P: a memory WAIT_REG_MEM whose compare holds for every value (the occlusion records' ">= 0" polls) does
+        // not read the memory, so it no longer drains the queue and waits for the GPU -
+        // docs/NATIVE_RENDER_R6_CP_OPTIMIZATION.md §4.1
+        preset.push_back({"SSPC_R6_CP_POLL_TRIVIAL", "1"});
     }
     std::string set, kept;
     for (const auto& [name, value] : preset) {
