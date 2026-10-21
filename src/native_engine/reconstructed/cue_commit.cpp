@@ -16,7 +16,9 @@
 #include "native_engine/guest_code_clone.h"
 #include "native_engine/native_dispatch.h"
 #include "native_engine/native_engine_verify.h"
+#include "base/log.h"
 #include "native_engine/r6/cue_dedup.h"
+#include "native_engine/r7/resources/resource_state.h"
 
 namespace SecondSon::NativeEngine::Reconstructed {
 
@@ -285,9 +287,12 @@ struct Impl {
         Run(cue);
     }
 
-    /// The implementation's real call: with R6's snapshot reuse when it is on (r6/cue_dedup.h).
+    /// The implementation's real call: observed by R7-R's resource state when it is on (r7/resources/resource_state.h),
+    /// with R6's snapshot reuse when that is on (r6/cue_dedup.h; the two exclude each other).
     static void Run(u64 cue) {
-        if (R6::CueDedup::Enabled()) {
+        if (R7::Resources::Active()) {
+            R7::Resources::Commit(g_impl, cue);
+        } else if (R6::CueDedup::Enabled()) {
             R6::CueDedup::Commit(g_impl, cue);
         } else {
             g_impl(cue);
@@ -363,6 +368,15 @@ bool PrepareInstall(u64 module_base, std::string& error) {
             return false;
         }
         R6::CueDedup::Prepare(module_base, g_redirect);
+    }
+    if (R7::Resources::Enabled() && !R7::Resources::Active()) {
+        std::string why;
+        if (!R7::Resources::Prepare(module_base, g_redirect, why)) {
+            SSPC_LOG(Engine, Error, "SSPC_R7_RES_STATE: the resource state does not run: {}", why);
+        } else {
+            SSPC_LOG(Engine, Warning, "SSPC_R7_RES_STATE: resource state on (setters observed, commit observed, reset "
+                     "probes 0x13d20 / 0x12390)");
+        }
     }
     return CC::Prepare(module_base, error);
 }

@@ -562,7 +562,8 @@ private:
     void DescribedDraw(Queue& q, u32 word, u32 ps_shape);
     void ApplyNativeRegisters(const u32* pairs, u32 count);
     bool ApplyNativeState(const u32* pairs, u32 count);
-    StepStatus NativeDrawOp(Queue& q, u64 addr, s32 pass, bool indexed, u32 count, u64 base, u32 vs_shape, u32 ps_shape);
+    /// `bits`: Engine::Render::kStreamDraw* (indexed; R7: the CITY-OPT run hint the draw goes on with)
+    StepStatus NativeDrawOp(Queue& q, u64 addr, s32 pass, u32 bits, u32 count, u64 base, u32 vs_shape, u32 ps_shape);
     void VerifyNativeDraw(const DrawDescriptor& d);
     /// The processor's time in native operations, every 8th call timed (DirectCounters::native_tsc); the executor's
     /// part of their draws paused out (Draw).
@@ -580,6 +581,9 @@ private:
     bool engine_runs_ = false; ///< CITY-OPT Phase 5: draws' run tags read (SSPC_CITY_ENGINE_OPT)
     bool run_ahead_ = false;   ///< ... RunAhead (SSPC_CITY_ENGINE_AHEAD=1 or SSPC_CITY_ENGINE_OPT=ahead)
     bool in_run_ahead_ = false;
+    /// R7: the run hint of the native draw being built (Draw without a packet: no trailing NOP to read it from) - the
+    /// trailing NOP's tag dword (DrawRuns::Source | kMaterialChanged); 0: none
+    u32 native_run_ = 0;
     RegisterFile regs_;
     std::array<std::unique_ptr<Queue>, kNumQueues> queues_;
     std::array<u64, 4> set_base_{}; ///< SET_BASE: 0 display list patch table, 1 draw indirect args, 2 GDS, 3 CE

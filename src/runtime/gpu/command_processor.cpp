@@ -1037,6 +1037,7 @@ void CommandProcessor::ExtentHint(const Frame& f, u32 reg, u32 count) {
 
 StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, DrawKind kind, bool packet) {
     const u8 op = static_cast<u8>(p[0] >> 8);
+    const u32 native_run = std::exchange(native_run_, 0u); // (NativeDrawOp's, for this draw only)
     if (q.compute) {
         return Fail(q, CpErrorKind::UnsupportedForm, addr, op, static_cast<u32>(p.size()),
                     "a draw on a compute queue");
@@ -1066,6 +1067,10 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
             d.engine_run = static_cast<u8>(Engine::Render::DrawRuns::TagOf(f.data + f.pos));
             d.engine_material = Engine::Render::DrawRuns::MaterialChangedOf(f.data + f.pos);
         }
+    } else if (!packet && native_run != 0 && engine_runs_) {
+        // R7: a native draw's tag came with its stream operation (the Native Render Layer keeps the Phase 5/6 runs)
+        d.engine_run = static_cast<u8>(native_run & 0xFF);
+        d.engine_material = (native_run & Engine::Render::DrawRuns::kMaterialChanged) != 0;
     }
     switch (kind) {
     case DrawKind::Index2:
@@ -1499,9 +1504,11 @@ bool CommandProcessor::ApplyNativeState(const u32* pairs, u32 count) {
     return ok;
 }
 
-StepStatus CommandProcessor::NativeDrawOp(Queue& q, u64 addr, s32 pass, bool indexed, u32 count, u64 base,
+StepStatus CommandProcessor::NativeDrawOp(Queue& q, u64 addr, s32 pass, u32 bits, u32 count, u64 base,
                                           u32 vs_shape, u32 ps_shape) {
     namespace R = Engine::Render;
+    const bool indexed = (bits & R::kStreamDrawIndexed) != 0;
+    native_run_ = (bits & R::kStreamDrawRunMask) >> R::kStreamDrawRunShift; // (taken by Draw)
     PassCaptureMarker(pass, true);
     engine_next_.valid = true;
     engine_next_.queue = q.id;
@@ -1564,10 +1571,25 @@ StepStatus CommandProcessor::NativeRun(Queue& q, u64 addr, std::span<const u32> 
                 c.malformed.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
-            status = NativeDrawOp(q, addr, static_cast<s32>(body[0]), (body[1] & 1) != 0, body[2],
+            status = NativeDrawOp(q, addr, static_cast<s32>(body[0]), body[1], body[2],
                                   u64{body[3]} | (u64{body[4]} << 32), body[5], body[6]);
             ++draws;
             break;
+        case R::StreamOp::Verify: {
+            // R7: the engine's description of the run's next draw, compared with it as a kVerify marker's
+            R::DrawOp op;
+            u16 flags = 0;
+            if (!R::DecodeDrawMarker(std::span<const u32>(body, n), op, flags) || (flags & R::kVerify) == 0) {
+                c.malformed.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (native_expect_ != nullptr) {
+                c.orphaned.fetch_add(1, std::memory_order_relaxed);
+            }
+            native_expect_ = std::make_unique<R::DrawOp>(op);
+            native_expect_queue_ = q.id;
+            break;
+        }
         default:
             c.malformed.fetch_add(1, std::memory_order_relaxed);
             break;

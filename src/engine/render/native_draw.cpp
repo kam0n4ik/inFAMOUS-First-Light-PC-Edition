@@ -128,8 +128,16 @@ struct EngineCounters {
     std::atomic<u64> direct_undescribed{0}; ///< ... the game's draw left no NOP where expected (not described)
     std::atomic<u64> direct_runs{0};        ///< run tokens written into a DCB
     std::atomic<u64> direct_ops{0};         ///< operations put into the native stream
+    // R7-Core C3 (SSPC_R7_NATIVE_RENDER=gbuffer*): inside 0x1a1770's calls
+    std::atomic<u64> r7_commits{0};
+    std::atomic<u64> r7_commit_fallbacks{0}; ///< the game's commit ran (CheckNativeCommit, no stream room)
+    std::atomic<u64> r7_draw_fallbacks{0};   ///< the game's wrapper ran (predication, flags, no stream room)
+    std::atomic<u64> r7_verify_ops{0};       ///< StreamOp::Verify written (gbuffer-verify)
 };
 EngineCounters g_engine;
+
+R7::Mode g_r7 = R7::Mode::Off; ///< R7-Core C3: the layer's G-buffer path installed
+bool g_r7_only = false;        ///< ... without SSPC_P53_NATIVE_DRAW: outside its scope the game's functions, unmarked
 
 bool g_direct = false; ///< SSPC_P53_DIRECT=1: native operations and descriptions without markers (native_render_ops.h)
 constexpr u32 kStreamContexts = L::kPoolSlots + 2 + L::kDeformContextCount;
@@ -430,7 +438,88 @@ bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_d
     return apply;
 }
 
+// --- R7-Core C3: the G-buffer's instanced draw 0x1a1770 through the Native Render Layer -----------------------------
+
+/// None: not in a 0x1a1770 scope (the probe's other paths); Native: in the native stream; Game: the game's function.
+enum class R7Path : u8 { None, Native, Game };
+
+R7Path R7Draw(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags) {
+    const u64 cb = reinterpret_cast<u64>(dcb);
+    R7::NativeRenderContext ctx;
+    ctx.r = cb - L::kContextGfx;
+    u32 tag = 0;
+    if (!R7::InScope(ctx.r, tag) || !NativeActive()) {
+        return R7Path::None;
+    }
+    ctx.cue = ctx.r + L::kContextCue;
+    ctx.dcb = cb;
+    // the predication bit of the buffer (+0x28) and the wrapper's flags reach the packet; a native draw has neither
+    if (flags != 0 || (At<u32>(cb + 0x28) & 1) != 0 || !ContextPass(g_base, ctx.r, ctx.pass, ctx.sub) ||
+        At<u64>(ctx.cue + L::kCueDcb) != cb) {
+        g_engine.r7_draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return R7Path::Game;
+    }
+    R7::NativeDrawCommand cmd;
+    cmd.producer = R7::Producer::GBuffer;
+    cmd.fn = R7::EngineFn::GBufferInstanced;
+    cmd.indexed = indexed;
+    cmd.index_count = count;
+    cmd.index_base = indexed ? indices : 0;
+    cmd.run_tag = tag;
+    cmd.state.pass = ctx.pass;
+    cmd.state.sub = ctx.sub;
+    if (R7::Submit(ctx, cmd) != R7::SubmitResult::Native) {
+        g_engine.r7_draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return R7Path::Game;
+    }
+    R7::ScopeNative();
+    return R7Path::Native;
+}
+
+/// The commit of a 0x1a1770 call: the native commit's register writes as a stream operation (the draw joins its run
+/// when the call writes nothing of the game's between them).
+R7Path R7Commit(u8* cue_ptr) {
+    const u64 cue = reinterpret_cast<u64>(cue_ptr);
+    const u64 r = cue - L::kContextCue;
+    u32 tag = 0;
+    if (!R7::InScope(r, tag) || !NativeActive()) {
+        return R7Path::None;
+    }
+    if (At<u64>(cue + L::kCueDcb) != r + L::kContextGfx) {
+        g_engine.r7_commit_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return R7Path::Game;
+    }
+    if (const CommitCheck check = CheckNativeCommit(cue); check != CommitCheck::Native) {
+        g_engine.commit_fallbacks[static_cast<u32>(check)].fetch_add(1, std::memory_order_relaxed);
+        g_engine.r7_commit_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return R7Path::Game;
+    }
+    const bool emitted = EmitDirect(reinterpret_cast<u8*>(r + L::kContextGfx), 1 + 2 * kMaxRegWrites, [&](u32* op) {
+        RegWrite writes[kMaxRegWrites];
+        const u32 n = NativeCommit(cue, g_env, writes);
+        op[0] = OpHeader(StreamOp::Registers, 2 * n);
+        std::memcpy(op + 1, writes, sizeof(RegWrite) * n);
+        return n == 0 ? 0u : 1 + 2 * n;
+    });
+    if (!emitted) {
+        g_engine.r7_commit_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return R7Path::Game;
+    }
+    g_engine.r7_commits.fetch_add(1, std::memory_order_relaxed);
+    return R7Path::Native;
+}
+
 SSPC_SYSV_ABI void DrawIndexProbe(u8* dcb, u32 count, u64 indices, u32 flags) {
+    if (g_r7 != R7::Mode::Off) {
+        const R7Path path = R7Draw(dcb, true, count, indices, flags);
+        if (path == R7Path::Native) {
+            return;
+        }
+        if (path == R7Path::Game || g_r7_only) {
+            g_draw_index(dcb, count, indices, flags);
+            return;
+        }
+    }
     if (g_direct) {
         DirectDraw(dcb, true, count, indices, flags, 10, [&] { g_draw_index(dcb, count, indices, flags); });
     } else if (!Mark(dcb, true, count, indices, flags, 10)) {
@@ -439,6 +528,16 @@ SSPC_SYSV_ABI void DrawIndexProbe(u8* dcb, u32 count, u64 indices, u32 flags) {
 }
 
 SSPC_SYSV_ABI void DrawAutoProbe(u8* dcb, u32 count, u32 flags) {
+    if (g_r7 != R7::Mode::Off) {
+        const R7Path path = R7Draw(dcb, false, count, 0, flags);
+        if (path == R7Path::Native) {
+            return;
+        }
+        if (path == R7Path::Game || g_r7_only) {
+            g_draw_auto(dcb, count, flags);
+            return;
+        }
+    }
     if (g_direct) {
         DirectDraw(dcb, false, count, 0, flags, 7, [&] { g_draw_auto(dcb, count, flags); });
     } else if (!Mark(dcb, false, count, 0, flags, 7)) {
@@ -448,6 +547,16 @@ SSPC_SYSV_ABI void DrawAutoProbe(u8* dcb, u32 count, u32 flags) {
 
 /// Apply mode: the CUE commit of a listed pass's context runs natively (CheckNativeCommit), otherwise the game's.
 SSPC_SYSV_ABI void CommitProbe(u8* cue_ptr) {
+    if (g_r7 != R7::Mode::Off) {
+        const R7Path path = R7Commit(cue_ptr);
+        if (path == R7Path::Native) {
+            return;
+        }
+        if (path == R7Path::Game || g_apply_passes == 0) {
+            g_commit(cue_ptr);
+            return;
+        }
+    }
     const u64 cue = reinterpret_cast<u64>(cue_ptr);
     const u64 r = cue - L::kContextCue;
     s32 pass = -1;
@@ -794,7 +903,7 @@ void ReportTransport(double seconds, double tsc_per_ms) {
                  static_cast<double>(now.tsc - last.tsc) / tsc_per_ms / frames);
     }
     last = now;
-    if (g_direct) {
+    if (g_direct || g_r7 != R7::Mode::Off) {
         SSPC_LOG(Engine, Info,
                  "native direct path: engine described {}, undescribed {}, run tokens {}, stream operations {}, stream "
                  "full {}, shapes full {} | processor described {} (unknown shape {}), runs {} (stale {}), operations "
@@ -834,6 +943,25 @@ void Reporter(u32 seconds) {
         }
         if (g_state_on) {
             ReportState();
+        }
+        if (g_r7 != R7::Mode::Off) {
+            const R7::ScopeCounters& s = R7::ScopeStats();
+            const R7::LayerCounters& l = R7::Counters();
+            constexpr u32 g = static_cast<u32>(R7::Producer::GBuffer);
+            SSPC_LOG(Engine, Info,
+                     "R7 native render (G-buffer 0x1a1770): calls in scope {}, with native draws {} ({} draws) | native "
+                     "commits {}, commit fallbacks {} (stage mode {}, alt shader {}, missing {}), draw fallbacks {}, "
+                     "verify operations {} | layer submitted {}, native {}, fallback {} | processor verified {}, "
+                     "matched {}, mismatched {}{}",
+                     s.scopes.load(), s.native_calls.load(), s.native_draws.load(), g_engine.r7_commits.load(),
+                     g_engine.r7_commit_fallbacks.load(), g_engine.commit_fallbacks[1].load(),
+                     g_engine.commit_fallbacks[2].load(), g_engine.commit_fallbacks[3].load(),
+                     g_engine.r7_draw_fallbacks.load(), g_engine.r7_verify_ops.load(), l.submitted[g].load(),
+                     l.native[g].load(), l.fallback[g].load(), c.verified.load(), c.matched.load(), c.mismatched.load(),
+                     fields.empty() ? std::string() : " (fields:" + fields + ")");
+            if (g_r7_only) {
+                continue; // (the P5.3 lines below: nothing of theirs runs)
+            }
         }
         if (g_apply_passes != 0) {
             SSPC_LOG(Engine, Info,
@@ -1106,10 +1234,19 @@ std::string ApplyRenderMode(std::string mode, bool native_backend) {
 
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     const std::string mode = Env("SSPC_P53_NATIVE_DRAW");
-    if (mode.empty() || mode == "0" || mode == "off") {
+    const bool p53 = !(mode.empty() || mode == "0" || mode == "off");
+    R7::Mode r7 = R7::GetMode();
+    if (r7 != R7::Mode::Off && !native_backend) {
+        SSPC_LOG(Engine, Error, "SSPC_R7_NATIVE_RENDER needs --gpu-backend sspc (its processor runs the native stream); "
+                                "off");
+        r7 = R7::Mode::Off;
+    }
+    if (!p53 && r7 == R7::Mode::Off) {
         return true;
     }
-    if (mode.rfind("apply:", 0) == 0) {
+    if (!p53) {
+        // R7-Core C3 alone: the probes below, native only inside 0x1a1770's calls
+    } else if (mode.rfind("apply:", 0) == 0) {
         if (mode == "apply:all") {
             g_apply_passes = (u64{1} << 41) - 1; // P5.3 NATIVE_EXPERIMENTAL: every pass 0..40
         }
@@ -1160,7 +1297,7 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     }
     g_draw_index = reinterpret_cast<DrawIndexFn>(index);
     g_draw_auto = reinterpret_cast<DrawAutoFn>(autod);
-    if (g_apply_passes != 0) {
+    if (g_apply_passes != 0 || r7 != R7::Mode::Off) {
         g_env.alloc = reinterpret_cast<AllocFn>(eboot_base + 0x123d0);
         g_env.ps_inputs = reinterpret_cast<PsInputsFn>(eboot_base + 0x638540);
         void* commit = InstallEntryProbe(eboot_base, kCommitSite, reinterpret_cast<const void*>(&CommitProbe), error);
@@ -1169,6 +1306,22 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
             std::abort();
         }
         g_commit = reinterpret_cast<CommitFn>(commit);
+    }
+    if (r7 != R7::Mode::Off) {
+        g_r7 = r7;
+        g_r7_only = !p53;
+        R7::SetGBufferPath(true); // (DrawRuns installs after this: its probe on 0x1a1770 opens the scope)
+        SSPC_LOG(Engine, Warning,
+                 "EXPERIMENT: SSPC_R7_NATIVE_RENDER={} - R7 Native Render Layer: in the G-buffer's instanced draw "
+                 "0x1a1770 the CUE commit 0x14ad0 and the draw go to the native stream (no PM4 of their own) with the "
+                 "draw's CITY-OPT run tag{}; everything else the game's{}",
+                 r7 == R7::Mode::GBufferVerify ? "gbuffer-verify" : "gbuffer",
+                 r7 == R7::Mode::GBufferVerify ? ", each draw verified by the processor against the engine's "
+                                                 "description (StreamOp::Verify)"
+                                               : "",
+                 p53 ? fmt::format(" (with SSPC_P53_NATIVE_DRAW={})", mode) : std::string());
+    }
+    if (g_apply_passes != 0) {
         std::string passes;
         for (u32 p = 0; p <= 40; ++p) {
             if (((g_apply_passes >> p) & 1) != 0) {
@@ -1276,7 +1429,7 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
                      g_verify ? "; verification markers kept (SSPC_P53_NATIVE_VERIFY)" : "");
         }
     }
-    if (const std::string ab = Env("SSPC_P53_NATIVE_AB"); !ab.empty() && g_apply_passes != 0) {
+    if (const std::string ab = Env("SSPC_P53_NATIVE_AB"); !ab.empty() && (g_apply_passes != 0 || g_r7 != R7::Mode::Off)) {
         Control().ab_frames = static_cast<u32>(std::strtoul(ab.c_str(), nullptr, 10));
         SSPC_LOG(Engine, Warning,
                  "EXPERIMENT: SSPC_P53_NATIVE_AB={} - blocks of {} flips alternate: the game's PM4 path (verified), then "
@@ -1290,13 +1443,43 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     if (const std::string s = Env("SSPC_P53_NATIVE_DRAW_STATS"); !s.empty()) {
         stats = static_cast<u32>(std::strtoul(s.c_str(), nullptr, 10));
     }
-    SSPC_LOG(Engine, Warning,
-             "EXPERIMENT: SSPC_P53_NATIVE_DRAW=shadow - the engine's draws (0x623c60, 0x623a40) are described from its "
-             "objects and verified by the command processor against the PM4 path (kVerify markers in the DCB)");
+    if (p53) {
+        SSPC_LOG(Engine, Warning,
+                 "EXPERIMENT: SSPC_P53_NATIVE_DRAW=shadow - the engine's draws (0x623c60, 0x623a40) are described from "
+                 "its objects and verified by the command processor against the PM4 path (kVerify markers in the DCB)");
+    }
     if (stats != 0) {
         std::thread(Reporter, stats).detach();
     }
     return true;
+}
+
+bool EmitNativeDraw(const R7::NativeRenderContext& ctx, const R7::NativeDrawCommand& cmd, bool verify) {
+    u8* dcb = reinterpret_cast<u8*>(ctx.dcb);
+    if (verify) {
+        // the engine's description (its objects: shaders, tables, the wrapper's arguments) ahead of the draw in its run;
+        // should the draw not follow it into the stream, the game's draw packet is compared with it instead
+        DrawOp op;
+        if (BuildDrawOp(g_base, ctx.r, cmd.indexed, cmd.index_count, cmd.index_base, op) &&
+            EmitDirect(dcb, 1 + kDrawMarkerDwords, [&](u32* w) {
+                w[0] = OpHeader(StreamOp::Verify, kDrawMarkerDwords);
+                return 1 + EncodeDrawMarker(op, kVerify, w + 1);
+            })) {
+            g_engine.r7_verify_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const u32 bits = (cmd.indexed ? kStreamDrawIndexed : 0u) | ((cmd.run_tag << kStreamDrawRunShift) & kStreamDrawRunMask);
+    return EmitDirect(dcb, 1 + kStreamDrawWords, [&](u32* op) {
+        op[0] = OpHeader(StreamOp::Draw, kStreamDrawWords);
+        op[1] = static_cast<u32>(cmd.state.pass);
+        op[2] = bits;
+        op[3] = cmd.index_count;
+        op[4] = static_cast<u32>(cmd.index_base);
+        op[5] = static_cast<u32>(cmd.index_base >> 32);
+        op[6] = 0; // (no description: the frontend walks the stages from the registers, as for the game's packet)
+        op[7] = 0;
+        return 1 + kStreamDrawWords;
+    });
 }
 
 } // namespace SecondSon::Engine::Render::NativeDraw

@@ -16,6 +16,7 @@
 
 #include "base/log.h"
 #include "engine/guest_probe.h"
+#include "engine/render/native_render_layer.h"
 #include "engine/render/render_layout.h"
 #include "runtime/gpu/native_videoout.h"
 
@@ -136,8 +137,24 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     u32* const* cmd = reinterpret_cast<u32* const*>(r + L::kContextGfx + L::kCbCmdPtr);
     const u32* const b0 = *begin;
     const u32* const p0 = *cmd;
-    g_orig[I](a, r, c, d, e, f);
     constexpr u32 src = I + 1;
+    u32 tag = src;
+    R7::DrawScope outer{};
+    bool scoped = false;
+    if constexpr (I == 2) {
+        if (R7::GBufferPath()) {
+            // R7-Core C3: the tag before the call (0x448640 ran before it), for the native draws inside it
+            if (t_material_context == r) {
+                t_material_context = 0;
+                tag |= kMaterialChanged;
+                g_stats.material_tagged.fetch_add(1, std::memory_order_relaxed);
+            }
+            outer = R7::OpenScope(r, tag);
+            scoped = true;
+        }
+    }
+    g_orig[I](a, r, c, d, e, f);
+    const u32 native = scoped ? R7::CloseScope(outer) : 0;
     if (g_diag) {
         // 0x1a1960: the instance (c) -> its mesh **(c + 0x18); 0x43d480, 0x1a1770: the mesh (e), d instances
         DiagNote(I, r, I == 0 ? **reinterpret_cast<const u64* const*>(c + 0x18) : e, I == 0 ? 1 : static_cast<u32>(d));
@@ -147,9 +164,8 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     // the trailing NOP of the draw this call wrote: the last 4 dwords, written by this call (in this chunk after p0,
     // or in a chunk the call started), its first body dword still the driver's 0
     const bool fresh = *begin != b0 ? p1 - *begin >= 4 : p1 - p0 >= 4;
-    u32 tag = src;
     if constexpr (I == 2) {
-        if (t_material_context == r) {
+        if (!scoped && t_material_context == r) {
             t_material_context = 0;
             tag |= kMaterialChanged;
             g_stats.material_tagged.fetch_add(1, std::memory_order_relaxed);
@@ -159,7 +175,7 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
         p1[-3] = kRunMagic;
         p1[-2] = tag;
         g_stats.tagged[src].fetch_add(1, std::memory_order_relaxed);
-    } else {
+    } else if (native == 0) { // (a native draw left a run token, not a NOP: its tag went with it - R7::ScopeStats)
         g_stats.no_nop.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -240,6 +256,11 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     }
     g_on = true;
     g_gbuffer = sites == 3;
+    if (R7::GBufferPath() && !g_gbuffer) {
+        SSPC_LOG(Engine, Error, "SSPC_R7_NATIVE_RENDER: the G-buffer path needs 0x1a1770's probe "
+                                "(SSPC_CITY_ENGINE_GBUFFER_RUNS=1) - its draws stay the game's");
+        R7::SetGBufferPath(false);
+    }
     if (char dv[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_ENGINE_RUNS", dv, sizeof(dv)) == 1 && dv[0] == '1') {
         g_diag = true;
         std::thread(DiagReporter).detach();
