@@ -584,14 +584,20 @@ std::string Table(const Row& w, u32 frames, bool t2) {
         for (u32 k = 0; k < kPacketClasses; ++k) {
             sampled += w.packet_ticks[k];
         }
+        // (a sampled packet carries the sample's own rdtsc reads and its light markers: its time is inflated - the
+        // "share" column scales the classes to the Packets section, assuming the inflation is alike for all of them)
+        const double norm = sampled != 0 ? static_cast<double>(w.self[static_cast<u32>(Sec::Packets)]) /
+                                               (static_cast<double>(sampled) * g_every)
+                                         : 0.0;
         out += fmt::format("    sampled packets (1 of {}, scaled; their sum {:.3f} ms/frame against the Packets section "
-                           "{:.3f}):\n", g_every, ms(sampled * g_every), ms(w.self[static_cast<u32>(Sec::Packets)]));
+                           "{:.3f}; share = scaled x {:.3f}):\n", g_every, ms(sampled * g_every),
+                           ms(w.self[static_cast<u32>(Sec::Packets)]), norm);
         for (u32 k = 0; k < kPacketClasses; ++k) {
             if (w.packet_n[k] == 0) {
                 continue;
             }
-            out += fmt::format("      {:<64} {:>9.3f} ms/frame {:>9.0f} packets/frame {:>7.0f} ns\n", kPacketNames[k],
-                               ms(w.packet_ticks[k] * g_every),
+            out += fmt::format("      {:<64} {:>9.3f} ms/frame (share {:>7.3f}) {:>9.0f} packets/frame {:>7.0f} ns\n",
+                               kPacketNames[k], ms(w.packet_ticks[k] * g_every), ms(w.packet_ticks[k] * g_every) * norm,
                                static_cast<double>(w.packet_n[k]) * g_every / f,
                                static_cast<double>(w.packet_ticks[k]) * ms_per_tick * 1e6 / w.packet_n[k]);
         }
@@ -599,8 +605,9 @@ std::string Table(const Row& w, u32 frames, bool t2) {
             if (w.light_n[k] == 0) {
                 continue;
             }
-            out += fmt::format("      light, inclusive: {:<46} {:>9.3f} ms/frame {:>9.0f} calls/frame {:>7.0f} ns\n",
-                               kLightNames[k], ms(w.light_ticks[k] * g_every),
+            out += fmt::format("      light, inclusive: {:<46} {:>9.3f} ms/frame (share {:>7.3f}) {:>9.0f} calls/frame "
+                               "{:>7.0f} ns\n",
+                               kLightNames[k], ms(w.light_ticks[k] * g_every), ms(w.light_ticks[k] * g_every) * norm,
                                static_cast<double>(w.light_n[k]) * g_every / f,
                                static_cast<double>(w.light_ticks[k]) * ms_per_tick * 1e6 / w.light_n[k]);
         }
