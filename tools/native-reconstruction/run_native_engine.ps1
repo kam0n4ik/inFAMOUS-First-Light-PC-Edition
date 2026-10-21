@@ -70,6 +70,7 @@ while ($true) {
     break
 }
 "$Owner $(Get-Date -Format 'HH:mm:ss') $Tag" | Set-Content -Encoding ASCII "$lock\owner.txt"
+$saved = [ordered]@{}
 try {
     $saveCopy = Join-Path $run "save"
     if (Test-Path $saveCopy) { Remove-Item $saveCopy -Recurse -Force }
@@ -88,8 +89,16 @@ try {
     foreach ($kv in $Env.Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
         $k, $v = $kv.Split('=', 2); $vars[$k.Trim()] = $v
     }
-    foreach ($k in $vars.Keys) { Set-Item "env:$k" $vars[$k] }
+    # every variable set here is put back as it was in finally: a series calls this script in one PowerShell process,
+    # and a switch of one run must not leak into the next (R6: a series' A runs inherited B's render mode)
+    foreach ($k in $vars.Keys) {
+        if (-not $saved.Contains($k)) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+        Set-Item "env:$k" $vars[$k]
+    }
     $vars | ConvertTo-Json | Set-Content -Encoding UTF8 "$run\env.json"
+    # what the game really gets (inherited switches included): the check that a run is the configuration it claims
+    Get-ChildItem env: | Where-Object { $_.Name -like "SSPC_*" } | Sort-Object Name |
+        ForEach-Object { "$($_.Name)=$($_.Value)" } | Set-Content -Encoding UTF8 "$run\env_effective.txt"
     Remove-Item "$Worktree\logs\gpu_frames.csv", "$Worktree\logs\SecondSonPC.log" -ErrorAction SilentlyContinue
     Remove-Item "$Worktree\logs\native_engine" -Recurse -ErrorAction SilentlyContinue
     $extra = "--loader sspc --user-data $saveCopy --shader-cache $ShaderCache --press $Press"
@@ -103,6 +112,7 @@ try {
     if (Test-Path $rj) { Copy-Item $rj $run }
     if (Test-Path "$LogsDir\runs\$Tag\screen.png") { Copy-Item "$LogsDir\runs\$Tag\screen.png" $run }
 } finally {
+    foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } # $null removes it
     foreach ($k in @("SSPC_NATIVE_ENGINE", "SSPC_NATIVE_ENGINE_FUNCS", "SSPC_NATIVE_ENGINE_SAMPLE",
                      "SSPC_NATIVE_ENGINE_MEASURE", "SSPC_NATIVE_ENGINE_RECOMP")) { Remove-Item "env:$k" -ErrorAction SilentlyContinue }
     Remove-Item $lock -Recurse -Force -ErrorAction SilentlyContinue
