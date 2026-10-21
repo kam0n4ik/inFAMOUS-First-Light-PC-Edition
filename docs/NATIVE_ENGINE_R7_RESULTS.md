@@ -4,6 +4,12 @@
 R7-S `e28753c`, R7-R `e40a8e1`, R7-G `b882919`. База сравнения — пресет стенда **CITY-OPT Phase 6 +
 `SSPC_R6_CP_POLL_TRIVIAL`** (`main` `973976b`). Подробности — `NATIVE_ENGINE_R7_{CORE,GBUFFER,SHADOWS,RESOURCES}.md`.
 
+**В `main` — `25eec6b`** (merge, без push; прежний `main` — `refs/backup/main-before-r7-merge-20261021`). Проверка
+после слияния в `E:\SecondSonPC\build`: сборка `all` и `sspc_native_engine_tests` — exit 0; тесты 176/0 и 363/0; город
+(`E:\research\r7\core\main_r7_runs.ps1`): `m7_base` (пресет, POLL_TRIVIAL активен, ни одной замены R7) 32,18 FPS,
+1 % low 27,61; `m7_all_guard` (13 функций guarded) 32,31 FPS, 1 % low 27,42, во всех 13 — 0 расхождений, 0 откатов
+(например `cue_commit` 48,0 млн нативно / 187 481 сверка). Оба прогона — выход 0, ни одной Error/Critical.
+
 Статусы: `OFFLINE_VERIFIED` — офлайн-сверка с кодом eboot; `GAME_VERIFIED` — сверка в игре (verify/guarded,
 0 расхождений); `PERFORMANCE_VERIFIED` — ускорение, подтверждённое чередующимися A/B вне разброса. Проценты
 «готовности» по числу функций не приводятся.
