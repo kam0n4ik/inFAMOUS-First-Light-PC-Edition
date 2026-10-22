@@ -2871,6 +2871,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                           .pBufferInfo = nullptr});
     }
     // images
+    const bool gb_parts = !compute && CpProfile::On() && (CpProfile::t_source & 3) == 3; // (R8: a 0x1a1770 draw's parts)
+    if (gb_parts) {
+        CpProfile::Enter(CpProfile::Sec::T2GbBindImages);
+    }
     const VkPipelineStageFlags2 shader_stage = compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : kGraphicsShaders;
     images_.ApplyPendingInvalidations(); // before the memo's dirty checks below
     for (const auto& im : plan.images) {
@@ -2948,6 +2952,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             stats_.t_image += GS::FineTicks() - ti0;
             if (img == nullptr) {
                 Skipped(Skip::Image, err);
+                if (gb_parts) {
+                    CpProfile::Leave();
+                }
                 return false;
             }
         }
@@ -2957,6 +2964,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 ImageViewDesc vd = TSharpView(im.desc, im.depth, im.array, im.storage);
                 if (!vd.supported) {
                     Skipped(Skip::Image, std::string(vd.reason));
+                    if (gb_parts) {
+                        CpProfile::Leave();
+                    }
                     return false;
                 }
                 if (count > 1) {
@@ -2998,6 +3008,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         (void)shader_stage;
     }
     // samplers
+    if (gb_parts) {
+        CpProfile::Leave();
+        CpProfile::Enter(CpProfile::Sec::T2GbBindSamplers);
+    }
     const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
     for (size_t i = 0; i < plan.samplers.size(); ++i) {
         const auto& sm = plan.samplers[i];
@@ -3018,6 +3032,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                           .descriptorCount = 1,
                           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
                           .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+    }
+    if (gb_parts) {
+        CpProfile::Leave();
     }
     return true;
 }
@@ -4340,7 +4357,35 @@ bool Executor::DrawPreparedBatch(std::span<const BatchDraw> draws) {
     return true;
 }
 
+namespace {
+/// R8 profile (SSPC_R8_CP_PROFILE): a 0x1a1770 draw's record by its stage (CpProfile::Sec::T2Gb*) - one section open at
+/// a time, the last one left at the record's end (any return)
+class GBufferRecordStages {
+public:
+    GBufferRecordStages() : on_(CpProfile::On() && (CpProfile::t_source & 3) == 3) { // (3: DrawRuns::Source::GBuffer)
+        if (on_) {
+            CpProfile::Enter(CpProfile::Sec::T2GbHead);
+        }
+    }
+    ~GBufferRecordStages() {
+        if (on_) {
+            CpProfile::Leave();
+        }
+    }
+    void Next(CpProfile::Sec s) {
+        if (on_) {
+            CpProfile::Leave();
+            CpProfile::Enter(s);
+        }
+    }
+
+private:
+    bool on_;
+};
+} // namespace
+
 void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0) {
+    GBufferRecordStages gb;
     stream_pipe_ = 0;
     run_ok_ = false;
     ++stats_.draws;
@@ -4454,6 +4499,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
 
     // targets
+    gb.Next(CpProfile::Sec::T2GbTargets);
     std::vector<CachedImage*>& targets = scratch_.targets;
     targets.clear();
     RenderKey key;
@@ -4630,6 +4676,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         }
     }
     // resources
+    gb.Next(CpProfile::Sec::T2GbBind);
     PushData push{};
     const u32 vte = regs.Get(kPaClVteCntl);
     push.xscale = (vte & 1) ? F(regs, kViewport0) : 1.0f;
@@ -4680,6 +4727,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     if (has_ps) {
         NoteOrderRange(&ps.plan, ps.address, d.queue, false);
     }
+    gb.Next(CpProfile::Sec::T2GbVertex);
     ts = GS::FineTicks();
     // SSPC_CITY_BATCH: the batch's geometry (DrawPreparedBatch) in place of this draw's - not with a memory write, an
     // occlusion query, the upscaler's display draw or a diagnostic that looks at single draws
@@ -4790,6 +4838,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
 
     stage(stats_.t_vertex);
+    gb.Next(CpProfile::Sec::T2GbLayout);
     {
         // SSPC_DIAG_GEOM=<VS address hex>:<first flip>:<flips> (CITY-OPT Phase 3, diagnostics): every range of that VS's
         // draws - address, size, content hash, residency, why it is not cached - to logs\geom\geom.tsv
@@ -4985,6 +5034,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         }
     }
     stage(stats_.t_layout);
+    gb.Next(CpProfile::Sec::T2GbEmit);
     if (!rendering_) {
         std::array<VkRenderingAttachmentInfo, 8> colors{};
         for (u32 i = 0; i < key.color_count; ++i) {

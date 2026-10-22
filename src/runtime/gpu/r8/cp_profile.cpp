@@ -127,6 +127,17 @@ constexpr std::array<Info, kSections> MakeInfo() {
     set(Sec::T2BindMesh, "T2 BindStage: mesh 0x1a1960", Cls::Compute);
     set(Sec::T2BindShadow, "T2 BindStage: shadow 0x43d480", Cls::Compute);
     set(Sec::T2BindGBuffer, "T2 BindStage: G-buffer 0x1a1770", Cls::Compute);
+    set(Sec::T2GbHead, "T2 G-buffer record: checks, pipeline lookup", Cls::Compute);
+    set(Sec::T2GbTargets, "T2 G-buffer record: targets", Cls::Compute);
+    set(Sec::T2GbBind, "T2 G-buffer record: around BindStage", Cls::Compute);
+    set(Sec::T2GbVertex, "T2 G-buffer record: vertex inputs, index buffer", Cls::Compute);
+    set(Sec::T2GbLayout, "T2 G-buffer record: barriers, layouts, descriptor fix-ups", Cls::Compute);
+    set(Sec::T2GbEmit, "T2 G-buffer record: commands (rendering, pipeline, descriptors, state, draw)", Cls::Compute);
+    set(Sec::T2GbBindImages, "T2 BindStage G-buffer: images", Cls::Compute);
+    set(Sec::T2GbBindSamplers, "T2 BindStage G-buffer: samplers", Cls::Compute);
+    set(Sec::FrontNativeFind, "frontend native G-buffer: template, validation, stage maps", Cls::Compute);
+    set(Sec::FrontNativeDecode, "frontend native G-buffer: flat from the CUE state, DecodeResources", Cls::Compute);
+    set(Sec::FrontNativeKey, "frontend native G-buffer: specialization key, variant, EndOf", Cls::Compute);
     return a;
 }
 constexpr std::array<Info, kSections> kInfo = MakeInfo();

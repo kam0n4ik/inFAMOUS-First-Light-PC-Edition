@@ -1017,8 +1017,8 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         ngb_check = engine != nullptr && (ngb_.mode() == NativeGBuffer::Mode::Verify || ngb_.SampleCheck());
         if (engine != nullptr && ngb_.Takes() && !ngb_check) {
             R8_CP_PROF_ENTER(CpProfile::Sec::FrontNative);
-            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->Programs().Epoch(), ngb_targets, r.prep, r.state,
-                                         r.stage, r.ps) &&
+            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep,
+                                         r.state, r.stage, r.ps) &&
                             DR::EngineDescStill(r.draw.engine_native); // (the slot not reused while it was read)
             R8_CP_PROF_LEAVE();
             if (ok) {
@@ -1080,7 +1080,7 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         R8_CP_PROF(CpProfile::Sec::FrontNative);
         const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
         const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
-        ngb_.AfterFull(r.draw, *engine, frontend_->Programs().Epoch(), ngb_targets, r.prep, r.state, dv, dp,
+        ngb_.AfterFull(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep, r.state, dv, dp,
                        ngb_check);
     }
     if (srt_diag_) {

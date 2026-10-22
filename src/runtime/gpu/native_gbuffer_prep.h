@@ -14,7 +14,10 @@
 //   * a draw's stages built from the engine's state through the map (no SRT walk: the flattened user data, the
 //     vertex V#s), decoded as the full preparation decodes (DecodeResources), the specialization key checked;
 //   * the heads (program, module, runtime parameters, pipeline) from a template: an earlier full preparation of
-//     the same programs, pipeline registers (the processor's pipeline key), targets and CUE layouts.
+//     the same programs, pipeline registers (the processor's pipeline key), targets and CUE layouts. A template
+//     outlives its frame: at its first use in a new one its programs are looked up again in the program cache (as
+//     the full preparation looks them up: read again, or trusted by write tracking) and its fetch shader's code is
+//     read and compared; a variant whose program or fetch shader is another now is dropped.
 // verify: every draw prepared in full (the walk, what the draw uses) and built from the engine too, the two plans
 // compared binding by binding (raw V#/T#/S#, addresses, sizes, bindings, statuses) and the flattened data dword by
 // dword. guarded / native: the engine build is the draw's preparation; anything it does not describe (no record, a
@@ -61,17 +64,19 @@ public:
     }
 
     /// guarded / native: prepare `d` from the engine record `e` and a template (see above) into `prep`, `state`, `vs`,
-    /// `ps`. false: the full path (the reason is counted). `epoch`: the frontend's program cache epoch; `targets`: a
-    /// hash of the draw's colour/depth target registers (the register file's group hashes).
-    bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch, u64 targets,
-                 GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state, GS::StageView& vs,
-                 GS::StageView& ps);
+    /// `ps`. false: the full path (the reason is counted). `programs`, `memory`: the frontend's program cache and its
+    /// guest reader (a template's validation in a new frame); `targets`: a hash of the draw's colour/depth target
+    /// registers (the register file's group hashes).
+    bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+                 GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets, GS::DrawPreparation& prep,
+                 const GS::GraphicsPipelineState*& state, GS::StageView& vs, GS::StageView& ps);
 
     /// After `d`'s full preparation (`prep`, `state`, its VS/PS views): keep it as its key's template; `check` (verify:
     /// every draw, guarded: its samples) builds the draw from `e` as Prepare would and compares it with the walk's.
-    void AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch, u64 targets,
-                   const GS::DrawPreparation& prep, const GS::GraphicsPipelineState* state, const GS::StageView& vs,
-                   const GS::StageView& ps, bool check);
+    void AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+                   GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets, const GS::DrawPreparation& prep,
+                   const GS::GraphicsPipelineState* state, const GS::StageView& vs, const GS::StageView& ps,
+                   bool check);
 
     /// guarded: this engine build is one to check against a full preparation (every 64th).
     bool SampleCheck() { return mode_ == Mode::Guarded && (++sample_ & 63) == 0; }
@@ -108,12 +113,13 @@ private:
         const GS::GraphicsPipelineState* state = nullptr;
         GS::StageView vs, ps; ///< the heads (their plans are each draw's)
         u64 fetch = 0;        ///< the VS fetch shader's address (user data at the fetch registers)
-        u32 fetch_reg = 0xff;
+        u32 fetch_reg = 0xff; ///< (0xff: no fetch shader)
+        std::vector<u32> fetch_code; ///< its code up to its s_setpc_b64 (a new frame compares it)
     };
-    static constexpr u32 kVariants = 4;
+    static constexpr u32 kVariants = 16; ///< (a material's texture formats select modules: city keys have more than 4)
     struct Template {
         Key key;
-        u64 epoch = 0;
+        u64 epoch = 0; ///< the program cache epoch its variants were validated in
         std::array<Variant, kVariants> v;
         u32 n = 0, next = 0; ///< variants filled; the one a new variant replaces when all are
     };
@@ -125,6 +131,11 @@ private:
     static Key KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 targets);
     static u64 HashOf(const Key& k);
     static u64 FetchOf(const GS::StageView& vs, std::span<const u32, 16> ud, u32& reg);
+    /// The fetch shader at `addr` (its address pair at `reg`) up to its s_setpc_b64, as the fetch cache reads it.
+    static bool ReadFetch(GS::GuestReader& memory, u64 addr, u32 reg, std::vector<u32>& code);
+    /// A template first used in a new frame: its variants' programs and fetch shaders validated again (see above),
+    /// those changed dropped. false: none is left.
+    bool Revalidate(Template& t, GS::ProgramCache& programs, GS::GuestReader& memory);
 
     /// The map of `v`'s stage for CUE state `sh` (made on first use). nullptr: the view has no first module yet.
     const StageMap* MapOf(const GS::StageView& v, const GDR::StageShadow& sh);
@@ -142,6 +153,7 @@ private:
     std::unordered_map<u64, std::unique_ptr<StageMap>> maps_;
     std::unordered_map<u64, Template> templates_;
     std::vector<std::array<u32, 4>> vreads_;
+    std::vector<u32> fetch_code_, fetch_read_;
     GS::SpecializationKey key_vs_, key_ps_;
     GS::StageView check_vs_, check_ps_; ///< verify: the engine builds compared with the walk's
 
@@ -150,6 +162,7 @@ private:
     std::array<std::atomic<u64>, 12> refused_{}; ///< by reason (Report)
     std::array<std::atomic<u64>, 8> map_why_{};  ///< maps made, by StageMap::why (0: ok)
     std::atomic<u64> templates_made_{0}, variants_made_{0}, templates_dropped_{0};
+    std::atomic<u64> revalidated_{0}, variants_changed_{0}, fetch_unread_{0};
     // verify / guarded checks: stages compared, the same, different by part (flat, buffers, images, samplers,
     // vertices, heads)
     std::atomic<u64> compared_{0}, same_{0};

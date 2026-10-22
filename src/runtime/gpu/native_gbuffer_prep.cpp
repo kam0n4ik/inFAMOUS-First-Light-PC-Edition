@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include "base/log.h"
+#include "runtime/gpu/r8/cp_profile.h"
 
 namespace SecondSon::Gpu {
 
@@ -156,6 +157,56 @@ u64 NativeGBuffer::FetchOf(const GS::StageView& vs, std::span<const u32, 16> ud,
     return (ud[b] | (u64{ud[b + 1]} << 32)) & 0xFFFFFFFFFFFFull; // (PrepareStage's fetch shader address)
 }
 
+bool NativeGBuffer::ReadFetch(GS::GuestReader& memory, u64 addr, u32 reg, std::vector<u32>& code) {
+    // (FetchCache::GetEntry's read: 64 dwords at a time until the parse finds the end)
+    code.clear();
+    GS::FetchShader parsed;
+    std::string error;
+    for (u32 have = 0; have < GS::kMaxFetchDwords;) {
+        const u32 chunk = std::min<u32>(64, GS::kMaxFetchDwords - have);
+        code.resize(have + chunk);
+        if (addr == 0 || addr + (have + chunk) * 4ull > (1ull << 40) ||
+            !memory.Read(addr + have * 4ull, code.data() + have, chunk * 4ull)) {
+            return false;
+        }
+        have += chunk;
+        if (GS::ParseFetchShaderCode(code, reg, parsed, error)) {
+            code.resize(parsed.size / 4);
+            return !code.empty();
+        }
+        if (error.rfind("no s_setpc_b64", 0) != 0 && error.rfind("a buffer load cut", 0) != 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool NativeGBuffer::Revalidate(Template& t, GS::ProgramCache& programs, GS::GuestReader& memory) {
+    Bump(revalidated_);
+    u32 n = 0;
+    for (u32 i = 0; i < t.n; ++i) {
+        Variant& v = t.v[i];
+        bool same = programs.Get(memory, v.vs.address, GS::HwStage::Vs).program == v.vs.program &&
+                    programs.Get(memory, v.ps.address, GS::HwStage::Ps).program == v.ps.program;
+        if (same && v.fetch_reg != 0xff) {
+            fetch_read_.resize(v.fetch_code.size());
+            same = memory.Read(v.fetch, fetch_read_.data(), fetch_read_.size() * 4ull) && fetch_read_ == v.fetch_code;
+        }
+        if (!same) {
+            Bump(variants_changed_);
+            continue;
+        }
+        if (n != i) {
+            t.v[n] = std::move(v);
+        }
+        ++n;
+    }
+    t.n = n;
+    t.next = 0;
+    t.epoch = programs.Epoch();
+    return n != 0;
+}
+
 const NativeGBuffer::StageMap* NativeGBuffer::MapOf(const GS::StageView& v, const GDR::StageShadow& sh) {
     const GS::Module* first = FirstModule(v);
     if (first == nullptr) {
@@ -273,6 +324,7 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
         return false;
     }
     CopyHead(out, head);
+    R8_CP_PROF_ENTER(CpProfile::Sec::FrontNativeDecode);
     // the flattened user data: the draw's registers, then the CUE copy's dwords the walk would have loaded
     std::vector<u32>& flat = out.plan.flat;
     flat.resize(m.flat_size);
@@ -288,13 +340,17 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
     out.plan.srt = {};
     out.plan.srt.user_data_read = m.ud_read; // (the registers the walk reads: the next draw's checks)
     out.plan.error.clear();
+    R8_CP_PROF_LEAVE();
+    R8_CP_PROF_ENTER(CpProfile::Sec::FrontNativeKey);
     GS::BuildSpecializationKey(head.runtime, head.start, r, fetch, out.plan, key); // (the module it selects)
+    R8_CP_PROF_LEAVE();
     return true;
 }
 
-bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch,
-                            u64 targets, GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state,
-                            GS::StageView& vs, GS::StageView& ps) {
+bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+                            GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets,
+                            GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state, GS::StageView& vs,
+                            GS::StageView& ps) {
     const auto refuse = [&](u32 why) {
         Bump(refused_[why]);
         return false;
@@ -302,33 +358,42 @@ bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::D
     if (d.indirect || d.active_stages != kVsPs) {
         return refuse(1);
     }
-    if (e.vs.dwords == 0 || e.ps.dwords == 0) {
+    if (!e.vs.captured || !e.ps.captured) {
         return refuse(2);
     }
-    const Key k = KeyOf(d, e, targets);
-    const auto it = templates_.find(HashOf(k));
-    if (it == templates_.end() || !(it->second.key == k) || it->second.n == 0) {
-        return refuse(3);
-    }
-    Template& t = it->second;
-    if (t.epoch != epoch) {
-        templates_.erase(it); // the programs may have changed since
-        return refuse(4);
-    }
     const std::span<const u32, 16> vud(d.user_data[kVs]), pud(d.user_data[kPs]);
-    // the plans from the engine's CUE copy, on any variant's heads (the same programs, runtime and bindings)
-    const Variant& base = t.v[0];
+    Template* tp = nullptr;
+    const StageMap* vm = nullptr;
+    const StageMap* pm = nullptr;
     u32 freg = 0xff;
-    const u64 fetch = FetchOf(base.vs, vud, freg);
-    const StageMap* vm = MapOf(base.vs, e.vs);
-    const StageMap* pm = MapOf(base.ps, e.ps);
-    if (vm == nullptr || pm == nullptr || !vm->ok || !pm->ok) {
-        return refuse(6);
+    u64 fetch = 0;
+    {
+        R8_CP_PROF(CpProfile::Sec::FrontNativeFind);
+        const Key k = KeyOf(d, e, targets);
+        const auto it = templates_.find(HashOf(k));
+        if (it == templates_.end() || !(it->second.key == k) || it->second.n == 0) {
+            return refuse(3);
+        }
+        tp = &it->second;
+        if (tp->epoch != programs.Epoch() && !Revalidate(*tp, programs, memory)) {
+            templates_.erase(it); // (every variant's program or fetch shader is another now)
+            return refuse(4);
+        }
+        // the plans from the engine's CUE copy, on any variant's heads (the same programs, runtime and bindings)
+        fetch = FetchOf(tp->v[0].vs, vud, freg);
+        vm = MapOf(tp->v[0].vs, e.vs);
+        pm = MapOf(tp->v[0].ps, e.ps);
+        if (vm == nullptr || pm == nullptr || !vm->ok || !pm->ok) {
+            return refuse(6);
+        }
     }
+    const Template& t = *tp;
+    const Variant& base = t.v[0];
     if (!BuildStage(base.ps, *pm, e.ps, pud, ps, key_ps_) || !BuildStage(base.vs, *vm, e.vs, vud, vs, key_vs_)) {
         return refuse(7);
     }
     // the variant with the modules these plans select (and this draw's fetch shader)
+    R8_CP_PROF(CpProfile::Sec::FrontNativeKey);
     const Variant* hit = nullptr;
     bool fetch_seen = false;
     for (u32 i = 0; i < t.n && hit == nullptr; ++i) {
@@ -420,19 +485,20 @@ bool NativeGBuffer::Compare(const GS::StageView& x, const GS::StageView& y, u32 
     return false;
 }
 
-void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch,
-                              u64 targets, const GS::DrawPreparation& prep, const GS::GraphicsPipelineState* state,
+void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+                              GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets,
+                              const GS::DrawPreparation& prep, const GS::GraphicsPipelineState* state,
                               const GS::StageView& vs, const GS::StageView& ps, bool check) {
     if (!prep.ready || state == nullptr || d.indirect || d.active_stages != kVsPs ||
-        vs.status != GS::StageStatus::Ready || ps.status != GS::StageStatus::Ready || e.vs.dwords == 0 ||
-        e.ps.dwords == 0 || Writes(vs) || Writes(ps)) {
+        vs.status != GS::StageStatus::Ready || ps.status != GS::StageStatus::Ready || !e.vs.captured ||
+        !e.ps.captured || Writes(vs) || Writes(ps)) {
         return;
     }
     if (check) {
         // the engine path as it would prepare this draw (its template), else the plans alone on this draw's heads
         GS::DrawPreparation eprep;
         const GS::GraphicsPipelineState* estate = nullptr;
-        bool built = Prepare(d, e, epoch, targets, eprep, estate, check_vs_, check_ps_);
+        bool built = Prepare(d, e, programs, memory, targets, eprep, estate, check_vs_, check_ps_);
         if (built) {
             if (eprep.pipeline != prep.pipeline || estate != state) {
                 Bump(diff_[5]);
@@ -465,11 +531,13 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
     }
     auto [it, made] = templates_.try_emplace(HashOf(k));
     Template& t = it->second;
-    if (made || !(t.key == k) || t.epoch != epoch) {
+    if (made || !(t.key == k)) {
         Bump(templates_made_);
         t.key = k;
-        t.epoch = epoch;
+        t.epoch = programs.Epoch();
         t.n = t.next = 0;
+    } else if (t.epoch != programs.Epoch()) {
+        Revalidate(t, programs, memory);
     }
     u32 freg = 0xff;
     const u64 fetch = FetchOf(vs, std::span<const u32, 16>(d.user_data[kVs]), freg);
@@ -481,7 +549,12 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
             break;
         }
     }
-    if (slot == t.n) {
+    const bool fresh = slot == t.n;
+    if (fresh && freg != 0xff && !ReadFetch(memory, fetch, freg, fetch_code_)) {
+        Bump(fetch_unread_);
+        return;
+    }
+    if (fresh) {
         Bump(variants_made_);
         if (t.n < kVariants) {
             ++t.n;
@@ -497,6 +570,9 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
     CopyHead(v.ps, ps);
     v.fetch = fetch;
     v.fetch_reg = freg;
+    if (fresh) {
+        v.fetch_code.assign(fetch_code_.begin(), freg != 0xff ? fetch_code_.end() : fetch_code_.begin());
+    }
 }
 
 std::string NativeGBuffer::Report() const {
@@ -507,7 +583,7 @@ std::string NativeGBuffer::Report() const {
     const char* name = mode_ == Mode::Verify ? "verify" : mode_ == Mode::Guarded ? "guarded" : "native";
     std::string out = fmt::format(
         "native G-buffer 0x1a1770 (SSPC_NATIVE_GBUFFER={}{}): tagged draws {}, with an engine record {}, without {}; "
-        "prepared from the engine {}{}; refused (1 indirect/stages, 2 no CUE state, 3 no template, 4 programs changed, "
+        "prepared from the engine {}{}; refused (1 indirect/stages, 2 no CUE state, 3 no template, 4 its programs changed, "
         "5 another fetch shader, 6 a stage not of the CUE copy, 7 not ready, 8 no variant of these modules, 9 other "
         "bindings):",
         name, tripped_ ? ", tripped: off" : "", ld(draws_), ld(with_record_), ld(no_record_), ld(taken_),
@@ -515,12 +591,18 @@ std::string NativeGBuffer::Report() const {
     for (u32 i = 1; i <= 9; ++i) {
         out += fmt::format(" {}:{}", i, ld(refused_[i]));
     }
-    out += fmt::format("; templates {} (variants {}, all dropped {} times); stage maps (0 ok, 1 no walk, 2 failed, 3 other memory, 4 wrote registers, "
-                       "5 unknown dword, 6 past the copy, 7 vertex V#):",
-                       ld(templates_made_), ld(variants_made_), ld(templates_dropped_));
+    out += fmt::format("; templates {} (variants {}, all dropped {} times; validated in a new frame {}, variants "
+                       "changed {}, fetch shader unread {}); stage maps (0 ok, 1 no walk, 2 failed, 3 other memory, "
+                       "4 wrote registers, 5 unknown dword, 6 past the copy, 7 vertex V#):",
+                       ld(templates_made_), ld(variants_made_), ld(templates_dropped_), ld(revalidated_),
+                       ld(variants_changed_), ld(fetch_unread_));
     for (u32 i = 0; i < 8; ++i) {
         out += fmt::format(" {}:{}", i, ld(map_why_[i]));
     }
+    const auto cr = GDR::CaptureRefusals();
+    out += fmt::format("; CUE state not captured: no layout {}, more than {} dwords {}; empty layouts {} (the most "
+                       "dwords {})",
+                       cr[0], GDR::kMaxShadowDwords, cr[2], cr[1], cr[3]);
     if (mode_ != Mode::Native) {
         out += fmt::format("; checked stages {} (same {}), differing by part flat {} buffers {} images {} samplers {} "
                            "vertices {} head/pipeline {}; draws not built {}",

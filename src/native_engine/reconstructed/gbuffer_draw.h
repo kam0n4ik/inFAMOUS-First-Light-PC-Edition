@@ -133,13 +133,17 @@ inline constexpr u32 kMaxShadowDwords = 512;
 inline constexpr u32 kShadowPointers = 7;
 struct StageShadow {
     u64 layout = 0;   ///< L: the stage's layout (the CUE's per-shader user-data layout)
-    u16 dwords = 0;   ///< L[0]: the dwords the commit copies; 0 = not captured (no layout, or > kMaxShadowDwords)
+    u16 dwords = 0;   ///< L[0]: the dwords the commit copies (0: an empty layout - its registers are direct entries)
+    bool captured = false; ///< false: no layout, or more than kMaxShadowDwords
     std::array<u8, kShadowPointers> reg{};   ///< the user-data register given the copy + off[i] dwords (0xff: none)
     std::array<u16, kShadowPointers> off{};
     std::array<u32, kMaxShadowDwords> shadow{}; ///< [0, dwords): the copy the stage's registers point into
 };
 /// Capture `stage`'s (VS 2, PS 1) CUE state of context `r` into `out`; false when it has no layout or too many dwords.
 bool CaptureStage(u64 r, u32 stage, StageShadow& out);
+/// CaptureStage so far: [0] no layout (refused), [1] an empty layout (captured: nothing copied), [2] more than
+/// kMaxShadowDwords (refused); [3] the most dwords a layout had.
+std::array<u64, 4> CaptureRefusals();
 
 /// Set the module base and the pure callees Describe needs (0x45f590, 0x61e260, 0x27530) if Prepare() has not already;
 /// a lighter setup than Prepare for the Native Engine G-buffer path, which uses no recording clones.

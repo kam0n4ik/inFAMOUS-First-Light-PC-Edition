@@ -123,6 +123,20 @@ enum class Sec : u8 {
     T2BindMesh,      ///< thread 2: BindStage for a 0x1a1960 draw
     T2BindShadow,    ///< ... for a 0x43d480 draw
     T2BindGBuffer,   ///< ... for a 0x1a1770 draw
+    // a 0x1a1770 draw's record by its stage (Executor::RecordDraw; SSPC_NATIVE_GBUFFER's thread 2 work - BindStage
+    // is T2BindGBuffer inside them)
+    T2GbHead,        ///< thread 2, a 0x1a1770 draw's record: its checks and pipeline lookup
+    T2GbTargets,     ///< ... its targets (the target cache, or images found)
+    T2GbBind,        ///< ... around its stages' BindStage (push data, instancing, order notes)
+    T2GbVertex,      ///< ... its vertex inputs, index buffer (batch geometry)
+    T2GbLayout,      ///< ... barriers, image layouts, descriptor fix-ups
+    T2GbEmit,        ///< ... the commands: rendering, pipeline, descriptors, push constants, dynamic state, the draw
+    T2GbBindImages,  ///< BindStage of a 0x1a1770 draw: its images (T2BindGBuffer keeps the buffers)
+    T2GbBindSamplers, ///< ... its samplers
+    // the native G-buffer preparation (FrontNative) by its part
+    FrontNativeFind,   ///< the template, its validation in a new frame, the stage maps
+    FrontNativeDecode, ///< a stage's plan: the flattened data from the CUE state, DecodeResources
+    FrontNativeKey,    ///< its specialization key, the variant of these modules, EndOf
     Count,
 };
 inline constexpr u32 kSections = static_cast<u32>(Sec::Count);
