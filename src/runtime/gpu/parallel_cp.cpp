@@ -247,6 +247,12 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
             }
             SSPC_LOG(GPU, Info, "SSPC_CITY_ENGINE_GBUFFER_RUNS={}: runs of the instanced mesh draws (0x1a1770) too, their "
                                 "members with their own PS constant buffers (CITY-OPT Phase 6)", g);
+            if (char m[16] = {}; GetEnvironmentVariableA("SSPC_CITY_GB_RUN_MATERIAL", m, sizeof(m)) > 0 && m[0] != '0') {
+                gmat_ = std::string_view(m) == "verify" ? 2 : 1;
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CITY_GB_RUN_MATERIAL={} - G-buffer members of another material "
+                                       "join their run with their own PS textures and samplers{}",
+                         m, gmat_ == 2 ? " (verify: each also prepared in full and compared)" : "");
+            }
         }
     }
     if (fthread_mode_) {
@@ -2144,9 +2150,10 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     // Phase 6: a G-buffer run - its members may differ in PS user data too (each one's PS plan decoded again below)
     const bool g = GRunsNow() && a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer);
     if (g && b.engine_material) {
-        // (the engine set another material for it: its PS reads other descriptors - not walked again to see that)
+        // (the engine set another material for it: its PS reads other descriptors - not walked again to see that;
+        // SSPC_CITY_GB_RUN_MATERIAL: walked again below, its own images and samplers)
         Bump(run_material_);
-        if (gruns_ != 2) {
+        if (gruns_ != 2 && gmat_ == 0) {
             return no(16);
         }
     }
@@ -2159,6 +2166,11 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             SrtDiag& sd = srt_by_[a.engine_run & 3];
             for (u32 k = 0; k < sd.groups.size(); ++k) {
                 Bump(sd.groups[k], (other >> k) & 1);
+            }
+        }
+        if (g) { // (a G-buffer member: which groups ended the run - the report)
+            for (Cp::GroupMask o = other; o != 0; o &= o - 1) {
+                Bump(gb_groups_[std::countr_zero(o) & 63]);
             }
         }
         return no(3);
@@ -2299,6 +2311,8 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             lead.member_flat.insert(lead.member_flat.end(), y.flat.begin(), y.flat.end());
         }
     }
+    u32 own_img = 0, own_smp = 0; // (SSPC_CITY_GB_RUN_MATERIAL: its own T#s / S#s, without those it has again)
+    bool ps_redecoded = false;
     if (g && a.user_data[ps] != b.user_data[ps]) {
         // Phase 6: its PS plan from its registers (RedecodeStage: the walk's output again, the same module and binding
         // numbers) - the same images and samplers; only read-only constant blocks of the same format elsewhere
@@ -2313,20 +2327,50 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
         const GS::ResourceBindingPlan& y = run_ps_plan_;
         bool same = x.images.size() == y.images.size() && x.samplers.size() == y.samplers.size() &&
                     x.buffers.size() == y.buffers.size() && x.vertices.empty() && y.vertices.empty();
+        // SSPC_CITY_GB_RUN_MATERIAL: an image or sampler of the same kind with another T# / S# is the member's own (one
+        // sampled view of a real image; a null one binds the null descriptor whatever its T#, a sampler with a bad S#
+        // the default one - the same as the first draw's)
+        u32 img_mask = 0, smp_mask = 0;
         for (size_t i = 0; same && i < x.images.size(); ++i) {
             const GS::ImageBinding& p = x.images[i];
             const GS::ImageBinding& q = y.images[i];
-            same = p.binding == q.binding && p.count == q.count && p.desc.raw == q.desc.raw && p.view_type == q.view_type &&
+            same = p.binding == q.binding && p.count == q.count && p.view_type == q.view_type &&
                    p.storage == q.storage && p.depth == q.depth && p.array == q.array && p.fmask == q.fmask &&
                    p.status == q.status;
+            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (gmat_ == 0) {
+                    same = false;
+                } else if (i >= Cp::RunMember::kMaxSharpIndex) {
+                    return no(18);
+                } else if (q.count > 1 || q.storage || q.fmask || q.atomic || p.atomic) {
+                    return no(17);
+                } else {
+                    img_mask |= 1u << i;
+                }
+            }
         }
         for (size_t i = 0; same && i < x.samplers.size(); ++i) {
-            same = x.samplers[i].binding == y.samplers[i].binding && x.samplers[i].desc.raw == y.samplers[i].desc.raw &&
-                   x.samplers[i].status == y.samplers[i].status;
+            const GS::SamplerBinding& p = x.samplers[i];
+            const GS::SamplerBinding& q = y.samplers[i];
+            same = p.binding == q.binding && p.status == q.status;
+            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (gmat_ == 0) {
+                    same = false;
+                } else if (i >= Cp::RunMember::kMaxSharpIndex) {
+                    return no(18);
+                } else {
+                    smp_mask |= 1u << i;
+                }
+            }
         }
         if (!same) {
             return no(13);
         }
+        m.img_mask = img_mask;
+        m.smp_mask = smp_mask;
+        own_img = img_mask;
+        own_smp = smp_mask;
+        ps_redecoded = true;
         for (size_t i = 0; i < x.buffers.size(); ++i) {
             const GS::BufferBinding& p = x.buffers[i];
             const GS::BufferBinding& q = y.buffers[i];
@@ -2363,6 +2407,70 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             Bump(srt_by_[a.engine_run & 3].own_ps);
         }
     }
+    if (!lead.members.empty()) {
+        // thread 2 records a member on the descriptors the one before it left (Executor::DrawRunMembers pushes only a
+        // member's own over them): what that one had of its own and this one has not, this one has again - the run's
+        // (the first draw's: this one's are those), with its own registers
+        const Cp::RunMember& prev = lead.members.back();
+        u32 again = 0;
+        const auto restore = [&](const Cp::RunMember::Buffer* before, u32 n_before, Cp::RunMember::Buffer* own,
+                                 u32& n_own, const GS::ResourceBindingPlan& run) {
+            for (u32 k = 0; k < n_before; ++k) {
+                const u32 index = before[k].index;
+                if (std::any_of(own, own + n_own, [&](const Cp::RunMember::Buffer& o) { return o.index == index; })) {
+                    continue;
+                }
+                if (n_own >= Cp::RunMember::kMaxBuffers || index >= run.buffers.size()) {
+                    return false;
+                }
+                const GS::BufferBinding& q = run.buffers[index];
+                own[n_own++] = {index, q.address, q.size, q.desc.raw};
+                ++again;
+            }
+            return true;
+        };
+        if (!restore(prev.b.data(), prev.buffers, m.b.data(), m.buffers, pv.plan)) {
+            return no(19);
+        }
+        if (prev.own_user_data && !m.own_user_data) {
+            m.own_user_data = true; // (the run's past the registers: vs_flat_at stays kNoFlat)
+            ++again;
+        }
+        if (prev.own_ps && !m.own_ps) {
+            m.own_ps = true; // (its PS user data are the first draw's)
+            m.ps_user_data = b.user_data[ps];
+        }
+        if (prev.own_ps) {
+            if (!restore(prev.pb.data(), prev.ps_buffers, m.pb.data(), m.ps_buffers, lead.ps.plan)) {
+                return no(19);
+            }
+            if (prev.own_ps_user_data && !m.own_ps_user_data) {
+                m.own_ps_user_data = true; // (ps_flat_at stays kNoFlat)
+                ++again;
+            }
+            again += static_cast<u32>(std::popcount(prev.img_mask & ~m.img_mask) +
+                                      std::popcount(prev.smp_mask & ~m.smp_mask));
+            m.img_mask |= prev.img_mask;
+            m.smp_mask |= prev.smp_mask;
+        }
+        if (again != 0) {
+            Bump(run_restored_, again);
+        }
+    }
+    if ((m.img_mask | m.smp_mask) != 0) {
+        // its T#s / S#s (RunMember::sharps_at): its own from its PS plan decoded again, those it has again the run's
+        // (the same in that plan where it has none of its own)
+        const GS::ResourceBindingPlan& sp = ps_redecoded ? run_ps_plan_ : lead.ps.plan;
+        m.sharps_at = static_cast<u32>(lead.member_flat.size());
+        for (u32 mk = m.img_mask; mk != 0; mk &= mk - 1) {
+            const auto& raw = sp.images[std::countr_zero(mk)].desc.raw;
+            lead.member_flat.insert(lead.member_flat.end(), raw.begin(), raw.end());
+        }
+        for (u32 mk = m.smp_mask; mk != 0; mk &= mk - 1) {
+            const auto& raw = sp.samplers[std::countr_zero(mk)].desc.raw;
+            lead.member_flat.insert(lead.member_flat.end(), raw.begin(), raw.end());
+        }
+    }
     if (g) {
         // (its stencil reference at its packet: thread 2 sets it for its draw - `regs` are the registers at the packet)
         constexpr u32 kDbStencilRefMask = 0xA10C, kDbStencilRefMaskBf = 0xA10D;
@@ -2380,9 +2488,15 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     m.vgt_index_offset = b.vgt_index_offset;
     m.changed = b.changed;
     m.vs_user_data = b.user_data[vs];
-    if (runs_ == 2 || gruns_ == 2) {
+    if (runs_ == 2 || gruns_ == 2 || (gmat_ == 2 && g)) {
         // verify: the full preparation of this draw against the first's with its geometry (it must be the same)
-        const GS::DrawPreparation& prep = frontend_->PrepareDraw(b, regs, reader_);
+        // (R8: the groups changed at draws the native G-buffer path prepared without the frontend - the run's first
+        // one too - count as changed, as in PrepareDraw: else the frontend kept older registers - a PS translated with
+        // another SPI_PS_IN_CONTROL, a bridge assert)
+        Cp::DrawDescriptor bv = b;
+        bv.changed |= ngb_pending_;
+        ngb_pending_ = 0;
+        const GS::DrawPreparation& prep = frontend_->PrepareDraw(bv, regs, reader_);
         GS::StageView expect = pv;
         std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), expect.plan.flat.begin());
         if (m.vs_flat_at != Cp::RunMember::kNoFlat) {
@@ -2400,6 +2514,15 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
                 bb.address = m.pb[k].address;
                 bb.size = m.pb[k].size;
                 bb.desc.raw = m.pb[k].desc;
+            }
+            if (m.sharps_at != Cp::RunMember::kNoFlat) { // (SSPC_CITY_GB_RUN_MATERIAL: its T#s / S#s)
+                auto at = lead.member_flat.begin() + m.sharps_at;
+                for (u32 mk = m.img_mask; mk != 0; mk &= mk - 1, at += 8) {
+                    std::copy_n(at, 8, expect_ps.plan.images[std::countr_zero(mk)].desc.raw.begin());
+                }
+                for (u32 mk = m.smp_mask; mk != 0; mk &= mk - 1, at += 4) {
+                    std::copy_n(at, 4, expect_ps.plan.samplers[std::countr_zero(mk)].desc.raw.begin());
+                }
             }
         }
         for (u32 i = 0; i < m.streams; ++i) {
@@ -2449,6 +2572,11 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     if (g && b.engine_material) {
         Bump(run_material_joined_);
+    }
+    if ((own_img | own_smp) != 0) {
+        Bump(gmat_joined_);
+        Bump(gmat_images_, static_cast<u64>(std::popcount(own_img)));
+        Bump(gmat_samplers_, static_cast<u64>(std::popcount(own_smp)));
     }
     return true;
 }
@@ -2868,16 +2996,33 @@ std::string ParallelCp::Report() const {
                            "refused (1 full, 2 memory, 3 groups, 4 draw, 5 shaders, 6 other user data, 7 VS user data, "
                            "8 table read, 9 V#, 10 published meanwhile, 11 verify, 12 VS/PS decoded again refused, 13 other "
                            "bindings, 14 a buffer not its own constants, 15 VS walk read a register that differs, 16 another "
-                           "material):{}; verified {} (mismatches {}); instanced mesh draws (0x1a1770) tagged {} of {}{}; "
-                           "materials set (0x448640) {}, G-buffer draws tagged with another material {} (as members {}, "
-                           "joined anyway {})\n",
+                           "material, 17 another kind of image/sampler, 18 an image/sampler index past 32, 19 the earlier "
+                           "member's own bindings again past 2 buffers):{}; verified {} (mismatches {}); bindings had "
+                           "again (the member before had them as its own) {}; instanced mesh draws (0x1a1770) tagged {} of "
+                           "{}{}; materials set (0x448640) {}, G-buffer draws tagged with another material {} (as members "
+                           "{}, joined anyway {})\n",
                            runs_ == 2 ? "=verify" : "", ld(es.tagged[1]), ld(es.calls[1]), ld(es.tagged[2]),
                            ld(es.calls[2]), ld(es.no_nop), ld(run_count_), ld(run_members_), ld(run_leaders_), why,
-                           ld(run_verified_), ld(run_mismatches_), ld(es.tagged[3]), ld(es.calls[3]),
+                           ld(run_verified_), ld(run_mismatches_), ld(run_restored_), ld(es.tagged[3]), ld(es.calls[3]),
                            gruns_ != 0 ? fmt::format(" - their runs (SSPC_CITY_ENGINE_GBUFFER_RUNS{})",
                                                      gruns_ == 2 ? "=verify" : "")
                                        : std::string{},
                            ld(es.materials), ld(es.material_tagged), ld(run_material_), ld(run_material_joined_));
+        if (gruns_ != 0) {
+            std::string groups;
+            for (size_t k = 0; k < gb_groups_.size(); ++k) {
+                if (ld(gb_groups_[k]) != 0) {
+                    groups += fmt::format(" {}:{}", k, ld(gb_groups_[k]));
+                }
+            }
+            out += fmt::format("  R8 G-buffer members refused for registers (3), by group (Cp::Group):{}\n",
+                               groups.empty() ? std::string(" none") : groups);
+        }
+        if (gmat_ != 0) {
+            out += fmt::format("  R8 G-buffer members with another material (SSPC_CITY_GB_RUN_MATERIAL{}): joined with "
+                               "images/samplers of their own {} (images {}, samplers {})\n",
+                               gmat_ == 2 ? "=verify" : "", ld(gmat_joined_), ld(gmat_images_), ld(gmat_samplers_));
+        }
     }
     if (ngb_.On()) {
         out += "  " + ngb_.Report();

@@ -176,6 +176,13 @@ struct RunMember {
     /// state in Vulkan, not the pipeline's): set before its draw
     bool own_stencil = false;
     u32 stencil_ref = 0, stencil_ref_bf = 0;
+    /// SSPC_CITY_GB_RUN_MATERIAL: a G-buffer member whose material differs (0x448640): its PS images / samplers (bits of
+    /// the first draw's plan indices) whose T# / S# differ from the first draw's - and those the member before it had
+    /// as its own (their T# / S# again: what an earlier member pushed over the run's is replaced); their descriptors in
+    /// the run's store at `sharps_at`: 8 dwords a T# for each image bit, then 4 a S# for each sampler bit, ascending.
+    static constexpr u32 kMaxSharpIndex = 32;
+    u32 img_mask = 0, smp_mask = 0;
+    u32 sharps_at = kNoFlat;
 };
 
 struct DispatchDescriptor {

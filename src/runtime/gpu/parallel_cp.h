@@ -551,10 +551,21 @@ private:
     void FrontCloseRun(u64 upto);
     GS::ResourceBindingPlan run_plan_; ///< a joining draw's VS plan decoded again (its own constant buffers)
     std::atomic<u64> run_count_{0}, run_members_{0}, run_leaders_{0}, run_verified_{0}, run_mismatches_{0};
-    std::array<std::atomic<u64>, 17> run_refused_{};
+    std::array<std::atomic<u64>, 20> run_refused_{};
     /// Phase 6: G-buffer members tagged with another material (DrawRuns::kMaterialChanged) - refused before their PS is
     /// walked again (16); verify: not refused, those that still joined counted (the hint's misses)
     std::atomic<u64> run_material_{0}, run_material_joined_{0};
+    /// SSPC_CITY_GB_RUN_MATERIAL=1|verify (with GBUFFER_RUNS; default off): a G-buffer member whose material differs
+    /// joins too - the PS images / samplers whose T# / S# differ from the first draw's are its own (RunMember::img_mask,
+    /// smp_mask; 17: another kind of image or sampler, 18: one past kMaxSharpIndex), thread 2 pushes only those
+    /// (Executor::DrawRunMembers); verify: each member prepared in full too and compared (as GBUFFER_RUNS=verify)
+    u8 gmat_ = 0; ///< 0 off, 1 on, 2 verify
+    /// members joined with images or samplers of their own; those images / samplers
+    std::atomic<u64> gmat_joined_{0}, gmat_images_{0}, gmat_samplers_{0};
+    /// R8: bindings a member has again because the member before it had them as its own (thread 2 records a member on
+    /// the descriptors the one before left: the run's again over those - 19: more than RunMember::kMaxBuffers then)
+    std::atomic<u64> run_restored_{0};
+    std::array<std::atomic<u64>, 64> gb_groups_{}; ///< G-buffer members refused for groups (3): the groups that changed
     bool batch_on_ = false;
     u32 batch_ab_ = 0;
     std::vector<Vk::BatchDraw> batch_items_;

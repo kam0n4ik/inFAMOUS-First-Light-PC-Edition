@@ -2361,9 +2361,17 @@ std::string Backend::Report() {
         if (s.run_lean != 0 || s.run_own != 0) {
             out += fmt::format("engine runs' draws (SSPC_CITY_ENGINE_OPT): by their bindings only {}, recorded on their "
                                "own {} (of them a range not in video memory {}; geometry {}, descriptors {}, own range "
-                               "{}, user data {}; own ranges none/partial/all {})\n",
+                               "{}, user data {}, own textures/samplers {}; own ranges none/partial/all {})\n",
                                s.run_lean, s.run_own, s.run_not_resident, s.run_why[0], s.run_why[1], s.run_why[2],
-                               s.run_why[3], fmt::join(s.run_range, "/"));
+                               s.run_why[3], s.run_why[4], fmt::join(s.run_range, "/"));
+            if (s.run_sharp_images != 0 || s.run_sharp_samplers != 0 || s.run_why[4] != 0 || s.run_checked != 0) {
+                out += fmt::format("  their own textures (SSPC_CITY_GB_RUN_MATERIAL): images {}, samplers {} pushed; "
+                                   "members recorded on their own for them: not in the memo/not valid {}, another "
+                                   "layout {}, a target {}, writes pending {}; verify: members compared {} (differed "
+                                   "{})\n",
+                                   s.run_sharp_images, s.run_sharp_samplers, s.run_sharp_why[0], s.run_sharp_why[1],
+                                   s.run_sharp_why[2], s.run_sharp_why[3], s.run_checked, s.run_check_mismatches);
+            }
         }
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",

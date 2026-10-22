@@ -95,6 +95,98 @@ private:
     u64 t0_;
 };
 
+/// TexMemo's binding flags and key (BindStage; a run member's own textures - DrawRunMembers)
+u32 TexFlags(const GS::ImageBinding& im) {
+    return (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
+}
+u64 TexMemoKey(const std::array<u32, 8>& raw, u32 flags) {
+    u64 key = flags;
+    for (const u32 w : raw) {
+        key = (key ^ w) * 0x100000001B3ull;
+    }
+    return key;
+}
+
+/// The layout a draw reads a texture in (RecordDraw's barriers move it there outside rendering)
+VkImageLayout TextureLayout(const CachedImage* img) {
+    const bool storage =
+        (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) && img->gpu_written && img->current == VK_IMAGE_LAYOUT_GENERAL;
+    return storage ? VK_IMAGE_LAYOUT_GENERAL
+           : img->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+/// SSPC_CITY_GB_RUN_MATERIAL=verify: what a graphics binding refers to, a hash of its guest description (never 0)
+u64 HashWords(u64 h, const u32* w, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        h = (h ^ w[i]) * 0x100000001B3ull;
+    }
+    return h | 1;
+}
+/// ... the registers a stage reads through its flattened user data (a VS: not its vertex tables' or offsets' - the run's
+/// draws are recorded with the first one's there, CITY-OPT Phase 5)
+u32 FlatRegisters(const GS::StageView& st) {
+    const GS::ShaderReflection& refl = st.module->result.reflection;
+    const GS::FetchShader& fetch = refl.fetch;
+    u32 skip = 0;
+    for (const GS::FetchAttribute& at : fetch.attributes) {
+        skip |= at.sgpr_base + 1 < 16 ? 3u << at.sgpr_base : 0u;
+    }
+    if (fetch.sgpr_base < 16) {
+        skip &= ~(3u << fetch.sgpr_base); // (the fetch shader's own address: the same in every draw of a run)
+    }
+    skip |= fetch.vertex_offset_sgpr >= 0 && fetch.vertex_offset_sgpr < 16 ? 1u << fetch.vertex_offset_sgpr : 0u;
+    skip |= fetch.instance_offset_sgpr >= 0 && fetch.instance_offset_sgpr < 16 ? 1u << fetch.instance_offset_sgpr : 0u;
+    return refl.user_data_used & ~skip;
+}
+u64 FlatHash(const u32* flat, size_t n, u32 registers) {
+    u64 h = 0xF1A7;
+    for (u32 i = 0; i < 16 && i < n; ++i) {
+        h = (h ^ ((registers >> i) & 1 ? flat[i] : 0u)) * 0x100000001B3ull;
+    }
+    return n > 16 ? HashWords(h, flat + 16, n - 16) : h | 1;
+}
+u64 BufferHash(const GS::BufferBinding& b) {
+    const u32 w[] = {static_cast<u32>(b.kind), static_cast<u32>(b.address), static_cast<u32>(b.address >> 32),
+                     static_cast<u32>(b.size), static_cast<u32>(b.size >> 32), b.desc.raw[0], b.desc.raw[1],
+                     b.desc.raw[2], b.desc.raw[3], (b.written ? 1u : 0u) | (b.formatted ? 2u : 0u),
+                     static_cast<u32>(b.status)};
+    return HashWords(0xB0F, w, std::size(w));
+}
+u64 ImageHash(const GS::ImageBinding& im) {
+    const u32 w[] = {TexFlags(im), im.count, (im.fmask ? 1u : 0u) | (im.atomic ? 2u : 0u), static_cast<u32>(im.status)};
+    const u64 h = HashWords(0x1A6, w, std::size(w));
+    return im.status != GS::ResourceStatus::Ok ? h : HashWords(h, im.desc.raw.data(), 8); // (a null one: no T#)
+}
+u64 SamplerHash(const GS::SamplerBinding& sm) {
+    const GS::SamplerDesc d = sm.status != GS::ResourceStatus::Ok ? GS::SamplerDesc{} : sm.desc;
+    return HashWords(0x5A3, d.raw.data(), 4);
+}
+/// ... every binding of a stage's plan into `out` (by binding; a stage without a module is not bound - RecordDraw's
+/// has_ps: a draw without a pixel shader)
+void StageHashes(const GS::StageView& st, std::vector<u64>& out) {
+    if (st.module == nullptr) {
+        return;
+    }
+    const auto put = [&](u32 binding, u64 h) {
+        if (binding >= out.size()) {
+            out.resize(binding + 1, 0);
+        }
+        out[binding] = h;
+    };
+    const u32 registers = FlatRegisters(st);
+    for (const GS::BufferBinding& b : st.plan.buffers) {
+        put(b.binding, b.kind == GS::BufferKind::Flatbuf ? FlatHash(st.plan.flat.data(), st.plan.flat.size(), registers)
+                                                         : BufferHash(b));
+    }
+    for (const GS::ImageBinding& im : st.plan.images) {
+        put(im.binding, ImageHash(im));
+    }
+    for (const GS::SamplerBinding& sm : st.plan.samplers) {
+        put(sm.binding, SamplerHash(sm));
+    }
+}
+
 constexpr u32 kQuerySlots = 1024; ///< batches in flight stay far below
 constexpr u32 kProfBatches = 64, kProfPerBatch = 2048; ///< the profiler's pool: batch slots x timestamps
 /// P4.8 Performance Inspector: batch slots x timestamps at category changes (a batch has ~500 commands; the
@@ -2880,9 +2972,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     images_.ApplyPendingInvalidations(); // before the memo's dirty checks below
     const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
     const float lod = !compute && jitter_draw_ ? lod_bias_ : 0.0f;
-    const auto image_flags = [](const GS::ImageBinding& im) {
-        return (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
-    };
+    const auto image_flags = [](const GS::ImageBinding& im) { return TexFlags(im); };
     const auto sampler_desc = [](const GS::SamplerBinding& sm) {
         return sm.status != GS::ResourceStatus::Ok ? GS::SamplerDesc{} : sm.desc;
     };
@@ -3036,10 +3126,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         u64 memo_key = 0;
         TexMemo* memo = nullptr;
         if (memo_able) {
-            memo_key = flags;
-            for (const u32 w : im.desc.raw) {
-                memo_key = (memo_key ^ w) * 0x100000001B3ull;
-            }
+            memo_key = TexMemoKey(im.desc.raw, flags);
             auto& slot = tex_slot_[TexSlot(memo_key)];
             if (slot.second != nullptr && slot.first == memo_key) {
                 memo = slot.second;
@@ -5156,13 +5243,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     if (depth_img != nullptr && want(depth_img, depth_layout)) {
         need_transition = true;
     }
-    const auto texture_layout = [](const CachedImage* img) {
-        const bool storage = (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) && img->gpu_written &&
-                             img->current == VK_IMAGE_LAYOUT_GENERAL;
-        return storage ? VK_IMAGE_LAYOUT_GENERAL
-               : img->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    };
+    const auto texture_layout = [](const CachedImage* img) { return TextureLayout(img); };
     for (CachedImage* img : bound) {
         // a texture in another layout (rendered, uploaded, stored) needs its barrier outside rendering; one already
         // read in its layout does not (storage writes since are ordered by pending_writes_' global barrier)
@@ -5553,6 +5634,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
             // (push descriptors are updated binding by binding within one layout: a member pushes only its own)
             run_push_desc_ = pipe->push_descriptors && push_layout_ == pipe->layout &&
                              (!bind_shadow_ || desc_layout_ == pipe->layout);
+            run_feedback_ = feedback_any;
         }
     } else {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
@@ -5764,6 +5846,92 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
     const VkIndexType it = idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     std::vector<VkBuffer>& vbufs = scratch_.vbufs;
     std::vector<VkDeviceSize>& voffs = scratch_.voffs;
+    if (run_check_ < 0) {
+        // (any of the runs' verify modes: the frontend's check of a member's description, this one of its recording)
+        run_check_ = 0;
+        for (const char* name :
+             {"SSPC_CITY_GB_RUN_MATERIAL", "SSPC_CITY_ENGINE_OPT", "SSPC_CITY_ENGINE_GBUFFER_RUNS"}) {
+            char v[16] = {};
+            const DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+            run_check_ |= std::string_view(v, n < sizeof(v) ? n : 0) == "verify" ? 1 : 0;
+        }
+    }
+    const bool check = run_check_ == 1;
+    if (check) {
+        run_desc_.clear(); // (the run's first draw's: RecordDraw pushed them all)
+        StageHashes(vs, run_desc_);
+        if (pc.ps != nullptr) {
+            StageHashes(*pc.ps, run_desc_);
+        }
+    }
+    // a member's own views: the run's VS with its geometry, its registers and its own constant blocks, the run's PS
+    // with its registers, its own constant blocks (CITY-OPT Phase 6) and its own T#s / S#s (SSPC_CITY_GB_RUN_MATERIAL)
+    const auto own_views = [&](const Cp::RunMember& m) {
+        if (run_view_ == nullptr) {
+            run_view_ = std::make_unique<GS::StageView>();
+        }
+        *run_view_ = vs;
+        std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), run_view_->plan.flat.begin());
+        if (m.vs_flat_at != Cp::RunMember::kNoFlat &&
+            u64{m.vs_flat_at} + run_view_->plan.flat.size() <= member_flat.size()) {
+            std::copy_n(member_flat.begin() + m.vs_flat_at, run_view_->plan.flat.size(), run_view_->plan.flat.begin());
+        }
+        for (u32 i = 0; i < m.streams; ++i) {
+            GS::VertexBinding& v = run_view_->plan.vertices[i];
+            v.read = m.v[i].read;
+            v.desc.raw = m.v[i].desc;
+            v.address = m.v[i].address;
+            v.size = m.v[i].size;
+        }
+        for (u32 k = 0; k < m.buffers; ++k) {
+            GS::BufferBinding& bb = run_view_->plan.buffers[m.b[k].index];
+            bb.address = m.b[k].address;
+            bb.size = m.b[k].size;
+            bb.desc.raw = m.b[k].desc;
+        }
+        PreparedCommand p = pc;
+        p.stage = run_view_.get();
+        if (m.own_ps && pc.ps != nullptr) {
+            if (run_ps_view_ == nullptr) {
+                run_ps_view_ = std::make_unique<GS::StageView>();
+            }
+            *run_ps_view_ = *pc.ps;
+            GS::ResourceBindingPlan& plan = run_ps_view_->plan;
+            std::copy(m.ps_user_data.begin(), m.ps_user_data.end(), plan.flat.begin());
+            if (m.ps_flat_at != Cp::RunMember::kNoFlat && u64{m.ps_flat_at} + plan.flat.size() <= member_flat.size()) {
+                std::copy_n(member_flat.begin() + m.ps_flat_at, plan.flat.size(), plan.flat.begin());
+            }
+            for (u32 k = 0; k < m.ps_buffers; ++k) {
+                GS::BufferBinding& bb = plan.buffers[m.pb[k].index];
+                bb.address = m.pb[k].address;
+                bb.size = m.pb[k].size;
+                bb.desc.raw = m.pb[k].desc;
+            }
+            if (m.sharps_at != Cp::RunMember::kNoFlat &&
+                u64{m.sharps_at} + 8 * std::popcount(m.img_mask) + 4 * std::popcount(m.smp_mask) <= member_flat.size() &&
+                static_cast<size_t>(std::bit_width(m.img_mask)) <= plan.images.size() &&
+                static_cast<size_t>(std::bit_width(m.smp_mask)) <= plan.samplers.size()) {
+                const u32* at = member_flat.data() + m.sharps_at;
+                for (u32 mk = m.img_mask; mk != 0; mk &= mk - 1, at += 8) {
+                    std::copy_n(at, 8, plan.images[std::countr_zero(mk)].desc.raw.begin());
+                }
+                for (u32 mk = m.smp_mask; mk != 0; mk &= mk - 1, at += 4) {
+                    std::copy_n(at, 4, plan.samplers[std::countr_zero(mk)].desc.raw.begin());
+                }
+                p.material[1] = 0; // (GbBind: the run's material is not its)
+            }
+            p.ps = run_ps_view_.get();
+        }
+        return p;
+    };
+    const float lod = jitter_draw_ ? lod_bias_ : 0.0f; // (BindStage's for the run's first draw)
+    bool invalidations = false; // (ApplyPendingInvalidations before the members' own textures' memo checks)
+    // a member's own descriptors (written in full before each use)
+    constexpr size_t kMaxBufferWrites = 2 * (Cp::RunMember::kMaxBuffers + 1); // (VS and PS: buffers + flattened data)
+    constexpr size_t kMaxImageWrites = 2 * Cp::RunMember::kMaxSharpIndex;   // (its own images and samplers)
+    std::array<VkDescriptorBufferInfo, kMaxBufferWrites> infos;
+    std::array<VkDescriptorImageInfo, kMaxImageWrites> iinfos;
+    std::array<VkWriteDescriptorSet, kMaxBufferWrites + kMaxImageWrites> ws;
     for (const Cp::RunMember& m : members) {
         const u64 t0 = GS::Ticks();
         const u32 count = std::min(m.index_count, m.max_index_size);
@@ -5792,23 +5960,22 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
         }
         // its own constant blocks and user data (the shadow casters' instances): descriptors of their own, pushed over
         // the run's (the shadow of what this command buffer has pushed decides what is pushed)
-        u32 nw = 0;
-        constexpr size_t kMaxWrites = 2 * (Cp::RunMember::kMaxBuffers + 1); // (VS and PS: buffers + flattened data)
-        std::array<VkDescriptorBufferInfo, kMaxWrites> infos{};
-        std::array<VkWriteDescriptorSet, kMaxWrites> ws{};
+        u32 nw = 0, nb = 0, ni = 0;
         PushData push = push_last_;
+        if (check) {
+            run_check_own_.clear();
+        }
         if (lean && (m.buffers != 0 || m.own_user_data || m.own_ps)) {
             lean = run_push_desc_ && push_layout_ == run_layout_ && (!bind_shadow_ || desc_layout_ == run_layout_);
             stats_.run_why[1] += lean ? 0 : 1;
             const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
             const auto add = [&](u32 binding, VkBuffer buf, u64 offset, u64 range) {
-                infos[nw] = {buf, offset, range};
-                ws[nw] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                          .dstBinding = binding,
-                          .descriptorCount = 1,
-                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                          .pBufferInfo = &infos[nw]};
-                ++nw;
+                infos[nb] = {buf, offset, range};
+                ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                            .dstBinding = binding,
+                            .descriptorCount = 1,
+                            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            .pBufferInfo = &infos[nb++]};
             };
             // a stage's own constant blocks (the run's plan index, range, V#) at its bindings
             const auto own_buffers = [&](const GS::StageView& st, std::span<const Cp::RunMember::Buffer> own) {
@@ -5825,6 +5992,13 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                         }
                         add(st.plan.buffers[own[k].index].binding, buf, aligned,
                             std::min<u64>(own[k].size + adjust, avail + adjust));
+                        if (check) {
+                            GS::BufferBinding bb = st.plan.buffers[own[k].index];
+                            bb.address = own[k].address;
+                            bb.size = own[k].size;
+                            bb.desc.raw = own[k].desc;
+                            run_check_own_.push_back({bb.binding, BufferHash(bb)});
+                        }
                     }
                 }
             };
@@ -5847,6 +6021,100 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                         std::memcpy(sl.data, user_data.data(), user_data.size() * 4);
                     }
                     add(fb->binding, sl.buffer, sl.offset, bytes);
+                    if (check) { // (the bytes pushed, read back)
+                        run_check_own_.push_back({fb->binding, FlatHash(reinterpret_cast<const u32*>(sl.data),
+                                                                        st.plan.flat.size(), FlatRegisters(st))});
+                    }
+                }
+            };
+            // its own textures and samplers (SSPC_CITY_GB_RUN_MATERIAL): an image's view as BindStage's memo keeps it -
+            // valid as BindStage takes it, already in the layout the run's draw reads it in (no barrier inside
+            // rendering), not one of the targets -, an S#'s sampler as BindStage makes it
+            const auto own_sharps = [&](const GS::StageView& st) {
+                const u32 n_img = static_cast<u32>(std::popcount(m.img_mask));
+                const u32 n_smp = static_cast<u32>(std::popcount(m.smp_mask));
+                lean = m.sharps_at != Cp::RunMember::kNoFlat && regs_ != nullptr && st.module != nullptr &&
+                       u64{m.sharps_at} + 8 * n_img + 4 * n_smp <= member_flat.size() &&
+                       static_cast<size_t>(std::bit_width(m.img_mask)) <= st.plan.images.size() &&
+                       static_cast<size_t>(std::bit_width(m.smp_mask)) <= st.plan.samplers.size();
+                u32 why = ~0u;
+                if (lean && (run_feedback_ || pending_writes_)) {
+                    why = run_feedback_ ? 2 : 3;
+                    lean = false;
+                }
+                if (lean && n_img != 0 && !invalidations) {
+                    images_.ApplyPendingInvalidations(); // (as BindStage before its memo's checks)
+                    invalidations = true;
+                }
+                const u32* at = lean ? member_flat.data() + m.sharps_at : nullptr;
+                const u64 epoch = images_.Epoch();
+                for (u32 mk = m.img_mask; mk != 0 && lean; mk &= mk - 1, at += 8) {
+                    const GS::ImageBinding& im = st.plan.images[std::countr_zero(mk)];
+                    std::array<u32, 8> raw;
+                    std::copy_n(at, 8, raw.begin());
+                    const u32 flags = TexFlags(im);
+                    const u64 key = TexMemoKey(raw, flags);
+                    const TexMemo* memo = nullptr;
+                    if (const auto& slot = tex_slot_[TexSlot(key)]; slot.second != nullptr && slot.first == key) {
+                        memo = slot.second;
+                    } else if (const auto mi = tex_memo_.find(key); mi != tex_memo_.end()) {
+                        memo = &mi->second;
+                    }
+                    CachedImage* img = memo != nullptr ? memo->img : nullptr;
+                    if (img == nullptr || memo->epoch != epoch || memo->raw != raw || memo->flags != flags ||
+                        !((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written))) {
+                        why = 0; // (BindStage would find it, maybe upload it)
+                    } else if (img->current != TextureLayout(img)) {
+                        why = 1; // (a barrier first)
+                    } else if (std::ranges::find(scratch_.targets, img) != scratch_.targets.end()) {
+                        why = 2; // (the attachments in the general layout)
+                    } else {
+                        images_.Touch(*img, cur_.value); // what Find records
+                        iinfos[ni] = {VK_NULL_HANDLE, memo->view, img->current};
+                        ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstBinding = im.binding,
+                                    .descriptorCount = 1,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                    .pImageInfo = &iinfos[ni++]};
+                        if (check) {
+                            GS::ImageBinding ib = im;
+                            ib.desc.raw = raw;
+                            run_check_own_.push_back({im.binding, ImageHash(ib)});
+                        }
+                        continue;
+                    }
+                    lean = false;
+                }
+                const GS::ShaderReflection* refl = lean ? &st.module->result.reflection : nullptr;
+                const u64 border_base = lean ? u64{regs_->Get(kTaBcBase)} << 8 : 0;
+                for (u32 mk = m.smp_mask; mk != 0 && lean; mk &= mk - 1, at += 4) {
+                    const u32 i = static_cast<u32>(std::countr_zero(mk));
+                    GS::SamplerDesc desc;
+                    std::copy_n(at, 4, desc.raw.begin());
+                    const bool depth = i < refl->samplers.size() && refl->samplers[i].is_depth;
+                    VkSampler s = images_.Sampler(desc, depth, border_base, lod);
+                    if (s == VK_NULL_HANDLE) {
+                        s = images_.Sampler(GS::SamplerDesc{}, depth, 0); // the bridge's fallback: the default S#
+                    }
+                    iinfos[ni] = {s, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+                    ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .dstBinding = st.plan.samplers[i].binding,
+                                .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                                .pImageInfo = &iinfos[ni++]};
+                    if (check) {
+                        GS::SamplerBinding sb = st.plan.samplers[i];
+                        sb.desc = desc;
+                        run_check_own_.push_back({sb.binding, SamplerHash(sb)});
+                    }
+                }
+                stats_.run_why[4] += lean ? 0 : 1;
+                if (!lean && why < stats_.run_sharp_why.size()) {
+                    ++stats_.run_sharp_why[why];
+                }
+                if (lean) {
+                    stats_.run_sharp_images += n_img;
+                    stats_.run_sharp_samplers += n_smp;
                 }
             };
             own_buffers(vs, std::span(m.b.data(), m.buffers));
@@ -5860,6 +6128,9 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                 }
                 if (lean && m.own_ps_user_data) {
                     own_flat(*pc.ps, m.ps_user_data, m.ps_flat_at);
+                }
+                if (lean && (m.img_mask | m.smp_mask) != 0) {
+                    own_sharps(*pc.ps);
                 }
             }
             stats_.run_not_resident += lean ? 0 : 1;
@@ -5877,50 +6148,16 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
             d.vgt_index_offset = m.vgt_index_offset;
             d.changed = m.changed;
             d.user_data[static_cast<size_t>(Cp::Stage::Vs)] = m.vs_user_data;
-            if (run_view_ == nullptr) {
-                run_view_ = std::make_unique<GS::StageView>();
-            }
-            *run_view_ = vs;
-            std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), run_view_->plan.flat.begin());
-            if (m.vs_flat_at != Cp::RunMember::kNoFlat &&
-                u64{m.vs_flat_at} + run_view_->plan.flat.size() <= member_flat.size()) {
-                std::copy_n(member_flat.begin() + m.vs_flat_at, run_view_->plan.flat.size(), run_view_->plan.flat.begin());
-            }
-            for (u32 i = 0; i < m.streams; ++i) {
-                GS::VertexBinding& v = run_view_->plan.vertices[i];
-                v.read = m.v[i].read;
-                v.desc.raw = m.v[i].desc;
-                v.address = m.v[i].address;
-                v.size = m.v[i].size;
-            }
-            for (u32 k = 0; k < m.buffers; ++k) {
-                GS::BufferBinding& bb = run_view_->plan.buffers[m.b[k].index];
-                bb.address = m.b[k].address;
-                bb.size = m.b[k].size;
-                bb.desc.raw = m.b[k].desc;
-            }
-            PreparedCommand p = pc;
-            p.stage = run_view_.get();
             if (m.own_ps && pc.ps != nullptr) {
-                // (CITY-OPT Phase 6: its PS registers and constant blocks)
-                d.user_data[static_cast<size_t>(Cp::Stage::Ps)] = m.ps_user_data;
-                if (run_ps_view_ == nullptr) {
-                    run_ps_view_ = std::make_unique<GS::StageView>();
+                d.user_data[static_cast<size_t>(Cp::Stage::Ps)] = m.ps_user_data; // (CITY-OPT Phase 6)
+            }
+            const PreparedCommand p = own_views(m);
+            if (check) {
+                run_desc_.clear(); // (RecordDraw pushes them all)
+                StageHashes(*p.stage, run_desc_);
+                if (p.ps != nullptr) {
+                    StageHashes(*p.ps, run_desc_);
                 }
-                *run_ps_view_ = *pc.ps;
-                std::copy(m.ps_user_data.begin(), m.ps_user_data.end(), run_ps_view_->plan.flat.begin());
-                if (m.ps_flat_at != Cp::RunMember::kNoFlat &&
-                    u64{m.ps_flat_at} + run_ps_view_->plan.flat.size() <= member_flat.size()) {
-                    std::copy_n(member_flat.begin() + m.ps_flat_at, run_ps_view_->plan.flat.size(),
-                                run_ps_view_->plan.flat.begin());
-                }
-                for (u32 k = 0; k < m.ps_buffers; ++k) {
-                    GS::BufferBinding& bb = run_ps_view_->plan.buffers[m.pb[k].index];
-                    bb.address = m.pb[k].address;
-                    bb.size = m.pb[k].size;
-                    bb.desc.raw = m.pb[k].desc;
-                }
-                p.ps = run_ps_view_.get();
             }
             ++stats_.run_own;
             stencil_override_ = m.own_stencil;
@@ -5929,6 +6166,41 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
             RecordDraw(d, p, t0);
             stencil_override_ = false;
             continue;
+        }
+        if (check) {
+            // =verify: the bindings it is recorded with - those the run's draws before it left, its own over them -
+            // against those it has recorded on its own (its views)
+            for (const auto& [binding, h] : run_check_own_) {
+                if (binding >= run_desc_.size()) {
+                    run_desc_.resize(binding + 1, 0);
+                }
+                run_desc_[binding] = h;
+            }
+            const PreparedCommand p = own_views(m);
+            run_expect_.clear();
+            StageHashes(*p.stage, run_expect_);
+            if (p.ps != nullptr) {
+                StageHashes(*p.ps, run_expect_);
+            }
+            const size_t n = std::max(run_desc_.size(), run_expect_.size());
+            run_desc_.resize(n, 0);
+            run_expect_.resize(n, 0);
+            ++stats_.run_checked;
+            u32 differ = 0, first = 0;
+            for (u32 k = 0; k < n; ++k) {
+                if (run_desc_[k] != run_expect_[k]) {
+                    first = differ == 0 ? k : first;
+                    ++differ;
+                }
+            }
+            if (differ != 0) {
+                if (++stats_.run_check_mismatches <= 12) {
+                    SSPC_LOG(GPU, Warning, "SSPC_CITY_GB_RUN_MATERIAL=verify: run member at {:#x} (of the draw at {:#x}) "
+                                           "recorded with {} bindings that differ from its own (first: binding {})",
+                             m.packet_addr, lead.packet_addr, differ, first);
+                }
+                run_desc_.swap(run_expect_);
+            }
         }
         if (bind_shadow_ && vb_valid_ && vbufs == vb_last_ && voffs == vb_off_last_) {
             ++stats_.vb_binds_skipped;
@@ -5955,8 +6227,12 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                 }
                 DescShadow& sh = desc_shadow_[ws[k].dstBinding];
                 sh.valid = true;
-                sh.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                sh.buffer = infos[k];
+                sh.type = ws[k].descriptorType;
+                if (ws[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    sh.buffer = *ws[k].pBufferInfo;
+                } else {
+                    sh.image = *ws[k].pImageInfo;
+                }
             }
             stats_.desc_pushed += nw;
         }

@@ -103,7 +103,13 @@ struct ExecutorStats {
     u64 inst_no_pipeline = 0, inst_not_current = 0; ///< fallbacks: the patched pipeline not built yet / a block not current
     u64 zc_batches = 0, zc_draws = 0; ///< batches (draws) drawn from their ranges in video memory, nothing copied
     u64 run_lean = 0, run_own = 0, run_not_resident = 0; ///< SSPC_CITY_ENGINE_OPT: run members by bindings only / own
-    std::array<u64, 4> run_why{};   ///< ... not by bindings: geometry not resident, descriptors not pushed, own range, user data
+    /// ... not by bindings: geometry not resident, descriptors not pushed, own range, user data, own textures/samplers
+    std::array<u64, 5> run_why{};
+    /// SSPC_CITY_GB_RUN_MATERIAL: members' own textures / samplers pushed; members with them not by bindings: an image
+    /// not kept by the memo (or not valid), in another layout, a target (or the run's draw samples one), writes pending
+    u64 run_sharp_images = 0, run_sharp_samplers = 0;
+    std::array<u64, 4> run_sharp_why{};
+    u64 run_checked = 0, run_check_mismatches = 0; ///< ... =verify: members by bindings compared / that differed
     std::array<u64, 3> run_range{}; ///< ... own ranges by residency: none, partial, all
     /// SSPC_CITY_GEOMETRY_CACHE: batches drawn from their kept geometry, kept ones whose sources changed, geometry built
     /// (and its bytes), built into an arena (kept), arenas recycled
@@ -652,6 +658,13 @@ private:
     bool RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& offset, u64& avail);
     VkPipelineLayout run_layout_ = VK_NULL_HANDLE; ///< ... its pipeline's layout
     bool run_push_desc_ = false;                    ///< ... its descriptors pushed with the shadow (P4.7)
+    bool run_feedback_ = false; ///< ... it samples one of its targets (its attachments in the general layout)
+    /// SSPC_CITY_GB_RUN_MATERIAL=verify: what each graphics binding refers to (a hash of its guest description; 0: none)
+    /// as the run's draws left it - the first draw's, each member's own over it - and as a member recorded on its own
+    /// would have it (its views); -1 not read yet
+    int run_check_ = -1;
+    std::vector<u64> run_desc_, run_expect_;
+    std::vector<std::pair<u32, u64>> run_check_own_; ///< ... a member's own pushed (binding, hash)
     /// SSPC_CITY_GEOMETRY_CACHE=1: a batch's geometry kept in video memory (two arenas mapped through the BAR, recycled
     /// in turn once the GPU is done with the older one) by its exact composition, valid while its source ranges'
     /// buffer cache versions are those it was built from
