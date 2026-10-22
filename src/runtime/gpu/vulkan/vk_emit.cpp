@@ -2,6 +2,7 @@
 #include "runtime/gpu/vulkan/vk_emit.h"
 
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <new>
 #include <thread>
@@ -34,11 +35,15 @@ static_assert(sizeof(Header) == kHeader);
 
 Api g_real; ///< the driver's functions (the table as loaded)
 bool g_on = false;
+bool g_defer_more = false; ///< SSPC_VK_EMIT_DEFER (default on): barriers, render passes, copies, dispatches deferred too
 u8* g_ring = nullptr;
 thread_local bool t_producer = false;
 
 alignas(64) std::atomic_flag g_lock;      ///< the producers' ring (two of them may record at once)
 alignas(64) u64 g_wlocal = 0;             ///< under g_lock
+/// under g_lock: the emitter's position as last read (g_r moves after every entry - reading it for each command missed
+/// the cache on another core; it is read again only when the ring looks full)
+u64 g_rlocal = 0;
 alignas(64) std::atomic<u64> g_w{0};      ///< published to the emitter
 alignas(64) std::atomic<u64> g_r{0};      ///< passed to the driver
 alignas(64) std::atomic<u32> g_sleeping{0};
@@ -76,10 +81,13 @@ u8* Begin(ReplayFn fn, u64 payload) {
     u64 pos = g_wlocal;
     const u64 off = pos & (kRingBytes - 1);
     const u64 pad = off + total > kRingBytes ? kRingBytes - off : 0;
-    if (pos + pad + total - g_r.load(std::memory_order_acquire) > kRingBytes) {
-        Bump(g_full_waits);
-        while (pos + pad + total - g_r.load(std::memory_order_acquire) > kRingBytes) {
-            _mm_pause();
+    if (pos + pad + total - g_rlocal > kRingBytes) {
+        g_rlocal = g_r.load(std::memory_order_acquire);
+        if (pos + pad + total - g_rlocal > kRingBytes) {
+            Bump(g_full_waits);
+            while (pos + pad + total - (g_rlocal = g_r.load(std::memory_order_acquire)) > kRingBytes) {
+                _mm_pause();
+            }
         }
     }
     if (pad != 0) {
@@ -93,12 +101,12 @@ u8* Begin(ReplayFn fn, u64 payload) {
 }
 
 void Commit() {
+    g_deferred.store(g_deferred.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); // (under g_lock)
     g_w.store(g_wlocal, std::memory_order_seq_cst);
     g_lock.clear(std::memory_order_release);
     if (g_sleeping.load(std::memory_order_seq_cst) != 0) {
         g_w.notify_one();
     }
-    Bump(g_deferred);
 }
 
 /// A non-producer's call that may order with the producers' commands (a destroy): every published one passed on.
@@ -513,6 +521,234 @@ void VKAPI_CALL PushDescriptors(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPi
     Commit();
 }
 
+// ---- the recording commands with arrays (deep perf: a Sync each - per render pass, barrier and copy - kept the
+// producer waiting for the emitter hundreds of times a frame); their arrays copied into the entry
+
+/// A producer's command `M(cb, lead..., n, regions)` whose leading arguments are values and whose regions (T) have no
+/// pNext: the regions after the arguments. (Lead given, not deduced: a pack before other parameters.)
+template <auto M, class T, class... Lead>
+struct Regions {
+    using Args = std::tuple<VkCommandBuffer, Lead..., u32>;
+    static void Replay(const u8* p) {
+        const Args& a = *reinterpret_cast<const Args*>(p);
+        const T* r = reinterpret_cast<const T*>(p + ((sizeof(Args) + 7) & ~size_t{7}));
+        std::apply([&](auto... v) { (g_real.*M)(v..., r); }, a);
+    }
+    static void VKAPI_CALL Call(VkCommandBuffer cb, Lead... lead, u32 n, const T* r) {
+        if (!t_producer) {
+            FullSync();
+            (g_real.*M)(cb, lead..., n, r);
+            return;
+        }
+        u8* e = Begin(&Replay, ((sizeof(Args) + 7) & ~u64{7}) + sizeof(T) * n);
+        new (e) Args(cb, lead..., n);
+        if (n != 0) {
+            std::memcpy(e + ((sizeof(Args) + 7) & ~size_t{7}), r, sizeof(T) * n);
+        }
+        Commit();
+    }
+};
+
+// vkCmdBlitImage (regions, then the filter)
+void ReplayBlitImage(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto src = in.Get<VkImage>();
+    const auto sl = in.Get<VkImageLayout>();
+    const auto dst = in.Get<VkImage>();
+    const auto dl = in.Get<VkImageLayout>();
+    const auto filter = in.Get<VkFilter>();
+    const auto n = in.Get<u32>();
+    g_real.vkCmdBlitImage(cb, src, sl, dst, dl, n, in.Arr<VkImageBlit>(n), filter);
+}
+void VKAPI_CALL BlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, u32 n,
+                          const VkImageBlit* r, VkFilter filter) {
+    if (!t_producer) {
+        FullSync();
+        g_real.vkCmdBlitImage(cb, src, sl, dst, dl, n, r, filter);
+        return;
+    }
+    Out o{Begin(&ReplayBlitImage, Sz<VkCommandBuffer>() + 2 * Sz<VkImage>() + 2 * Sz<VkImageLayout>() + Sz<VkFilter>() +
+                                      Sz<u32>() + Sz<VkImageBlit>(n))};
+    o.Put(cb), o.Put(src), o.Put(sl), o.Put(dst), o.Put(dl), o.Put(filter), o.Put(n), o.Arr(r, n);
+    Commit();
+}
+
+// vkCmdClearColorImage / vkCmdClearDepthStencilImage (the value, then the ranges)
+template <class V, auto M>
+void ReplayClearImage(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto img = in.Get<VkImage>();
+    const auto layout = in.Get<VkImageLayout>();
+    const V* v = in.Arr<V>(1);
+    const auto n = in.Get<u32>();
+    (g_real.*M)(cb, img, layout, v, n, in.Arr<VkImageSubresourceRange>(n));
+}
+template <class V, auto M>
+void VKAPI_CALL ClearImage(VkCommandBuffer cb, VkImage img, VkImageLayout layout, const V* v, u32 n,
+                           const VkImageSubresourceRange* r) {
+    if (!t_producer) {
+        FullSync();
+        (g_real.*M)(cb, img, layout, v, n, r);
+        return;
+    }
+    Out o{Begin(&ReplayClearImage<V, M>, Sz<VkCommandBuffer>() + Sz<VkImage>() + Sz<VkImageLayout>() + Sz<V>() +
+                                             Sz<u32>() + Sz<VkImageSubresourceRange>(n))};
+    o.Put(cb), o.Put(img), o.Put(layout), o.Arr(v, 1), o.Put(n), o.Arr(r, n);
+    Commit();
+}
+
+// vkCmdUpdateBuffer (the data, at most 64 KiB)
+void ReplayUpdateBuffer(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto buf = in.Get<VkBuffer>();
+    const auto off = in.Get<VkDeviceSize>();
+    const auto size = in.Get<VkDeviceSize>();
+    g_real.vkCmdUpdateBuffer(cb, buf, off, size, in.Arr<u8>(size));
+}
+void VKAPI_CALL UpdateBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkDeviceSize size, const void* data) {
+    if (!t_producer) {
+        FullSync();
+        g_real.vkCmdUpdateBuffer(cb, buf, off, size, data);
+        return;
+    }
+    Out o{Begin(&ReplayUpdateBuffer, Sz<VkCommandBuffer>() + Sz<VkBuffer>() + 2 * Sz<VkDeviceSize>() + Sz<u8>(size))};
+    o.Put(cb), o.Put(buf), o.Put(off), o.Put(size), o.Arr(static_cast<const u8*>(data), size);
+    Commit();
+}
+
+// vkCmdClearAttachments (two arrays)
+void ReplayClearAttachments(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto n = in.Get<u32>();
+    const auto m = in.Get<u32>();
+    const VkClearAttachment* a = in.Arr<VkClearAttachment>(n);
+    g_real.vkCmdClearAttachments(cb, n, a, m, in.Arr<VkClearRect>(m));
+}
+void VKAPI_CALL ClearAttachments(VkCommandBuffer cb, u32 n, const VkClearAttachment* a, u32 m, const VkClearRect* r) {
+    if (!t_producer) {
+        FullSync();
+        g_real.vkCmdClearAttachments(cb, n, a, m, r);
+        return;
+    }
+    Out o{Begin(&ReplayClearAttachments,
+                Sz<VkCommandBuffer>() + 2 * Sz<u32>() + Sz<VkClearAttachment>(n) + Sz<VkClearRect>(m))};
+    o.Put(cb), o.Put(n), o.Put(m), o.Arr(a, n), o.Arr(r, m);
+    Commit();
+}
+
+// vkCmdPipelineBarrier2 (the three barrier arrays; any pNext: called at once after a Sync)
+void ReplayBarrier2(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto flags = in.Get<VkDependencyFlags>();
+    const auto nm = in.Get<u32>();
+    const auto nb = in.Get<u32>();
+    const auto ni = in.Get<u32>();
+    const VkMemoryBarrier2* m = in.Arr<VkMemoryBarrier2>(nm);
+    const VkBufferMemoryBarrier2* b = in.Arr<VkBufferMemoryBarrier2>(nb);
+    const VkImageMemoryBarrier2* i = in.Arr<VkImageMemoryBarrier2>(ni);
+    const VkDependencyInfo d{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                             .dependencyFlags = flags,
+                             .memoryBarrierCount = nm,
+                             .pMemoryBarriers = m,
+                             .bufferMemoryBarrierCount = nb,
+                             .pBufferMemoryBarriers = b,
+                             .imageMemoryBarrierCount = ni,
+                             .pImageMemoryBarriers = i};
+    g_real.vkCmdPipelineBarrier2(cb, &d);
+}
+template <class T>
+bool NoNext(const T* a, u32 n) {
+    for (u32 k = 0; k < n; ++k) {
+        if (a[k].pNext != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+void VKAPI_CALL Barrier2(VkCommandBuffer cb, const VkDependencyInfo* d) {
+    if (!t_producer) {
+        FullSync();
+        g_real.vkCmdPipelineBarrier2(cb, d);
+        return;
+    }
+    if (d->pNext != nullptr || !NoNext(d->pMemoryBarriers, d->memoryBarrierCount) ||
+        !NoNext(d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount) ||
+        !NoNext(d->pImageMemoryBarriers, d->imageMemoryBarrierCount)) {
+        Bump(g_fallbacks);
+        Sync();
+        g_real.vkCmdPipelineBarrier2(cb, d);
+        return;
+    }
+    Out o{Begin(&ReplayBarrier2, Sz<VkCommandBuffer>() + Sz<VkDependencyFlags>() + 3 * Sz<u32>() +
+                                     Sz<VkMemoryBarrier2>(d->memoryBarrierCount) +
+                                     Sz<VkBufferMemoryBarrier2>(d->bufferMemoryBarrierCount) +
+                                     Sz<VkImageMemoryBarrier2>(d->imageMemoryBarrierCount))};
+    o.Put(cb), o.Put(d->dependencyFlags), o.Put(d->memoryBarrierCount), o.Put(d->bufferMemoryBarrierCount),
+        o.Put(d->imageMemoryBarrierCount);
+    o.Arr(d->pMemoryBarriers, d->memoryBarrierCount);
+    o.Arr(d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount);
+    o.Arr(d->pImageMemoryBarriers, d->imageMemoryBarrierCount);
+    Commit();
+}
+
+// vkCmdBeginRendering (the colour attachments, then depth / stencil when present; any pNext: at once after a Sync)
+void ReplayBeginRendering(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto flags = in.Get<VkRenderingFlags>();
+    const auto area = in.Get<VkRect2D>();
+    const auto layers = in.Get<u32>();
+    const auto view_mask = in.Get<u32>();
+    const auto nc = in.Get<u32>();
+    const auto has = in.Get<u32>(); // (1 depth, 2 stencil)
+    const VkRenderingAttachmentInfo* c = in.Arr<VkRenderingAttachmentInfo>(nc);
+    const VkRenderingAttachmentInfo* depth = (has & 1) != 0 ? in.Arr<VkRenderingAttachmentInfo>(1) : nullptr;
+    const VkRenderingAttachmentInfo* stencil = (has & 2) != 0 ? in.Arr<VkRenderingAttachmentInfo>(1) : nullptr;
+    const VkRenderingInfo ri{.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                             .flags = flags,
+                             .renderArea = area,
+                             .layerCount = layers,
+                             .viewMask = view_mask,
+                             .colorAttachmentCount = nc,
+                             .pColorAttachments = c,
+                             .pDepthAttachment = depth,
+                             .pStencilAttachment = stencil};
+    g_real.vkCmdBeginRendering(cb, &ri);
+}
+void VKAPI_CALL BeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
+    if (!t_producer) {
+        FullSync();
+        g_real.vkCmdBeginRendering(cb, ri);
+        return;
+    }
+    if (ri->pNext != nullptr || !NoNext(ri->pColorAttachments, ri->colorAttachmentCount) ||
+        (ri->pDepthAttachment != nullptr && ri->pDepthAttachment->pNext != nullptr) ||
+        (ri->pStencilAttachment != nullptr && ri->pStencilAttachment->pNext != nullptr)) {
+        Bump(g_fallbacks);
+        Sync();
+        g_real.vkCmdBeginRendering(cb, ri);
+        return;
+    }
+    const u32 has = (ri->pDepthAttachment != nullptr ? 1u : 0u) | (ri->pStencilAttachment != nullptr ? 2u : 0u);
+    Out o{Begin(&ReplayBeginRendering, Sz<VkCommandBuffer>() + Sz<VkRenderingFlags>() + Sz<VkRect2D>() + 4 * Sz<u32>() +
+                                           Sz<VkRenderingAttachmentInfo>(ri->colorAttachmentCount + std::popcount(has)))};
+    o.Put(cb), o.Put(ri->flags), o.Put(ri->renderArea), o.Put(ri->layerCount), o.Put(ri->viewMask),
+        o.Put(ri->colorAttachmentCount), o.Put(has);
+    o.Arr(ri->pColorAttachments, ri->colorAttachmentCount);
+    if ((has & 1) != 0) {
+        o.Arr(ri->pDepthAttachment, 1);
+    }
+    if ((has & 2) != 0) {
+        o.Arr(ri->pStencilAttachment, 1);
+    }
+    Commit();
+}
+
 } // namespace
 
 void Sync() {
@@ -566,6 +802,70 @@ bool Install(Api& f) {
     SSPC_EMIT_SCALAR(vkCmdSetRasterizerDiscardEnable)
     SSPC_EMIT_SCALAR(vkCmdSetLineWidth)
     SSPC_EMIT_SCALAR(vkCmdSetPrimitiveRestartEnable)
+    // deep perf (SSPC_VK_EMIT_DEFER=0: off, as before): the other recording commands deferred too - each was a Sync
+    // (the producer waiting for the emitter to catch up) per render pass, barrier, copy and dispatch
+    char d[4] = {};
+    g_defer_more = GetEnvironmentVariableA("SSPC_VK_EMIT_DEFER", d, sizeof(d)) == 0 || d[0] != '0';
+    if (g_defer_more) {
+        SSPC_EMIT_SCALAR(vkCmdResetQueryPool)
+        SSPC_EMIT_SCALAR(vkCmdBeginQuery)
+        SSPC_EMIT_SCALAR(vkCmdEndQuery)
+        SSPC_EMIT_SCALAR(vkCmdCopyQueryPoolResults)
+        SSPC_EMIT_SCALAR(vkCmdWriteTimestamp2)
+        SSPC_EMIT_SCALAR(vkCmdEndRendering)
+        SSPC_EMIT_SCALAR(vkCmdDrawIndirect)
+        SSPC_EMIT_SCALAR(vkCmdDrawIndexedIndirect)
+        SSPC_EMIT_SCALAR(vkCmdDispatch)
+        SSPC_EMIT_SCALAR(vkCmdDispatchIndirect)
+        SSPC_EMIT_SCALAR(vkCmdFillBuffer)
+        SSPC_EMIT_SCALAR(vkCmdWriteBufferMarkerAMD)
+        f.vkCmdCopyBuffer = &Regions<&Api::vkCmdCopyBuffer, VkBufferCopy, VkBuffer, VkBuffer>::Call;
+        f.vkCmdCopyBufferToImage =
+            &Regions<&Api::vkCmdCopyBufferToImage, VkBufferImageCopy, VkBuffer, VkImage, VkImageLayout>::Call;
+        f.vkCmdCopyImageToBuffer =
+            &Regions<&Api::vkCmdCopyImageToBuffer, VkBufferImageCopy, VkImage, VkImageLayout, VkBuffer>::Call;
+        f.vkCmdCopyImage =
+            &Regions<&Api::vkCmdCopyImage, VkImageCopy, VkImage, VkImageLayout, VkImage, VkImageLayout>::Call;
+        f.vkCmdResolveImage =
+            &Regions<&Api::vkCmdResolveImage, VkImageResolve, VkImage, VkImageLayout, VkImage, VkImageLayout>::Call;
+        f.vkCmdBlitImage = &BlitImage;
+        f.vkCmdClearColorImage = &ClearImage<VkClearColorValue, &Api::vkCmdClearColorImage>;
+        f.vkCmdClearDepthStencilImage = &ClearImage<VkClearDepthStencilValue, &Api::vkCmdClearDepthStencilImage>;
+        f.vkCmdUpdateBuffer = &UpdateBuffer;
+        f.vkCmdClearAttachments = &ClearAttachments;
+        f.vkCmdPipelineBarrier2 = &Barrier2;
+        f.vkCmdBeginRendering = &BeginRendering;
+    } else {
+#define SSPC_EMIT_SYNC_OLD(name)                                                                                       \
+    if (f.name != nullptr) {                                                                                           \
+        f.name = &Synced<&Api::name, PFN_##name>::Call;                                                                \
+    }
+        SSPC_EMIT_SYNC_OLD(vkCmdResetQueryPool)
+        SSPC_EMIT_SYNC_OLD(vkCmdBeginQuery)
+        SSPC_EMIT_SYNC_OLD(vkCmdEndQuery)
+        SSPC_EMIT_SYNC_OLD(vkCmdCopyQueryPoolResults)
+        SSPC_EMIT_SYNC_OLD(vkCmdWriteTimestamp2)
+        SSPC_EMIT_SYNC_OLD(vkCmdClearAttachments)
+        SSPC_EMIT_SYNC_OLD(vkCmdPipelineBarrier2)
+        SSPC_EMIT_SYNC_OLD(vkCmdBeginRendering)
+        SSPC_EMIT_SYNC_OLD(vkCmdEndRendering)
+        SSPC_EMIT_SYNC_OLD(vkCmdDrawIndirect)
+        SSPC_EMIT_SYNC_OLD(vkCmdDrawIndexedIndirect)
+        SSPC_EMIT_SYNC_OLD(vkCmdDispatch)
+        SSPC_EMIT_SYNC_OLD(vkCmdDispatchIndirect)
+        SSPC_EMIT_SYNC_OLD(vkCmdCopyBuffer)
+        SSPC_EMIT_SYNC_OLD(vkCmdCopyBufferToImage)
+        SSPC_EMIT_SYNC_OLD(vkCmdCopyImageToBuffer)
+        SSPC_EMIT_SYNC_OLD(vkCmdCopyImage)
+        SSPC_EMIT_SYNC_OLD(vkCmdBlitImage)
+        SSPC_EMIT_SYNC_OLD(vkCmdClearColorImage)
+        SSPC_EMIT_SYNC_OLD(vkCmdClearDepthStencilImage)
+        SSPC_EMIT_SYNC_OLD(vkCmdFillBuffer)
+        SSPC_EMIT_SYNC_OLD(vkCmdUpdateBuffer)
+        SSPC_EMIT_SYNC_OLD(vkCmdResolveImage)
+        SSPC_EMIT_SYNC_OLD(vkCmdWriteBufferMarkerAMD)
+#undef SSPC_EMIT_SYNC_OLD
+    }
 #undef SSPC_EMIT_SCALAR
     f.vkCmdPushConstants = &PushConstants;
     f.vkCmdBindVertexBuffers = &BindVertexBuffers;
@@ -594,34 +894,10 @@ bool Install(Api& f) {
     SSPC_EMIT_SYNC(vkAllocateCommandBuffers)
     SSPC_EMIT_SYNC(vkBeginCommandBuffer)
     SSPC_EMIT_SYNC(vkEndCommandBuffer)
-    SSPC_EMIT_SYNC(vkCmdResetQueryPool)
-    SSPC_EMIT_SYNC(vkCmdBeginQuery)
-    SSPC_EMIT_SYNC(vkCmdEndQuery)
-    SSPC_EMIT_SYNC(vkCmdCopyQueryPoolResults)
-    SSPC_EMIT_SYNC(vkCmdWriteTimestamp2)
-    SSPC_EMIT_SYNC(vkCmdClearAttachments)
-    SSPC_EMIT_SYNC(vkCmdPipelineBarrier2)
-    SSPC_EMIT_SYNC(vkCmdBeginRendering)
-    SSPC_EMIT_SYNC(vkCmdEndRendering)
     SSPC_EMIT_SYNC(vkCmdBindVertexBuffers2)
-    SSPC_EMIT_SYNC(vkCmdDrawIndirect)
-    SSPC_EMIT_SYNC(vkCmdDrawIndexedIndirect)
-    SSPC_EMIT_SYNC(vkCmdDispatch)
-    SSPC_EMIT_SYNC(vkCmdDispatchIndirect)
-    SSPC_EMIT_SYNC(vkCmdCopyBuffer)
-    SSPC_EMIT_SYNC(vkCmdCopyBufferToImage)
-    SSPC_EMIT_SYNC(vkCmdCopyImageToBuffer)
-    SSPC_EMIT_SYNC(vkCmdCopyImage)
-    SSPC_EMIT_SYNC(vkCmdBlitImage)
-    SSPC_EMIT_SYNC(vkCmdClearColorImage)
-    SSPC_EMIT_SYNC(vkCmdClearDepthStencilImage)
-    SSPC_EMIT_SYNC(vkCmdFillBuffer)
-    SSPC_EMIT_SYNC(vkCmdUpdateBuffer)
-    SSPC_EMIT_SYNC(vkCmdResolveImage)
     SSPC_EMIT_SYNC(vkCmdBeginDebugUtilsLabelEXT)
     SSPC_EMIT_SYNC(vkCmdEndDebugUtilsLabelEXT)
     SSPC_EMIT_SYNC(vkCmdSetCheckpointNV)
-    SSPC_EMIT_SYNC(vkCmdWriteBufferMarkerAMD)
 #undef SSPC_EMIT_SYNC
     // the objects the ring may name, and the pools its command buffers come from: from any thread, after it
 #define SSPC_EMIT_ORDERED(name)                                                                                        \
@@ -661,8 +937,10 @@ std::string Report() {
     if (!g_on) {
         return {};
     }
-    return fmt::format("emitter thread: {} commands deferred, {} syncs ({} waited, {:.0f} ms), ring full {} times, "
+    return fmt::format("emitter thread ({}): {} commands deferred, {} syncs ({} waited, {:.0f} ms), ring full {} times, "
                        "called at once (extension data) {}",
+                       g_defer_more ? "barriers, render passes, copies, dispatches deferred too"
+                                    : "per-draw commands only (SSPC_VK_EMIT_DEFER=0)",
                        g_deferred.load(), g_syncs.load(), g_sync_waits.load(),
                        static_cast<double>(g_sync_ticks.load()) / 3.0e6, g_full_waits.load(), g_fallbacks.load());
 }

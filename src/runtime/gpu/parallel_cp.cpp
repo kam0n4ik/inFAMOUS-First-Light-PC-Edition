@@ -260,6 +260,18 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
                  geofast_ != 0 ? ", takes the geometry-only ones from the draw before" : "",
                  runs_ != 0 ? " and builds the runs" : "", us);
     }
+    u64 ring = fthread_mode_ ? kSlots : 1024;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_CP_RING", v, sizeof(v)) > 0) {
+        ring = std::bit_ceil(std::clamp<u64>(std::strtoull(v, nullptr, 10), 64, kSlots));
+    }
+    slot_mask_ = ring - 1;
+    depth_limit_ = ring;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_CP_QUEUE_DEPTH", v, sizeof(v)) > 0) {
+        depth_limit_ = std::clamp<u64>(std::strtoull(v, nullptr, 10), 16, ring);
+    }
+    SSPC_LOG(GPU, Info, "parallel CP: a ring of {} records (SSPC_CP_RING), at most {} queued ahead of thread 2 "
+                        "(SSPC_CP_QUEUE_DEPTH), {} bytes a record",
+             ring, depth_limit_, sizeof(Record));
     // (front mode too: the hook's frontend invalidations reach the frontend thread as events of the next record -
     // Backend::FrontendInvalidate - in stream order)
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
@@ -337,10 +349,10 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
         R6::Bump(R6::Count().run_closed_by[static_cast<u32>(kind) & (R6::kKinds - 1)]); // (R6-P diagnostics)
     }
     CloseRun(); // (a held run's first draw goes before any other record)
-    if (next_ - head_.load(std::memory_order_acquire) >= kSlots) {
-        WaitHead(next_ - kSlots + 1, true, kWhyFull); // backpressure: the oldest slot executed
+    if (next_ - head_.load(std::memory_order_acquire) >= depth_limit_) {
+        WaitHead(next_ - depth_limit_ + 1, true, kWhyFull); // backpressure: the oldest slot executed
     }
-    Record& r = slots_[next_ & (kSlots - 1)];
+    Record& r = slots_[next_ & slot_mask_];
     r.kind = kind;
     r.front_memo = pending_front_memo_; // (frontend thread: told before it prepares this record)
     pending_front_memo_ = false;
@@ -356,7 +368,7 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
 }
 
 void ParallelCp::PushRecord(bool keep_journal_end) {
-    Record& r = slots_[next_ & (kSlots - 1)];
+    Record& r = slots_[next_ & slot_mask_];
     if (!keep_journal_end) {
         r.journal_end = jtail_; // every register write of the stream before the record
     }
@@ -808,7 +820,7 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
         frontend_->MemoryGeneration() != geofast_gen_) {
         return no(1);
     }
-    const Record& p = slots_[(index - 1) & (kSlots - 1)];
+    const Record& p = slots_[(index - 1) & slot_mask_];
     if (p.kind != Kind::Draw || !p.prepared || !p.prep.ready || p.state == nullptr || p.stage_shared != nullptr ||
         p.ps_shared != nullptr) {
         return no(2);
@@ -1330,6 +1342,7 @@ void ParallelCp::ApplyDeferred(u64 before) {
 // ---- P5.3D: the frontend thread (between thread 1 and thread 2)
 
 void ParallelCp::FrontApplyJournal(u64 end) {
+    R8_CP_PROF(CpProfile::Sec::Journal);
     u64 pos = fjhead_.load(std::memory_order_relaxed);
     while (pos < end) {
         const u32* w = JournalAt(pos);
@@ -1426,6 +1439,7 @@ void ParallelCp::ApplyFrontEvents(u64 upto) {
 
 bool ParallelCp::FrontTryJoin(Record& r, u64 index) {
     (void)index;
+    R8_CP_PROF(CpProfile::Sec::JoinRun);
     if (r.kind != Kind::Draw || r.memory_changed || r.front_memo || r.run_barrier || !RunTagged(r.draw) ||
         !JoinRun(r.draw, freplica_)) {
         return false;
@@ -1444,7 +1458,7 @@ void ParallelCp::FrontCloseRun(u64 upto) {
         return;
     }
     f_run_open_ = false;
-    const Record& r = slots_[f_run_lead_ & (kSlots - 1)];
+    const Record& r = slots_[f_run_lead_ & slot_mask_];
     if (!r.members.empty()) {
         geofast_prev_ = ~0ull; // (the draw before the next one is the run's last, not this record's)
         run_count_.store(run_count_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -1514,10 +1528,13 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
 
 void ParallelCp::FrontLoop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuFrontend");
+    R8_CP_PROF_THREAD(Front);
     u64 k = fhead_.load(std::memory_order_relaxed);
     for (;;) {
         u64 t = tail_.load(std::memory_order_acquire);
+        R8_CP_PROF_FRAME_POLL(); // (R8 profiler: the processor's frame moved on - the frontend's row so far is that frame's)
         if (t == k && f_run_open_) {
+            R8_CP_PROF(CpProfile::Sec::T2Idle); // (a held run waiting for its next member)
             // front mode: a held run never waits blocked - published when thread 1 waits for thread 2 (a drain,
             // backpressure: no record comes before thread 2 got further) or after f_hold_ticks_ without a record
             const u64 w0 = __rdtsc();
@@ -1532,6 +1549,7 @@ void ParallelCp::FrontLoop() {
             Bump(fc_.idle, __rdtsc() - w0);
         }
         if (t == k) {
+            R8_CP_PROF(CpProfile::Sec::T2Idle); // (the frontend thread waiting for records)
             const u64 w0 = __rdtsc();
             while (t == k && __rdtsc() - w0 < spin_ticks_) {
                 _mm_pause();
@@ -1549,7 +1567,7 @@ void ParallelCp::FrontLoop() {
             Bump(fc_.idle, __rdtsc() - w0);
         }
         const u64 b0 = __rdtsc();
-        Record& r = slots_[k & (kSlots - 1)];
+        Record& r = slots_[k & slot_mask_];
         const bool stop = r.kind == Kind::Stop;
         if (!stop && !failed_.load(std::memory_order_relaxed)) {
             try {
@@ -1627,7 +1645,7 @@ void ParallelCp::Loop() {
         }
         R8_CP_PROF_FRAME_POLL();
         const u64 b0 = __rdtsc();
-        Record& r = slots_[h & (kSlots - 1)];
+        Record& r = slots_[h & slot_mask_];
         const bool stop = r.kind == Kind::Stop;
         const u16 kind = static_cast<u16>(r.kind); // (before Execute: a record is not touched by thread 1 until head_ moves)
         const u64 queue = r.kind == Kind::Dispatch ? r.dispatch.queue : 0; // (P5.4: the guest queue in the trace)
@@ -1804,7 +1822,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     batch_items_.push_back({&r.draw, pc});
                     batch_end_ = 0;
                     while (batch_items_.size() < kMaxBatch && index + batch_items_.size() < avail) {
-                        Record& f = slots_[(index + batch_items_.size()) & (kSlots - 1)];
+                        Record& f = slots_[(index + batch_items_.size()) & slot_mask_];
                         if (f.kind != Kind::Draw || !f.prepared || f.memory_changed || !f.members.empty()) {
                             break;
                         }
@@ -1822,7 +1840,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     for (u64 k = 1; k <= extra; ++k) {
                         // each draw's registers (only theirs changed: VS user data, index, draw parameters); not
                         // recorded as one: each on its own after its registers, as Execute does it
-                        ApplyJournal(slots_[(index + k) & (kSlots - 1)].journal_end);
+                        ApplyJournal(slots_[(index + k) & slot_mask_].journal_end);
                         if (!one) {
                             exec_.DrawPrepared(*batch_items_[k].draw, batch_items_[k].prepared);
                         }
@@ -1836,11 +1854,11 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                         if (fthread_mode_) {
                             // front mode: the members' own records (published with this one, right after it) - their
                             // registers now, one step for thread 2 instead of a record each
-                            while (index + 1 + extra < avail && slots_[(index + 1 + extra) & (kSlots - 1)].joined) {
+                            while (index + 1 + extra < avail && slots_[(index + 1 + extra) & slot_mask_].joined) {
                                 ++extra;
                             }
                             if (extra != 0) {
-                                ApplyJournal(slots_[(index + extra) & (kSlots - 1)].journal_end);
+                                ApplyJournal(slots_[(index + extra) & slot_mask_].journal_end);
                             }
                         }
                         if (r.members.capacity() > 32) {
@@ -1944,7 +1962,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
         const bool joined = tagged && JoinRun(draw, cp_->Registers());
         if (srt_diag_ && tagged) {
             // (Phase 6 diagnostics: a member's cost, and the cost of an attempt that did not join)
-            SrtDiag& sd = srt_by_[slots_[next_ & (kSlots - 1)].draw.engine_run & 3];
+            SrtDiag& sd = srt_by_[slots_[next_ & slot_mask_].draw.engine_run & 3];
             Bump(joined ? sd.t_join : sd.t_refused, __rdtsc() - tj);
             Bump(joined ? sd.joins : sd.refusals);
         }
@@ -1986,7 +2004,7 @@ void ParallelCp::CloseRun() {
         return;
     }
     run_open_ = false;
-    Record& r = slots_[next_ & (kSlots - 1)];
+    Record& r = slots_[next_ & slot_mask_];
     if (!r.members.empty()) {
         geofast_prev_ = ~0ull; // (the draw before the next one is the run's last, not this record's)
         run_count_.store(run_count_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);

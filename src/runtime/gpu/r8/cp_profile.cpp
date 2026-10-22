@@ -267,9 +267,9 @@ struct Row {
 constexpr u32 kMaxFrames = 8192;
 
 struct Store {
-    std::unique_ptr<Row[]> rows[2]; ///< [0] the processor's thread, [1] the recording thread
-    Row total[2]{};                 ///< the whole run (also past the ring)
-    std::array<u64, kSections> incl[2]{};
+    std::unique_ptr<Row[]> rows[3]; ///< [0] the processor's thread, [1] the recording thread, [2] the frontend thread
+    Row total[3]{};                 ///< the whole run (also past the ring)
+    std::array<u64, kSections> incl[3]{};
     std::once_flag once;
 };
 Store g_store;
@@ -480,11 +480,12 @@ void FrameEnd() {
 void FramePollSlow() {
     ThreadAcc& t = t_acc;
     const u32 g = g_cp_frame.load(std::memory_order_acquire);
-    if (g == t.frame || t.role != static_cast<u8>(Role::Record)) {
+    if (g == t.frame || t.role == static_cast<u8>(Role::Cp)) {
         return;
     }
-    Row& row = g_store.rows[1][t.frame % kMaxFrames];
-    Flush(t, row, g_store.total[1], g_store.incl[1]);
+    const u32 ri = t.role == static_cast<u8>(Role::Front) ? 2 : 1;
+    Row& row = g_store.rows[ri][t.frame % kMaxFrames];
+    Flush(t, row, g_store.total[ri], g_store.incl[ri]);
     row.frame = t.frame;
     t.frame = g;
 }
@@ -664,7 +665,8 @@ u32 SumWindow(u32 role, double from, double to, Row& out) {
     return n;
 }
 
-std::string Table(const Row& w, u32 frames, bool t2) {
+std::string Table(const Row& w, u32 frames, u32 role) {
+    const bool t2 = role != 0;
     const double f = std::max<double>(frames, 1);
     const double ms_per_tick = 1000.0 / Freq();
     const auto ms = [&](u64 ticks) { return static_cast<double>(ticks) * ms_per_tick / f; };
@@ -682,7 +684,10 @@ std::string Table(const Row& w, u32 frames, bool t2) {
     std::string out = fmt::format(
         "  {}: wall {:.2f} ms/frame = busy {:.2f} (compute {:.2f}, sync {:.2f}, wait {:.2f}) + idle {:.2f}; markers "
         "{:.0f}/frame (est. cost {:.2f} ms/frame at {:.0f} ticks a pair){}\n",
-        t2 ? "thread 2 (SecondSonPC:GpuRecord)" : "thread 1 (SecondSonPC:GpuNative)", ms(wall), ms(busy),
+        role == 2 ? "frontend thread (SecondSonPC:GpuFrontend)"
+        : t2      ? "thread 2 (SecondSonPC:GpuRecord)"
+                  : "thread 1 (SecondSonPC:GpuNative)",
+        ms(wall), ms(busy),
         ms(by_cls[0]), ms(by_cls[1]), ms(by_cls[2]), ms(by_cls[3]), static_cast<double>(pairs) / f,
         ms(static_cast<u64>(static_cast<double>(pairs) * g_pair_ticks)), g_pair_ticks,
         w.overflow != 0 ? fmt::format(", stack overflows {}", w.overflow) : std::string{});
@@ -810,22 +815,32 @@ std::string Report() {
     const u32 n1 = SumWindow(0, from, to, w);
     out += fmt::format(" window {:.0f}..{:.0f} s: {} frames\n", from, to, n1);
     if (n1 != 0) {
-        out += Table(w, n1, false);
+        out += Table(w, n1, 0);
         if (g_mode == 2) {
             out += CensusText(w.census, n1);
         }
         Row w2{};
         const u32 n2 = SumWindow(1, from, to, w2);
-        out += Table(w2, std::max(n2, 1u), true);
+        out += Table(w2, std::max(n2, 1u), 1);
+        Row w3{};
+        if (const u32 n3 = SumWindow(2, from, to, w3); n3 != 0) {
+            bool any = false; // (the frontend thread runs in front mode only)
+            for (u32 k = 0; k < kSections; ++k) {
+                any |= w3.self[k] != 0;
+            }
+            if (any) {
+                out += Table(w3, std::max(n3, 1u), 2);
+            }
+        }
     }
     const u32 frames = g_cp_frame.load(std::memory_order_acquire);
     out += fmt::format(" whole run: {} frames\n", frames);
     if (frames != 0) {
-        out += Table(g_store.total[0], frames, false);
+        out += Table(g_store.total[0], frames, 0);
         if (g_mode == 2) {
             out += CensusText(g_store.total[0].census, frames);
         }
-        out += Table(g_store.total[1], frames, true);
+        out += Table(g_store.total[1], frames, 1);
         // inclusive times of the outer sections (whole run)
         out += "  inclusive (whole run, ms/frame):";
         for (const Sec s : {Sec::Packets, Sec::JoinRun, Sec::ParDraw, Sec::PrepDraw, Sec::GeoFast, Sec::CbGds,

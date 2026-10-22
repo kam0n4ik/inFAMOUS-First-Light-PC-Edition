@@ -54,7 +54,7 @@ inline bool On() {
     return g_mode != 0;
 }
 
-enum class Role : u8 { None = 0, Cp = 1, Record = 2 };
+enum class Role : u8 { None = 0, Cp = 1, Record = 2, Front = 3 }; ///< Front: the frontend thread (front mode)
 
 /// The sections. Thread 1's first, thread 2's after T2Idle; a section's class (compute / sync / wait / idle) is in the
 /// report's table (cp_profile.cpp kInfo).

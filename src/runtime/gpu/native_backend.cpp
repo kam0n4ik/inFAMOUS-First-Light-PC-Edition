@@ -2232,6 +2232,9 @@ std::string Backend::Report() {
     if (parallel_) {
         out += parallel_->Report();
     }
+    if (std::string e = Vk::Emit::Report(); !e.empty()) {
+        out += e + "\n";
+    }
     if (executor_) {
         const auto& s = executor_->Stats();
         out += fmt::format("the processor's other callbacks (P4.10): {} calls, {:.0f} ms; recording {:.0f} ms; draws/"

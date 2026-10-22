@@ -539,8 +539,12 @@ private:
     };
     std::unordered_map<u64, TexMemo, U64Hash> tex_memo_;
     /// P4.9: tex_memo_'s entries looked up last, direct-mapped by key (never erased: the pointers stay valid) - the map's
-    /// hashing on every texture of every draw was ~1.1% of the GPU thread (village); SSPC_P49_LOOKUP_MEMO=0: off
-    std::array<std::pair<u64, TexMemo*>, 256> tex_slot_{};
+    /// hashing on every texture of every draw was ~1.1% of the GPU thread (village); SSPC_P49_LOOKUP_MEMO=0: off.
+    /// 2048 slots: the city binds thousands of textures a frame - with 256 most lookups missed into the map (deep-perf
+    /// ETW: its hashing 2.6% of the recording thread)
+    static constexpr u32 kTexSlots = 2048;
+    static size_t TexSlot(u64 key) { return static_cast<size_t>((key * 0x9E3779B97F4A7C15ull) >> 53); }
+    std::array<std::pair<u64, TexMemo*>, kTexSlots> tex_slot_{};
     struct StreamSeen {
         u64 hash = 0, flip = 0;
     };

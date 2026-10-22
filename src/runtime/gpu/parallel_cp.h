@@ -414,6 +414,13 @@ private:
     Cp::CommandProcessor* cp_ = nullptr;
     Cp::RegisterFile replica_;
     const u64 spin_ticks_;
+    /// Records thread 1 may have queued ahead of thread 2 (SSPC_CP_QUEUE_DEPTH, at most the ring): a deep queue's
+    /// prepared records are cold in the caches by the time thread 2 takes them, and a drain waits for all of them
+    u64 depth_limit_ = kSlots;
+    /// The slots in use, less one (SSPC_CP_RING; 1024 - front mode 8192): every record takes the next slot, so a ring
+    /// larger than the queue ever gets cycles through cold memory (the 8192 of front mode cost the default 2 ms of
+    /// thread 1 - deep perf)
+    u64 slot_mask_ = kSlots - 1;
     const bool async_, async_copies_, verify_;
     const bool async_writes_, async_gds_only_;
     bool async_acquire_ = false;
@@ -523,7 +530,7 @@ private:
     /// `regs`: the registers at the joining draw's packet (the processor's, or the frontend thread's replica)
     bool JoinRun(const Cp::DrawDescriptor& d, const Cp::RegisterFile& regs);
     /// The held run's first draw and whether one is held - thread 1's, or with the frontend thread that thread's
-    Record& RunLead() { return slots_[(fthread_mode_ ? f_run_lead_ : next_) & (kSlots - 1)]; }
+    Record& RunLead() { return slots_[(fthread_mode_ ? f_run_lead_ : next_) & slot_mask_]; }
     bool RunHeld() const { return fthread_mode_ ? f_run_open_ : run_open_; }
     // Fork port (front mode: SSPC_P53_FRONTEND_THREAD=1 with SSPC_CITY_ENGINE_OPT): thread 1 only parses the packets and
     // publishes every draw; the frontend thread prepares them (GEOFAST included) and builds the runs - a held run's

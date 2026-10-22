@@ -2887,7 +2887,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             for (const u32 w : im.desc.raw) {
                 memo_key = (memo_key ^ w) * 0x100000001B3ull;
             }
-            auto& slot = tex_slot_[GS::LookupMemoSlot(memo_key)];
+            auto& slot = tex_slot_[TexSlot(memo_key)];
             if (slot.second != nullptr && slot.first == memo_key) {
                 memo = slot.second;
                 if (GS::LookupMemoVerify()) {
