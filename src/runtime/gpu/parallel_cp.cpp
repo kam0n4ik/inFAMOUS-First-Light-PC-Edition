@@ -404,6 +404,8 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
     R8_CP_PROF(full ? (why == kWhyJournal ? CpProfile::Sec::WaitJournal : CpProfile::Sec::WaitFull) : CpProfile::Drain(why));
     const u64 h0 = h;
     const u64 t0 = __rdtsc();
+    // (R8: a full queue while the frontend thread holds a run - filed apart below)
+    const bool held = full && fthread_mode_ && f_hold_lead_.load(std::memory_order_relaxed) != 0;
     if (fthread_mode_) {
         f_flush_.store(1, std::memory_order_seq_cst); // (front mode: a run the frontend thread holds is published now)
     }
@@ -429,6 +431,10 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
     if (full) {
         t1_.t1_full_ticks += ticks;
         ++t1_.t1_full_waits;
+        if (held) {
+            t1_full_held_.store(t1_full_held_.load(std::memory_order_relaxed) + ticks, std::memory_order_relaxed);
+            t1_full_held_n_.store(t1_full_held_n_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        }
     } else {
         t1_.t1_drain_ticks += ticks;
         if (why < t1_.drain_ticks_by.size()) {
@@ -1513,6 +1519,7 @@ void ParallelCp::FrontCloseRun(u64 upto) {
         return;
     }
     f_run_open_ = false;
+    f_hold_lead_.store(0, std::memory_order_relaxed);
     const Record& r = slots_[f_run_lead_ & slot_mask_];
     if (!r.members.empty()) {
         geofast_prev_ = ~0ull; // (the draw before the next one is the run's last, not this record's)
@@ -1552,6 +1559,7 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
             // front mode: held - the tagged draws after it may join (fhead_ stays at it until the run is complete)
             f_run_open_ = true;
             f_run_lead_ = index;
+            f_hold_lead_.store(index + 1, std::memory_order_relaxed);
             run_gen_ = frontend_->MemoryGeneration();
             run_leaders_.store(run_leaders_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         }
@@ -1676,7 +1684,10 @@ void ParallelCp::Loop() {
     for (;;) {
         u64 t = source.load(std::memory_order_acquire);
         if (t == h) {
-            R8_CP_PROF(CpProfile::Sec::T2Idle);
+            // (R8: a wait at the first draw of a run the frontend thread holds - it is still joining the members - filed
+            // apart; read at the wait's start)
+            const bool held = fthread_mode_ && f_hold_lead_.load(std::memory_order_relaxed) == h + 1;
+            R8_CP_PROF(held ? CpProfile::Sec::T2IdleHeld : CpProfile::Sec::T2Idle);
             const u64 w0 = __rdtsc();
             while (t == h && __rdtsc() - w0 < spin_ticks_) {
                 _mm_pause();
@@ -1694,6 +1705,10 @@ void ParallelCp::Loop() {
             }
             const u64 w1 = __rdtsc();
             add(t2_idle_, w1 - w0);
+            if (held) {
+                add(t2_idle_held_, w1 - w0);
+                add(t2_idle_held_n_, 1);
+            }
             // P4.12: waited for record h - thread 1 pushed it at push_tsc_[h] (deep), the wake-up is the rest
             StallTrace::Span(StallTrace::Ev::RecordWait, w0, w1, push_tsc_ != nullptr ? push_tsc_[h & (kRecRing - 1)] : 0,
                              static_cast<u32>(h));
@@ -2998,6 +3013,12 @@ std::string ParallelCp::Report() const {
                            f_run_closed_flush_.load(std::memory_order_relaxed),
                            static_cast<double>(f_hold_ticks_) * 1e6 / static_cast<double>(Kernel::Clock::TscFrequency()),
                            f_run_closed_idle_.load(std::memory_order_relaxed));
+        out += fmt::format("  R8 waits for a held run: thread 2 at its first draw {:.0f} ms ({} times); thread 1's full "
+                           "queue while a run was held {:.0f} ms ({} times)\n",
+                           ms(t2_idle_held_.load(std::memory_order_relaxed)),
+                           t2_idle_held_n_.load(std::memory_order_relaxed),
+                           ms(t1_full_held_.load(std::memory_order_relaxed)),
+                           t1_full_held_n_.load(std::memory_order_relaxed));
     }
     if (geofast_ != 0) {
         out += fmt::format("  CITY-OPT geometry-only draw preparations (SSPC_CITY_GEOFAST): taken {}, verified {} "

@@ -139,6 +139,7 @@ constexpr std::array<Info, kSections> MakeInfo() {
     set(Sec::FrontNativeDecode, "frontend native G-buffer: flat from the CUE state, DecodeResources", Cls::Compute);
     set(Sec::FrontNativeKey, "frontend native G-buffer: specialization key, variant, EndOf", Cls::Compute);
     set(Sec::JoinPsPlan, "JoinRun: a G-buffer member's PS plan from its CUE state (no walk)", Cls::Compute);
+    set(Sec::T2IdleHeld, "T2 idle: at a held run's first draw (the frontend joining)", Cls::Idle);
     return a;
 }
 constexpr std::array<Info, kSections> kInfo = MakeInfo();

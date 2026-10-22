@@ -546,6 +546,10 @@ private:
     alignas(64) std::atomic<u32> f_flush_{0};
     u64 f_hold_ticks_ = 0; ///< how long the frontend thread keeps a run held with no record to join (then publishes)
     std::atomic<u64> f_run_joined_{0}, f_run_closed_idle_{0}, f_run_closed_flush_{0};
+    /// R8: the held run's first draw's record + 1 (0: none held) - the frontend thread writes it; thread 2 and thread 1
+    /// read it only to file their waits (a wait at the held run's first draw, a full queue while a run is held)
+    alignas(64) std::atomic<u64> f_hold_lead_{0};
+    std::atomic<u64> t2_idle_held_{0}, t2_idle_held_n_{0}, t1_full_held_{0}, t1_full_held_n_{0}; ///< TSC ticks, waits
     /// The frontend thread: record `index` (its registers applied) joins the held run - true: it is a journal record now
     bool FrontTryJoin(Record& r, u64 index);
     /// The frontend thread: the held run is complete - every record before `upto` published to thread 2
