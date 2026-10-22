@@ -27,6 +27,7 @@
 namespace SecondSon::Gpu {
 
 namespace GDR = NativeEngine::Reconstructed::GBufferDraw;
+namespace GS = Gpu::Shader;
 
 class NativeGBuffer {
 public:
@@ -47,8 +48,8 @@ public:
     /// verify: compare the engine descriptors `d` of a draw with the SRT walk's plans; count matches and mismatches.
     /// A descriptor matches when some binding of the walk's plan holds the same V# (value match - the walk resolves
     /// the same bytes the engine supplied). `vs` / `ps` are the draw's VS / PS resource plans.
-    void Verify(const GDR::DrawDescription& d, const Shader::ResourceBindingPlan& vs,
-                const Shader::ResourceBindingPlan& ps);
+    void Verify(const GDR::DrawDescription& d, const GS::ResourceBindingPlan& vs,
+                const GS::ResourceBindingPlan& ps);
 
     std::string Report() const;
 

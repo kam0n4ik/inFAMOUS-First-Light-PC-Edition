@@ -18,13 +18,13 @@ std::string EnvA(const char* name) {
 }
 
 /// A walk binding holds this V# (its raw four dwords) - a buffer, a vertex stream's read V#, anywhere in the plan.
-bool PlanHasBuffer(const Shader::ResourceBindingPlan& p, const std::array<u32, 4>& v) {
-    for (const Shader::BufferBinding& b : p.buffers) {
+bool PlanHasBuffer(const GS::ResourceBindingPlan& p, const std::array<u32, 4>& v) {
+    for (const GS::BufferBinding& b : p.buffers) {
         if (b.desc.raw == v) {
             return true;
         }
     }
-    for (const Shader::VertexBinding& vb : p.vertices) {
+    for (const GS::VertexBinding& vb : p.vertices) {
         if (vb.read == v || vb.desc.raw == v) {
             return true;
         }
@@ -55,8 +55,8 @@ NativeGBuffer::NativeGBuffer() {
              v, mode_ == Mode::Verify ? " - verify: built and compared with the SRT walk, the walk is used" : "");
 }
 
-void NativeGBuffer::Verify(const GDR::DrawDescription& d, const Shader::ResourceBindingPlan& vs,
-                           const Shader::ResourceBindingPlan& ps) {
+void NativeGBuffer::Verify(const GDR::DrawDescription& d, const GS::ResourceBindingPlan& vs,
+                           const GS::ResourceBindingPlan& ps) {
     bool all = true;
     for (u32 i = 0; i < d.count && i < GDR::kMaxDescResources; ++i) {
         const GDR::DescResource& e = d.res[i];
