@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <thread>
@@ -21,7 +22,9 @@ namespace SecondSon::Gpu::Vk::Emit {
 
 namespace {
 
-constexpr u64 kRingBytes = 16ull << 20; ///< power of two
+/// The ring's size, a power of two: 16 MiB, SSPC_VK_EMIT_RING_MB=<1..16> (deep perf R8: the queue's footprint - a
+/// smaller one stays in the caches the emitter reads it from)
+u64 g_ring_bytes = 16ull << 20;
 constexpr u64 kHeader = 16;
 
 using ReplayFn = void (*)(const u8* payload);
@@ -36,8 +39,13 @@ static_assert(sizeof(Header) == kHeader);
 Api g_real; ///< the driver's functions (the table as loaded)
 bool g_on = false;
 bool g_defer_more = false; ///< SSPC_VK_EMIT_DEFER (default on): barriers, render passes, copies, dispatches deferred too
+/// SSPC_VK_EMIT_BATCH=1 (deep perf R8, off by default): a producer that asked (EnableBatching) publishes its entries to
+/// the emitter at Publish - once a record - not after each command. Each publish is a store to g_w, the line the
+/// emitter reads while it waits: one move of that line between the cores a command (~53 000 a frame in the city).
+bool g_batch = false;
 u8* g_ring = nullptr;
 thread_local bool t_producer = false;
+thread_local bool t_batching = false, t_pending = false; ///< ... this producer batches / has entries not published
 
 alignas(64) std::atomic_flag g_lock;      ///< the producers' ring (two of them may record at once)
 alignas(64) u64 g_wlocal = 0;             ///< under g_lock
@@ -49,6 +57,7 @@ alignas(64) std::atomic<u64> g_r{0};      ///< passed to the driver
 alignas(64) std::atomic<u32> g_sleeping{0};
 
 std::atomic<u64> g_deferred{0}, g_syncs{0}, g_sync_waits{0}, g_sync_ticks{0}, g_full_waits{0}, g_fallbacks{0};
+std::atomic<u64> g_publishes{0}; ///< SSPC_VK_EMIT_BATCH: Publish's stores (under g_lock)
 
 void Bump(std::atomic<u64>& a, u64 v = 1) {
     a.fetch_add(v, std::memory_order_relaxed);
@@ -79,13 +88,18 @@ u8* Begin(ReplayFn fn, u64 payload) {
     }
     const u64 total = (kHeader + payload + 15) & ~u64{15};
     u64 pos = g_wlocal;
-    const u64 off = pos & (kRingBytes - 1);
-    const u64 pad = off + total > kRingBytes ? kRingBytes - off : 0;
-    if (pos + pad + total - g_rlocal > kRingBytes) {
+    const u64 off = pos & (g_ring_bytes - 1);
+    const u64 pad = off + total > g_ring_bytes ? g_ring_bytes - off : 0;
+    if (pos + pad + total - g_rlocal > g_ring_bytes) {
         g_rlocal = g_r.load(std::memory_order_acquire);
-        if (pos + pad + total - g_rlocal > kRingBytes) {
+        if (pos + pad + total - g_rlocal > g_ring_bytes) {
             Bump(g_full_waits);
-            while (pos + pad + total - (g_rlocal = g_r.load(std::memory_order_acquire)) > kRingBytes) {
+            // (SSPC_VK_EMIT_BATCH: what is not published yet - every entry before this one is complete under the lock)
+            g_w.store(g_wlocal, std::memory_order_seq_cst);
+            if (g_sleeping.load(std::memory_order_seq_cst) != 0) {
+                g_w.notify_one();
+            }
+            while (pos + pad + total - (g_rlocal = g_r.load(std::memory_order_acquire)) > g_ring_bytes) {
                 _mm_pause();
             }
         }
@@ -94,7 +108,7 @@ u8* Begin(ReplayFn fn, u64 payload) {
         *reinterpret_cast<Header*>(g_ring + off) = {nullptr, pad};
         pos += pad;
     }
-    u8* h = g_ring + (pos & (kRingBytes - 1));
+    u8* h = g_ring + (pos & (g_ring_bytes - 1));
     *reinterpret_cast<Header*>(h) = {fn, total};
     g_wlocal = pos + total;
     return h + kHeader;
@@ -102,6 +116,11 @@ u8* Begin(ReplayFn fn, u64 payload) {
 
 void Commit() {
     g_deferred.store(g_deferred.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); // (under g_lock)
+    if (t_batching) { // (published at Publish, or by another producer's commit)
+        t_pending = true;
+        g_lock.clear(std::memory_order_release);
+        return;
+    }
     g_w.store(g_wlocal, std::memory_order_seq_cst);
     g_lock.clear(std::memory_order_release);
     if (g_sleeping.load(std::memory_order_seq_cst) != 0) {
@@ -136,7 +155,7 @@ void Loop() {
             }
         }
         while (r < w) {
-            const u8* e = g_ring + (r & (kRingBytes - 1));
+            const u8* e = g_ring + (r & (g_ring_bytes - 1));
             const Header& h = *reinterpret_cast<const Header*>(e);
             if (h.fn != nullptr) {
                 h.fn(e + kHeader);
@@ -751,10 +770,27 @@ void VKAPI_CALL BeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
 
 } // namespace
 
+void Publish() {
+    if (!t_pending) {
+        return;
+    }
+    t_pending = false;
+    while (g_lock.test_and_set(std::memory_order_acquire)) {
+        _mm_pause();
+    }
+    g_w.store(g_wlocal, std::memory_order_seq_cst);
+    g_publishes.store(g_publishes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); // (under g_lock)
+    g_lock.clear(std::memory_order_release);
+    if (g_sleeping.load(std::memory_order_seq_cst) != 0) {
+        g_w.notify_one();
+    }
+}
+
 void Sync() {
     if (!g_on) {
         return;
     }
+    Publish(); // (this producer's entries not published yet)
     // every producer's entries, not only this thread's: the two producers hand their command buffers to each other
     // (and to the submissions) - what the other one put in the ring goes before this call
     Bump(g_syncs);
@@ -765,12 +801,24 @@ void SetProducerThread() {
     t_producer = true;
 }
 
+bool EnableBatching() {
+    t_batching = g_on && g_batch && t_producer;
+    return t_batching;
+}
+
 bool Install(Api& f) {
     char e[8] = {};
     if (GetEnvironmentVariableA("SSPC_VK_EMIT_THREAD", e, sizeof(e)) != 1 || e[0] != '1') {
         return false;
     }
-    g_ring = static_cast<u8*>(VirtualAlloc(nullptr, kRingBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    char rs[8] = {};
+    if (GetEnvironmentVariableA("SSPC_VK_EMIT_RING_MB", rs, sizeof(rs)) > 0) {
+        const u64 mb = std::strtoull(rs, nullptr, 10);
+        if (mb >= 1 && mb <= 16) {
+            g_ring_bytes = std::bit_floor(mb) << 20; // (a power of two)
+        }
+    }
+    g_ring = static_cast<u8*>(VirtualAlloc(nullptr, g_ring_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (g_ring == nullptr) {
         SSPC_LOG(GPU, Warning, "emitter thread: no memory for its ring - not used");
         return false;
@@ -925,11 +973,13 @@ bool Install(Api& f) {
     SSPC_EMIT_ORDERED(vkDestroyPipeline)
 #undef SSPC_EMIT_ORDERED
     g_on = true;
+    char b[4] = {};
+    g_batch = GetEnvironmentVariableA("SSPC_VK_EMIT_BATCH", b, sizeof(b)) == 1 && b[0] == '1';
     std::thread(Loop).detach();
     SSPC_LOG(GPU, Warning,
              "EXPERIMENT: SSPC_VK_EMIT_THREAD=1 - the per-draw Vulkan commands of the command processor's and the "
-             "recording thread are passed to the driver by the emitter thread ({} MiB ring)",
-             kRingBytes >> 20);
+             "recording thread are passed to the driver by the emitter thread ({} MiB ring){}",
+             g_ring_bytes >> 20, g_batch ? "; SSPC_VK_EMIT_BATCH=1 - the recording thread's published once a record" : "");
     return true;
 }
 
@@ -938,11 +988,14 @@ std::string Report() {
         return {};
     }
     return fmt::format("emitter thread ({}): {} commands deferred, {} syncs ({} waited, {:.0f} ms), ring full {} times, "
-                       "called at once (extension data) {}",
+                       "called at once (extension data) {}{}",
                        g_defer_more ? "barriers, render passes, copies, dispatches deferred too"
                                     : "per-draw commands only (SSPC_VK_EMIT_DEFER=0)",
                        g_deferred.load(), g_syncs.load(), g_sync_waits.load(),
-                       static_cast<double>(g_sync_ticks.load()) / 3.0e6, g_full_waits.load(), g_fallbacks.load());
+                       static_cast<double>(g_sync_ticks.load()) / 3.0e6, g_full_waits.load(), g_fallbacks.load(),
+                       g_batch ? fmt::format("; SSPC_VK_EMIT_BATCH: the recording thread's published {} times",
+                                             g_publishes.load())
+                               : std::string{});
 }
 
 } // namespace SecondSon::Gpu::Vk::Emit

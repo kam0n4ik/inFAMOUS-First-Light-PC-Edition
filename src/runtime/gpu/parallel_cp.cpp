@@ -1669,6 +1669,7 @@ void ParallelCp::Loop() {
     StallTrace::RegisterThread(StallTrace::Role::Record);
     R8_CP_PROF_THREAD(Record);
     Vk::Emit::SetProducerThread();
+    Vk::Emit::EnableBatching(); // (SSPC_VK_EMIT_BATCH=1: its commands handed to the emitter once a record)
     const bool trace_records = StallTrace::DeepRecords();
     u64 h = head_.load(std::memory_order_relaxed);
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
@@ -1725,6 +1726,7 @@ void ParallelCp::Loop() {
             if (lazy) {
                 exec_.ServeKeptBack();
             }
+            Vk::Emit::Publish(); // (before the record is published as executed: thread 1 may use the executor then)
             if (rec_value_ != nullptr) {
                 for (u64 k = 0; k <= extra; ++k) {
                     rec_value_[(h + k) & (kRecRing - 1)].store(exec_.RecordedValue(), std::memory_order_relaxed);

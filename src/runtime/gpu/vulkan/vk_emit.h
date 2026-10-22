@@ -26,6 +26,12 @@ bool Install(Api& f);
 /// The calling thread records into the backend's command buffers: its per-draw commands go through the ring.
 void SetProducerThread();
 
+/// A producer, SSPC_VK_EMIT_BATCH=1: its commands are handed to the emitter at Publish (and at any Sync, and when the
+/// ring is full), not each one as it is put in the ring. true: on for this thread.
+bool EnableBatching();
+/// A batching producer: what it put in the ring since its last publish handed to the emitter (nothing: no cost).
+void Publish();
+
 /// A producer: returns once every command it put in the ring was passed to the driver (before anything that records
 /// into its command buffers by other means - the upscalers' own Vulkan calls). Elsewhere: nothing.
 void Sync();
