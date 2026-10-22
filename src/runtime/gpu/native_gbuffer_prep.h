@@ -61,14 +61,15 @@ public:
     }
 
     /// guarded / native: prepare `d` from the engine record `e` and a template (see above) into `prep`, `state`, `vs`,
-    /// `ps`. false: the full path (the reason is counted). `epoch`: the frontend's program cache epoch.
-    bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch,
+    /// `ps`. false: the full path (the reason is counted). `epoch`: the frontend's program cache epoch; `targets`: a
+    /// hash of the draw's colour/depth target registers (the register file's group hashes).
+    bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch, u64 targets,
                  GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state, GS::StageView& vs,
                  GS::StageView& ps);
 
     /// After `d`'s full preparation (`prep`, `state`, its VS/PS views): keep it as its key's template; `check` (verify:
     /// every draw, guarded: its samples) builds the draw from `e` as Prepare would and compares it with the walk's.
-    void AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch,
+    void AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch, u64 targets,
                    const GS::DrawPreparation& prep, const GS::GraphicsPipelineState* state, const GS::StageView& vs,
                    const GS::StageView& ps, bool check);
 
@@ -96,34 +97,42 @@ private:
     struct Key {
         u64 vs = 0, ps = 0;    ///< program addresses
         u64 pipeline_key = 0;  ///< the processor's hash of every pipeline-group register
-        u32 targets = 0;       ///< the processor's targets version
+        u64 targets = 0;       ///< the colour/depth target registers' hash (runtime parameters and pipeline read them)
         u64 vs_layout = 0, ps_layout = 0;
         bool operator==(const Key&) const = default;
     };
-    struct Template {
-        Key key;
-        u64 epoch = 0;
+    /// One full preparation of a key: its modules (specialized on the plans' descriptors: a material's texture types
+    /// select another module of the same programs), fetch shader and pipeline.
+    struct Variant {
         GS::DrawPreparation prep;
         const GS::GraphicsPipelineState* state = nullptr;
         GS::StageView vs, ps; ///< the heads (their plans are each draw's)
         u64 fetch = 0;        ///< the VS fetch shader's address (user data at the fetch registers)
         u32 fetch_reg = 0xff;
     };
+    static constexpr u32 kVariants = 4;
+    struct Template {
+        Key key;
+        u64 epoch = 0;
+        std::array<Variant, kVariants> v;
+        u32 n = 0, next = 0; ///< variants filled; the one a new variant replaces when all are
+    };
+    static constexpr size_t kMaxTemplates = 8192; ///< (more keys: all dropped, made again)
 
     static void Bump(std::atomic<u64>& c, u64 n = 1) {
         c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); // (one writer thread)
     }
-    static Key KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e);
+    static Key KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 targets);
     static u64 HashOf(const Key& k);
     static u64 FetchOf(const GS::StageView& vs, std::span<const u32, 16> ud, u32& reg);
 
     /// The map of `v`'s stage for CUE state `sh` (made on first use). nullptr: the view has no first module yet.
     const StageMap* MapOf(const GS::StageView& v, const GDR::StageShadow& sh);
     void MakeMap(StageMap& m, const GS::Module& first, const GDR::StageShadow& sh);
-    /// `out` = `head`'s stage for this draw, its plan from the CUE state `sh` through `m`. false (`why`): another
-    /// specialization or other bindings than the head's module (the full path).
+    /// `out` = `head`'s stage for this draw, its plan from the CUE state `sh` through `m`, `key` its specialization
+    /// (the module it needs). false: the head's module is not ready.
     bool BuildStage(const GS::StageView& head, const StageMap& m, const GDR::StageShadow& sh,
-                    std::span<const u32, 16> ud, GS::StageView& out, u32& why);
+                    std::span<const u32, 16> ud, GS::StageView& out, GS::SpecializationKey& key);
     /// verify: `built` against the walk's `full`, binding by binding; counts by part, logs the first ones. true: same.
     bool Compare(const GS::StageView& full, const GS::StageView& built, u32 stage);
 
@@ -133,14 +142,14 @@ private:
     std::unordered_map<u64, std::unique_ptr<StageMap>> maps_;
     std::unordered_map<u64, Template> templates_;
     std::vector<std::array<u32, 4>> vreads_;
-    GS::SpecializationKey key_;
+    GS::SpecializationKey key_vs_, key_ps_;
     GS::StageView check_vs_, check_ps_; ///< verify: the engine builds compared with the walk's
 
     std::atomic<u64> draws_{0}, with_record_{0}, no_record_{0};
     std::atomic<u64> taken_{0};            ///< prepared from the engine (guarded / native)
     std::array<std::atomic<u64>, 12> refused_{}; ///< by reason (Report)
     std::array<std::atomic<u64>, 8> map_why_{};  ///< maps made, by StageMap::why (0: ok)
-    std::atomic<u64> templates_made_{0};
+    std::atomic<u64> templates_made_{0}, variants_made_{0}, templates_dropped_{0};
     // verify / guarded checks: stages compared, the same, different by part (flat, buffers, images, samplers,
     // vertices, heads)
     std::atomic<u64> compared_{0}, same_{0};

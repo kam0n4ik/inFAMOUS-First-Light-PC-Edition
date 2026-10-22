@@ -1007,14 +1007,18 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     namespace DR = Engine::Render::DrawRuns;
     const DR::EngineDraw* engine = nullptr;
     bool ngb_check = false;
+    u64 ngb_targets = 0;
     if (ngb_.On() && r.draw.engine_run == static_cast<u8>(DR::Source::GBuffer)) {
+        // (the colour/depth target registers, which the stages' runtime parameters and the pipeline read: by content)
+        ngb_targets = (regs.GroupHash(Cp::Group::ColorTarget) * 0x9E3779B97F4A7C15ull) ^
+                      regs.GroupHash(Cp::Group::DepthTarget);
         engine = r.draw.engine_native_present ? DR::EngineDescPeek(r.draw.engine_native) : nullptr;
         ngb_.NoteRecord(engine != nullptr);
         ngb_check = engine != nullptr && (ngb_.mode() == NativeGBuffer::Mode::Verify || ngb_.SampleCheck());
         if (engine != nullptr && ngb_.Takes() && !ngb_check) {
             R8_CP_PROF_ENTER(CpProfile::Sec::FrontNative);
-            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->Programs().Epoch(), r.prep, r.state, r.stage,
-                                         r.ps) &&
+            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->Programs().Epoch(), ngb_targets, r.prep, r.state,
+                                         r.stage, r.ps) &&
                             DR::EngineDescStill(r.draw.engine_native); // (the slot not reused while it was read)
             R8_CP_PROF_LEAVE();
             if (ok) {
@@ -1076,7 +1080,8 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         R8_CP_PROF(CpProfile::Sec::FrontNative);
         const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
         const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
-        ngb_.AfterFull(r.draw, *engine, frontend_->Programs().Epoch(), r.prep, r.state, dv, dp, ngb_check);
+        ngb_.AfterFull(r.draw, *engine, frontend_->Programs().Epoch(), ngb_targets, r.prep, r.state, dv, dp,
+                       ngb_check);
     }
     if (srt_diag_) {
         // (a view not copied is the frontend's current one)
