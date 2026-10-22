@@ -249,6 +249,22 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
                                 "members with their own PS constant buffers (CITY-OPT Phase 6)", g);
         }
     }
+    // SSPC_NATIVE_GBUFFER (ngb_ reads the environment itself): the verify / guarded modes build the native preparation
+    // into this scratch record to compare it with the full one. The G-buffer draws must be tagged (engine_run), which
+    // needs SSPC_CITY_ENGINE_GBUFFER_RUNS (the preset has it) or SSPC_DIAG_ENGINE_SRT.
+    if (ngb_.On()) {
+        if (frontend_ == nullptr) {
+            SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER ignored: no frontend (not the native backend)");
+        } else {
+            if (ngb_.mode() != NativeGBuffer::Mode::Native) {
+                ngb_check_ = std::make_unique<Record>();
+            }
+            if (gruns_ == 0) {
+                SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER: 0x1a1770's draws are not tagged "
+                                       "(SSPC_CITY_ENGINE_GBUFFER_RUNS=1) - the native G-buffer path will see none");
+            }
+        }
+    }
     if (fthread_mode_) {
         // SSPC_FP_RUN_HOLD_US (default 50): a held run with no record to join is published after this long (thread 1
         // waiting for thread 2 publishes it at once)
@@ -728,7 +744,8 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
 }
 
 bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
-                               std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out) {
+                               std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out,
+                               bool force_rewalk) {
     R8_CP_PROF(CpProfile::Sec::Redecode);
     // a stage without an SRT walk: its plan is the registers' decoding alone (ResolveResources with an empty walk);
     // CITY-OPT Phase 6 (resources_): one with a walk whose output stays - the registers it read are the same
@@ -745,7 +762,7 @@ bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> 
     // again for these registers (the same walk program, memory and decoding as the full preparation)
     bool rewalk = false;
     if (walked) {
-        if (resources_ == 0 && gruns_ == 0) {
+        if (resources_ == 0 && gruns_ == 0 && !force_rewalk) {
             return false;
         }
         // (the flattened data's first 16 dwords are the registers of the draw it was prepared for)
@@ -753,7 +770,8 @@ bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> 
         for (u32 i = 0; i < 16; ++i) {
             diff |= v.plan.flat[i] != user_data[i] ? 1u << i : 0u;
         }
-        rewalk = (diff & v.plan.srt.user_data_read) != 0;
+        // force_rewalk: always walk anew (the anchor is from an earlier frame; its walk output may be stale)
+        rewalk = force_rewalk || (diff & v.plan.srt.user_data_read) != 0;
         if (!rewalk && (v.plan.srt.user_data_written || v.plan.srt.faults != 0)) {
             return refuse(2);
         }
@@ -1002,6 +1020,31 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         }
         return;
     }
+    // SSPC_NATIVE_GBUFFER: the Native Engine prepares a G-buffer draw (0x1a1770) from a cached anchor of the same
+    // engine identity - no frontend preparation. A miss or a refusal leaves the full path below (which stores the
+    // anchor on a miss); verify / a sampled hit set ngb_pending_ so the full preparation below is compared with the
+    // native one afterwards.
+    ngb_pending_ = nullptr;
+    ngb_pending_unusable_ = false;
+    if (ngb_.On() && ngb_.trusted() &&
+        r.draw.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) &&
+        NativeGBufferTry(r, index, regs)) {
+        r.prepared = true;
+        ngb_reused_.store(ngb_reused_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        bool writes = false;
+        NoteStageWrites(r.Vs(), index, writes);
+        NoteStageWrites(r.Ps(), index, writes);
+        if (writes) {
+            frontend_->GuestMemoryChanged();
+        }
+        geofast_prev_ = index;
+        geofast_gen_ = frontend_->MemoryGeneration();
+        Bump(fc_.ticks, __rdtsc() - t0);
+        if (census_end_ != 0) {
+            CensusPrepared(r, __rdtsc() - t0, true);
+        }
+        return;
+    }
     const bool check = geofast_ == 2 && PrepareGeometryOnly(r, index, *geofast_check_);
     const u8 why = geofast_why_;
     u64 t_copy = 0;
@@ -1151,12 +1194,152 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
             }
         }
     }
+    // SSPC_NATIVE_GBUFFER: the full preparation above is this identity's anchor (a miss learns it; a hit that was
+    // verified or sampled compares it with the native one built below).
+    if (ngb_.On() && r.draw.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) &&
+        r.stage_shared == nullptr && r.ps_shared == nullptr) {
+        NativeGBuffer::Key key{};
+        const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
+        key.vs_addr = r.draw.shaders[vs].address;
+        key.vs_rsrc1 = r.draw.shaders[vs].rsrc1;
+        key.vs_rsrc2 = r.draw.shaders[vs].rsrc2;
+        key.ps_addr = r.draw.shaders[ps].address;
+        key.ps_rsrc1 = r.draw.shaders[ps].rsrc1;
+        key.ps_rsrc2 = r.draw.shaders[ps].rsrc2;
+        key.pipeline_key = r.draw.pipeline_key;
+        key.color_hash = regs.GroupHash(Cp::Group::ColorTarget);
+        const u64 h = NativeGBuffer::Hash(key);
+        if (ngb_pending_ != nullptr) {
+            // verify / a sampled hit: the native preparation of the anchor against this full one, field by field
+            if (NativeGBufferReuse(*ngb_pending_, r.draw, *ngb_check_)) {
+                const bool mismatch =
+                    !(r.prep.ready == ngb_check_->prep.ready && r.state == ngb_check_->state &&
+                      SameView(r.Vs(), ngb_check_->stage) && SameView(r.Ps(), ngb_check_->ps));
+                ngb_.NoteVerified(mismatch);
+                if (mismatch) {
+                    const u64 n = ngb_mismatch_logged_.load(std::memory_order_relaxed) + 1;
+                    ngb_mismatch_logged_.store(n, std::memory_order_relaxed);
+                    if (n <= 12) {
+                        SSPC_LOG(GPU, Warning,
+                                 "SSPC_NATIVE_GBUFFER: record {} (VS {:#x} PS {:#x}) differs: pipeline {}/{} state {}",
+                                 index, key.vs_addr, key.ps_addr, r.prep.pipeline, ngb_check_->prep.pipeline,
+                                 r.state == ngb_check_->state);
+                    }
+                    if (ngb_pending_unusable_) { // guarded: this identity is dropped from the native path
+                        NativeGBuffer::Entry bad{};
+                        bad.key = key;
+                        bad.usable = false;
+                        ngb_.Store(h, bad);
+                    }
+                }
+            } else {
+                ngb_.NoteVerified(false); // the anchor refused the comparison draw: nothing to compare
+            }
+            ngb_pending_ = nullptr;
+        } else if (r.prep.ready && r.state != nullptr && r.Vs().status == GS::StageStatus::Ready &&
+                   r.Ps().status == GS::StageStatus::Ready) {
+            // a miss: keep this preparation as the identity's anchor
+            NativeGBuffer::Entry e{};
+            e.key = key;
+            CopyStage(e.vs, r.Vs());
+            CopyStage(e.ps, r.Ps());
+            e.prep = r.prep;
+            e.state = r.state;
+            e.usable = true;
+            ngb_.Store(h, e);
+        }
+    }
     geofast_prev_ = index;
     geofast_gen_ = frontend_->MemoryGeneration();
     Bump(fc_.ticks, __rdtsc() - t0);
     if (census_end_ != 0) {
         CensusPrepared(r, __rdtsc() - t0, false);
     }
+}
+
+bool ParallelCp::NativeGBufferReuse(const NativeGBuffer::Entry& a, const Cp::DrawDescriptor& b, Record& out) {
+    const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
+    // the vertex V#s from this draw's VS table (a non-walked VS reads them here; a walked VS re-reads them inside
+    // ResolveResources, so its reads are left empty)
+    ngb_reads_.clear();
+    if (a.vs.plan.flat.size() == 16 && !a.vs.plan.vertices.empty()) {
+        for (const GS::VertexBinding& v : a.vs.plan.vertices) {
+            const GS::FetchAttribute& at = v.fetch;
+            if (at.sgpr_base + 1 >= 16) {
+                ngb_.NoteRefused(2);
+                return false;
+            }
+            const u64 table =
+                (b.user_data[vs][at.sgpr_base] | (u64{b.user_data[vs][at.sgpr_base + 1]} << 32)) & 0xFFFFFFFFFFFFull;
+            const u64 where = table + u64{at.dword_offset} * 4;
+            std::array<u32, 4> raw{};
+            if (where >= (1ull << 40) || !reader_.Read(where, raw.data(), 16)) {
+                ngb_.NoteRefused(2);
+                return false;
+            }
+            ngb_reads_.push_back(raw);
+        }
+    }
+    const u8 before = geofast_why_;
+    if (!RedecodeStage(a.vs, b.user_data[vs], ngb_reads_, ngb_vs_, true)) {
+        ngb_.NoteRefused(2); // (RedecodeStage's own refusal counters carry the detail; 2 here is "VS refused")
+        geofast_why_ = before;
+        return false;
+    }
+    if (!RedecodeStage(a.ps, b.user_data[ps], {}, ngb_ps_, true)) {
+        ngb_.NoteRefused(3);
+        geofast_why_ = before;
+        return false;
+    }
+    out.prep = a.prep;
+    out.state = a.state;
+    out.stage_shared.reset();
+    out.ps_shared.reset();
+    const auto overwrite = [](GS::StageView& dst, const GS::StageView& anchor, const GS::ResourceBindingPlan& plan) {
+        CopyStage(dst, anchor);
+        dst.plan.flat.assign(plan.flat.begin(), plan.flat.end());
+        dst.plan.buffers.assign(plan.buffers.begin(), plan.buffers.end());
+        dst.plan.images.assign(plan.images.begin(), plan.images.end());
+        dst.plan.samplers.assign(plan.samplers.begin(), plan.samplers.end());
+        dst.plan.vertices.assign(plan.vertices.begin(), plan.vertices.end());
+        dst.plan.status_counts = plan.status_counts;
+        dst.plan.srt = plan.srt;
+        dst.plan.error = plan.error;
+    };
+    overwrite(out.stage, a.vs, ngb_vs_);
+    overwrite(out.ps, a.ps, ngb_ps_);
+    return true;
+}
+
+bool ParallelCp::NativeGBufferTry(Record& r, u64 index, const Cp::RegisterFile& regs) {
+    const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
+    NativeGBuffer::Key key{};
+    key.vs_addr = r.draw.shaders[vs].address;
+    key.vs_rsrc1 = r.draw.shaders[vs].rsrc1;
+    key.vs_rsrc2 = r.draw.shaders[vs].rsrc2;
+    key.ps_addr = r.draw.shaders[ps].address;
+    key.ps_rsrc1 = r.draw.shaders[ps].rsrc1;
+    key.ps_rsrc2 = r.draw.shaders[ps].rsrc2;
+    key.pipeline_key = r.draw.pipeline_key;
+    key.color_hash = regs.GroupHash(Cp::Group::ColorTarget);
+    const u64 h = NativeGBuffer::Hash(key);
+    NativeGBuffer::Entry* a = ngb_.Find(h, key);
+    if (a == nullptr) {
+        return false; // a miss (or a known-not-reusable identity): the full path below prepares and may learn it
+    }
+    // verify, or a sampled guarded hit: leave the full preparation below to run, then compare it with the native one
+    const bool guarded_sample = ngb_.mode() == NativeGBuffer::Mode::Guarded && ngb_.sample() != 0 &&
+                                (ngb_sample_counter_.fetch_add(1, std::memory_order_relaxed) % ngb_.sample() == 0);
+    if (ngb_.mode() == NativeGBuffer::Mode::Verify || guarded_sample) {
+        ngb_pending_ = a;
+        ngb_pending_unusable_ = guarded_sample;
+        return false;
+    }
+    if (!NativeGBufferReuse(*a, r.draw, r)) {
+        return false; // refused: the full path prepares it with the frontend
+    }
+    ngb_.NoteHit();
+    return true;
 }
 
 void ParallelCp::CensusPrepared(Record& r, u64 ticks, bool fast) {
@@ -1781,7 +1964,11 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
         return 0; // consumed, not executed: thread 1's drains still complete; the backend stops at its next check
     }
     try {
-        R8_CP_PROF(CpProfile::RecordSection(static_cast<u32>(r.kind)));
+        // (a draw's sections by the engine function that wrote it: BindStage and DrawRunMembers read the source)
+        CpProfile::t_source = r.kind == Kind::Draw ? static_cast<u8>(r.draw.engine_run & 3) : u8{0};
+        R8_CP_PROF(r.kind == Kind::Draw ? CpProfile::BySource(CpProfile::Sec::T2Draw, CpProfile::Sec::T2DrawMesh,
+                                                              CpProfile::t_source)
+                                        : CpProfile::RecordSection(static_cast<u32>(r.kind)));
         // (stage 2: thread 1 tells the frontend about guest memory changes in stream order; nothing from here)
         exec_.SetMemoBumps(frontend_ == nullptr);
         ApplyJournal(r.journal_end);
@@ -2825,6 +3012,9 @@ std::string ParallelCp::Report() const {
                                                      gruns_ == 2 ? "=verify" : "")
                                        : std::string{},
                            ld(es.materials), ld(es.material_tagged), ld(run_material_), ld(run_material_joined_));
+    }
+    if (ngb_.On()) {
+        out += "  " + ngb_.Report();
     }
     if (resources_ != 0 || gruns_ != 0) {
         std::string why;

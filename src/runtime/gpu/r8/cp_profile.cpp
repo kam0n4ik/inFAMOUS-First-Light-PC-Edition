@@ -78,6 +78,7 @@ constexpr std::array<Info, kSections> MakeInfo() {
     set(Sec::FrontMesh, "frontend PrepareDraw: mesh 0x1a1960 (Phase 5)", Cls::Compute);
     set(Sec::FrontShadow, "frontend PrepareDraw: shadow 0x43d480 (Phase 5)", Cls::Compute);
     set(Sec::FrontGBuffer, "frontend PrepareDraw: G-buffer 0x1a1770 (Phase 6)", Cls::Compute);
+    set(Sec::FrontNative, "frontend: native G-buffer preparation 0x1a1770 (SSPC_NATIVE_GBUFFER)", Cls::Compute);
     set(Sec::CopyStage, "CopyStage (stage views into records)", Cls::Compute);
     set(Sec::ParDispatch, "dispatch record", Cls::Compute);
     set(Sec::FrontDispatch, "frontend PrepareDispatch + copy", Cls::Compute);
@@ -117,6 +118,15 @@ constexpr std::array<Info, kSections> MakeInfo() {
     set(Sec::T2Other, "T2 other records", Cls::Compute);
     set(Sec::T2Run, "T2 run members (DrawRunMembers)", Cls::Compute);
     set(Sec::T2Bind, "T2 BindStage", Cls::Compute);
+    set(Sec::T2DrawMesh, "T2 draw records: mesh 0x1a1960", Cls::Compute);
+    set(Sec::T2DrawShadow, "T2 draw records: shadow 0x43d480", Cls::Compute);
+    set(Sec::T2DrawGBuffer, "T2 draw records: G-buffer 0x1a1770", Cls::Compute);
+    set(Sec::T2RunMesh, "T2 run members: mesh 0x1a1960", Cls::Compute);
+    set(Sec::T2RunShadow, "T2 run members: shadow 0x43d480", Cls::Compute);
+    set(Sec::T2RunGBuffer, "T2 run members: G-buffer 0x1a1770", Cls::Compute);
+    set(Sec::T2BindMesh, "T2 BindStage: mesh 0x1a1960", Cls::Compute);
+    set(Sec::T2BindShadow, "T2 BindStage: shadow 0x43d480", Cls::Compute);
+    set(Sec::T2BindGBuffer, "T2 BindStage: G-buffer 0x1a1770", Cls::Compute);
     return a;
 }
 constexpr std::array<Info, kSections> kInfo = MakeInfo();

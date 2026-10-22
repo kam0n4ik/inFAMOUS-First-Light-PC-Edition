@@ -2709,7 +2709,8 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                          std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& buffers,
                          std::vector<VkDescriptorImageInfo>& image_infos, std::vector<CachedImage*>& bound,
                          bool& writes_memory, const std::vector<CachedImage*>& targets, const u32* user_data) {
-    R8_CP_PROF(CpProfile::Sec::T2Bind);
+    R8_CP_PROF(compute ? CpProfile::Sec::T2Bind
+                       : CpProfile::BySource(CpProfile::Sec::T2Bind, CpProfile::Sec::T2BindMesh, CpProfile::t_source));
     const auto& s = *static_cast<const GS::StageView*>(stage_view);
     const GS::ResourceBindingPlan& plan = s.plan;
     const GS::ShaderReflection& refl = s.module->result.reflection;
@@ -5514,7 +5515,7 @@ bool Executor::RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& of
 
 void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedCommand& pc,
                               std::span<const Cp::RunMember> members, std::span<const u32> member_flat) {
-    R8_CP_PROF(CpProfile::Sec::T2Run);
+    R8_CP_PROF(CpProfile::BySource(CpProfile::Sec::T2Run, CpProfile::Sec::T2RunMesh, CpProfile::t_source));
     const auto& f = Fn();
     const GS::StageView& vs = *pc.stage;
     const GS::FetchShader& fetch = vs.module->result.reflection.fetch;

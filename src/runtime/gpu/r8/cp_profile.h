@@ -79,6 +79,7 @@ enum class Sec : u8 {
     FrontMesh,       ///< ... tagged mesh 0x1a1960 (Phase 5)
     FrontShadow,     ///< ... tagged shadow 0x43d480 (Phase 5)
     FrontGBuffer,    ///< ... tagged G-buffer 0x1a1770 (Phase 6)
+    FrontNative,     ///< the native G-buffer preparation of a 0x1a1770 draw (SSPC_NATIVE_GBUFFER: lookup, check, patch)
     CopyStage,       ///< a prepared stage view copied into its record
     ParDispatch,     ///< a dispatch's record
     FrontDispatch,   ///< ShaderFrontend::PrepareDispatch and the stage's copy
@@ -111,6 +112,17 @@ enum class Sec : u8 {
     T2Other,         ///< thread 2: the other records (cache actions, fences, DMA, waits, copies, writes)
     T2Run,           ///< thread 2: a run's members (Executor::DrawRunMembers)
     T2Bind,          ///< thread 2: Executor::BindStage (descriptors of a stage)
+    // the same three by the engine function that wrote the draw (Cp::DrawDescriptor::engine_run; T2Draw, T2Run and
+    // T2Bind are the untagged draws' then)
+    T2DrawMesh,      ///< thread 2: a draw record of a 0x1a1960 draw
+    T2DrawShadow,    ///< ... of a 0x43d480 draw
+    T2DrawGBuffer,   ///< ... of a 0x1a1770 draw
+    T2RunMesh,       ///< thread 2: a run's members, the run of a 0x1a1960 draw
+    T2RunShadow,     ///< ... of a 0x43d480 draw
+    T2RunGBuffer,    ///< ... of a 0x1a1770 draw
+    T2BindMesh,      ///< thread 2: BindStage for a 0x1a1960 draw
+    T2BindShadow,    ///< ... for a 0x43d480 draw
+    T2BindGBuffer,   ///< ... for a 0x1a1770 draw
     Count,
 };
 inline constexpr u32 kSections = static_cast<u32>(Sec::Count);
@@ -121,6 +133,13 @@ inline constexpr Sec Drain(u32 reason) {
 /// FrontUntagged + the draw's engine tag (Cp::DrawDescriptor::engine_run & 3).
 inline constexpr Sec Front(u32 engine_run) {
     return static_cast<Sec>(static_cast<u32>(Sec::FrontUntagged) + (engine_run & 3));
+}
+/// Thread 2: the engine tag of the draw record it executes (Cp::DrawDescriptor::engine_run & 3; 0 for any other
+/// record), set by ParallelCp::Execute - BindStage and DrawRunMembers file their time under it.
+inline thread_local constinit u8 t_source = 0;
+/// `untagged` for an untagged draw, else the section of the source among the three after `mesh`.
+inline constexpr Sec BySource(Sec untagged, Sec mesh, u32 source) {
+    return (source & 3) == 0 ? untagged : static_cast<Sec>(static_cast<u32>(mesh) + (source & 3) - 1);
 }
 /// Thread 2's section for a record of ParallelCp::Kind `kind` (Draw 0, Dispatch 1, ..., Flip 10, RoundEnd 11).
 inline constexpr Sec RecordSection(u32 kind) {

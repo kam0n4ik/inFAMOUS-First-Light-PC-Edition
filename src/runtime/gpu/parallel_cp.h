@@ -43,6 +43,7 @@
 #include "base/abi.h"
 #include "runtime/gpu/command_processor.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/native_gbuffer_prep.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 
 namespace SecondSon::Gpu::Vk {
@@ -455,8 +456,27 @@ private:
     std::atomic<u64> dc_vs_hits_{0}, dc_ps_hits_{0}, dc_key_refused_{0};
     /// The plan of stage `v` (prepared for the draw before) for `user_data`: false when the stage has an SRT walk (that
     /// Phase 6 cannot take again), or the registers give another specialization or other binding numbers.
+    /// `force_rewalk`: a stage with an SRT walk is walked again (ResolveResources) even when the registers the walk
+    /// read did not change - the native G-buffer cache reuses an anchor across frames, so its resources are re-read
+    /// from live guest memory rather than taken from the anchor's (possibly stale) walk output.
     bool RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
-                       std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out);
+                       std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out,
+                       bool force_rewalk = false);
+    /// SSPC_NATIVE_GBUFFER: the Native Engine's preparation of a G-buffer draw (0x1a1770) from a cached anchor of the
+    /// same engine identity (no frontend preparation). True: `r` is prepared (stage, ps, prep, state). The caller falls
+    /// back to the frontend on false. `regs`: the draw's register file (the colour-target hash of its key).
+    bool NativeGBufferTry(Record& r, u64 index, const Cp::RegisterFile& regs);
+    /// Build `out`'s VS/PS from the anchor `a` and `b`'s own registers (RedecodeStage, force_rewalk); false: refused.
+    bool NativeGBufferReuse(const NativeGBuffer::Entry& a, const Cp::DrawDescriptor& b, Record& out);
+    NativeGBuffer ngb_;
+    std::vector<std::array<u32, 4>> ngb_reads_;   ///< scratch: the vertex V#s read for a reused VS
+    GS::ResourceBindingPlan ngb_vs_, ngb_ps_;     ///< scratch: the re-derived plans
+    std::unique_ptr<Record> ngb_check_;           ///< verify / guarded: the native preparation compared with the full
+    const NativeGBuffer::Entry* ngb_pending_ = nullptr; ///< a hit awaiting the full preparation (verify / sampled)
+    bool ngb_pending_unusable_ = false;           ///< ... mark the entry not reusable on a mismatch (guarded)
+    std::atomic<u64> ngb_reused_{0};              ///< draws prepared natively (the frontend skipped)
+    std::atomic<u64> ngb_sample_counter_{0};      ///< guarded: counts hits to pick every sample-th
+    std::atomic<u64> ngb_mismatch_logged_{0};     ///< verify / guarded: mismatch log lines written
     /// CITY-OPT Phase 6 (SSPC_CITY_ENGINE_RESOURCES=1|verify, with SSPC_CITY_GEOFAST; docs/CITY_ENGINE_RESOURCES.md):
     /// the engine's instanced draws of one material (0x1a1770 G-buffer, 0x43d480 shadows) change only the registers of
     /// the per-object constant buffer's V# and the vertex table; the material's tables the stages' SRT walks follow
