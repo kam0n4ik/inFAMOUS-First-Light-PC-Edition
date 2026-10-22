@@ -1,18 +1,18 @@
 # CALLS — реальные вызовы импортов (Phase 0)
 
-Источник: `E:\SecondSonPC\logs\runs\ru_phase0\calls.json` (снимок 2026-10-08 01:22:02). Счётчиком обёрнуто 4622 функций: native 2, observed 2, bridge 4618 (весь HLE-реестр shadPS4).
+Источник: `E:\SecondSonPC\logs\runs\owncs_full2\calls.json` (снимок 2026-10-18 23:27:58). Счётчиком обёрнуто 413 функций: native 336, observed 0, bridge 59 (весь HLE-реестр shadPS4).
 
-Прогон: tag=ru_phase0 lang='' seconds=150
+Прогон: tag=owncs_full2 lang='' seconds=120
 
 ## Владельцы 417 функций, которые должен предоставить рантайм
 
 | Владелец | Всего | Вызваны в прогоне |
 |---|---:|---:|
-| NATIVE | 2 | 2 |
-| OBSERVED | 2 | 2 |
-| BRIDGE | 392 | 167 |
-| COMMON_STUB | 21 | 0 |
-| **Итого** | **417** | **171** |
+| NATIVE | 336 | 163 |
+| OBSERVED | 0 | 0 |
+| BRIDGE | 61 | 8 |
+| COMMON_STUB | 20 | 1 |
+| **Итого** | **417** | **172** |
 | LLE (модули игры, не входят в 417) | 147 | не считаются |
 
 OBSERVED — наблюдатель SecondSonPC перед реализацией shadPS4; для миграции это всё ещё BRIDGE.
@@ -22,177 +22,178 @@ COMMON_STUB-вызовы счётчик не видит (shadPS4 пишет их
 
 | # | Функция | Библиотека | Владелец | Вызовов |
 |---:|---|---|---|---:|
-| 1 | `scePthreadMutexLock` | libkernel | BRIDGE | 12831738 |
-| 2 | `scePthreadMutexUnlock` | libkernel | BRIDGE | 12822505 |
-| 3 | `sceGnmDrawIndex` | libSceGnmDriver | BRIDGE | 5863663 |
-| 4 | `sceGnmUpdateVsShader` | libSceGnmDriver | BRIDGE | 2975030 |
-| 5 | `sceGnmUpdatePsShader350` | libSceGnmDriver | BRIDGE | 2647363 |
-| 6 | `sceGnmSetPsShader350` | libSceGnmDriver | BRIDGE | 1375034 |
-| 7 | `sceGnmSetVsShader` | libSceGnmDriver | BRIDGE | 1047367 |
-| 8 | `sceGnmDrawIndexAuto` | libSceGnmDriver | BRIDGE | 914685 |
-| 9 | `pthread_mutex_unlock` | libScePosix | BRIDGE | 714213 |
-| 10 | `scePthreadCondBroadcast` | libkernel | BRIDGE | 593830 |
-| 11 | `scePthreadCondWait` | libkernel | BRIDGE | 564054 |
-| 12 | `pthread_mutex_lock` | libScePosix | BRIDGE | 406772 |
-| 13 | `sceGnmDispatchDirect` | libSceGnmDriver | BRIDGE | 356846 |
-| 14 | `pthread_mutex_trylock` | libScePosix | BRIDGE | 307753 |
-| 15 | `sceGnmSetCsShaderWithModifier` | libSceGnmDriver | BRIDGE | 143355 |
-| 16 | `scePthreadSelf` | libkernel | BRIDGE | 76089 |
-| 17 | `sceKernelWaitSema` | libkernel | BRIDGE | 75760 |
-| 18 | `scePthreadEqual` | libkernel | BRIDGE | 41421 |
-| 19 | `sceGnmDrawIndexIndirect` | libSceGnmDriver | BRIDGE | 30234 |
-| 20 | `sceKernelSignalSema` | libkernel | BRIDGE | 19512 |
-| 21 | `sceGnmDrawInitDefaultHardwareState350` | libSceGnmDriver | BRIDGE | 17202 |
-| 22 | `scePadReadState` | libScePad | BRIDGE | 17202 |
-| 23 | `scePadSetLightBar` | libScePad | BRIDGE | 17202 |
-| 24 | `scePadSetVibration` | libScePad | BRIDGE | 17200 |
-| 25 | `sceGnmDrawIndirect` | libSceGnmDriver | BRIDGE | 15597 |
-| 26 | `sceKernelClockGettime` | libkernel | BRIDGE | 15016 |
-| 27 | `sceGnmDingDong` | libSceGnmDriver | BRIDGE | 9092 |
-| 28 | `sceGnmSubmitDone` | libSceGnmDriver | BRIDGE | 8647 |
-| 29 | `sceKernelSetEventFlag` | libkernel | BRIDGE | 8626 |
-| 30 | `sceUserServiceGetEvent` | libSceUserService | BRIDGE | 8602 |
-| 31 | `sceGnmInsertWaitFlipDone` | libSceGnmDriver | BRIDGE | 8601 |
-| 32 | `sceNpCheckCallback` | libSceNpManager | BRIDGE | 8600 |
-| 33 | `sceSystemServiceGetStatus` | libSceSystemService | BRIDGE | 8600 |
-| 34 | `sceVideoOutIsFlipPending` | libSceVideoOut | BRIDGE | 8600 |
-| 35 | `sceGnmSubmitAndFlipCommandBuffers` | libSceGnmDriver | BRIDGE | 8599 |
-| 36 | `sceAudioOutOutputs` | libSceAudioOut | BRIDGE | 6964 |
-| 37 | `memset` | libSceLibcInternal | BRIDGE | 4074 |
-| 38 | `__tls_get_addr` | libkernel | BRIDGE | 3653 |
-| 39 | `scePthreadRwlockUnlock` | libkernel | BRIDGE | 1353 |
-| 40 | `scePthreadRwlockRdlock` | libkernel | BRIDGE | 1352 |
-| 41 | `sceDiscMapIsRequestOnHDD` | libSceDiscMap | BRIDGE | 1290 |
-| 42 | `?` | libSceDiscMap | BRIDGE | 1252 |
-| 43 | `sceKernelPread` | libkernel | BRIDGE | 1137 |
-| 44 | `clock_gettime` | libScePosix | BRIDGE | 1090 |
-| 45 | `sceVideodecDecode` | libSceVideodec | BRIDGE | 308 |
-| 46 | `scePthreadMutexInit` | libkernel | BRIDGE | 185 |
-| 47 | `scePthreadMutexattrDestroy` | libkernel | BRIDGE | 174 |
-| 48 | `scePthreadMutexattrInit` | libkernel | BRIDGE | 174 |
-| 49 | `scePthreadMutexattrSettype` | libkernel | BRIDGE | 173 |
-| 50 | `sceKernelStat` | libkernel | OBSERVED | 96 |
-| 51 | `scePlayGoGetProgress` | libScePlayGo | BRIDGE | 71 |
-| 52 | `sceKernelUsleep` | libkernel | BRIDGE | 60 |
-| 53 | `sceKernelOpen` | libkernel | OBSERVED | 53 |
-| 54 | `sceKernelClose` | libkernel | BRIDGE | 44 |
-| 55 | `sceKernelWaitEventFlag` | libkernel | BRIDGE | 27 |
-| 56 | `scePthreadAttrDestroy` | libkernel | BRIDGE | 21 |
-| 57 | `scePthreadAttrInit` | libkernel | BRIDGE | 21 |
-| 58 | `scePthreadCondInit` | libkernel | BRIDGE | 21 |
-| 59 | `sceKernelCreateSema` | libkernel | BRIDGE | 20 |
-| 60 | `scePthreadAttrSetdetachstate` | libkernel | BRIDGE | 20 |
-| 61 | `scePthreadAttrSetinheritsched` | libkernel | BRIDGE | 20 |
-| 62 | `scePthreadAttrSetschedparam` | libkernel | BRIDGE | 20 |
-| 63 | `scePthreadAttrSetstacksize` | libkernel | BRIDGE | 20 |
-| 64 | `scePthreadCreate` | libkernel | BRIDGE | 20 |
-| 65 | `sceAppContentGetAddcontInfo` | libSceAppContent | BRIDGE | 16 |
-| 66 | `sceKernelCreateEventFlag` | libkernel | BRIDGE | 16 |
-| 67 | `sceKernelDeleteEventFlag` | libkernel | BRIDGE | 13 |
-| 68 | `pthread_mutex_init` | libScePosix | BRIDGE | 11 |
-| 69 | `pthread_mutexattr_destroy` | libScePosix | BRIDGE | 11 |
-| 70 | `pthread_mutexattr_init` | libScePosix | BRIDGE | 11 |
-| 71 | `pthread_mutexattr_settype` | libScePosix | BRIDGE | 11 |
-| 72 | `scePthreadMutexDestroy` | libkernel | BRIDGE | 10 |
-| 73 | `scePthreadMutexattrSetprotocol` | libkernel | BRIDGE | 10 |
-| 74 | `sceSysmoduleLoadModule` | libSceSysmodule | BRIDGE | 9 |
-| 75 | `__error` | libkernel | BRIDGE | 8 |
-| 76 | `sceKernelFstat` | libkernel | BRIDGE | 7 |
-| 77 | `sceAudioOutInit` | libSceAudioOut | BRIDGE | 4 |
-| 78 | `sceSaveDataDirNameSearch` | libSceSaveData | BRIDGE | 4 |
-| 79 | `sceKernelGetDirectMemorySize` | libkernel | BRIDGE | 4 |
-| 80 | `sceKernelPwrite` | libkernel | BRIDGE | 4 |
-| 81 | `sceAudioOutOpen` | libSceAudioOut | BRIDGE | 3 |
-| 82 | `sceAudioOutSetVolume` | libSceAudioOut | BRIDGE | 3 |
-| 83 | `sceSaveDataMount2` | libSceSaveData | BRIDGE | 3 |
-| 84 | `sceSaveDataUmount` | libSceSaveData | BRIDGE | 3 |
-| 85 | `sceVideodecFlush` | libSceVideodec | BRIDGE | 3 |
-| 86 | `sceKernelAllocateDirectMemory` | libkernel | BRIDGE | 3 |
-| 87 | `sceKernelMapDirectMemory` | libkernel | BRIDGE | 3 |
-| 88 | `scePthreadJoin` | libkernel | BRIDGE | 3 |
-| 89 | `sceKernelGetProcParam` | libkernel | BRIDGE | 3 |
-| 90 | `sceKernelLseek` | libkernel | BRIDGE | 3 |
-| 91 | `sceKernelRead` | libkernel | BRIDGE | 3 |
-| 92 | `scePthreadRwlockInit` | libkernel | BRIDGE | 3 |
-| 93 | `sceNetCtlGetInfo` | libSceNetCtl | BRIDGE | 2 |
-| 94 | `scePadGetControllerInformation` | libScePad | BRIDGE | 2 |
-| 95 | `scePadOpen` | libScePad | BRIDGE | 2 |
-| 96 | `scePlayGoGetLocus` | libScePlayGo | BRIDGE | 2 |
-| 97 | `sceSaveDataSetParam` | libSceSaveData | BRIDGE | 2 |
-| 98 | `sceSystemServiceParamGetInt` | libSceSystemService | NATIVE | 2 |
-| 99 | `sceVideoOutRegisterBuffers` | libSceVideoOut | BRIDGE | 2 |
-| 100 | `sceKernelIsNeoMode` | libkernel | BRIDGE | 2 |
-| 101 | `sceKernelWaitEqueue` | libkernel | BRIDGE | 2 |
-| 102 | `scePthreadAttrGetschedparam` | libkernel | BRIDGE | 2 |
-| 103 | `scePthreadAttrSetaffinity` | libkernel | BRIDGE | 2 |
-| 104 | `scePthreadAttrSetschedpolicy` | libkernel | BRIDGE | 2 |
-| 105 | `scePthreadCondDestroy` | libkernel | BRIDGE | 2 |
+| 1 | `sceGnmDrawIndex` | libSceGnmDriver | NATIVE | 27570582 |
+| 2 | `scePthreadMutexLock` | libkernel | NATIVE | 10974485 |
+| 3 | `scePthreadMutexUnlock` | libkernel | NATIVE | 10967931 |
+| 4 | `sceGnmUpdateVsShader` | libSceGnmDriver | NATIVE | 3540338 |
+| 5 | `sceGnmUpdatePsShader350` | libSceGnmDriver | NATIVE | 3223028 |
+| 6 | `sceGnmSetPsShader350` | libSceGnmDriver | NATIVE | 1559491 |
+| 7 | `sceGnmSetVsShader` | libSceGnmDriver | NATIVE | 1242181 |
+| 8 | `sceGnmDispatchDirect` | libSceGnmDriver | NATIVE | 1214051 |
+| 9 | `sceGnmDrawIndexIndirect` | libSceGnmDriver | NATIVE | 1155030 |
+| 10 | `sceGnmSetCsShaderWithModifier` | libSceGnmDriver | NATIVE | 716360 |
+| 11 | `scePthreadCondBroadcast` | libkernel | NATIVE | 431344 |
+| 12 | `pthread_mutex_unlock` | libScePosix | NATIVE | 411005 |
+| 13 | `scePthreadCondWait` | libkernel | NATIVE | 268831 |
+| 14 | `pthread_mutex_lock` | libScePosix | NATIVE | 265179 |
+| 15 | `sceGnmDrawIndexAuto` | libSceGnmDriver | NATIVE | 262128 |
+| 16 | `pthread_mutex_trylock` | libScePosix | NATIVE | 149050 |
+| 17 | `scePthreadSelf` | libkernel | NATIVE | 131861 |
+| 18 | `scePthreadEqual` | libkernel | NATIVE | 71729 |
+| 19 | `sceKernelWaitSema` | libkernel | NATIVE | 25732 |
+| 20 | `sceKernelClockGettime` | libkernel | NATIVE | 14491 |
+| 21 | `sceGnmDingDong` | libSceGnmDriver | NATIVE | 14249 |
+| 22 | `sceKernelSignalSema` | libkernel | NATIVE | 8740 |
+| 23 | `memset` | libSceLibcInternal | NATIVE | 6903 |
+| 24 | `sceGnmDrawInitDefaultHardwareState350` | libSceGnmDriver | NATIVE | 6594 |
+| 25 | `__tls_get_addr` | libkernel | NATIVE | 6469 |
+| 26 | `sceAudioOutOutputs` | libSceAudioOut | NATIVE | 5504 |
+| 27 | `sceGnmDrawIndirect` | libSceGnmDriver | NATIVE | 5120 |
+| 28 | `__error` | libkernel | NATIVE | 4108 |
+| 29 | `sceGnmSubmitDone` | libSceGnmDriver | NATIVE | 3422 |
+| 30 | `sceKernelSetEventFlag` | libkernel | NATIVE | 3320 |
+| 31 | `sceGnmInsertWaitFlipDone` | libSceGnmDriver | NATIVE | 3297 |
+| 32 | `scePadReadState` | libScePad | NATIVE | 3297 |
+| 33 | `scePadSetLightBar` | libScePad | NATIVE | 3297 |
+| 34 | `sceUserServiceGetEvent` | libSceUserService | NATIVE | 3297 |
+| 35 | `sceNpCheckCallback` | libSceNpManager | NATIVE | 3296 |
+| 36 | `scePadSetVibration` | libScePad | NATIVE | 3296 |
+| 37 | `sceSystemServiceGetStatus` | libSceSystemService | NATIVE | 3296 |
+| 38 | `sceVideoOutIsFlipPending` | libSceVideoOut | NATIVE | 3296 |
+| 39 | `sceGnmSubmitAndFlipCommandBuffers` | libSceGnmDriver | NATIVE | 3295 |
+| 40 | `sceVideodecDecode` | libSceVideodec | NATIVE | 2749 |
+| 41 | `scePthreadRwlockUnlock` | libkernel | NATIVE | 2305 |
+| 42 | `scePthreadRwlockRdlock` | libkernel | NATIVE | 2304 |
+| 43 | `sceDiscMapIsRequestOnHDD` | libSceDiscMap | NATIVE | 2229 |
+| 44 | `?` | libSceDiscMap | NATIVE | 2192 |
+| 45 | `sceKernelPread` | libkernel | NATIVE | 2053 |
+| 46 | `clock_gettime` | libScePosix | NATIVE | 1071 |
+| 47 | `scePthreadMutexInit` | libkernel | NATIVE | 157 |
+| 48 | `scePthreadMutexattrDestroy` | libkernel | NATIVE | 144 |
+| 49 | `scePthreadMutexattrInit` | libkernel | NATIVE | 144 |
+| 50 | `scePthreadMutexattrSettype` | libkernel | NATIVE | 143 |
+| 51 | `sceKernelUsleep` | libkernel | NATIVE | 138 |
+| 52 | `sceKernelStat` | libkernel | NATIVE | 109 |
+| 53 | `scePlayGoGetProgress` | libScePlayGo | NATIVE | 71 |
+| 54 | `sceKernelOpen` | libkernel | NATIVE | 66 |
+| 55 | `sceKernelClose` | libkernel | NATIVE | 56 |
+| 56 | `sceKernelWaitEventFlag` | libkernel | NATIVE | 25 |
+| 57 | `scePthreadCondInit` | libkernel | NATIVE | 23 |
+| 58 | `sceKernelCreateSema` | libkernel | NATIVE | 20 |
+| 59 | `scePthreadAttrDestroy` | libkernel | NATIVE | 20 |
+| 60 | `scePthreadAttrInit` | libkernel | NATIVE | 20 |
+| 61 | `scePthreadAttrSetdetachstate` | libkernel | NATIVE | 19 |
+| 62 | `scePthreadAttrSetinheritsched` | libkernel | NATIVE | 19 |
+| 63 | `scePthreadAttrSetschedparam` | libkernel | NATIVE | 19 |
+| 64 | `scePthreadAttrSetstacksize` | libkernel | NATIVE | 19 |
+| 65 | `scePthreadCreate` | libkernel | NATIVE | 19 |
+| 66 | `sceAppContentGetAddcontInfo` | libSceAppContent | NATIVE | 16 |
+| 67 | `sceKernelCreateEventFlag` | libkernel | NATIVE | 15 |
+| 68 | `sceKernelDeleteEventFlag` | libkernel | NATIVE | 12 |
+| 69 | `pthread_mutex_init` | libScePosix | NATIVE | 11 |
+| 70 | `pthread_mutexattr_destroy` | libScePosix | NATIVE | 11 |
+| 71 | `pthread_mutexattr_init` | libScePosix | NATIVE | 11 |
+| 72 | `pthread_mutexattr_settype` | libScePosix | NATIVE | 11 |
+| 73 | `scePthreadMutexattrSetprotocol` | libkernel | NATIVE | 10 |
+| 74 | `sceSysmoduleLoadModule` | libSceSysmodule | NATIVE | 9 |
+| 75 | `scePthreadMutexDestroy` | libkernel | NATIVE | 9 |
+| 76 | `sceKernelFstat` | libkernel | NATIVE | 7 |
+| 77 | `sceKernelGetDirectMemorySize` | libkernel | NATIVE | 4 |
+| 78 | `sceAudioOutInit` | libSceAudioOut | NATIVE | 3 |
+| 79 | `sceSaveDataDirNameSearch` | libSceSaveData | NATIVE | 3 |
+| 80 | `sceVideodecFlush` | libSceVideodec | NATIVE | 3 |
+| 81 | `sceKernelAllocateDirectMemory` | libkernel | NATIVE | 3 |
+| 82 | `sceKernelMapDirectMemory` | libkernel | NATIVE | 3 |
+| 83 | `sceKernelGetProcParam` | libkernel | NATIVE | 3 |
+| 84 | `sceKernelLseek` | libkernel | NATIVE | 3 |
+| 85 | `sceKernelRead` | libkernel | NATIVE | 3 |
+| 86 | `scePthreadRwlockInit` | libkernel | NATIVE | 3 |
+| 87 | `sceAudioOutOpen` | libSceAudioOut | NATIVE | 2 |
+| 88 | `sceAudioOutSetVolume` | libSceAudioOut | NATIVE | 2 |
+| 89 | `sceNetCtlGetInfo` | libSceNetCtl | NATIVE | 2 |
+| 90 | `scePlayGoGetLocus` | libScePlayGo | NATIVE | 2 |
+| 91 | `sceSaveDataMount2` | libSceSaveData | NATIVE | 2 |
+| 92 | `sceSaveDataUmount` | libSceSaveData | NATIVE | 2 |
+| 93 | `sceSystemServiceParamGetInt` | libSceSystemService | NATIVE | 2 |
+| 94 | `sceVideoOutRegisterBuffers` | libSceVideoOut | NATIVE | 2 |
+| 95 | `sceVideodecCreateDecoder` | libSceVideodec | NATIVE | 2 |
+| 96 | `sceVideodecQueryResourceInfo` | libSceVideodec | NATIVE | 2 |
+| 97 | `sceVideodecReset` | libSceVideodec | NATIVE | 2 |
+| 98 | `sceKernelIsNeoMode` | libkernel | NATIVE | 2 |
+| 99 | `sceKernelWaitEqueue` | libkernel | NATIVE | 2 |
+| 100 | `scePthreadAttrGetschedparam` | libkernel | NATIVE | 2 |
+| 101 | `scePthreadAttrSetaffinity` | libkernel | NATIVE | 2 |
+| 102 | `scePthreadAttrSetschedpolicy` | libkernel | NATIVE | 2 |
+| 103 | `scePthreadCondDestroy` | libkernel | NATIVE | 2 |
+| 104 | `scePthreadJoin` | libkernel | NATIVE | 2 |
+| 105 | `sceKernelPwrite` | libkernel | NATIVE | 2 |
 | 106 | `sceAjmInitialize` | libSceAjm | BRIDGE | 1 |
 | 107 | `sceAjmModuleRegister` | libSceAjm | BRIDGE | 1 |
-| 108 | `sceAppContentInitialize` | libSceAppContent | BRIDGE | 1 |
+| 108 | `sceAppContentInitialize` | libSceAppContent | NATIVE | 1 |
 | 109 | `sceCommonDialogInitialize` | libSceCommonDialog | BRIDGE | 1 |
-| 110 | `sceGnmDispatchInitDefaultHardwareState` | libSceGnmDriver | BRIDGE | 1 |
-| 111 | `sceGnmMapComputeQueue` | libSceGnmDriver | BRIDGE | 1 |
-| 112 | `sceGnmSubmitCommandBuffers` | libSceGnmDriver | BRIDGE | 1 |
-| 113 | `sceHttpCreateTemplate` | libSceHttp | BRIDGE | 1 |
-| 114 | `sceHttpInit` | libSceHttp | BRIDGE | 1 |
-| 115 | `sceHttpSetConnectTimeOut` | libSceHttp | BRIDGE | 1 |
-| 116 | `sceHttpSetRecvTimeOut` | libSceHttp | BRIDGE | 1 |
-| 117 | `sceHttpSetSendTimeOut` | libSceHttp | BRIDGE | 1 |
-| 118 | `sceHttpsLoadCert` | libSceHttp | BRIDGE | 1 |
+| 110 | `sceGnmDispatchInitDefaultHardwareState` | libSceGnmDriver | NATIVE | 1 |
+| 111 | `sceGnmMapComputeQueue` | libSceGnmDriver | NATIVE | 1 |
+| 112 | `sceGnmSubmitCommandBuffers` | libSceGnmDriver | NATIVE | 1 |
+| 113 | `sceHttpCreateTemplate` | libSceHttp | NATIVE | 1 |
+| 114 | `sceHttpInit` | libSceHttp | NATIVE | 1 |
+| 115 | `sceHttpSetConnectTimeOut` | libSceHttp | NATIVE | 1 |
+| 116 | `sceHttpSetRecvTimeOut` | libSceHttp | NATIVE | 1 |
+| 117 | `sceHttpSetSendTimeOut` | libSceHttp | NATIVE | 1 |
+| 118 | `sceHttpsLoadCert` | libSceHttp | NATIVE | 1 |
 | 119 | `sceNetInetNtop` | libSceNet | BRIDGE | 1 |
 | 120 | `sceNetInit` | libSceNet | BRIDGE | 1 |
 | 121 | `sceNetPoolCreate` | libSceNet | BRIDGE | 1 |
-| 122 | `sceNetCtlGetState` | libSceNetCtl | BRIDGE | 1 |
-| 123 | `sceNetCtlInit` | libSceNetCtl | BRIDGE | 1 |
-| 124 | `sceNetCtlRegisterCallback` | libSceNetCtl | BRIDGE | 1 |
-| 125 | `sceNpGetState` | libSceNpManager | BRIDGE | 1 |
-| 126 | `sceNpRegisterGamePresenceCallbackA` | libSceNpManager | BRIDGE | 1 |
-| 127 | `sceNpRegisterStateCallbackA` | libSceNpManager | BRIDGE | 1 |
-| 128 | `sceNpSetContentRestriction` | libSceNpManager | BRIDGE | 1 |
-| 129 | `sceNpSetNpTitleId` | libSceNpManager | BRIDGE | 1 |
-| 130 | `sceNpTrophyCreateContext` | libSceNpTrophy | BRIDGE | 1 |
-| 131 | `sceNpTrophyCreateHandle` | libSceNpTrophy | BRIDGE | 1 |
-| 132 | `sceNpTrophyGetTrophyUnlockState` | libSceNpTrophy | BRIDGE | 1 |
-| 133 | `sceNpTrophyRegisterContext` | libSceNpTrophy | BRIDGE | 1 |
-| 134 | `scePadInit` | libScePad | BRIDGE | 1 |
-| 135 | `scePlayGoGetToDoList` | libScePlayGo | BRIDGE | 1 |
-| 136 | `scePlayGoInitialize` | libScePlayGo | BRIDGE | 1 |
-| 137 | `scePlayGoOpen` | libScePlayGo | BRIDGE | 1 |
-| 138 | `scePlayGoSetLanguageMask` | libScePlayGo | BRIDGE | 1 |
-| 139 | `scePlayGoSetToDoList` | libScePlayGo | BRIDGE | 1 |
-| 140 | `sceSaveDataInitialize3` | libSceSaveData | BRIDGE | 1 |
-| 141 | `sceSslInit` | libSceSsl | BRIDGE | 1 |
-| 142 | `sceSystemServiceGetDisplaySafeAreaInfo` | libSceSystemService | BRIDGE | 1 |
-| 143 | `sceSystemServiceHideSplashScreen` | libSceSystemService | BRIDGE | 1 |
-| 144 | `sceSystemServiceParamGetString` | libSceSystemService | NATIVE | 1 |
-| 145 | `sceUserServiceGetInitialUser` | libSceUserService | BRIDGE | 1 |
-| 146 | `sceUserServiceGetLoginUserIdList` | libSceUserService | BRIDGE | 1 |
-| 147 | `sceUserServiceInitialize` | libSceUserService | BRIDGE | 1 |
-| 148 | `sceVideoOutAdjustColor_` | libSceVideoOut | BRIDGE | 1 |
-| 149 | `sceVideoOutColorSettingsSetGamma_` | libSceVideoOut | BRIDGE | 1 |
-| 150 | `sceVideoOutConfigureOutputMode_` | libSceVideoOut | BRIDGE | 1 |
-| 151 | `sceVideoOutGetDeviceCapabilityInfo_` | libSceVideoOut | BRIDGE | 1 |
-| 152 | `sceVideoOutModeSetAny_` | libSceVideoOut | BRIDGE | 1 |
-| 153 | `sceVideoOutOpen` | libSceVideoOut | BRIDGE | 1 |
-| 154 | `sceVideoOutSetBufferAttribute` | libSceVideoOut | BRIDGE | 1 |
-| 155 | `sceVideoOutSetFlipRate` | libSceVideoOut | BRIDGE | 1 |
-| 156 | `sceVideodecCreateDecoder` | libSceVideodec | BRIDGE | 1 |
-| 157 | `sceVideodecDeleteDecoder` | libSceVideodec | BRIDGE | 1 |
-| 158 | `sceVideodecQueryResourceInfo` | libSceVideodec | BRIDGE | 1 |
-| 159 | `sceVideodecReset` | libSceVideodec | BRIDGE | 1 |
-| 160 | `sceKernelAddUserEvent` | libkernel | BRIDGE | 1 |
-| 161 | `sceKernelCreateEqueue` | libkernel | BRIDGE | 1 |
-| 162 | `sceKernelDeleteUserEvent` | libkernel | BRIDGE | 1 |
-| 163 | `sceKernelGetTscFrequency` | libkernel | BRIDGE | 1 |
-| 164 | `sceKernelTriggerUserEvent` | libkernel | BRIDGE | 1 |
+| 122 | `sceNetCtlGetState` | libSceNetCtl | NATIVE | 1 |
+| 123 | `sceNetCtlInit` | libSceNetCtl | NATIVE | 1 |
+| 124 | `sceNetCtlRegisterCallback` | libSceNetCtl | NATIVE | 1 |
+| 125 | `sceNpGetState` | libSceNpManager | NATIVE | 1 |
+| 126 | `sceNpRegisterGamePresenceCallbackA` | libSceNpManager | NATIVE | 1 |
+| 127 | `sceNpRegisterStateCallbackA` | libSceNpManager | NATIVE | 1 |
+| 128 | `sceNpSetContentRestriction` | libSceNpManager | NATIVE | 1 |
+| 129 | `sceNpSetNpTitleId` | libSceNpManager | NATIVE | 1 |
+| 130 | `sceNpTrophyCreateContext` | libSceNpTrophy | NATIVE | 1 |
+| 131 | `sceNpTrophyCreateHandle` | libSceNpTrophy | NATIVE | 1 |
+| 132 | `sceNpTrophyGetTrophyUnlockState` | libSceNpTrophy | NATIVE | 1 |
+| 133 | `sceNpTrophyRegisterContext` | libSceNpTrophy | NATIVE | 1 |
+| 134 | `scePadGetControllerInformation` | libScePad | NATIVE | 1 |
+| 135 | `scePadInit` | libScePad | NATIVE | 1 |
+| 136 | `scePadOpen` | libScePad | NATIVE | 1 |
+| 137 | `scePlayGoGetToDoList` | libScePlayGo | NATIVE | 1 |
+| 138 | `scePlayGoInitialize` | libScePlayGo | NATIVE | 1 |
+| 139 | `scePlayGoOpen` | libScePlayGo | NATIVE | 1 |
+| 140 | `scePlayGoSetLanguageMask` | libScePlayGo | NATIVE | 1 |
+| 141 | `scePlayGoSetToDoList` | libScePlayGo | NATIVE | 1 |
+| 142 | `sceSaveDataInitialize3` | libSceSaveData | NATIVE | 1 |
+| 143 | `sceSaveDataSetParam` | libSceSaveData | NATIVE | 1 |
+| 144 | `sceSslInit` | libSceSsl | NATIVE | 1 |
+| 145 | `sceSystemServiceGetDisplaySafeAreaInfo` | libSceSystemService | NATIVE | 1 |
+| 146 | `sceSystemServiceHideSplashScreen` | libSceSystemService | NATIVE | 1 |
+| 147 | `sceSystemServiceParamGetString` | libSceSystemService | NATIVE | 1 |
+| 148 | `sceUserServiceGetInitialUser` | libSceUserService | NATIVE | 1 |
+| 149 | `sceUserServiceGetLoginUserIdList` | libSceUserService | NATIVE | 1 |
+| 150 | `sceUserServiceInitialize` | libSceUserService | NATIVE | 1 |
+| 151 | `sceVideoOutAdjustColor_` | libSceVideoOut | NATIVE | 1 |
+| 152 | `sceVideoOutColorSettingsSetGamma_` | libSceVideoOut | NATIVE | 1 |
+| 153 | `sceVideoOutConfigureOutputMode_` | libSceVideoOut | NATIVE | 1 |
+| 154 | `sceVideoOutGetDeviceCapabilityInfo_` | libSceVideoOut | NATIVE | 1 |
+| 155 | `sceVideoOutModeSetAny_` | libSceVideoOut | NATIVE | 1 |
+| 156 | `sceVideoOutOpen` | libSceVideoOut | NATIVE | 1 |
+| 157 | `sceVideoOutSetBufferAttribute` | libSceVideoOut | NATIVE | 1 |
+| 158 | `sceVideoOutSetFlipRate` | libSceVideoOut | NATIVE | 1 |
+| 159 | `sceVideodecDeleteDecoder` | libSceVideodec | NATIVE | 1 |
+| 160 | `sceKernelAddUserEvent` | libkernel | NATIVE | 1 |
+| 161 | `sceKernelCreateEqueue` | libkernel | NATIVE | 1 |
+| 162 | `sceKernelDeleteUserEvent` | libkernel | NATIVE | 1 |
+| 163 | `sceKernelGetTscFrequency` | libkernel | NATIVE | 1 |
+| 164 | `sceKernelTriggerUserEvent` | libkernel | NATIVE | 1 |
 | 165 | `sceLibcHeapGetTraceInfo` | libSceLibcInternalExt | BRIDGE | 1 |
-| 166 | `_sceKernelRtldSetApplicationHeapAPI` | libkernel | BRIDGE | 1 |
-| 167 | `clock_gettime` | libkernel | BRIDGE | 1 |
-| 168 | `scePthreadAttrGet` | libkernel | BRIDGE | 1 |
-| 169 | `scePthreadAttrGetaffinity` | libkernel | BRIDGE | 1 |
+| 166 | `_sceKernelRtldSetApplicationHeapAPI` | libkernel | NATIVE | 1 |
+| 167 | `clock_gettime` | libkernel | NATIVE | 1 |
+| 168 | `scePthreadAttrGet` | libkernel | NATIVE | 1 |
+| 169 | `scePthreadAttrGetaffinity` | libkernel | NATIVE | 1 |
 | 170 | `fflush` | libSceLibcInternal | BRIDGE | 1 |
-| 171 | `scePthreadRwlockWrlock` | libkernel | BRIDGE | 1 |
+| 171 | `vprintf` | libSceLibcInternal | COMMON_STUB | 1 |
+| 172 | `scePthreadRwlockWrlock` | libkernel | NATIVE | 1 |
 
 ## Не вызывались в этом прогоне (по модулям)
 
@@ -203,7 +204,7 @@ COMMON_STUB-вызовы счётчик не видит (shadPS4 пишет их
 | libSceErrorDialog | 4 |
 | libSceGnmDriver | 67 |
 | libSceHttp | 12 |
-| libSceLibcInternal | 14 |
+| libSceLibcInternal | 13 |
 | libSceMsgDialog | 3 |
 | libSceNet | 27 |
 | libSceNetCtl | 2 |
