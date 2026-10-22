@@ -35,9 +35,9 @@ namespace GDR = NativeEngine::Reconstructed::GBufferDraw;
 // flight between a draw's capture and its recording, so reuse does not race the reader in practice.
 struct DescSlot {
     std::atomic<u64> seq{~0ull}; ///< the sequence number whose description this holds (~0: none / being written)
-    GDR::DrawDescription desc;
+    EngineDraw draw;
 };
-constexpr u32 kDescRingBits = 14;
+constexpr u32 kDescRingBits = 13; // (8192 slots of ~5 KiB: several frames of G-buffer draws in flight)
 constexpr u32 kDescRingSize = 1u << kDescRingBits;
 constexpr u32 kDescRingMask = kDescRingSize - 1;
 std::unique_ptr<DescSlot[]> g_desc_ring;
@@ -185,13 +185,15 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     bool have_desc = false;
     if constexpr (I == 2) {
         if (g_desc_on && !scoped) { // (not the R7 native-render path, which replaces the draw and its tag)
-            GDR::DrawDescription tmp;
-            if (GDR::Describe(a, r, c, d, e, tmp) && tmp.followed) {
-                const u64 h = g_desc_head.fetch_add(1, std::memory_order_relaxed);
-                DescSlot& s = g_desc_ring[h & kDescRingMask];
-                s.seq.store(~0ull, std::memory_order_release); // being written: readers see it as stale
-                s.desc = tmp;
-                s.seq.store(h, std::memory_order_release);     // published
+            const u64 h = g_desc_head.fetch_add(1, std::memory_order_relaxed);
+            DescSlot& s = g_desc_ring[h & kDescRingMask];
+            s.seq.store(~0ull, std::memory_order_release); // being written: readers see it as stale
+            std::atomic_thread_fence(std::memory_order_release);
+            if (GDR::Describe(a, r, c, d, e, s.draw.desc) && s.draw.desc.followed) {
+                // the stages' CUE state at the draw's commit (what their SRT walks would read: gbuffer_draw.h)
+                GDR::CaptureStage(r, 2, s.draw.vs);
+                GDR::CaptureStage(r, 1, s.draw.ps);
+                s.seq.store(h, std::memory_order_release); // published
                 desc_seq = static_cast<u32>(h);
                 have_desc = true;
                 tag |= kNativeDesc;
@@ -245,18 +247,22 @@ bool EngineDescOn() {
     return g_desc_on;
 }
 
-bool EngineDescCopy(u32 seq, GDR::DrawDescription& out) {
+const EngineDraw* EngineDescPeek(u32 seq) {
     if (!g_desc_on) {
-        return false;
+        return nullptr;
     }
     const DescSlot& s = g_desc_ring[seq & kDescRingMask];
     const u64 seq1 = s.seq.load(std::memory_order_acquire);
     if (static_cast<u32>(seq1) != seq || seq1 == ~0ull) {
-        return false; // the slot holds another draw now (or is being written)
+        return nullptr; // the slot holds another draw now (or is being written)
     }
-    out = s.desc;
-    const u64 seq2 = s.seq.load(std::memory_order_acquire);
-    return seq2 == seq1; // the copy was not overwritten mid-read
+    return &s.draw;
+}
+
+bool EngineDescStill(u32 seq) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 seq2 = g_desc_ring[seq & kDescRingMask].seq.load(std::memory_order_relaxed);
+    return static_cast<u32>(seq2) == seq && seq2 != ~0ull; // not overwritten while it was read
 }
 
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
@@ -337,8 +343,8 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
             g_desc_ring = std::make_unique<DescSlot[]>(kDescRingSize);
             g_desc_on = true;
             SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_NATIVE_GBUFFER={} - 0x1a1770's engine descriptors (instance V#, "
-                                      "vertex streams, draw constants) captured from the engine's structures for the "
-                                      "command processor's native path", ng);
+                                      "vertex streams, draw constants) and its VS/PS CUE state at the commit captured "
+                                      "for the command processor's native path", ng);
         }
     }
     SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_CITY_ENGINE_OPT={} - the engine's mesh draws (0x1a1960) and shadow casters' "

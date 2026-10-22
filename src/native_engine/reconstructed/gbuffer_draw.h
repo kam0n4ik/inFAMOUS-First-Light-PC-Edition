@@ -122,6 +122,25 @@ struct DrawDescription {
 /// after the original draw ran (the context's stencil and constant-buffer state are then already the draw's).
 bool Describe(u64 material, u64 r, u64 records, u64 n, u64 mesh, DrawDescription& out);
 
+/// A stage's constant-update-engine state at the draw's commit. 0x14ad0 (the CUE commit, docs §9) copies a dirty
+/// stage's shadow - cue+0x90+stage*0x1800, its layout's first L[0] dwords (L = [cue+0xc180+stage*8]) - whole to new
+/// frame memory and points the stage's user-data registers into that copy: register L[7] at +0, L[8]/L[9] at
+/// L16[0x16]/L16[0x1a], L[10]/L[11] at L16[0x1c]/L16[0x1e], L[5] at L16[0x18], L[6] at L16[0x20] (dwords; 0xff: no
+/// register). So what the shader's SRT walk reads through those registers is this shadow, which Capture takes after
+/// the engine's draw (the commit ran; nothing writes the shadow between the commit and the draw). Registers given
+/// other memory - L[12] (cue+0x78), L[4] (cue+0xc120+stage*8) - and the dwords L[13]/L[14]/L[15] are not in it.
+inline constexpr u32 kMaxShadowDwords = 512;
+inline constexpr u32 kShadowPointers = 7;
+struct StageShadow {
+    u64 layout = 0;   ///< L: the stage's layout (the CUE's per-shader user-data layout)
+    u16 dwords = 0;   ///< L[0]: the dwords the commit copies; 0 = not captured (no layout, or > kMaxShadowDwords)
+    std::array<u8, kShadowPointers> reg{};   ///< the user-data register given the copy + off[i] dwords (0xff: none)
+    std::array<u16, kShadowPointers> off{};
+    std::array<u32, kMaxShadowDwords> shadow{}; ///< [0, dwords): the copy the stage's registers point into
+};
+/// Capture `stage`'s (VS 2, PS 1) CUE state of context `r` into `out`; false when it has no layout or too many dwords.
+bool CaptureStage(u64 r, u32 stage, StageShadow& out);
+
 /// Set the module base and the pure callees Describe needs (0x45f590, 0x61e260, 0x27530) if Prepare() has not already;
 /// a lighter setup than Prepare for the Native Engine G-buffer path, which uses no recording clones.
 void EnsurePureCallees(u64 module_base);

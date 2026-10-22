@@ -1,28 +1,41 @@
 // SecondSonPC - the Native Engine G-buffer draw path (SSPC_NATIVE_GBUFFER; off by default;
-// docs/NATIVE_GBUFFER_DRAW_0x1a1770.md). The descriptors of a 0x1a1770 draw taken from the engine's own structures.
+// docs/NATIVE_GBUFFER_DRAW_0x1a1770.md). A 0x1a1770 draw prepared from the engine's own state, not from PM4/SRT.
 //
-// The mesh pass draws the city's G-buffer with 0x1a1770 (engine/render/draw_runs.h). Its per-draw resources - the
-// instance records' V#, the vertex-stream V#s, the per-object constant buffer - are built by the engine from
-// (records, n, mesh); the engine commits them into the constant update engine, and today the command processor reads
-// them back by walking the shader's SRT over the committed register snapshot. The native path instead takes those
-// descriptors from the engine's source structures at the draw (draw_runs.cpp captures them with the GAME_VERIFIED
-// Instanced formulas - gbuffer_draw.h Describe - into a side ring, indexed by the draw's trailing NOP), so no PM4/SRT
-// processing of those resources is needed.
-//
-// This file is the command processor's consumer. verify: build the engine descriptors and the SRT walk both and
-// compare them descriptor by descriptor (the gate before the walk is skipped); guarded / native use the engine
-// descriptors and fall back to the walk when a draw has no valid engine record. The material's PS textures/samplers
-// (0x448640) are the stable per-material part; they are not per-draw and are covered by the walk/caches for now
-// (docs §5: what is engine-sourced and what is not, with addresses).
+// The mesh pass draws the city's G-buffer with 0x1a1770 (engine/render/draw_runs.h). At each such draw the engine
+// side (draw_runs.cpp) records into a side ring, indexed by the draw's trailing NOP:
+//   * its descriptors from their source structures (gbuffer_draw.h Describe: the instance records' V#, the vertex
+//     streams, the per-object constants - the GAME_VERIFIED Instanced formulas), and
+//   * its VS / PS constant-update-engine state at the commit (gbuffer_draw.h CaptureStage): the CUE shadow 0x14ad0
+//     copies to frame memory, and the user-data registers it points into that copy.
+// What a stage's SRT walk reads through those registers *is* that shadow. This file is the command processor's
+// consumer:
+//   * a stage map, once per (module, CUE layout): which shadow dword each flattened user-data dword is - the module's
+//     own walk run once over tagged registers (TagReader), never over guest memory;
+//   * a draw's stages built from the engine's state through the map (no SRT walk: the flattened user data, the
+//     vertex V#s), decoded as the full preparation decodes (DecodeResources), the specialization key checked;
+//   * the heads (program, module, runtime parameters, pipeline) from a template: an earlier full preparation of
+//     the same programs, pipeline registers (the processor's pipeline key), targets and CUE layouts.
+// verify: every draw prepared in full (the walk, what the draw uses) and built from the engine too, the two plans
+// compared binding by binding (raw V#/T#/S#, addresses, sizes, bindings, statuses) and the flattened data dword by
+// dword. guarded / native: the engine build is the draw's preparation; anything it does not describe (no record, a
+// map the walk does not fit, no template, another key) takes the full path. guarded also checks every 64th engine
+// build against the walk and turns the engine path off at the first difference.
 #pragma once
 
 #include <array>
 #include <atomic>
+#include <memory>
+#include <span>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "base/abi.h"
+#include "engine/render/draw_runs.h"
 #include "native_engine/reconstructed/gbuffer_draw.h"
-#include "runtime/gpu/shader/shader_resources.h"
+#include "runtime/gpu/command_processor.h"
+#include "runtime/gpu/shader/pipeline_state.h"
+#include "runtime/gpu/shader/shader_frontend.h"
 
 namespace SecondSon::Gpu {
 
@@ -37,31 +50,103 @@ public:
 
     Mode mode() const { return mode_; }
     bool On() const { return mode_ != Mode::Off; }
+    /// guarded / native: the engine build is used (and not turned off by a guarded difference).
+    bool Takes() const { return (mode_ == Mode::Guarded || mode_ == Mode::Native) && !tripped_; }
 
-    /// A tagged G-buffer draw was prepared; `had_record`: a valid engine record was found for it (false: the ring
-    /// slot was reused, or the draw carried no engine descriptors - the full path is used).
-    void NoteDraw(bool had_record) {
-        draws_.fetch_add(1, std::memory_order_relaxed);
-        (had_record ? with_record_ : no_record_).fetch_add(1, std::memory_order_relaxed);
+    /// A tagged G-buffer draw reached the preparation; `has`: its engine record was found (false: no record, or the
+    /// ring slot reused since - the full path).
+    void NoteRecord(bool has) {
+        Bump(draws_);
+        Bump(has ? with_record_ : no_record_);
     }
 
-    /// verify: compare the engine descriptors `d` of a draw with the SRT walk's plans; count matches and mismatches.
-    /// A descriptor matches when some binding of the walk's plan holds the same V# (value match - the walk resolves
-    /// the same bytes the engine supplied). `vs` / `ps` are the draw's VS / PS resource plans.
-    void Verify(const GDR::DrawDescription& d, const GS::ResourceBindingPlan& vs,
-                const GS::ResourceBindingPlan& ps);
+    /// guarded / native: prepare `d` from the engine record `e` and a template (see above) into `prep`, `state`, `vs`,
+    /// `ps`. false: the full path (the reason is counted). `epoch`: the frontend's program cache epoch.
+    bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch,
+                 GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state, GS::StageView& vs,
+                 GS::StageView& ps);
+
+    /// After `d`'s full preparation (`prep`, `state`, its VS/PS views): keep it as its key's template; `check` (verify:
+    /// every draw, guarded: its samples) builds the draw from `e` as Prepare would and compares it with the walk's.
+    void AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 epoch,
+                   const GS::DrawPreparation& prep, const GS::GraphicsPipelineState* state, const GS::StageView& vs,
+                   const GS::StageView& ps, bool check);
+
+    /// guarded: this engine build is one to check against a full preparation (every 64th).
+    bool SampleCheck() { return mode_ == Mode::Guarded && (++sample_ & 63) == 0; }
 
     std::string Report() const;
 
 private:
+    static constexpr u16 kZero = 0xffff; ///< a flattened dword the walk does not write (0 in both)
+
+    /// Where a stage's flattened user data comes from in its CUE copy (one module's walk over one CUE layout).
+    struct StageMap {
+        const GS::Module* first = nullptr; ///< the layout's first module (whose walk PrepareStage runs)
+        u64 layout = 0;                    ///< the CUE layout (GDR::StageShadow::layout)
+        bool ok = false;
+        u8 why = 0;       ///< not ok: 1 no walk / not ready, 2 the walk failed, 3 it read memory not of the copy,
+                          ///< 4 it wrote the registers, 5 a dword of unknown origin, 6 past the copy, 7 a vertex V#
+        u32 ud_read = 0;  ///< the registers the walk reads (RunStats::user_data_read)
+        u32 flat_size = 0;
+        std::vector<u16> flat;   ///< [16, flat_size): the copy's dword each is (kZero: not written)
+        std::vector<u16> vertex; ///< per fetch attribute: the copy's dword its V# starts at
+    };
+
+    struct Key {
+        u64 vs = 0, ps = 0;    ///< program addresses
+        u64 pipeline_key = 0;  ///< the processor's hash of every pipeline-group register
+        u32 targets = 0;       ///< the processor's targets version
+        u64 vs_layout = 0, ps_layout = 0;
+        bool operator==(const Key&) const = default;
+    };
+    struct Template {
+        Key key;
+        u64 epoch = 0;
+        GS::DrawPreparation prep;
+        const GS::GraphicsPipelineState* state = nullptr;
+        GS::StageView vs, ps; ///< the heads (their plans are each draw's)
+        u64 fetch = 0;        ///< the VS fetch shader's address (user data at the fetch registers)
+        u32 fetch_reg = 0xff;
+    };
+
+    static void Bump(std::atomic<u64>& c, u64 n = 1) {
+        c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); // (one writer thread)
+    }
+    static Key KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e);
+    static u64 HashOf(const Key& k);
+    static u64 FetchOf(const GS::StageView& vs, std::span<const u32, 16> ud, u32& reg);
+
+    /// The map of `v`'s stage for CUE state `sh` (made on first use). nullptr: the view has no first module yet.
+    const StageMap* MapOf(const GS::StageView& v, const GDR::StageShadow& sh);
+    void MakeMap(StageMap& m, const GS::Module& first, const GDR::StageShadow& sh);
+    /// `out` = `head`'s stage for this draw, its plan from the CUE state `sh` through `m`. false (`why`): another
+    /// specialization or other bindings than the head's module (the full path).
+    bool BuildStage(const GS::StageView& head, const StageMap& m, const GDR::StageShadow& sh,
+                    std::span<const u32, 16> ud, GS::StageView& out, u32& why);
+    /// verify: `built` against the walk's `full`, binding by binding; counts by part, logs the first ones. true: same.
+    bool Compare(const GS::StageView& full, const GS::StageView& built, u32 stage);
+
     Mode mode_ = Mode::Off;
+    bool tripped_ = false; ///< guarded: a checked build differed - the engine path is off from then on
+    u64 sample_ = 0;
+    std::unordered_map<u64, std::unique_ptr<StageMap>> maps_;
+    std::unordered_map<u64, Template> templates_;
+    std::vector<std::array<u32, 4>> vreads_;
+    GS::SpecializationKey key_;
+    GS::StageView check_vs_, check_ps_; ///< verify: the engine builds compared with the walk's
+
     std::atomic<u64> draws_{0}, with_record_{0}, no_record_{0};
-    // verify, by resource kind (0 buffer / instance V#, 1 vertex stream, 2 draw constant buffer): engine descriptors
-    // seen, those a walk binding reproduced (value match), those none did
-    std::array<std::atomic<u64>, 3> seen_{}, matched_{}, unmatched_{};
-    std::atomic<u64> verified_draws_{0};  ///< draws whose every engine descriptor matched a walk binding
-    std::atomic<u64> mismatch_draws_{0};  ///< draws with at least one engine descriptor no walk binding held
-    std::atomic<u64> mismatch_logged_{0};
+    std::atomic<u64> taken_{0};            ///< prepared from the engine (guarded / native)
+    std::array<std::atomic<u64>, 12> refused_{}; ///< by reason (Report)
+    std::array<std::atomic<u64>, 8> map_why_{};  ///< maps made, by StageMap::why (0: ok)
+    std::atomic<u64> templates_made_{0};
+    // verify / guarded checks: stages compared, the same, different by part (flat, buffers, images, samplers,
+    // vertices, heads)
+    std::atomic<u64> compared_{0}, same_{0};
+    std::array<std::atomic<u64>, 6> diff_{};
+    std::atomic<u64> built_failed_{0}; ///< verify: a draw whose engine build was refused (why: refused_)
+    std::atomic<u64> logged_{0};
 };
 
 } // namespace SecondSon::Gpu

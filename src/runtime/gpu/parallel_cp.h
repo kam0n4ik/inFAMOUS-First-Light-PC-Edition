@@ -566,6 +566,7 @@ private:
     std::atomic<u64> reuse_same_{0}, reuse_copied_{0}, reuse_mismatches_{0};
     GS::ShaderFrontend* frontend_ = nullptr;
     NativeGBuffer ngb_; ///< SSPC_NATIVE_GBUFFER: the engine-descriptor G-buffer path (reads the environment itself)
+    Cp::GroupMask ngb_pending_ = 0; ///< the groups changed at draws ngb_ prepared without the frontend
     const std::atomic<u64>* map_gen_ = nullptr;
     const Vk::Timeline* timeline_ = nullptr;
     FrontReader reader_{*this};

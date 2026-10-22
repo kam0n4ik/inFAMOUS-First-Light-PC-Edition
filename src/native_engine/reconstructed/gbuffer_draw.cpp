@@ -694,6 +694,29 @@ void GD::EnsurePureCallees(u64 module_base) {
     }
 }
 
+bool GD::CaptureStage(u64 r, u32 stage, StageShadow& out) {
+    const u64 cue = r + kCue;
+    out.layout = GuestLoad<u64>(cue + kCueLayout + 8 * u64{stage});
+    out.dwords = 0;
+    if (out.layout == 0) {
+        return false;
+    }
+    const u16 dwords = GuestLoad<u16>(out.layout);
+    if (dwords == 0 || dwords > kMaxShadowDwords) {
+        return false;
+    }
+    // 0x14ad0: the registers it points into the stage's copy and the dword offset each gets (L byte, L u16)
+    constexpr std::array<std::pair<u8, u8>, kShadowPointers> kPointers = {
+        {{7, 0}, {8, 0x16}, {9, 0x1a}, {10, 0x1c}, {11, 0x1e}, {5, 0x18}, {6, 0x20}}};
+    for (u32 i = 0; i < kShadowPointers; ++i) {
+        out.reg[i] = GuestLoad<u8>(out.layout + kPointers[i].first);
+        out.off[i] = kPointers[i].second == 0 ? 0 : GuestLoad<u16>(out.layout + kPointers[i].second);
+    }
+    std::memcpy(out.shadow.data(), reinterpret_cast<const void*>(cue + 0x90 + u64{stage} * 0x1800), dwords * 4u);
+    out.dwords = dwords;
+    return true;
+}
+
 bool GD::Describe(u64 material, u64 r, u64 records, u64 n, u64 mesh, DrawDescription& out) {
     out = {};
     if (g_real.vsharp == nullptr || g_real.init_buffer == nullptr || g_real.stage == nullptr ||

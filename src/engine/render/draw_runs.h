@@ -53,10 +53,17 @@ inline u32 NativeDescSeq(const u32* nop) {
     return nop[3];
 }
 
-/// SSPC_NATIVE_GBUFFER: copy into `out` the engine descriptors captured for the draw whose trailing NOP holds `seq`.
-/// False when the ring slot has since been reused (a seqlock check) - the command processor then uses the full path.
-/// The command processor's thread. The reconstruction's own type (gbuffer_draw.h).
-bool EngineDescCopy(u32 seq, NativeEngine::Reconstructed::GBufferDraw::DrawDescription& out);
+/// SSPC_NATIVE_GBUFFER: what the engine gave one 0x1a1770 draw - its descriptors (Describe) and its VS / PS CUE state
+/// at the commit (CaptureStage) - in the side ring (the reconstruction's own types, gbuffer_draw.h).
+struct EngineDraw {
+    NativeEngine::Reconstructed::GBufferDraw::DrawDescription desc;
+    NativeEngine::Reconstructed::GBufferDraw::StageShadow vs, ps;
+};
+/// The ring slot of the draw whose trailing NOP holds `seq`, read in place (a seqlock): nullptr when the slot has since
+/// been reused or is being written - the command processor then uses the full path. After reading it, EngineDescStill
+/// says whether the slot still held `seq` throughout (false: what was read may be another draw's - discard it).
+const EngineDraw* EngineDescPeek(u32 seq);
+bool EngineDescStill(u32 seq);
 /// Engine-descriptor capture is on (SSPC_NATIVE_GBUFFER set and the reconstruction's pure callees are ready).
 bool EngineDescOn();
 /// The tag carries kMaterialChanged.

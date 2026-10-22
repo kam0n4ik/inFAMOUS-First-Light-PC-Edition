@@ -1002,13 +1002,45 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         }
         return;
     }
+    // SSPC_NATIVE_GBUFFER (native_gbuffer_prep.h): a 0x1a1770 draw with the engine's record - guarded / native prepare it
+    // from the engine's state (no SRT walk); verify and guarded's samples prepare it in full below and compare
+    namespace DR = Engine::Render::DrawRuns;
+    const DR::EngineDraw* engine = nullptr;
+    bool ngb_check = false;
+    if (ngb_.On() && r.draw.engine_run == static_cast<u8>(DR::Source::GBuffer)) {
+        engine = r.draw.engine_native_present ? DR::EngineDescPeek(r.draw.engine_native) : nullptr;
+        ngb_.NoteRecord(engine != nullptr);
+        ngb_check = engine != nullptr && (ngb_.mode() == NativeGBuffer::Mode::Verify || ngb_.SampleCheck());
+        if (engine != nullptr && ngb_.Takes() && !ngb_check) {
+            R8_CP_PROF_ENTER(CpProfile::Sec::FrontNative);
+            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->Programs().Epoch(), r.prep, r.state, r.stage,
+                                         r.ps) &&
+                            DR::EngineDescStill(r.draw.engine_native); // (the slot not reused while it was read)
+            R8_CP_PROF_LEAVE();
+            if (ok) {
+                r.prepared = true;
+                // the frontend skipped this draw: its next preparation sees the register groups changed meanwhile
+                ngb_pending_ |= r.draw.changed;
+                copied_gen_vs_ = copied_gen_ps_ = kNoGen; // (FB-6: the frontend's views are not this draw's)
+                geofast_prev_ = index;
+                geofast_gen_ = frontend_->MemoryGeneration();
+                Bump(fc_.ticks, __rdtsc() - t0);
+                return;
+            }
+        }
+    }
     const bool check = geofast_ == 2 && PrepareGeometryOnly(r, index, *geofast_check_);
     const u8 why = geofast_why_;
     u64 t_copy = 0;
     {
         const GS::FineSample fine(front_fine_counter_);
         R8_CP_PROF_ENTER(CpProfile::Front(r.draw.engine_run));
+        // (the groups changed at draws the native G-buffer path prepared without the frontend count as changed now)
+        const Cp::GroupMask changed = r.draw.changed;
+        r.draw.changed |= ngb_pending_;
+        ngb_pending_ = 0;
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
+        r.draw.changed = changed;
         R8_CP_PROF_LEAVE();
         R8_CP_PROF_PREPARED(r.draw, frontend_->Stage(GS::HwStage::Vs), frontend_->Stage(GS::HwStage::Ps));
         const u64 tc = srt_diag_ ? __rdtsc() : 0;
@@ -1037,21 +1069,14 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         t_copy = srt_diag_ ? __rdtsc() - tc : 0;
     }
     r.prepared = true;
-    // SSPC_NATIVE_GBUFFER: a tagged G-buffer draw with captured engine descriptors - compare them with the walk the
-    // frontend just did (verify: the walk is used; the engine path is proven before it is relied on - req #4).
-    if (ngb_.On() && r.draw.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer)) {
-        if (r.draw.engine_native_present) {
-            GDR::DrawDescription desc;
-            const bool got = Engine::Render::DrawRuns::EngineDescCopy(r.draw.engine_native, desc) && desc.followed;
-            ngb_.NoteDraw(got);
-            if (got && ngb_.mode() == NativeGBuffer::Mode::Verify) {
-                const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
-                const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
-                ngb_.Verify(desc, dv.plan, dp.plan);
-            }
-        } else {
-            ngb_.NoteDraw(false);
-        }
+    // SSPC_NATIVE_GBUFFER: the full preparation is its key's template; verify / guarded's samples compare the engine
+    // build with it (the full one is what the draw uses)
+    if (engine != nullptr && r.stage_shared == nullptr && r.ps_shared == nullptr &&
+        DR::EngineDescStill(r.draw.engine_native)) {
+        R8_CP_PROF(CpProfile::Sec::FrontNative);
+        const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
+        const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
+        ngb_.AfterFull(r.draw, *engine, frontend_->Programs().Epoch(), r.prep, r.state, dv, dp, ngb_check);
     }
     if (srt_diag_) {
         // (a view not copied is the frontend's current one)
