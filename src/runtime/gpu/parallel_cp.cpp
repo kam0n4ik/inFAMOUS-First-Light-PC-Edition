@@ -2317,7 +2317,28 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
         // Phase 6: its PS plan from its registers (RedecodeStage: the walk's output again, the same module and binding
         // numbers) - the same images and samplers; only read-only constant blocks of the same format elsewhere
         const GS::StageView& pp = lead.ps;
-        if (!RedecodeStage(pp, b.user_data[ps], {}, run_ps_plan_)) {
+        // SSPC_CITY_GB_RUN_MATERIAL: the plan from its engine record's CUE state - the walk's plan without walking the
+        // material's tables again (NativeGBuffer::MemberPlan; the walk's cost, R8: most of the member's on the
+        // frontend); no map: the walk
+        u8 planned = NativeGBuffer::kPlanNone;
+        if (gmat_ != 0 && ngb_.On() && b.engine_native_present) {
+            namespace DR = Engine::Render::DrawRuns;
+            if (const DR::EngineDraw* e = DR::EngineDescPeek(b.engine_native); e != nullptr) {
+                planned = ngb_.MemberPlan(pp, e->ps, b.user_data[ps], run_ps_plan_);
+                if (planned != NativeGBuffer::kPlanNone && !DR::EngineDescStill(b.engine_native)) {
+                    planned = NativeGBuffer::kPlanNone; // (the slot reused while it was read: walked)
+                }
+            }
+            if (gmat_ == 2 && planned != NativeGBuffer::kPlanNone) {
+                // verify: the walk's plan too (what the member would have had)
+                const bool walked = RedecodeStage(pp, b.user_data[ps], {}, run_ps_check_);
+                ngb_.CheckMemberPlan(planned, walked, run_ps_plan_, run_ps_check_);
+            }
+        }
+        if (planned == NativeGBuffer::kPlanOther) {
+            return no(12); // (another module or other bindings: the walk's plan is the same)
+        }
+        if (planned == NativeGBuffer::kPlanNone && !RedecodeStage(pp, b.user_data[ps], {}, run_ps_plan_)) {
             return no(12);
         }
         if (!RunHeld() || frontend_->MemoryGeneration() != run_gen_) {

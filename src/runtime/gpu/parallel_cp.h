@@ -496,6 +496,7 @@ private:
     u32 gruns_ab_ = 0; ///< =ab:<n>: in odd blocks of n flips only (image A/B)
     bool GRunsNow() const; ///< on, and (=ab:<n>) in an odd block
     GS::ResourceBindingPlan run_ps_plan_;
+    GS::ResourceBindingPlan run_ps_check_; ///< SSPC_CITY_GB_RUN_MATERIAL=verify: the walk's plan, MemberPlan's checked
     // SSPC_DIAG_PREP_CENSUS=<first flip>:<flips> (CITY-OPT Phase 4): the draws of those flips by their VS/PS programs -
     // both threads' time, GEOFAST's answers, what changed since the draw before (Report)
     struct CensusRow {

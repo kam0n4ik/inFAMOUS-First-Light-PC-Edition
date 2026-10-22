@@ -383,6 +383,91 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
     return true;
 }
 
+u8 NativeGBuffer::MemberPlan(const GS::StageView& head, const GDR::StageShadow& sh, std::span<const u32, 16> ud,
+                             GS::ResourceBindingPlan& out) {
+    const auto give = [&](u8 result) {
+        Bump(member_[result]);
+        return result;
+    };
+    // (RedecodeStage's conditions: a keyed module of a prepared view, decoded with the layout's first module)
+    if (!sh.captured || head.module == nullptr || !head.module->keyed || head.plan.flat.size() < 16 ||
+        !head.plan.error.empty() || head.module->state.load(std::memory_order_acquire) != GS::ModuleState::Ready) {
+        return give(kPlanNone);
+    }
+    const StageMap* m = MapOf(head, sh);
+    if (m == nullptr || !m->ok || m->first == nullptr) {
+        return give(kPlanNone);
+    }
+    const GS::ShaderReflection& r = m->first->result.reflection;
+    const GS::ShaderReflection& mr = head.module->result.reflection;
+    if (r.fetch.present || mr.buffers.size() != r.buffers.size() || mr.images.size() != r.images.size() ||
+        mr.samplers.size() != r.samplers.size() || mr.flatbuf_dwords != r.flatbuf_dwords ||
+        m->flat_size != head.plan.flat.size()) {
+        return give(kPlanNone); // (a VS - its V#s are its own tables' - or the module's own reflection decides)
+    }
+    R8_CP_PROF(CpProfile::Sec::JoinPsPlan);
+    // BuildStage's flattened user data: the member's registers, then the CUE copy's dwords the walk would have loaded
+    out.flat.resize(m->flat_size);
+    std::copy(ud.begin(), ud.end(), out.flat.begin());
+    for (const StageMap::Run& run : m->runs) {
+        u32* to = out.flat.data() + 16 + run.at;
+        if (run.from == kZero) {
+            std::fill_n(to, run.n, 0u);
+        } else {
+            std::copy_n(sh.shadow.data() + run.from, run.n, to);
+        }
+    }
+    GS::DecodeResources(r, head.start, nullptr, ud, head.address, GS::VertexSource{}, out);
+    out.srt = {};
+    out.srt.user_data_read = m->ud_read; // (the registers the walk reads: the next draw's checks)
+    out.error.clear();
+    GS::BuildSpecializationKey(head.runtime, head.start, r, nullptr, out, key_member_);
+    if (!(key_member_ == head.module->key) || !(GS::EndOf(head.start, out) == head.end)) {
+        return give(kPlanOther);
+    }
+    return give(kPlanOk);
+}
+
+void NativeGBuffer::CheckMemberPlan(u8 result, bool walked, const GS::ResourceBindingPlan& mine,
+                                    const GS::ResourceBindingPlan& walk) {
+    Bump(member_check_[0]);
+    if ((result == kPlanOk) != walked) {
+        Bump(member_check_[result == kPlanOk ? 7 : 8]);
+        return;
+    }
+    if (result != kPlanOk) {
+        Bump(member_check_[1]); // (both refused)
+        return;
+    }
+    const auto bufs = [](const GS::BufferBinding& a, const GS::BufferBinding& b) {
+        return a.binding == b.binding && a.kind == b.kind && a.desc.raw == b.desc.raw && a.address == b.address &&
+               a.size == b.size && a.written == b.written && a.formatted == b.formatted && a.status == b.status;
+    };
+    const auto imgs = [](const GS::ImageBinding& a, const GS::ImageBinding& b) {
+        return a.binding == b.binding && a.count == b.count && a.desc.raw == b.desc.raw && a.view_type == b.view_type &&
+               a.storage == b.storage && a.depth == b.depth && a.array == b.array && a.atomic == b.atomic &&
+               a.fmask == b.fmask && a.status == b.status;
+    };
+    const auto smps = [](const GS::SamplerBinding& a, const GS::SamplerBinding& b) {
+        return a.binding == b.binding && a.desc.raw == b.desc.raw && a.status == b.status;
+    };
+    const std::array<bool, 5> same = {mine.flat == walk.flat, std::ranges::equal(mine.buffers, walk.buffers, bufs),
+                                      std::ranges::equal(mine.images, walk.images, imgs),
+                                      std::ranges::equal(mine.samplers, walk.samplers, smps),
+                                      mine.status_counts == walk.status_counts && mine.vertices.empty() &&
+                                          walk.vertices.empty()};
+    bool all = true;
+    for (u32 i = 0; i < same.size(); ++i) {
+        if (!same[i]) {
+            Bump(member_check_[2 + i]);
+            all = false;
+        }
+    }
+    if (all) {
+        Bump(member_check_[1]);
+    }
+}
+
 u64 NativeGBuffer::MaterialOf(const GS::StageView& v) {
     u64 h = Mix(0x6d61746572ull, reinterpret_cast<u64>(v.module));
     for (const GS::ImageBinding& im : v.plan.images) {
@@ -678,8 +763,17 @@ std::string NativeGBuffer::Report() const {
     }
     const auto cr = GDR::CaptureRefusals();
     out += fmt::format("; CUE state not captured: no layout {}, more than {} dwords {}; empty layouts {} (the most "
-                       "dwords {})",
-                       cr[0], GDR::kMaxShadowDwords, cr[2], cr[1], cr[3]);
+                       "dwords {}); run members' PS plans from the CUE state (SSPC_CITY_GB_RUN_MATERIAL): {}, another "
+                       "module/bindings {}, walked (no map) {}",
+                       cr[0], GDR::kMaxShadowDwords, cr[2], cr[1], cr[3], ld(member_[kPlanOk]),
+                       ld(member_[kPlanOther]), ld(member_[kPlanNone]));
+    if (ld(member_check_[0]) != 0) {
+        out += fmt::format("; checked against the walk {} (the same {}), differing by part flat {} buffers {} images {} "
+                           "samplers {} status {}; a plan the walk refused {}, refused the walk's plan {}",
+                           ld(member_check_[0]), ld(member_check_[1]), ld(member_check_[2]), ld(member_check_[3]),
+                           ld(member_check_[4]), ld(member_check_[5]), ld(member_check_[6]), ld(member_check_[7]),
+                           ld(member_check_[8]));
+    }
     if (mode_ != Mode::Native) {
         out += fmt::format("; checked stages {} (same {}), differing by part flat {} buffers {} images {} samplers {} "
                            "vertices {} head/pipeline {}; draws not built {}",

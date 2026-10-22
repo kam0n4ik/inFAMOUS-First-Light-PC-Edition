@@ -83,6 +83,18 @@ public:
     /// guarded: this engine build is one to check against a full preparation (every 64th).
     bool SampleCheck() { return mode_ == Mode::Guarded && (++sample_ & 63) == 0; }
 
+    /// SSPC_CITY_GB_RUN_MATERIAL: a G-buffer run member's plan of `head`'s stage (the run's first draw's view) for its
+    /// registers `ud`, from its engine record's CUE state `sh` through the stage map - what RedecodeStage decodes after
+    /// walking the guest's tables again, without the walk (the native path's plans: the same as the walk's, verify).
+    /// kPlanOk: `out` is the plan, of `head`'s module and bindings; kPlanOther: another module or other bindings (the
+    /// member is refused - the walk would decode the same); kPlanNone: no map / not ready (the caller walks).
+    static constexpr u8 kPlanOk = 0, kPlanOther = 1, kPlanNone = 2;
+    u8 MemberPlan(const GS::StageView& head, const GDR::StageShadow& sh, std::span<const u32, 16> ud,
+                  GS::ResourceBindingPlan& out);
+    /// SSPC_CITY_GB_RUN_MATERIAL=verify: MemberPlan's answer `result` / plan `mine` against the walk's (RedecodeStage:
+    /// `walked` - it gave a plan of the same module and bindings - and `walk`), counted by part (Report).
+    void CheckMemberPlan(u8 result, bool walked, const GS::ResourceBindingPlan& mine, const GS::ResourceBindingPlan& walk);
+
     std::string Report() const;
 
 private:
@@ -191,7 +203,7 @@ private:
     std::vector<std::array<u32, 4>> vreads_;
     std::vector<u32> fetch_code_;
     std::unordered_map<u64, FetchSeen> fetch_seen_; ///< by address
-    GS::SpecializationKey key_vs_, key_ps_;
+    GS::SpecializationKey key_vs_, key_ps_, key_member_;
     GS::StageView check_vs_, check_ps_; ///< verify: the engine builds compared with the walk's
 
     std::atomic<u64> draws_{0}, with_record_{0}, no_record_{0};
@@ -205,6 +217,10 @@ private:
     std::atomic<u64> compared_{0}, same_{0};
     std::array<std::atomic<u64>, 6> diff_{};
     std::atomic<u64> built_failed_{0}; ///< verify: a draw whose engine build was refused (why: refused_)
+    std::array<std::atomic<u64>, 3> member_{}; ///< MemberPlan by result (kPlanOk, kPlanOther, kPlanNone)
+    /// CheckMemberPlan: checked, the same; differing in flat, buffers, images, samplers, status counts; answers that
+    /// differ (a plan the walk refused, a refusal of a plan the walk gave)
+    std::array<std::atomic<u64>, 9> member_check_{};
     std::atomic<u64> logged_{0};
 };
 

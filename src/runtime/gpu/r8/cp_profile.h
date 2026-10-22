@@ -137,6 +137,7 @@ enum class Sec : u8 {
     FrontNativeFind,   ///< the template, its validation in a new frame, the stage maps
     FrontNativeDecode, ///< a stage's plan: the flattened data from the CUE state, DecodeResources
     FrontNativeKey,    ///< its specialization key, the variant of these modules, EndOf
+    JoinPsPlan,        ///< JoinRun: a G-buffer member's PS plan from its CUE state (NativeGBuffer::MemberPlan)
     Count,
 };
 inline constexpr u32 kSections = static_cast<u32>(Sec::Count);
