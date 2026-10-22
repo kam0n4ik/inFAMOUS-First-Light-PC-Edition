@@ -2708,7 +2708,8 @@ bool Executor::PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bin
 bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                          std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& buffers,
                          std::vector<VkDescriptorImageInfo>& image_infos, std::vector<CachedImage*>& bound,
-                         bool& writes_memory, const std::vector<CachedImage*>& targets, const u32* user_data) {
+                         bool& writes_memory, const std::vector<CachedImage*>& targets, const u32* user_data,
+                         u64 material) {
     R8_CP_PROF(compute ? CpProfile::Sec::T2Bind
                        : CpProfile::BySource(CpProfile::Sec::T2Bind, CpProfile::Sec::T2BindMesh, CpProfile::t_source));
     const auto& s = *static_cast<const GS::StageView*>(stage_view);
@@ -2877,14 +2878,161 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     }
     const VkPipelineStageFlags2 shader_stage = compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : kGraphicsShaders;
     images_.ApplyPendingInvalidations(); // before the memo's dirty checks below
+    const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
+    const float lod = !compute && jitter_draw_ ? lod_bias_ : 0.0f;
+    const auto image_flags = [](const GS::ImageBinding& im) {
+        return (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
+    };
+    const auto sampler_desc = [](const GS::SamplerBinding& sm) {
+        return sm.status != GS::ResourceStatus::Ok ? GS::SamplerDesc{} : sm.desc;
+    };
+    // SSPC_NATIVE_GBUFFER: a native 0x1a1770 stage's images and samplers as kept for its material (GbBind)
+    GbBind* gb = nullptr;
+    const u64 gb_epoch = images_.Epoch();
+    u32 lod_bits = 0;
+    std::memcpy(&lod_bits, &lod, 4);
+    if (gb_mode_ == GbMode::Unread) {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_NATIVE_GBUFFER_BIND", v, sizeof(v));
+        const std::string_view sv(v, n < sizeof(v) ? n : 0);
+        // (off by default: R8, city - images 533 -> 536 ns a stage, samplers 81 -> 60; the cost per texture is its
+        // image's state - validity, Touch, layout - not the lookup; docs/NATIVE_GBUFFER_DRAW_0x1a1770.md 9.8)
+        gb_mode_ = sv == "on" ? GbMode::On : sv == "verify" ? GbMode::Verify : GbMode::Off;
+        if (gb_mode_ != GbMode::Off) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_NATIVE_GBUFFER_BIND={} - the native G-buffer stages' material "
+                                   "bindings kept{}",
+                     sv, gb_mode_ == GbMode::Verify ? ", each hit made again in full and compared" : "");
+        }
+    }
+    bool gb_checking = false; // (verify: a hit's bindings, made again below)
+    size_t gb_i0 = 0, gb_w0 = 0, gb_b0 = 0, gb_n0 = 0;
+    if (material != 0 && gb_mode_ != GbMode::Off && !compute && !up_display_draw_ &&
+        plan.images.size() <= kGbMaxImages && plan.samplers.size() <= kGbMaxSamplers) {
+        if (gb_bind_.empty()) {
+            gb_bind_.resize(kGbBinds);
+        }
+        gb = &gb_bind_[(material * 0x9E3779B97F4A7C15ull) >> 53];
+        bool hit = gb->id == material && gb->module == s.module && gb->epoch == gb_epoch && gb->lod == lod_bits &&
+                   gb->images == plan.images.size() && gb->samplers == plan.samplers.size();
+        for (size_t i = 0; hit && i < plan.images.size(); ++i) {
+            const auto& im = plan.images[i];
+            if (im.count > 1 || im.fmask || im.storage) {
+                hit = false; // (one sampled view each - a null one too: its descriptor type and count are the binding's)
+            } else if (im.status != GS::ResourceStatus::Ok) {
+                hit = gb->flags[i] == kGbNull;
+                continue;
+            }
+            const CachedImage* m = gb->img[i];
+            hit = hit && gb->flags[i] == image_flags(im) && gb->raw[i] == im.desc.raw &&
+                  ((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written));
+        }
+        for (size_t i = 0; hit && i < plan.samplers.size(); ++i) {
+            hit = gb->sraw[i] == sampler_desc(plan.samplers[i]).raw;
+        }
+        if (hit) {
+            ++stats_.gb_bind_hits;
+            gb_i0 = image_infos.size();
+            gb_w0 = writes.size();
+            gb_b0 = bound.size();
+            gb_n0 = info_images_.size();
+            for (size_t i = 0; i < plan.images.size(); ++i) {
+                const auto& im = plan.images[i];
+                const size_t first = image_infos.size();
+                CachedImage* m = gb->img[i];
+                VkDescriptorImageInfo ii{VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+                if (gb->flags[i] != kGbNull) {
+                    images_.Touch(*m, cur_.value); // what Find records
+                    const bool feedback = std::ranges::find(targets, m) != targets.end();
+                    ii = {VK_NULL_HANDLE, gb->view[i],
+                          feedback                     ? VK_IMAGE_LAYOUT_GENERAL
+                          : m->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    bound.push_back(m);
+                } else {
+                    m = nullptr;
+                }
+                image_infos.push_back(ii);
+                info_images_.push_back(m);
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstBinding = im.binding,
+                                  .descriptorCount = 1,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                  .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+            }
+            if (gb_parts) {
+                CpProfile::Leave();
+                CpProfile::Enter(CpProfile::Sec::T2GbBindSamplers);
+            }
+            for (size_t i = 0; i < plan.samplers.size(); ++i) {
+                VkSampler vs = gb->smp[i];
+                if (vs == VK_NULL_HANDLE) {
+                    const bool depth = i < refl.samplers.size() && refl.samplers[i].is_depth;
+                    vs = images_.Sampler(sampler_desc(plan.samplers[i]), depth, border_base, lod);
+                    if (vs == VK_NULL_HANDLE) {
+                        vs = images_.Sampler(GS::SamplerDesc{}, depth, 0);
+                    }
+                }
+                const size_t first = image_infos.size();
+                image_infos.push_back({vs, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
+                info_images_.push_back(nullptr);
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstBinding = plan.samplers[i].binding,
+                                  .descriptorCount = 1,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                                  .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+            }
+            if (gb_mode_ != GbMode::Verify) {
+                if (gb_parts) {
+                    CpProfile::Leave();
+                }
+                return true;
+            }
+            // verify: set aside, the full lookups below make them again (compared at the end)
+            gb_check_infos_.assign(image_infos.begin() + gb_i0, image_infos.end());
+            gb_check_writes_.assign(writes.begin() + gb_w0, writes.end());
+            gb_check_bound_.assign(bound.begin() + gb_b0, bound.end());
+            gb_check_info_images_.assign(info_images_.begin() + gb_n0, info_images_.end());
+            image_infos.resize(gb_i0);
+            writes.resize(gb_w0);
+            bound.resize(gb_b0);
+            info_images_.resize(gb_n0);
+            gb_checking = true;
+            if (gb_parts) {
+                CpProfile::Leave();
+                CpProfile::Enter(CpProfile::Sec::T2GbBindImages);
+            }
+        } else {
+            ++stats_.gb_bind_misses;
+        }
+        // kept below when every image, null or not, is one sampled view (no FMask, not storage)
+        gb_new_.images = static_cast<u8>(plan.images.size());
+        gb_new_.samplers = static_cast<u8>(plan.samplers.size());
+        if (gb_checking) {
+            gb = nullptr; // (verify: the entry stays as it was)
+        }
+        for (const auto& im : plan.images) {
+            if (gb == nullptr || im.count > 1 || im.fmask || im.storage) {
+                gb = nullptr;
+                break;
+            }
+        }
+    }
+    u32 image_index = 0;
     for (const auto& im : plan.images) {
+        const u32 gi = image_index++;
         const u32 count = std::max<u32>(im.count, 1);
         const size_t first = image_infos.size();
         bool null_image = im.status != GS::ResourceStatus::Ok;
         CachedImage* img = nullptr;
         // the memo: one view (a dynamic mip index binds every level: not memoized), the same T# and binding flags
         const bool memo_able = !null_image && count == 1 && !im.fmask;
-        const u32 flags = (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
+        const u32 flags = image_flags(im);
+        if (gb != nullptr) {
+            gb_new_.flags[gi] = null_image ? kGbNull : flags;
+            gb_new_.raw[gi] = im.desc.raw;
+            gb_new_.img[gi] = nullptr;
+            gb_new_.view[gi] = VK_NULL_HANDLE;
+        }
         u64 memo_key = 0;
         TexMemo* memo = nullptr;
         if (memo_able) {
@@ -2930,6 +3078,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 image_infos.push_back(ii);
                 info_images_.push_back(m);
                 bound.push_back(m);
+                if (gb != nullptr) {
+                    gb_new_.img[gi] = m;
+                    gb_new_.view[gi] = memo->view;
+                }
                 if (im.storage) {
                     writes_memory = true;
                 }
@@ -2984,6 +3136,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 if (memo != nullptr && ii.imageView != VK_NULL_HANDLE) {
                     *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView};
                 }
+                if (gb != nullptr && count == 1) {
+                    gb_new_.img[gi] = img;
+                    gb_new_.view[gi] = ii.imageView;
+                }
                 const bool feedback = std::ranges::find(targets, img) != targets.end();
                 ii.imageLayout = (im.storage || feedback) ? VK_IMAGE_LAYOUT_GENERAL
                                  : img->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
@@ -3012,17 +3168,17 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         CpProfile::Leave();
         CpProfile::Enter(CpProfile::Sec::T2GbBindSamplers);
     }
-    const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
     for (size_t i = 0; i < plan.samplers.size(); ++i) {
         const auto& sm = plan.samplers[i];
         const bool depth = i < refl.samplers.size() && refl.samplers[i].is_depth;
-        GS::SamplerDesc desc = sm.desc;
-        if (sm.status != GS::ResourceStatus::Ok) {
-            desc = {};
-        }
-        VkSampler vs = images_.Sampler(desc, depth, border_base, !compute && jitter_draw_ ? lod_bias_ : 0.0f);
+        const GS::SamplerDesc desc = sampler_desc(sm);
+        VkSampler vs = images_.Sampler(desc, depth, border_base, lod);
         if (vs == VK_NULL_HANDLE) {
             vs = images_.Sampler(GS::SamplerDesc{}, depth, 0); // the bridge's fallback: the default S#
+        }
+        if (gb != nullptr) {
+            gb_new_.sraw[i] = desc.raw;
+            gb_new_.smp[i] = desc.BorderColorType() == 3 ? VK_NULL_HANDLE : vs; // (a custom colour: read each time)
         }
         const size_t first = image_infos.size();
         image_infos.push_back({vs, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
@@ -3032,6 +3188,40 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                           .descriptorCount = 1,
                           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
                           .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+    }
+    // (kept only when every image has its view and the image cache's epoch held: what the next draw checks)
+    if (gb_checking) {
+        const auto same_write = [](const VkWriteDescriptorSet& a, const VkWriteDescriptorSet& b) {
+            return a.dstBinding == b.dstBinding && a.descriptorCount == b.descriptorCount &&
+                   a.descriptorType == b.descriptorType && a.pImageInfo == b.pImageInfo;
+        };
+        const auto same_info = [](const VkDescriptorImageInfo& a, const VkDescriptorImageInfo& b) {
+            return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout;
+        };
+        const bool same =
+            std::ranges::equal(gb_check_infos_, std::span(image_infos).subspan(gb_i0), same_info) &&
+            std::ranges::equal(gb_check_writes_, std::span(writes).subspan(gb_w0), same_write) &&
+            std::ranges::equal(gb_check_bound_, std::span(bound).subspan(gb_b0)) &&
+            std::ranges::equal(gb_check_info_images_, std::span(info_images_).subspan(gb_n0));
+        ++stats_.gb_bind_verified;
+        if (!same && stats_.gb_bind_mismatches++ < 16) {
+            SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER_BIND=verify: program {:#x} material {:#x}: the kept bindings "
+                                   "differ from the full lookups ({} / {} image infos, {} / {} writes, {} / {} bound)",
+                     s.address, material, gb_check_infos_.size(), image_infos.size() - gb_i0, gb_check_writes_.size(),
+                     writes.size() - gb_w0, gb_check_bound_.size(), bound.size() - gb_b0);
+        }
+    }
+    bool gb_complete = gb != nullptr && images_.Epoch() == gb_epoch;
+    for (u32 i = 0; gb_complete && i < gb_new_.images; ++i) {
+        gb_complete = gb_new_.flags[i] == kGbNull || (gb_new_.img[i] != nullptr && gb_new_.view[i] != VK_NULL_HANDLE);
+    }
+    if (gb_complete) {
+        gb_new_.id = material;
+        gb_new_.module = s.module;
+        gb_new_.epoch = gb_epoch;
+        gb_new_.lod = lod_bits;
+        *gb = gb_new_;
+        ++stats_.gb_bind_kept;
     }
     if (gb_parts) {
         CpProfile::Leave();
@@ -4697,7 +4887,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     info_images_.clear();
     const u64 tb0 = GS::FineTicks();
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
-                             d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data())) {
+                             d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data(), pc.material[1])) {
         return;
     }
     if (instanced && !GatherInstanced(std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4))) {
@@ -4706,7 +4896,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         inst_bind_.clear();
     }
     const bool vs_bound = BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
-                                    d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data());
+                                    d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data(), pc.material[0]);
     inst_runs_.clear(); // (the copies' descriptors: a run of the multi-draw after the first binds them further on)
     for (const auto& [index, info] : inst_bind_) {
         inst_runs_.push_back({vs.plan.buffers[index - vs.start.buffer].binding, info});

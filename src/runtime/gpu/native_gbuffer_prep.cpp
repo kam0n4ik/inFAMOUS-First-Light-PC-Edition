@@ -143,9 +143,8 @@ u64 NativeGBuffer::HashOf(const Key& k) {
     return Mix(h, k.ps_layout);
 }
 
-u64 NativeGBuffer::FetchOf(const GS::StageView& vs, std::span<const u32, 16> ud, u32& reg) {
+u64 NativeGBuffer::FetchOf(const GS::Module* first, std::span<const u32, 16> ud, u32& reg) {
     reg = 0xff;
-    const GS::Module* first = FirstModule(vs);
     if (first == nullptr || !first->result.reflection.fetch.present) {
         return 0;
     }
@@ -181,16 +180,35 @@ bool NativeGBuffer::ReadFetch(GS::GuestReader& memory, u64 addr, u32 reg, std::v
     return false;
 }
 
+void NativeGBuffer::Keep(Template& t, u32 i, u64 fetch, u32 fetch_reg) {
+    const Variant& v = t.v[i];
+    t.hot[i] = {.fetch = fetch,
+                .vs = v.vs.module,
+                .ps = v.ps.module,
+                .vs_key = v.vs.module->keyed ? v.vs.module->key.hash : 0,
+                .ps_key = v.ps.module->keyed ? v.ps.module->key.hash : 0,
+                .fetch_reg = fetch_reg};
+}
+
 bool NativeGBuffer::Revalidate(Template& t, GS::ProgramCache& programs, GS::GuestReader& memory) {
     Bump(revalidated_);
+    const u64 epoch = programs.Epoch();
     u32 n = 0;
     for (u32 i = 0; i < t.n; ++i) {
         Variant& v = t.v[i];
+        const Hot h = t.hot[i];
         bool same = programs.Get(memory, v.vs.address, GS::HwStage::Vs).program == v.vs.program &&
                     programs.Get(memory, v.ps.address, GS::HwStage::Ps).program == v.ps.program;
-        if (same && v.fetch_reg != 0xff) {
-            fetch_read_.resize(v.fetch_code.size());
-            same = memory.Read(v.fetch, fetch_read_.data(), fetch_read_.size() * 4ull) && fetch_read_ == v.fetch_code;
+        if (same && h.fetch_reg != 0xff) {
+            // (the fetch shader at this address as read in this epoch: once a frame, whichever template asks first)
+            FetchSeen& f = fetch_seen_[h.fetch];
+            if (f.epoch != epoch || f.code.size() != v.fetch_code.size()) {
+                Bump(fetch_reads_);
+                f.code.resize(v.fetch_code.size());
+                f.ok = memory.Read(h.fetch, f.code.data(), f.code.size() * 4ull);
+                f.epoch = epoch;
+            }
+            same = f.ok && f.code == v.fetch_code;
         }
         if (!same) {
             Bump(variants_changed_);
@@ -198,12 +216,16 @@ bool NativeGBuffer::Revalidate(Template& t, GS::ProgramCache& programs, GS::Gues
         }
         if (n != i) {
             t.v[n] = std::move(v);
+            t.hot[n] = h;
         }
         ++n;
     }
+    if (n != t.n) {
+        Forget(t);
+    }
     t.n = n;
     t.next = 0;
-    t.epoch = programs.Epoch();
+    t.epoch = epoch;
     return n != 0;
 }
 
@@ -308,6 +330,15 @@ void NativeGBuffer::MakeMap(StageMap& m, const GS::Module& first, const GDR::Sta
             m.vertex.push_back(idx);
         }
     }
+    for (u32 i = 0; i < m.flat.size(); ++i) {
+        const u16 from = m.flat[i];
+        StageMap::Run* last = m.runs.empty() ? nullptr : &m.runs.back();
+        if (last != nullptr && (from == kZero ? last->from == kZero : last->from != kZero && last->from + last->n == from)) {
+            ++last->n;
+        } else {
+            m.runs.push_back({.at = static_cast<u16>(i), .from = from, .n = 1});
+        }
+    }
     m.ok = true;
 }
 
@@ -329,8 +360,13 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
     std::vector<u32>& flat = out.plan.flat;
     flat.resize(m.flat_size);
     std::copy(ud.begin(), ud.end(), flat.begin());
-    for (size_t i = 0; i < m.flat.size(); ++i) {
-        flat[16 + i] = m.flat[i] == kZero ? 0u : sh.shadow[m.flat[i]];
+    for (const StageMap::Run& run : m.runs) {
+        u32* to = flat.data() + 16 + run.at;
+        if (run.from == kZero) {
+            std::fill_n(to, run.n, 0u);
+        } else {
+            std::copy_n(sh.shadow.data() + run.from, run.n, to);
+        }
     }
     vreads_.resize(m.vertex.size());
     for (size_t i = 0; i < m.vertex.size(); ++i) {
@@ -347,10 +383,33 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
     return true;
 }
 
+u64 NativeGBuffer::MaterialOf(const GS::StageView& v) {
+    u64 h = Mix(0x6d61746572ull, reinterpret_cast<u64>(v.module));
+    for (const GS::ImageBinding& im : v.plan.images) {
+        if (im.count > 1 || im.fmask || im.storage) {
+            return 0;
+        }
+        if (im.status != GS::ResourceStatus::Ok) {
+            h = Mix(h, 0x4e554c4cull); // (a null image)
+            continue;
+        }
+        for (u32 i = 0; i < 8; i += 2) {
+            h = Mix(h, im.desc.raw[i] | (u64{im.desc.raw[i + 1]} << 32));
+        }
+        h = Mix(h, u64{im.view_type} << 8 | (im.depth ? 1u : 0u) | (im.array ? 2u : 0u));
+    }
+    for (const GS::SamplerBinding& sm : v.plan.samplers) {
+        h = sm.status != GS::ResourceStatus::Ok
+                ? Mix(h, 0x4e554c4cull)
+                : Mix(Mix(h, sm.desc.raw[0] | (u64{sm.desc.raw[1]} << 32)), sm.desc.raw[2] | (u64{sm.desc.raw[3]} << 32));
+    }
+    return h | 1; // (never 0)
+}
+
 bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
                             GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets,
                             GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state, GS::StageView& vs,
-                            GS::StageView& ps) {
+                            GS::StageView& ps, std::array<u64, 2>& material) {
     const auto refuse = [&](u32 why) {
         Bump(refused_[why]);
         return false;
@@ -379,13 +438,25 @@ bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::D
             templates_.erase(it); // (every variant's program or fetch shader is another now)
             return refuse(4);
         }
-        // the plans from the engine's CUE copy, on any variant's heads (the same programs, runtime and bindings)
-        fetch = FetchOf(tp->v[0].vs, vud, freg);
-        vm = MapOf(tp->v[0].vs, e.vs);
-        pm = MapOf(tp->v[0].ps, e.ps);
-        if (vm == nullptr || pm == nullptr || !vm->ok || !pm->ok) {
+        // the plans from the engine's CUE copy, on any variant's heads (the same programs, runtime and bindings):
+        // variant 0's maps, found once after it changed (the key fixes the CUE layouts; maps are never dropped)
+        if (tp->vfirst == nullptr) {
+            const GS::Module* first = FirstModule(tp->v[0].vs);
+            const StageMap* a = MapOf(tp->v[0].vs, e.vs);
+            const StageMap* b = MapOf(tp->v[0].ps, e.ps);
+            if (first == nullptr || a == nullptr || b == nullptr) {
+                return refuse(6);
+            }
+            tp->vfirst = first;
+            tp->vm = a;
+            tp->pm = b;
+        }
+        vm = tp->vm;
+        pm = tp->pm;
+        if (!vm->ok || !pm->ok) {
             return refuse(6);
         }
+        fetch = FetchOf(tp->vfirst, vud, freg);
     }
     const Template& t = *tp;
     const Variant& base = t.v[0];
@@ -397,13 +468,14 @@ bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::D
     const Variant* hit = nullptr;
     bool fetch_seen = false;
     for (u32 i = 0; i < t.n && hit == nullptr; ++i) {
-        const Variant& v = t.v[i];
-        if (v.fetch != fetch || v.fetch_reg != freg) {
+        const Hot& h = t.hot[i];
+        if (h.fetch != fetch || h.fetch_reg != freg) {
             continue;
         }
         fetch_seen = true;
-        if (v.ps.module->key == key_ps_ && v.vs.module->key == key_vs_) {
-            hit = &v;
+        if ((h.ps_key == 0 || h.ps_key == key_ps_.hash) && (h.vs_key == 0 || h.vs_key == key_vs_.hash) &&
+            h.ps->key == key_ps_ && h.vs->key == key_vs_) {
+            hit = &t.v[i];
         }
     }
     if (hit == nullptr) {
@@ -417,6 +489,7 @@ bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::D
     CopyHead(vs, hit->vs);
     prep = hit->prep;
     state = hit->state;
+    material = {MaterialOf(vs), MaterialOf(ps)};
     Bump(taken_);
     return true;
 }
@@ -498,7 +571,8 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
         // the engine path as it would prepare this draw (its template), else the plans alone on this draw's heads
         GS::DrawPreparation eprep;
         const GS::GraphicsPipelineState* estate = nullptr;
-        bool built = Prepare(d, e, programs, memory, targets, eprep, estate, check_vs_, check_ps_);
+        std::array<u64, 2> ematerial{};
+        bool built = Prepare(d, e, programs, memory, targets, eprep, estate, check_vs_, check_ps_, ematerial);
         if (built) {
             if (eprep.pipeline != prep.pipeline || estate != state) {
                 Bump(diff_[5]);
@@ -536,15 +610,16 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
         t.key = k;
         t.epoch = programs.Epoch();
         t.n = t.next = 0;
+        Forget(t);
     } else if (t.epoch != programs.Epoch()) {
         Revalidate(t, programs, memory);
     }
     u32 freg = 0xff;
-    const u64 fetch = FetchOf(vs, std::span<const u32, 16>(d.user_data[kVs]), freg);
+    const u64 fetch = FetchOf(FirstModule(vs), std::span<const u32, 16>(d.user_data[kVs]), freg);
     u32 slot = t.n;
     for (u32 i = 0; i < t.n; ++i) {
-        if (t.v[i].vs.module == vs.module && t.v[i].ps.module == ps.module && t.v[i].fetch == fetch &&
-            t.v[i].fetch_reg == freg) {
+        const Hot& h = t.hot[i];
+        if (h.vs == vs.module && h.ps == ps.module && h.fetch == fetch && h.fetch_reg == freg) {
             slot = i; // (the same variant: its newest preparation)
             break;
         }
@@ -568,10 +643,12 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
     v.state = state;
     CopyHead(v.vs, vs);
     CopyHead(v.ps, ps);
-    v.fetch = fetch;
-    v.fetch_reg = freg;
     if (fresh) {
         v.fetch_code.assign(fetch_code_.begin(), freg != 0xff ? fetch_code_.end() : fetch_code_.begin());
+    }
+    Keep(t, slot, fetch, freg);
+    if (slot == 0) {
+        Forget(t);
     }
 }
 
@@ -592,10 +669,10 @@ std::string NativeGBuffer::Report() const {
         out += fmt::format(" {}:{}", i, ld(refused_[i]));
     }
     out += fmt::format("; templates {} (variants {}, all dropped {} times; validated in a new frame {}, variants "
-                       "changed {}, fetch shader unread {}); stage maps (0 ok, 1 no walk, 2 failed, 3 other memory, "
-                       "4 wrote registers, 5 unknown dword, 6 past the copy, 7 vertex V#):",
+                       "changed {}, fetch shaders read {}, unread {}); stage maps (0 ok, 1 no walk, 2 failed, 3 other "
+                       "memory, 4 wrote registers, 5 unknown dword, 6 past the copy, 7 vertex V#):",
                        ld(templates_made_), ld(variants_made_), ld(templates_dropped_), ld(revalidated_),
-                       ld(variants_changed_), ld(fetch_unread_));
+                       ld(variants_changed_), ld(fetch_reads_), ld(fetch_unread_));
     for (u32 i = 0; i < 8; ++i) {
         out += fmt::format(" {}:{}", i, ld(map_why_[i]));
     }

@@ -979,6 +979,7 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     r.prepared = false;
     r.census_key = 0;
     r.vs_same = r.ps_same = false;
+    r.material = {};
     r.stage_shared.reset();
     r.ps_shared.reset();
     r.state = nullptr;
@@ -1018,10 +1019,12 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         if (engine != nullptr && ngb_.Takes() && !ngb_check) {
             R8_CP_PROF_ENTER(CpProfile::Sec::FrontNative);
             const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep,
-                                         r.state, r.stage, r.ps) &&
+                                         r.state, r.stage, r.ps, r.material) &&
                             DR::EngineDescStill(r.draw.engine_native); // (the slot not reused while it was read)
             R8_CP_PROF_LEAVE();
-            if (ok) {
+            if (!ok) {
+                r.material = {};
+            } else {
                 r.prepared = true;
                 // the frontend skipped this draw: its next preparation sees the register groups changed meanwhile
                 ngb_pending_ |= r.draw.changed;
@@ -1854,7 +1857,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                 Vk::PreparedCommand pc;
                 if (r.prepared) {
                     pc = {&r.prep, &ReuseView(r.stage, r.stage_shared != nullptr, r.vs_same, last_vs_),
-                          &ReuseView(r.ps, r.ps_shared != nullptr, r.ps_same, last_ps_), r.state};
+                          &ReuseView(r.ps, r.ps_shared != nullptr, r.ps_same, last_ps_), r.state, r.material};
                     if (r.stage_shared != nullptr) {
                         pc.stage = &r.Vs();
                     }

@@ -312,6 +312,7 @@ private:
         /// P5.3: the Native Render Frontend's shared preparations of the draw's VS/PS (instead of the copies above)
         std::shared_ptr<const GS::StageView> stage_shared, ps_shared;
         const GS::GraphicsPipelineState* state = nullptr;
+        std::array<u64, 2> material{}; ///< SSPC_NATIVE_GBUFFER: a native draw's VS / PS material ids (0: none)
         u64 census_key = 0; ///< SSPC_DIAG_PREP_CENSUS: the draw's row (0: not counted)
         /// SSPC_CITY_ENGINE_OPT: the draws that joined this one's run (recorded right after it, each with only its own
         /// geometry; their registers are in the journal after this record's journal_end)

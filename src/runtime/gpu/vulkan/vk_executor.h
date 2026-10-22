@@ -124,6 +124,8 @@ struct ExecutorStats {
     u64 shadow_vram = 0; ///< written bindings in the buffer cache's video memory (GPU-6: not shadowed with =skip)
     u64 target_cache_hits = 0, target_cache_misses = 0;
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
+    u64 gb_bind_hits = 0, gb_bind_misses = 0, gb_bind_kept = 0; ///< SSPC_NATIVE_GBUFFER (GbBind)
+    u64 gb_bind_verified = 0, gb_bind_mismatches = 0;          ///< ... SSPC_NATIVE_GBUFFER_BIND=verify
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
     /// P4.7 frontend reads: from a backing run kept / a run found for it / through the guest memory manager
     u64 read_run_hits = 0, read_run_misses = 0, read_run_none = 0;
@@ -190,6 +192,9 @@ struct PreparedCommand {
     const GS::StageView* stage = nullptr; ///< VS of a draw, CS of a dispatch
     const GS::StageView* ps = nullptr;    ///< a draw's PS
     const GS::GraphicsPipelineState* state = nullptr; ///< a ready draw's pipeline state
+    /// SSPC_NATIVE_GBUFFER: a native 0x1a1770 draw's VS / PS material ids - its module, T#s and S#s (Executor::GbBind;
+    /// 0: none)
+    std::array<u64, 2> material{};
 };
 
 /// SSPC_CITY_BATCH: one draw of a batch (Executor::DrawPreparedBatch).
@@ -545,6 +550,35 @@ private:
     static constexpr u32 kTexSlots = 2048;
     static size_t TexSlot(u64 key) { return static_cast<size_t>((key * 0x9E3779B97F4A7C15ull) >> 53); }
     std::array<std::pair<u64, TexMemo*>, kTexSlots> tex_slot_{};
+    /// SSPC_NATIVE_GBUFFER (native_gbuffer_prep.h): a native 0x1a1770 stage's images and samplers kept by its material -
+    /// the frontend's id (PreparedCommand::material) of its module, T#s and S#s, each compared again - while the image
+    /// cache's epoch is the same and each image needs no upload (TexMemo's rule): one lookup for the stage instead of
+    /// one per texture and sampler, the id's hashing on the frontend thread.
+    static constexpr u32 kGbMaxImages = 16, kGbMaxSamplers = 16;
+    static constexpr u32 kGbBinds = 2048;
+    struct GbBind {
+        u64 id = 0;
+        const void* module = nullptr;
+        u64 epoch = ~0ull;
+        u32 lod = 0; ///< the samplers' extra LOD bias (its bits)
+        u8 images = 0, samplers = 0;
+        std::array<std::array<u32, 8>, kGbMaxImages> raw{};
+        std::array<u32, kGbMaxImages> flags{}; ///< TexMemo's flags; kGbNull: a null image
+        std::array<CachedImage*, kGbMaxImages> img{};
+        std::array<VkImageView, kGbMaxImages> view{};
+        std::array<std::array<u32, 4>, kGbMaxSamplers> sraw{}; ///< the S# looked up (the default one for a null S#)
+        std::array<VkSampler, kGbMaxSamplers> smp{};           ///< VK_NULL_HANDLE: a custom border colour (each time)
+    };
+    static constexpr u32 kGbNull = ~0u;
+    std::vector<GbBind> gb_bind_;
+    GbBind gb_new_; ///< the stage being bound (kept when complete)
+    /// SSPC_NATIVE_GBUFFER_BIND: off (default: no gain measured), on, verify - a hit's bindings made again by the full
+    /// lookups and compared (the full ones are used)
+    enum class GbMode : u8 { Unread, On, Off, Verify };
+    GbMode gb_mode_ = GbMode::Unread;
+    std::vector<VkDescriptorImageInfo> gb_check_infos_;
+    std::vector<VkWriteDescriptorSet> gb_check_writes_;
+    std::vector<CachedImage*> gb_check_bound_, gb_check_info_images_;
     struct StreamSeen {
         u64 hash = 0, flip = 0;
     };
@@ -725,7 +759,7 @@ private:
     bool BindStage(const void* stage_view, bool compute, PushData& push, std::vector<VkWriteDescriptorSet>& writes,
                    std::vector<VkDescriptorBufferInfo>& buffers, std::vector<VkDescriptorImageInfo>& images,
                    std::vector<CachedImage*>& bound, bool& writes_memory, const std::vector<CachedImage*>& targets,
-                   const u32* user_data = nullptr);
+                   const u32* user_data = nullptr, u64 material = 0);
     bool PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bind, std::vector<VkWriteDescriptorSet>& writes);
     void SetDynamicState(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
     void SetDynamicStateWhole(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);

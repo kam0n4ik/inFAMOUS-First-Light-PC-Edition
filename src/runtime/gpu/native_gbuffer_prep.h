@@ -66,10 +66,12 @@ public:
     /// guarded / native: prepare `d` from the engine record `e` and a template (see above) into `prep`, `state`, `vs`,
     /// `ps`. false: the full path (the reason is counted). `programs`, `memory`: the frontend's program cache and its
     /// guest reader (a template's validation in a new frame); `targets`: a hash of the draw's colour/depth target
-    /// registers (the register file's group hashes).
+    /// registers (the register file's group hashes). `material`: the stages' (VS, PS) material ids - module, T#s,
+    /// S#s - for the executor's binding memo (Vk::Executor::GbBind; 0: a stage it does not keep).
     bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
                  GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets, GS::DrawPreparation& prep,
-                 const GS::GraphicsPipelineState*& state, GS::StageView& vs, GS::StageView& ps);
+                 const GS::GraphicsPipelineState*& state, GS::StageView& vs, GS::StageView& ps,
+                 std::array<u64, 2>& material);
 
     /// After `d`'s full preparation (`prep`, `state`, its VS/PS views): keep it as its key's template; `check` (verify:
     /// every draw, guarded: its samples) builds the draw from `e` as Prepare would and compares it with the walk's.
@@ -97,6 +99,11 @@ private:
         u32 flat_size = 0;
         std::vector<u16> flat;   ///< [16, flat_size): the copy's dword each is (kZero: not written)
         std::vector<u16> vertex; ///< per fetch attribute: the copy's dword its V# starts at
+        /// `flat` as runs (the walk copies tables: long runs of consecutive dwords) - what BuildStage copies
+        struct Run {
+            u16 at = 0, from = 0, n = 0; ///< flat[at, at + n) = the copy's [from, from + n) (from kZero: zeros)
+        };
+        std::vector<Run> runs;
     };
 
     struct Key {
@@ -112,16 +119,35 @@ private:
         GS::DrawPreparation prep;
         const GS::GraphicsPipelineState* state = nullptr;
         GS::StageView vs, ps; ///< the heads (their plans are each draw's)
+        std::vector<u32> fetch_code; ///< its fetch shader's code up to its s_setpc_b64 (a new frame compares it)
+    };
+    /// What the variant search reads of a variant - kept apart from the variants (a template's first cache lines: the
+    /// heads are read only of the variant a draw takes).
+    struct Hot {
         u64 fetch = 0;        ///< the VS fetch shader's address (user data at the fetch registers)
+        const GS::Module* vs = nullptr;
+        const GS::Module* ps = nullptr;
+        u64 vs_key = 0, ps_key = 0; ///< their specialization keys' hashes (0: not keyed when kept - compared in full)
         u32 fetch_reg = 0xff; ///< (0xff: no fetch shader)
-        std::vector<u32> fetch_code; ///< its code up to its s_setpc_b64 (a new frame compares it)
     };
     static constexpr u32 kVariants = 16; ///< (a material's texture formats select modules: city keys have more than 4)
     struct Template {
         Key key;
-        u64 epoch = 0; ///< the program cache epoch its variants were validated in
-        std::array<Variant, kVariants> v;
+        u64 epoch = 0;       ///< the program cache epoch its variants were validated in
         u32 n = 0, next = 0; ///< variants filled; the one a new variant replaces when all are
+        /// variant 0's stage maps and VS first module (its fetch register): found at the first use after variant 0
+        /// changed (nullptr: not yet)
+        const StageMap* vm = nullptr;
+        const StageMap* pm = nullptr;
+        const GS::Module* vfirst = nullptr;
+        std::array<Hot, kVariants> hot;
+        std::array<Variant, kVariants> v;
+    };
+    /// A fetch shader's code as read in one program cache epoch (Revalidate: each address read once a frame).
+    struct FetchSeen {
+        u64 epoch = ~0ull;
+        bool ok = false;
+        std::vector<u32> code;
     };
     static constexpr size_t kMaxTemplates = 8192; ///< (more keys: all dropped, made again)
 
@@ -130,7 +156,14 @@ private:
     }
     static Key KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 targets);
     static u64 HashOf(const Key& k);
-    static u64 FetchOf(const GS::StageView& vs, std::span<const u32, 16> ud, u32& reg);
+    /// The VS fetch shader's address in `ud` (`first`: the VS layout's first module) and its register.
+    static u64 FetchOf(const GS::Module* first, std::span<const u32, 16> ud, u32& reg);
+    /// Variant 0 changed: its maps are found again at the next use.
+    static void Forget(Template& t) {
+        t.vm = t.pm = nullptr;
+        t.vfirst = nullptr;
+    }
+    static void Keep(Template& t, u32 i, u64 fetch, u32 fetch_reg); ///< t.hot[i] from t.v[i]'s heads
     /// The fetch shader at `addr` (its address pair at `reg`) up to its s_setpc_b64, as the fetch cache reads it.
     static bool ReadFetch(GS::GuestReader& memory, u64 addr, u32 reg, std::vector<u32>& code);
     /// A template first used in a new frame: its variants' programs and fetch shaders validated again (see above),
@@ -144,6 +177,9 @@ private:
     /// (the module it needs). false: the head's module is not ready.
     bool BuildStage(const GS::StageView& head, const StageMap& m, const GDR::StageShadow& sh,
                     std::span<const u32, 16> ud, GS::StageView& out, GS::SpecializationKey& key);
+    /// A prepared stage's material id (Prepare); 0: an image the executor's memo does not keep (several views, FMask,
+    /// storage).
+    static u64 MaterialOf(const GS::StageView& v);
     /// verify: `built` against the walk's `full`, binding by binding; counts by part, logs the first ones. true: same.
     bool Compare(const GS::StageView& full, const GS::StageView& built, u32 stage);
 
@@ -153,7 +189,8 @@ private:
     std::unordered_map<u64, std::unique_ptr<StageMap>> maps_;
     std::unordered_map<u64, Template> templates_;
     std::vector<std::array<u32, 4>> vreads_;
-    std::vector<u32> fetch_code_, fetch_read_;
+    std::vector<u32> fetch_code_;
+    std::unordered_map<u64, FetchSeen> fetch_seen_; ///< by address
     GS::SpecializationKey key_vs_, key_ps_;
     GS::StageView check_vs_, check_ps_; ///< verify: the engine builds compared with the walk's
 
@@ -162,7 +199,7 @@ private:
     std::array<std::atomic<u64>, 12> refused_{}; ///< by reason (Report)
     std::array<std::atomic<u64>, 8> map_why_{};  ///< maps made, by StageMap::why (0: ok)
     std::atomic<u64> templates_made_{0}, variants_made_{0}, templates_dropped_{0};
-    std::atomic<u64> revalidated_{0}, variants_changed_{0}, fetch_unread_{0};
+    std::atomic<u64> revalidated_{0}, variants_changed_{0}, fetch_unread_{0}, fetch_reads_{0};
     // verify / guarded checks: stages compared, the same, different by part (flat, buffers, images, samplers,
     // vertices, heads)
     std::atomic<u64> compared_{0}, same_{0};

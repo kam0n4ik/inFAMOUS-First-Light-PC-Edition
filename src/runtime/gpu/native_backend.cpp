@@ -2293,8 +2293,11 @@ std::string Backend::Report() {
     if (cp_ && executor_) {
         const auto& c = cp_->Stats();
         const auto& s = executor_->Stats();
-        out += fmt::format("target cache: hits {}, misses {}; texture memo: hits {}, misses {}\n",
-                           s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses);
+        out += fmt::format("target cache: hits {}, misses {}; texture memo: hits {}, misses {}; native G-buffer "
+                           "material bindings: stages {} (missed {}, kept {}; verified {}, differing {})\n",
+                           s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses,
+                           s.gb_bind_hits, s.gb_bind_misses, s.gb_bind_kept, s.gb_bind_verified,
+                           s.gb_bind_mismatches);
         out += cp_->WaitReport();
         out += cp_->FenceReport();
         const VideoOut::Stats vo = VideoOut::GetStats();
