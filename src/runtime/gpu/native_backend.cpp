@@ -2599,6 +2599,13 @@ std::string Backend::Report() {
         const auto p = presenter_->GetStats();
         out += fmt::format("presented {} (black {}), copies {}, captures {}, swapchain recreated {}{}\n", p.presented,
                            p.black, p.copies, p.captures, p.swapchain_recreated, p.device_lost ? ", DEVICE LOST" : "");
+        if (p.acquire_fence_waits != 0) { // (SSPC_PRESENT_ACQUIRE_FENCE=1)
+            out += fmt::format("  the swapchain image waited for on the present thread (acquire fence): {} times, "
+                               "{:.3f} ms each, the longest {:.3f} ms, over 5 ms {}\n",
+                               p.acquire_fence_waits,
+                               static_cast<double>(p.acquire_fence_ns) / 1e6 / static_cast<double>(p.acquire_fence_waits),
+                               static_cast<double>(p.acquire_fence_max_ns) / 1e6, p.acquire_fence_over5);
+        }
     }
     if (frontend_) { // (P5.2: the shader frontend's own counters - programs read again per frame, fetch shaders, ...)
         out += "--- shader frontend ---\n" + frontend_->Report();

@@ -80,6 +80,9 @@ public:
     struct Stats {
         u64 presented = 0, black = 0, swapchain_recreated = 0, minimized_skips = 0, acquire_failures = 0;
         u64 captures = 0, copies = 0;
+        /// SSPC_PRESENT_ACQUIRE_FENCE=1: the swapchain image waited for on the present thread (its acquire fence) before
+        /// the present's submission - the waits, their time (ns), the longest, those over 5 ms
+        u64 acquire_fence_waits = 0, acquire_fence_ns = 0, acquire_fence_max_ns = 0, acquire_fence_over5 = 0;
         u32 window_width = 0, window_height = 0, frame_width = 0, frame_height = 0;
         bool device_lost = false;
         std::string last_error;
