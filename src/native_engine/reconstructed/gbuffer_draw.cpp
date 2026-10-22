@@ -580,6 +580,137 @@ SSPC_SYSV_ABI void GD::MeshNative(u64 material, u64 r, u64 instance) {
     }
 }
 
+// --- the Native Engine G-buffer path: Describe (SSPC_NATIVE_GBUFFER) --------------------------------------------
+//
+// Recording setters that read the engine descriptors into a DrawDescription instead of binding them. The pure callees
+// (init_buffer 0x61e260, vsharp 0x45f590, stage 0x27530) are the game's; everything that would touch the context or
+// the command buffer is a no-op. Only VS-side resources are described here; the material's PS resources are the
+// stable per-material part (material_bind.h).
+namespace {
+
+// the CUE's user-data layout table ([cue + 0xc180 + stage * 8]); the section each resource kind is listed in
+constexpr u64 kCueLayout = 0xc180;
+constexpr u64 kSecResource = 0x22;  ///< buffers and textures
+constexpr u64 kSecConstBuf = 0xe2;  ///< constant buffers
+constexpr u64 kSecVertex = 0x10a;   ///< vertex buffers
+
+thread_local GD::DrawDescription* t_desc = nullptr;
+
+/// The stage's user-data dword offset the layout maps `slot` in `section` to; 0xffff when the shader does not use it.
+u16 DescribeOffset(u64 cue, u64 stage, u64 slot, u64 section, u8& direct) {
+    direct = 0;
+    const u64 layout = GuestLoad<u64>(cue + kCueLayout + 8 * stage);
+    if (layout == 0) {
+        return 0xffff;
+    }
+    const u16 e = GuestLoad<u16>(layout + section + slot * 2);
+    if (e == 0xffff) {
+        return 0xffff;
+    }
+    direct = (e & 0x8000) != 0 ? 1 : 0;
+    return static_cast<u16>(e & 0x3fff);
+}
+
+void DescribeAdd(u64 cue, u32 stage, u32 slot, u32 kind, u64 section, u64 src16) {
+    GD::DrawDescription* d = t_desc;
+    if (d == nullptr || d->count >= GD::kMaxDescResources) {
+        return;
+    }
+    GD::DescResource& e = d->res[d->count++];
+    e.stage = static_cast<u8>(stage);
+    e.kind = static_cast<u8>(kind);
+    e.slot = static_cast<u8>(slot);
+    e.offset = DescribeOffset(cue, stage, slot, section, e.direct);
+    for (u32 i = 0; i < 4; ++i) {
+        e.desc[i] = GuestLoad<u32>(src16 + i * 4);
+    }
+}
+
+SSPC_SYSV_ABI u64 RecNoop1(u64, u64) { return 0; }
+SSPC_SYSV_ABI u64 RecNoop2(u64, u64, u64) { return 0; }
+SSPC_SYSV_ABI u64 RecNoop3(u64, u64, u64, u64) { return 0; }
+SSPC_SYSV_ABI u64 RecCommit(u64) { return 0; }
+
+/// 0x120280's effect, read from the context: the per-draw constant buffer's V# at R+0xde20+8 (both stages, slot 12).
+SSPC_SYSV_ABI u64 RecDrawConstants(u64 r) {
+    const u64 at = GuestLoad<u64>(r + 0xde20);
+    if (at == 0) {
+        return 0; // no per-draw constant buffer this draw (the slot keeps its previous binding)
+    }
+    const u64 cue = r + GD::kCue;
+    DescribeAdd(cue, 2, 12, 2, kSecConstBuf, r + 0xde20 + 8); // VS
+    DescribeAdd(cue, 1, 12, 2, kSecConstBuf, r + 0xde20 + 8); // PS
+    return 0;
+}
+
+SSPC_SYSV_ABI u64 RecSetBuffers(u64 cue, u64 stage, u64 slot, u64 count, u64 src) {
+    for (u64 i = 0; i < count; ++i) {
+        DescribeAdd(cue, static_cast<u32>(stage), static_cast<u32>(slot + i), 0, kSecResource, src + i * 16);
+    }
+    return cue;
+}
+
+SSPC_SYSV_ABI u64 RecSetVertex(u64 cue, u64 stage, u64 slot, u64 count, u64 src) {
+    for (u64 i = 0; i < count; ++i) {
+        DescribeAdd(cue, static_cast<u32>(stage), static_cast<u32>(slot + i), 1, kSecVertex, src + i * 16);
+    }
+    return cue;
+}
+
+Fns DescribeFns() {
+    Fns f{};
+    f.stencil = &RecNoop1;
+    f.draw_constants = &RecDrawConstants;
+    f.set_buffers = &RecSetBuffers;
+    f.set_vertex = &RecSetVertex;
+    f.num_instances = &RecNoop1;
+    f.primitive = &RecNoop1;
+    f.index_type = &RecNoop2;
+    f.debug_marker = &RecNoop1;
+    f.commit = &RecCommit;
+    f.draw_index = &RecNoop3;
+    f.vsharp = g_real.vsharp;         // pure: the real callees
+    f.init_buffer = g_real.init_buffer;
+    f.stage = g_real.stage;
+    return f;
+}
+
+} // namespace
+
+void GD::EnsurePureCallees(u64 module_base) {
+    if (module_base == 0) {
+        return;
+    }
+    u64 expected = 0;
+    g_module.compare_exchange_strong(expected, module_base, std::memory_order_relaxed);
+    if (g_real.vsharp == nullptr) {
+        g_real.vsharp = reinterpret_cast<VsharpFn>(module_base + 0x45f590);
+    }
+    if (g_real.init_buffer == nullptr) {
+        g_real.init_buffer = reinterpret_cast<InitBufferFn>(module_base + kInitBufferRva);
+    }
+    if (g_real.stage == nullptr) {
+        g_real.stage = reinterpret_cast<StageFn>(module_base + kStageRva);
+    }
+}
+
+bool GD::Describe(u64 material, u64 r, u64 records, u64 n, u64 mesh, DrawDescription& out) {
+    out = {};
+    if (g_real.vsharp == nullptr || g_real.init_buffer == nullptr || g_real.stage == nullptr ||
+        g_module.load(std::memory_order_relaxed) == 0) {
+        return false; // Prepare() not run: the pure callees / module base are unknown
+    }
+    const Fns f = DescribeFns();
+    t_desc = &out;
+    const bool followed = Instanced<false>(f, material, r, records, n, mesh);
+    t_desc = nullptr;
+    out.followed = followed;
+    out.n = static_cast<u32>(n);
+    out.index_count = GuestLoad<u32>(mesh + 0x68);
+    out.index_base = GuestLoad<u64>(mesh + 0x58);
+    return true;
+}
+
 std::string GD::CheckInstanced(u64 material, u64 r, u64 records, u64 n, u64 mesh, bool& skipped) {
     volatile u8 top = 0; // every frame of the runs is below
     Shadow& s = Shadows();

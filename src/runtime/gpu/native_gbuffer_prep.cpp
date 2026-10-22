@@ -1,4 +1,4 @@
-// SecondSonPC - the Native Engine G-buffer draw preparation (0x1a1770). See native_gbuffer_prep.h.
+// SecondSonPC - the Native Engine G-buffer draw path. See native_gbuffer_prep.h.
 #include "runtime/gpu/native_gbuffer_prep.h"
 
 #include <cstdlib>
@@ -17,9 +17,19 @@ std::string EnvA(const char* name) {
     return n > 0 && n < sizeof(v) ? std::string(v, n) : std::string();
 }
 
-u64 Mix(u64 h, u64 x) {
-    h ^= x + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-    return h;
+/// A walk binding holds this V# (its raw four dwords) - a buffer, a vertex stream's read V#, anywhere in the plan.
+bool PlanHasBuffer(const Shader::ResourceBindingPlan& p, const std::array<u32, 4>& v) {
+    for (const Shader::BufferBinding& b : p.buffers) {
+        if (b.desc.raw == v) {
+            return true;
+        }
+    }
+    for (const Shader::VertexBinding& vb : p.vertices) {
+        if (vb.read == v || vb.desc.raw == v) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -39,80 +49,37 @@ NativeGBuffer::NativeGBuffer() {
         SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER={} not understood (verify|guarded|native|off) - off", v);
         return;
     }
-    if (mode_ == Mode::Guarded) {
-        sample_ = 32;
-        if (const std::string s = EnvA("SSPC_NATIVE_GBUFFER_SAMPLE"); !s.empty()) {
-            const u32 n = static_cast<u32>(std::strtoul(s.c_str(), nullptr, 10));
-            sample_ = std::max<u32>(n, 1);
-        }
-    } else if (mode_ == Mode::Verify) {
-        sample_ = 1; // (every hit)
-    }
     SSPC_LOG(GPU, Warning,
-             "EXPERIMENT: SSPC_NATIVE_GBUFFER={} - the Native Engine prepares 0x1a1770's G-buffer draws (keyed by engine "
-             "identity, re-derived through RedecodeStage){}",
-             v, mode_ == Mode::Guarded ? fmt::format(", every {}th hit verified", sample_) : "");
+             "EXPERIMENT: SSPC_NATIVE_GBUFFER={} - the command processor takes 0x1a1770's per-draw descriptors from the "
+             "engine's structures (native_gbuffer_prep.h){}",
+             v, mode_ == Mode::Verify ? " - verify: built and compared with the SRT walk, the walk is used" : "");
 }
 
-u64 NativeGBuffer::Hash(const Key& k) {
-    u64 h = 0xcbf29ce484222325ull;
-    h = Mix(h, k.vs_addr);
-    h = Mix(h, k.ps_addr);
-    h = Mix(h, (u64{k.vs_rsrc1} << 32) | k.vs_rsrc2);
-    h = Mix(h, (u64{k.ps_rsrc1} << 32) | k.ps_rsrc2);
-    h = Mix(h, k.pipeline_key);
-    h = Mix(h, k.color_hash);
-    return h;
-}
-
-NativeGBuffer::Entry* NativeGBuffer::Find(u64 h, const Key& k) {
-    lookups_.fetch_add(1, std::memory_order_relaxed);
-    const auto it = entries_.find(h);
-    if (it == entries_.end()) {
-        return nullptr;
-    }
-    if (!(it->second.key == k)) {
-        collisions_.fetch_add(1, std::memory_order_relaxed);
-        return nullptr; // another identity at the same hash: not this one's anchor
-    }
-    it->second.last_frame = frame_.load(std::memory_order_relaxed);
-    if (!it->second.usable) {
-        return nullptr; // known not reusable: the frontend prepares it
-    }
-    return &it->second;
-}
-
-void NativeGBuffer::Store(u64 h, const Entry& e) {
-    const auto it = entries_.find(h);
-    if (it != entries_.end()) {
-        if (!(it->second.key == e.key)) {
-            return; // a collision: the first identity keeps the slot (the other stays on the frontend path)
+void NativeGBuffer::Verify(const GDR::DrawDescription& d, const Shader::ResourceBindingPlan& vs,
+                           const Shader::ResourceBindingPlan& ps) {
+    bool all = true;
+    for (u32 i = 0; i < d.count && i < GDR::kMaxDescResources; ++i) {
+        const GDR::DescResource& e = d.res[i];
+        if (e.offset == 0xffff) {
+            continue; // the shader does not use this slot: nothing to compare
         }
-        it->second = e;
-        it->second.last_frame = frame_.load(std::memory_order_relaxed);
-        return;
-    }
-    if (entries_.size() >= max_entries_) {
-        full_.fetch_add(1, std::memory_order_relaxed);
-        return; // (the city's distinct G-buffer identities are far fewer than the cap; no eviction needed)
-    }
-    Entry& slot = entries_[h];
-    slot = e;
-    slot.last_frame = frame_.load(std::memory_order_relaxed);
-    (slot.usable ? learned_ : unusable_).fetch_add(1, std::memory_order_relaxed);
-}
-
-void NativeGBuffer::NoteVerified(bool mismatch) {
-    verified_.fetch_add(1, std::memory_order_relaxed);
-    if (mismatch) {
-        const u64 n = mismatches_.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (mode_ == Mode::Guarded && n >= disable_after_ && trusted_.exchange(false)) {
-            SSPC_LOG(GPU, Error,
-                     "SSPC_NATIVE_GBUFFER=guarded: {} mismatches - the native G-buffer path is disabled, the frontend "
-                     "prepares every draw from here",
-                     n);
+        const u32 kind = e.kind < 3 ? e.kind : 0;
+        seen_[kind].fetch_add(1, std::memory_order_relaxed);
+        // the engine descriptor should be one the walk resolved on either stage it was bound to
+        const bool hit = PlanHasBuffer(vs, e.desc) || PlanHasBuffer(ps, e.desc);
+        (hit ? matched_ : unmatched_)[kind].fetch_add(1, std::memory_order_relaxed);
+        if (!hit) {
+            all = false;
+            const u64 n = mismatch_logged_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 12) {
+                SSPC_LOG(GPU, Warning,
+                         "SSPC_NATIVE_GBUFFER verify: engine descriptor (kind {}, stage {}, slot {}, offset {:#x}) "
+                         "V# {:08x} {:08x} {:08x} {:08x} not held by the walk",
+                         e.kind, e.stage, e.slot, e.offset, e.desc[0], e.desc[1], e.desc[2], e.desc[3]);
+            }
         }
     }
+    (all ? verified_draws_ : mismatch_draws_).fetch_add(1, std::memory_order_relaxed);
 }
 
 std::string NativeGBuffer::Report() const {
@@ -122,16 +89,15 @@ std::string NativeGBuffer::Report() const {
     const auto ld = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
     const char* name = mode_ == Mode::Verify ? "verify" : mode_ == Mode::Guarded ? "guarded" : "native";
     std::string out = fmt::format(
-        "native G-buffer 0x1a1770 (SSPC_NATIVE_GBUFFER={}): lookups {}, hits {} (reused the anchor, no frontend), "
-        "learned {}, not reusable {}, hash collisions {}, at the cap {}; refused by RedecodeStage (2 wrote/read "
-        "failed, 3 layout, 4 key, 5 bindings, 6 walk): {}:{} {}:{} {}:{} {}:{} {}:{}",
-        name, ld(lookups_), ld(hits_), ld(learned_), ld(unusable_), ld(collisions_), ld(full_), 2, ld(refused_[2]), 3,
-        ld(refused_[3]), 4, ld(refused_[4]), 5, ld(refused_[5]), 6, ld(refused_[6]));
-    if (mode_ != Mode::Native) {
-        out += fmt::format("; verified {}, mismatches {}", ld(verified_), ld(mismatches_));
-    }
-    if (!trusted_.load(std::memory_order_relaxed)) {
-        out += " [DISABLED by mismatches]";
+        "native G-buffer 0x1a1770 (SSPC_NATIVE_GBUFFER={}): tagged draws {}, with an engine record {}, without {}",
+        name, ld(draws_), ld(with_record_), ld(no_record_));
+    if (mode_ == Mode::Verify) {
+        const char* kn[3] = {"buffer/instance", "vertex", "constants"};
+        out += "; verify by kind (seen/matched/unmatched):";
+        for (u32 k = 0; k < 3; ++k) {
+            out += fmt::format(" {} {}/{}/{}", kn[k], ld(seen_[k]), ld(matched_[k]), ld(unmatched_[k]));
+        }
+        out += fmt::format("; draws all-matched {}, with a mismatch {}", ld(verified_draws_), ld(mismatch_draws_));
     }
     out += "\n";
     return out;

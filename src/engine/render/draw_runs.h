@@ -16,11 +16,16 @@
 #include <atomic>
 
 #include "base/abi.h"
+#include "native_engine/reconstructed/gbuffer_draw.h"
 
 namespace SecondSon::Engine::Render::DrawRuns {
 
 inline constexpr u32 kRunMagic = 0x52505353u; ///< "SSPR": the first body dword of a tagged draw's trailing NOP
 inline constexpr u32 kTrailingNopHeader = 0xC0021000u; ///< that NOP: type 3, 3 body dwords (kDrawNopHeader)
+
+/// SSPC_NATIVE_GBUFFER: the tag's source dword carries this bit when the draw's engine descriptors were captured into
+/// the side ring; the fourth NOP body dword (nop[3]) then holds the ring sequence number (EngineDesc).
+inline constexpr u32 kNativeDesc = 0x200;
 
 enum class Source : u8 {
     None = 0,
@@ -40,6 +45,20 @@ inline constexpr u32 kMaterialChanged = 0x100;
 inline Source TagOf(const u32* nop) {
     return nop[0] == kTrailingNopHeader && nop[1] == kRunMagic ? static_cast<Source>(nop[2] & 0xFF) : Source::None;
 }
+/// SSPC_NATIVE_GBUFFER: the tag carries engine descriptors (kNativeDesc); nop[3] is then the ring sequence number.
+inline bool NativeDescOf(const u32* nop) {
+    return nop[0] == kTrailingNopHeader && nop[1] == kRunMagic && (nop[2] & kNativeDesc) != 0;
+}
+inline u32 NativeDescSeq(const u32* nop) {
+    return nop[3];
+}
+
+/// SSPC_NATIVE_GBUFFER: copy into `out` the engine descriptors captured for the draw whose trailing NOP holds `seq`.
+/// False when the ring slot has since been reused (a seqlock check) - the command processor then uses the full path.
+/// The command processor's thread. The reconstruction's own type (gbuffer_draw.h).
+bool EngineDescCopy(u32 seq, NativeEngine::Reconstructed::GBufferDraw::DrawDescription& out);
+/// Engine-descriptor capture is on (SSPC_NATIVE_GBUFFER set and the reconstruction's pure callees are ready).
+bool EngineDescOn();
 /// The tag carries kMaterialChanged.
 inline bool MaterialChangedOf(const u32* nop) {
     return nop[0] == kTrailingNopHeader && nop[1] == kRunMagic && (nop[2] & kMaterialChanged) != 0;

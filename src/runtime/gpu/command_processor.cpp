@@ -1071,6 +1071,11 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
         if (u64{f.pos} + 4 <= f.size) {
             d.engine_run = static_cast<u8>(Engine::Render::DrawRuns::TagOf(f.data + f.pos));
             d.engine_material = Engine::Render::DrawRuns::MaterialChangedOf(f.data + f.pos);
+            // SSPC_NATIVE_GBUFFER: the engine descriptors' ring sequence, carried in the NOP's fourth body dword
+            if (Engine::Render::DrawRuns::NativeDescOf(f.data + f.pos)) {
+                d.engine_native_present = true;
+                d.engine_native = Engine::Render::DrawRuns::NativeDescSeq(f.data + f.pos);
+            }
         }
     } else if (!packet && native_run != 0 && engine_runs_) {
         // R7: a native draw's tag came with its stream operation (the Native Render Layer keeps the Phase 5/6 runs)

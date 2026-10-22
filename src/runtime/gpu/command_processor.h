@@ -126,6 +126,10 @@ struct DrawDescriptor {
     u8 engine_run = 0;
     /// CITY-OPT Phase 6: the tag says the engine set another material since the context's last G-buffer draw
     bool engine_material = false;
+    /// SSPC_NATIVE_GBUFFER: the tag carried engine descriptors (kNativeDesc); this is their ring sequence number
+    /// (DrawRuns::EngineDescCopy). Valid only when `engine_run` is the G-buffer source and `engine_native_present`.
+    bool engine_native_present = false;
+    u32 engine_native = 0;
 };
 
 /// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): a draw that joined the run of the engine's tagged draw before it
