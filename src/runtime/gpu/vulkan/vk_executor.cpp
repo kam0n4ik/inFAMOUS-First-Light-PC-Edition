@@ -667,6 +667,16 @@ void Executor::EndRendering() {
     }
 }
 
+void Executor::SegSync() {
+    const u64 g = images_.Generation();
+    if (g != seg_gen_ || cur_.value != seg_value_) {
+        ++tex_seg_;
+        ++stats_.tex_seg_segments;
+        seg_gen_ = g;
+        seg_value_ = cur_.value;
+    }
+}
+
 void Executor::Label(u64 key, std::string text) {
     EndLabel();
     const VkDebugUtilsLabelEXT l{.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = text.c_str()};
@@ -2970,6 +2980,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     }
     const VkPipelineStageFlags2 shader_stage = compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : kGraphicsShaders;
     images_.ApplyPendingInvalidations(); // before the memo's dirty checks below
+    const bool seg = seg_draw_ && !compute; // (SSPC_TEX_SEGMENT: a draw's textures checked once a segment)
+    if (seg) {
+        SegSync();
+    }
     const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
     const float lod = !compute && jitter_draw_ ? lod_bias_ : 0.0f;
     const auto image_flags = [](const GS::ImageBinding& im) { return TexFlags(im); };
@@ -3123,6 +3137,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             gb_new_.img[gi] = nullptr;
             gb_new_.view[gi] = VK_NULL_HANDLE;
         }
+        if (im.storage) {
+            ++tex_seg_; // (SSPC_TEX_SEGMENT: an image a shader writes - no stamp of before is taken again)
+        }
         u64 memo_key = 0;
         TexMemo* memo = nullptr;
         if (memo_able) {
@@ -3142,10 +3159,48 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 }
             }
             CachedImage* m = memo->img;
+            if (seg && m != nullptr && memo->seg == tex_seg_ && !im.storage && memo->epoch == images_.Epoch() &&
+                memo->raw == im.desc.raw && memo->flags == flags && std::ranges::find(targets, m) == targets.end()) {
+                // checked in this segment: valid, touched, in its layout, read there since its barrier - none of that
+                // can have changed (the image cache's generation is the same), the image is not looked at again
+                ++stats_.tex_seg_hits;
+                if (seg_mode_ != SegMode::Verify) {
+                    image_infos.push_back({VK_NULL_HANDLE, memo->view, memo->seg_layout});
+                    info_images_.push_back(nullptr); // (no layout fix-up: it is in seg_layout)
+                    if (gb != nullptr) {
+                        gb_new_.img[gi] = m;
+                        gb_new_.view[gi] = memo->view;
+                    }
+                    writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                      .dstBinding = im.binding,
+                                      .descriptorCount = 1,
+                                      .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                      .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+                    continue;
+                }
+                // verify: the image as the full path below finds it (before its Touch), then that path taken
+                const bool valid = (m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written);
+                const bool same = valid && m->current == memo->seg_layout && m->current == TextureLayout(m) &&
+                                  ImageCache::ReadSince(*m, kGraphicsShaders, VK_ACCESS_2_SHADER_READ_BIT) &&
+                                  m->last_seq == cur_.value && m->last_frame == images_.Frame();
+                ++stats_.tex_seg_verified;
+                if (!same && stats_.tex_seg_mismatches++ < 16) {
+                    SSPC_LOG(GPU, Warning,
+                             "SSPC_TEX_SEGMENT=verify: img{} {:#x} stamped in segment {} differs: valid {} layout {} "
+                             "(stamped {}, texture {}) stage {:#x} access {:#x} seq {} (batch {}) frame {} ({})",
+                             m->id, m->layout.guest_address, tex_seg_, valid, static_cast<int>(m->current),
+                             static_cast<int>(memo->seg_layout), static_cast<int>(TextureLayout(m)), m->stage, m->access,
+                             m->last_seq, cur_.value, m->last_frame, images_.Frame());
+                }
+                seg_check_.push_back({static_cast<u32>(image_infos.size()), memo->seg_layout});
+            }
             if (m != nullptr && memo->epoch == images_.Epoch() && memo->raw == im.desc.raw && memo->flags == flags &&
                 ((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written))) {
                 ++stats_.tex_memo_hits;
                 images_.Touch(*m, cur_.value); // what Find records
+                if (seg && !im.storage) {
+                    seg_pending_.push_back({memo, m}); // (stamped once the draw's barriers are recorded)
+                }
                 if (im.storage) {
                     m->gpu_written = true;
                 }
@@ -3221,7 +3276,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                                            tl.size.height});
                 }
                 if (memo != nullptr && ii.imageView != VK_NULL_HANDLE) {
-                    *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView};
+                    *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView}; // (no stamp)
+                    if (seg && !im.storage) {
+                        seg_pending_.push_back({memo, img});
+                    }
                 }
                 if (gb != nullptr && count == 1) {
                     gb_new_.img[gi] = img;
@@ -4972,9 +5030,25 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     bound.clear();
     bool writes_memory = false;
     info_images_.clear();
+    if (seg_mode_ == SegMode::Unread) {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_TEX_SEGMENT", v, sizeof(v));
+        const std::string_view sv(v, n < sizeof(v) ? n : 0);
+        seg_mode_ = sv == "on" || sv == "1" ? SegMode::On : sv == "verify" ? SegMode::Verify : SegMode::Off;
+        if (seg_mode_ != SegMode::Off) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_TEX_SEGMENT={} - a draw's textures checked once a segment{}", sv,
+                     seg_mode_ == SegMode::Verify ? ", each segment hit checked in full and the full path taken" : "");
+        }
+    }
+    // (not where a diagnostic looks at the draw's bound images, nor the upscaler's display draw)
+    seg_draw_ = seg_mode_ != SegMode::Off && !up_display_draw_ && !trace_.Active() && !histo_.active && !prof_ &&
+                !texdump_.active && insp_catalog_ == nullptr && (diag_ == nullptr || !diag_->Enabled());
+    seg_pending_.clear();
+    seg_check_.clear();
     const u64 tb0 = GS::FineTicks();
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
                              d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data(), pc.material[1])) {
+        seg_draw_ = false;
         return;
     }
     if (instanced && !GatherInstanced(std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4))) {
@@ -4984,6 +5058,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
     const bool vs_bound = BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
                                     d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data(), pc.material[0]);
+    seg_draw_ = false;
     inst_runs_.clear(); // (the copies' descriptors: a run of the multi-draw after the first binds them further on)
     for (const auto& [index, info] : inst_bind_) {
         inst_runs_.push_back({vs.plan.buffers[index - vs.start.buffer].binding, info});
@@ -5289,6 +5364,30 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         if (info_images_[i] != nullptr && img_infos[i].imageView != VK_NULL_HANDLE) {
             img_infos[i].imageLayout = info_images_[i]->current;
         }
+    }
+    // SSPC_TEX_SEGMENT: verify - a segment hit's layout as the full path left it; the draw's textures stamped, after
+    // its barriers (the generation they changed is the new segment's)
+    for (const SegCheck& c : seg_check_) {
+        if (c.info < img_infos.size() && img_infos[c.info].imageLayout != c.layout && stats_.tex_seg_mismatches++ < 16) {
+            SSPC_LOG(GPU, Warning, "SSPC_TEX_SEGMENT=verify: a segment hit's layout {} differs from the full path's {}",
+                     static_cast<int>(c.layout), static_cast<int>(img_infos[c.info].imageLayout));
+        }
+    }
+    if (!seg_pending_.empty()) {
+        SegSync();
+        const u64 epoch = images_.Epoch(), frame = images_.Frame();
+        for (const auto& [memo, img] : seg_pending_) {
+            if (memo->img == img && memo->epoch == epoch && std::ranges::find(targets, img) == targets.end() &&
+                ((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written)) &&
+                img->current == TextureLayout(img) &&
+                ImageCache::ReadSince(*img, kGraphicsShaders, VK_ACCESS_2_SHADER_READ_BIT) &&
+                img->last_seq == cur_.value && img->last_frame == frame) {
+                memo->seg = tex_seg_;
+                memo->seg_layout = img->current;
+                ++stats_.tex_seg_stamped;
+            }
+        }
+        seg_pending_.clear();
     }
     for (auto& w : writes) {
         if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
@@ -5761,6 +5860,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
     if (writes_memory) {
         MarkWrites(0);
+        ++tex_seg_; // (SSPC_TEX_SEGMENT: what it wrote may be a texture's memory - its invalidation applied later)
     }
     const u64 draw_ticks = GS::Ticks() - t0;
     stats_.record_ns += GS::TicksToNs(draw_ticks);
@@ -6046,6 +6146,11 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                     images_.ApplyPendingInvalidations(); // (as BindStage before its memo's checks)
                     invalidations = true;
                 }
+                // SSPC_TEX_SEGMENT: an image stamped in this segment taken from its stamp (on), checked (verify)
+                const bool seg = lean && n_img != 0 && seg_mode_ != SegMode::Off;
+                if (seg) {
+                    SegSync();
+                }
                 const u32* at = lean ? member_flat.data() + m.sharps_at : nullptr;
                 const u64 epoch = images_.Epoch();
                 for (u32 mk = m.img_mask; mk != 0 && lean; mk &= mk - 1, at += 8) {
@@ -6054,13 +6159,46 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                     std::copy_n(at, 8, raw.begin());
                     const u32 flags = TexFlags(im);
                     const u64 key = TexMemoKey(raw, flags);
-                    const TexMemo* memo = nullptr;
+                    TexMemo* memo = nullptr;
                     if (const auto& slot = tex_slot_[TexSlot(key)]; slot.second != nullptr && slot.first == key) {
                         memo = slot.second;
                     } else if (const auto mi = tex_memo_.find(key); mi != tex_memo_.end()) {
                         memo = &mi->second;
                     }
                     CachedImage* img = memo != nullptr ? memo->img : nullptr;
+                    const bool seg_hit = seg && img != nullptr && memo->seg == tex_seg_ && !im.storage &&
+                                         memo->epoch == epoch && memo->raw == raw && memo->flags == flags &&
+                                         std::ranges::find(scratch_.targets, img) == scratch_.targets.end();
+                    if (seg_hit && seg_mode_ == SegMode::On) {
+                        ++stats_.tex_seg_member_hits;
+                        iinfos[ni] = {VK_NULL_HANDLE, memo->view, memo->seg_layout};
+                        ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstBinding = im.binding,
+                                    .descriptorCount = 1,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                    .pImageInfo = &iinfos[ni++]};
+                        if (check) {
+                            GS::ImageBinding ib = im;
+                            ib.desc.raw = raw;
+                            run_check_own_.push_back({im.binding, ImageHash(ib)});
+                        }
+                        continue;
+                    }
+                    if (seg_hit) { // (verify: what the full checks below take - the stamp's layout, the image touched)
+                        ++stats_.tex_seg_member_hits;
+                        ++stats_.tex_seg_verified;
+                        const bool same =
+                            ((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written)) &&
+                            img->current == TextureLayout(img) && img->current == memo->seg_layout &&
+                            img->last_seq == cur_.value && img->last_frame == images_.Frame();
+                        if (!same && stats_.tex_seg_mismatches++ < 16) {
+                            SSPC_LOG(GPU, Warning,
+                                     "SSPC_TEX_SEGMENT=verify: a run member's img{} {:#x} stamped in segment {} differs: "
+                                     "layout {} (stamped {}) seq {} (batch {})",
+                                     img->id, img->layout.guest_address, tex_seg_, static_cast<int>(img->current),
+                                     static_cast<int>(memo->seg_layout), img->last_seq, cur_.value);
+                        }
+                    }
                     if (img == nullptr || memo->epoch != epoch || memo->raw != raw || memo->flags != flags ||
                         !((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written))) {
                         why = 0; // (BindStage would find it, maybe upload it)
@@ -6070,6 +6208,12 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                         why = 2; // (the attachments in the general layout)
                     } else {
                         images_.Touch(*img, cur_.value); // what Find records
+                        if (seg && !im.storage &&
+                            ImageCache::ReadSince(*img, kGraphicsShaders, VK_ACCESS_2_SHADER_READ_BIT)) {
+                            memo->seg = tex_seg_; // (inside rendering: no barrier since - checked as a draw's are)
+                            memo->seg_layout = img->current;
+                            ++stats_.tex_seg_stamped;
+                        }
                         iinfos[ni] = {VK_NULL_HANDLE, memo->view, img->current};
                         ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                     .dstBinding = im.binding,

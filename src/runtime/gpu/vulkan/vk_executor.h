@@ -132,6 +132,10 @@ struct ExecutorStats {
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
     u64 gb_bind_hits = 0, gb_bind_misses = 0, gb_bind_kept = 0; ///< SSPC_NATIVE_GBUFFER (GbBind)
     u64 gb_bind_verified = 0, gb_bind_mismatches = 0;          ///< ... SSPC_NATIVE_GBUFFER_BIND=verify
+    /// SSPC_TEX_SEGMENT: textures bound from a segment's stamp (draws, run members' own), stamps made, segments; verify:
+    /// hits checked in full, those that differed
+    u64 tex_seg_hits = 0, tex_seg_member_hits = 0, tex_seg_stamped = 0, tex_seg_segments = 0;
+    u64 tex_seg_verified = 0, tex_seg_mismatches = 0;
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
     /// P4.7 frontend reads: from a backing run kept / a run found for it / through the guest memory manager
     u64 read_run_hits = 0, read_run_misses = 0, read_run_none = 0;
@@ -547,6 +551,10 @@ private:
         u64 epoch = ~0ull;
         CachedImage* img = nullptr;
         VkImageView view = VK_NULL_HANDLE;
+        /// SSPC_TEX_SEGMENT: the segment (tex_seg_) its image was checked in - valid, touched, read in `seg_layout`
+        /// without a barrier, after the draw's barriers (0: none)
+        u64 seg = 0;
+        VkImageLayout seg_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
     std::unordered_map<u64, TexMemo, U64Hash> tex_memo_;
     /// P4.9: tex_memo_'s entries looked up last, direct-mapped by key (never erased: the pointers stay valid) - the map's
@@ -585,6 +593,28 @@ private:
     std::vector<VkDescriptorImageInfo> gb_check_infos_;
     std::vector<VkWriteDescriptorSet> gb_check_writes_;
     std::vector<CachedImage*> gb_check_bound_, gb_check_info_images_;
+    /// SSPC_TEX_SEGMENT (off by default; on, verify): a draw's texture checked once a segment. A segment: the image
+    /// cache's state (ImageCache::Generation - no barrier, upload, applied invalidation, image or frame since) and the
+    /// command buffer the same (SegSync). A memo hit stamped in it (after the draw's barriers: valid, touched, in its
+    /// texture layout and read there by the graphics shaders since its barrier) and not a target of the draw is bound
+    /// from the memo alone - its image not looked at again, not among the draw's bound images (no barrier, no layout
+    /// fix-up: none would be recorded or change anything). verify: such a hit's image checked as the full path does and
+    /// the full path taken (compared).
+    enum class SegMode : u8 { Unread, On, Off, Verify };
+    SegMode seg_mode_ = SegMode::Unread;
+    bool seg_draw_ = false; ///< the draw being bound may take segment hits (RecordDraw: no diagnostic looks at its images)
+    u64 tex_seg_ = 1, seg_gen_ = ~0ull, seg_value_ = ~0ull;
+    struct SegStamp {
+        TexMemo* memo;
+        CachedImage* img;
+    };
+    std::vector<SegStamp> seg_pending_; ///< the draw's memo hits and lookups, stamped once its barriers are recorded
+    struct SegCheck {
+        u32 info;
+        VkImageLayout layout;
+    };
+    std::vector<SegCheck> seg_check_; ///< verify: the draw's segment hits (their image infos, the stamped layout)
+    void SegSync(); ///< a new segment when the image cache's state or the command buffer changed
     struct StreamSeen {
         u64 hash = 0, flip = 0;
     };

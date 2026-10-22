@@ -2298,6 +2298,12 @@ std::string Backend::Report() {
                            s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses,
                            s.gb_bind_hits, s.gb_bind_misses, s.gb_bind_kept, s.gb_bind_verified,
                            s.gb_bind_mismatches);
+        if (s.tex_seg_segments != 0) {
+            out += fmt::format("textures checked once a segment (SSPC_TEX_SEGMENT): taken from the stamp - draws {}, run "
+                               "members {}; stamps {}, segments {}; verified {}, differing {}\n",
+                               s.tex_seg_hits, s.tex_seg_member_hits, s.tex_seg_stamped, s.tex_seg_segments,
+                               s.tex_seg_verified, s.tex_seg_mismatches);
+        }
         out += cp_->WaitReport();
         out += cp_->FenceReport();
         const VideoOut::Stats vo = VideoOut::GetStats();
