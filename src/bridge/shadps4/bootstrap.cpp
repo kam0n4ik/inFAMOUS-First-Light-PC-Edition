@@ -67,6 +67,7 @@
 #include "runtime/gpu/r9/gprof.h"
 #include "engine/guest_hooks.h"
 #include "engine/game_fixes.h"
+#include "engine/mouse_camera.h"
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/frame_trace.h"
@@ -862,6 +863,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::GameMenu::Install(linker.GetModule(eboot_index)->Base());
     // races in the game's own code the PC's timing exposes (docs/GAME_FIXES.md)
     Engine::GameFixes::Install(linker.GetModule(eboot_index)->Base());
+    Engine::MouseCamera::Install(linker.GetModule(eboot_index)->Base());
     Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (FrameBreak FB-3)
     Gpu::R8::Verify::Frame::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (R8-V3)

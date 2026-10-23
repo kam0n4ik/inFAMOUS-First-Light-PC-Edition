@@ -96,6 +96,9 @@ struct File {
     std::unique_ptr<Directory> dir;
     ContentPatch::FilePatch patch; // the PC Edition's replacements in what the game reads (read only)
     std::mutex mutex;
+    // a movie (.bsf): where its reads go (diagnostics: a video that repeats a moment or jumps elsewhere)
+    bool movie = false;
+    u64 movie_next = 0, movie_reads = 0, movie_jumps = 0, movie_bytes = 0;
 
     bool WriteOnly() const {
         return access == Access::Write || access == Access::Append;
@@ -334,6 +337,7 @@ s32 PosixOpen(const char* raw_path, s32 flags, u16 mode) {
             file->handle = OpenHost(r->host, access);
             if (access == Access::Read && file->handle != INVALID_HANDLE_VALUE) {
                 file->patch = ContentPatch::ForFile(file->guest, r->host);
+                file->movie = file->guest.ends_with(".bsf");
             }
         }
         if (file->handle == INVALID_HANDLE_VALUE) {
@@ -363,9 +367,26 @@ s32 PosixClose(s32 fd) {
         file = std::move(it->second);
         g_files.erase(it);
     }
-    SSPC_LOG(Filesystem, Info, "close {} ({})", fd, file->guest);
+    if (file->movie) {
+        SSPC_LOG(Filesystem, Info, "close {} ({}): {} reads, {} MiB, {} not where the previous one ended", fd,
+                 file->guest, file->movie_reads, file->movie_bytes >> 20, file->movie_jumps);
+    } else {
+        SSPC_LOG(Filesystem, Info, "close {} ({})", fd, file->guest);
+    }
     g_host->ReleaseDescriptor(fd);
     return ORBIS_OK;
+}
+
+void NoteMovieRead(File& f, u64 offset, s64 got) {
+    if (f.movie_reads != 0 && offset != f.movie_next && ++f.movie_jumps <= 32) {
+        SSPC_LOG(Filesystem, Warning, "movie {}: read {} at {:#x}, the previous read ended at {:#x}", f.guest,
+                 f.movie_reads + 1, offset, f.movie_next);
+    }
+    ++f.movie_reads;
+    if (got > 0) {
+        f.movie_bytes += static_cast<u64>(got);
+    }
+    f.movie_next = offset + static_cast<u64>(std::max<s64>(got, 0));
 }
 
 s64 PosixRead(s32 fd, void* buf, u64 nbytes) {
@@ -381,6 +402,9 @@ s64 PosixRead(s32 fd, void* buf, u64 nbytes) {
         return SetErrno(kEBADF);
     }
     const s64 got = ReadRegular(*f, buf, nbytes, f->pos);
+    if (f->movie) {
+        NoteMovieRead(*f, f->pos, got);
+    }
     f->pos += got;
     return got;
 }
@@ -404,7 +428,11 @@ s64 PosixPread(s32 fd, void* buf, u64 nbytes, s64 offset) {
     if (f->WriteOnly()) {
         return SetErrno(kEBADF);
     }
-    return ReadRegular(*f, buf, nbytes, static_cast<u64>(offset));
+    const s64 got = ReadRegular(*f, buf, nbytes, static_cast<u64>(offset));
+    if (f->movie) {
+        NoteMovieRead(*f, static_cast<u64>(offset), got);
+    }
+    return got;
 }
 
 s64 PosixWrite(s32 fd, const void* buf, u64 nbytes) {

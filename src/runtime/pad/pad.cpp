@@ -247,6 +247,7 @@ void Fill(PadData& d, s32 slot, Input::ReadInfo* info = nullptr) {
 
 constexpr u8 kGameReadSite[] = {0x85, 0xC0, 0x75, 0x2F, 0x0F, 0xB6, 0x83, 0x38, 0x01, 0x00, 0x00};
 constexpr size_t kGamePadDataOffset = 0xD0;
+std::atomic<u64> g_game_pad_object{0}; // (GamePadObject)
 
 struct GameSticks {
     bool known = false;
@@ -446,6 +447,10 @@ SSPC_SYSV_ABI s32 ReadState(s32 handle, PadData* data) {
     if (slot == kNoHandle) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
+    if (slot == 0 && g_game_pad_object.load(std::memory_order_relaxed) == 0 &&
+        std::memcmp(caller, kGameReadSite, sizeof(kGameReadSite)) == 0) {
+        g_game_pad_object.store(reinterpret_cast<u64>(data) - kGamePadDataOffset, std::memory_order_release);
+    }
     if (!g_log.enabled || slot != 0 || g_host == nullptr) {
         Fill(*data, slot);
         return ORBIS_OK;
@@ -571,6 +576,10 @@ void SetInputLog(bool on) {
 
 std::span<const Runtime::Export> PadExports() {
     return kExports;
+}
+
+u64 GamePadObject() {
+    return g_game_pad_object.load(std::memory_order_acquire);
 }
 
 } // namespace SecondSon::Pad

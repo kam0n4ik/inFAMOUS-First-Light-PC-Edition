@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <mutex>
 
@@ -114,6 +115,13 @@ public:
     /// scePadOpen: the motion pose returns to rest.
     void ResetOrientation();
 
+    /// Direct camera (engine/mouse_camera.cpp): the game's camera takes the mouse as angles, every frame it runs.
+    /// The counts it has not taken yet (x right, y down; mouse sensitivity and invert_y applied), zeroed. For
+    /// kDirectCameraHoldUs after a call the mouse leaves the right stick at rest and its counts wait for the next one;
+    /// counts that waited longer (the camera stopped meanwhile: a cut-scene, a menu) are dropped, not turned at once.
+    void TakeCameraCounts(double& dx, double& dy);
+    static constexpr u64 kDirectCameraHoldUs = 250'000;
+
     /// libScePad touch pad coordinates (the bridge reports x 0..1919, y 0..941).
     static constexpr u16 kTouchWidth = 1920;
     static constexpr u16 kTouchHeight = 942;
@@ -163,6 +171,8 @@ private:
     u64 focus_gained_ns_ = 0;  // a click right after the window got focus only focuses it
     u8 swallowed_button_ = 0;  // the click that captured the mouse: its release is not a press
     double mouse_dx_ = 0.0, mouse_dy_ = 0.0;
+    std::atomic<u64> camera_direct_us_{0}; // the last TakeCameraCounts (steady clock, us); 0: never
+    double camera_dx_ = 0.0, camera_dy_ = 0.0; // read but not yet taken by the camera
 
     bool motion_mode_ = false;
     VirtualMotion motion_;

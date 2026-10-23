@@ -20,6 +20,7 @@ extern "C" {
 #include "base/abi.h"
 #include "base/log.h"
 #include "runtime/exports.h"
+#include "runtime/filesystem/fs_host.h"
 
 namespace SecondSon::Media {
 
@@ -130,6 +131,10 @@ public:
         }
     }
     ~Decoder() {
+        SSPC_LOG(Audio, Info,
+                 "videodec: decoder {:#x} done: {} access units in, {} pictures out, {} flushes, {} resets, {} pictures "
+                 "with a pts at or before the previous one, {} without a pts, {} errors",
+                 reinterpret_cast<u64>(this), units_, pictures_, flushes_, resets_, pts_back_, no_pts_, errors_);
         avcodec_free_context(&ctx_);
         sws_freeContext(sws_);
     }
@@ -155,6 +160,17 @@ public:
         packet->pts = static_cast<s64>(in.pts);
         packet->dts = static_cast<s64>(in.dts);
         packet->opaque = reinterpret_cast<void*>(in.attached);
+        ++units_;
+        if (units_ <= 3) {
+            SSPC_LOG(Audio, Info, "videodec: decoder {:#x}: access unit {} ({} bytes): pts {:#x}, dts {:#x}, attached {:#x}",
+                     reinterpret_cast<u64>(this), units_, in.au_size, in.pts, in.dts, in.attached);
+        }
+        if (units_ > 1 && in.pts < last_in_pts_ && back_logged_ < 16) {
+            ++back_logged_;
+            SSPC_LOG(Audio, Warning, "videodec: decoder {:#x}: access unit {} goes back: pts {} after {} ({} pictures out)",
+                     reinterpret_cast<u64>(this), units_, in.pts, last_in_pts_, pictures_);
+        }
+        last_in_pts_ = in.pts;
         int ret = avcodec_send_packet(ctx_, packet);
         if (ret == AVERROR_EOF) {
             avcodec_flush_buffers(ctx_); // (after a flush: decoding again, as the oracle)
@@ -162,6 +178,7 @@ public:
         }
         av_packet_free(&packet);
         if (ret < 0) {
+            ++errors_;
             SSPC_LOG(Audio, Error, "videodec: sending an access unit failed ({})", ret);
             return kErrApiFail;
         }
@@ -170,6 +187,9 @@ public:
 
     s32 Flush(FrameBuffer& fb, PictureInfo& pic) {
         pic.is_valid = 0;
+        ++flushes_;
+        SSPC_LOG(Audio, Info, "videodec: decoder {:#x} flushed after {} access units, {} pictures",
+                 reinterpret_cast<u64>(this), units_, pictures_);
         // A flush can hold several pictures but returns one (the oracle: some games hang when one is skipped);
         // a second flush in a row is refused by FFmpeg, which is ignored.
         avcodec_send_packet(ctx_, nullptr);
@@ -177,6 +197,10 @@ public:
     }
 
     void Reset() {
+        ++resets_;
+        SSPC_LOG(Audio, Info, "videodec: decoder {:#x} reset after {} access units, {} pictures (last pts {})",
+                 reinterpret_cast<u64>(this), units_, pictures_, last_out_pts_);
+        has_out_pts_ = false;
         avcodec_flush_buffers(ctx_);
     }
 
@@ -193,6 +217,7 @@ private:
         }
         if (ret < 0) {
             av_frame_free(&frame);
+            ++errors_;
             SSPC_LOG(Audio, Error, "videodec: decoding failed ({})", ret);
             return kErrApiFail;
         }
@@ -214,6 +239,15 @@ private:
             return kErrArgumentPointer;
         }
         CopyNv12(static_cast<u8*>(fb.frame_buffer), pitch, height, *frame);
+        // The GPU backend's copies of the frame buffer (the texture the game draws the picture with) are refreshed: the
+        // page tracking does not see this write where the game's memory is imported into Vulkan, and the picture there
+        // stayed the one first uploaded - a video frozen on one frame while its sound played on, or an older frame (of
+        // this video or another one that used the same buffer) shown again.
+        Filesystem::NotifyHostWrite(reinterpret_cast<u64>(fb.frame_buffer), u64{pitch} * height * 3 / 2);
+        if (pictures_ == 0) {
+            SSPC_LOG(Audio, Info, "videodec: decoder {:#x}: frame buffer {:#x} ({:#x} bytes)", reinterpret_cast<u64>(this),
+                     reinterpret_cast<u64>(fb.frame_buffer), fb.frame_buffer_size);
+        }
         pic.is_valid = 1;
         pic.codec_type = 0;
         pic.frame_width = width;
@@ -221,6 +255,21 @@ private:
         pic.frame_height = height;
         pic.is_error_pic = 0;
         pic.pts = static_cast<u64>(frame->pts);
+        ++pictures_;
+        if (pictures_ <= 3) {
+            SSPC_LOG(Audio, Info, "videodec: decoder {:#x}: picture {}: pts {:#x}, attached {:#x}",
+                     reinterpret_cast<u64>(this), pictures_, pic.pts, reinterpret_cast<u64>(frame->opaque));
+        }
+        if (pic.pts == ~u64{0}) {
+            ++no_pts_;
+        } else if (has_out_pts_ && pic.pts <= last_out_pts_ && ++pts_back_ <= 16) {
+            SSPC_LOG(Audio, Warning, "videodec: decoder {:#x}: picture {} has pts {} after {}",
+                     reinterpret_cast<u64>(this), pictures_, pic.pts, last_out_pts_);
+        }
+        if (pic.pts != ~u64{0}) {
+            last_out_pts_ = pic.pts;
+            has_out_pts_ = true;
+        }
         pic.attached = reinterpret_cast<u64>(frame->opaque);
         pic.codec.avc.colour_primaries = static_cast<u8>(frame->color_primaries);
         pic.codec.avc.crop_left = 0;
@@ -273,6 +322,10 @@ private:
 
     AVCodecContext* ctx_ = nullptr;
     SwsContext* sws_ = nullptr;
+    // diagnostics (a video that repeats a moment or jumps elsewhere): what the game fed and got back
+    u64 units_ = 0, pictures_ = 0, flushes_ = 0, resets_ = 0, pts_back_ = 0, errors_ = 0, back_logged_ = 0, no_pts_ = 0;
+    u64 last_in_pts_ = 0, last_out_pts_ = 0;
+    bool has_out_pts_ = false;
 };
 
 std::mutex g_mutex; // (the set of live decoders; a decoder itself is used by one thread at a time, as on the console)

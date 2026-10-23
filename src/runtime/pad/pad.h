@@ -67,4 +67,8 @@ void SetInputLog(bool on);
 
 std::span<const Runtime::Export> PadExports();
 
+/// The game's pad object (inFAMOUS Second Son 01.07: its ScePadData at +0xD0, read at eboot 0x24B178; its stick filter's
+/// output at +0x08..+0x1C), 0 until the game's first read there.
+u64 GamePadObject();
+
 } // namespace SecondSon::Pad

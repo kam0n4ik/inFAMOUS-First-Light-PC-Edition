@@ -2,6 +2,7 @@
 #include "input/keyboard_mouse.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numbers>
 #include <string>
@@ -30,6 +31,12 @@ constexpr u64 kMinReadIntervalUs = 2000;
 
 u8 Axis(double v) {
     return static_cast<u8>(std::clamp(std::lround(127.5 + v * 127.5), 0L, 255L));
+}
+
+u64 SteadyMicroseconds() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
 }
 
 /// The program that took the focus away (focus-loss log): its executable name and process id only
@@ -630,6 +637,11 @@ PadState KeyboardMouse::Read(u64 now_us) {
     } else if (drag_) {
         drag_x_ = std::clamp(drag_x_ + mdx * kTouchUnitsPerCount, 0.0, kTouchWidth - 1.0);
         drag_y_ = std::clamp(drag_y_ + mdy * kTouchUnitsPerCount, 0.0, kTouchHeight - 1.0);
+    } else if (const u64 marked = camera_direct_us_.load(std::memory_order_relaxed);
+               marked != 0 && SteadyMicroseconds() - marked < kDirectCameraHoldUs) {
+        // the camera takes the counts as angles (TakeCameraCounts): the stick stays at rest
+        camera_dx_ += mdx;
+        camera_dy_ += mdy;
     } else {
         // Right stick = mouse speed over this read: the camera turns by an amount proportional to
         // the distance the mouse moved, whatever the frame rate; no smoothing, no delay.
@@ -690,6 +702,23 @@ void KeyboardMouse::ResetOrientation() {
     std::scoped_lock lock{mutex_};
     motion_.Reset();
     motion_mode_ = false;
+}
+
+void KeyboardMouse::TakeCameraCounts(double& dx, double& dy) {
+    std::scoped_lock lock{mutex_};
+    const u64 now = SteadyMicroseconds();
+    const u64 previous = camera_direct_us_.exchange(now, std::memory_order_relaxed);
+    const bool fresh = previous != 0 && now - previous < kDirectCameraHoldUs;
+    dx = fresh ? camera_dx_ : 0.0;
+    dy = fresh ? camera_dy_ : 0.0;
+    camera_dx_ = camera_dy_ = 0.0;
+    if (!motion_mode_ && !drag_) { // (the counts since the last reading as well: one frame less of delay)
+        dx += mouse_dx_;
+        dy += mouse_dy_;
+        mouse_dx_ = mouse_dy_ = 0.0;
+    }
+    dx *= settings_.mouse_sensitivity;
+    dy *= settings_.mouse_sensitivity * (settings_.invert_y ? -1.0 : 1.0);
 }
 
 KeyboardMouse& Player1() {

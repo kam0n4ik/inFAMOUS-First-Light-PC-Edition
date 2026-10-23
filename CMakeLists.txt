@@ -29,6 +29,7 @@ add_library(sspc_runtime STATIC
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp
+    src/engine/mouse_camera.cpp
     src/engine/particles/smoke_quality.cpp
     src/engine/render/dcb_scan.cpp
     src/engine/render/frame_trace.cpp
