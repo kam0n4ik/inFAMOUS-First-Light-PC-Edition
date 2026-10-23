@@ -54,4 +54,6 @@ for ($r = 1; $r -le $Rounds; $r++) {
     }
 }
 "$(Get-Date -Format 'HH:mm:ss') done" | Add-Content "$dir\series.txt"
-& python -I -X utf8 "$PSScriptRoot\ab_summary.py" $dir | Tee-Object "$dir\summary.txt"
+$summary = & python -I -X utf8 "$PSScriptRoot\ab_summary.py" $dir
+$summary | Set-Content -Encoding UTF8 "$dir\summary.txt" # (Tee-Object of PowerShell 5.1 writes UTF-16)
+$summary

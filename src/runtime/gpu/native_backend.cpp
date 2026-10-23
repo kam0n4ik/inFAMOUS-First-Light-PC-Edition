@@ -2322,6 +2322,9 @@ std::string Backend::Report() {
         out += fmt::format("REA-4 backing runs merged (host-contiguous): {}\n", g.merged_runs);
         out += fmt::format("guest buffer windows {} ({} MiB; through the backing {}, the guest's pages {}), imports {}, failures {} {}\n", g.windows, g.bytes >> 20, g.backing_windows, g.guest_windows,
                            g.imports, g.import_failures, g.first_failure);
+        if (g.superseded != 0) {
+            out += fmt::format("R9-F3 heap windows replaced by longer ones: {}\n", g.superseded);
+        }
     }
     if (cp_ && executor_) {
         const auto& c = cp_->Stats();

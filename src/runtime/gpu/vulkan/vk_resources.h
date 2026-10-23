@@ -215,6 +215,7 @@ public:
         u64 exact_windows = 0;
         u64 backing_windows = 0, guest_windows = 0; ///< imported through the backing's view / the guest's pages
         u64 merged_runs = 0; ///< REA-4: backing runs joined to the one before (host-contiguous)
+        u64 superseded = 0;  ///< R9-F3: windows replaced by a longer heap window of their base
         std::string first_failure;
     };
     Stats GetStats();
