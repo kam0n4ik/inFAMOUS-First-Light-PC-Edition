@@ -143,6 +143,8 @@ Diagnostics::Diagnostics(DeviceContext& ctx, bool enabled, const std::filesystem
                 markers_ = static_cast<volatile u32*>(p);
                 markers_[0] = 0;
                 markers_[1] = 0;
+                markers_[2] = 0;
+                markers_[3] = 0;
             } else {
                 SSPC_LOG(GPU, Warning, "native backend diagnostics: no buffer markers (host-visible memory)");
             }
@@ -168,7 +170,7 @@ Diagnostics::~Diagnostics() {
     }
 }
 
-u64 Diagnostics::Begin(VkCommandBuffer cb, u64 batch, std::string text) {
+u64 Diagnostics::Begin(VkCommandBuffer cb, u64 batch, std::string text, u8 lane) {
     if (!enabled_) {
         return 0;
     }
@@ -183,26 +185,30 @@ u64 Diagnostics::Begin(VkCommandBuffer cb, u64 batch, std::string text) {
         f.vkCmdSetCheckpointNV(cb, reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
     }
     if (markers_ != nullptr) {
-        f.vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, marker_buffer_, 0, static_cast<u32>(id));
+        f.vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, marker_buffer_, lane != 0 ? 8 : 0,
+                                    static_cast<u32>(id));
     }
     return id;
 }
 
-void Diagnostics::End(VkCommandBuffer cb, u64 id) {
+void Diagnostics::End(VkCommandBuffer cb, u64 id, u8 lane) {
     if (!enabled_ || id == 0 || markers_ == nullptr) {
         return;
     }
-    Fn().vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marker_buffer_, 4, static_cast<u32>(id));
+    Fn().vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marker_buffer_, lane != 0 ? 12 : 4,
+                                   static_cast<u32>(id));
 }
 
-void Diagnostics::Submitted(u64 batch, u64 first_cmd, u64 last_cmd) {
+void Diagnostics::Submitted(u64 batch, u64 first_cmd, u64 last_cmd, u8 lane) {
     if (!enabled_) {
         return;
     }
     std::scoped_lock lock{mutex_};
     batches_.push_back({batch, {first_cmd, last_cmd}});
+    batch_lanes_.push_back(lane);
     if (batches_.size() > 256) {
         batches_.erase(batches_.begin(), batches_.begin() + 128);
+        batch_lanes_.erase(batch_lanes_.begin(), batch_lanes_.begin() + 128);
     }
 }
 
@@ -280,29 +286,40 @@ std::filesystem::path Diagnostics::DeviceLost(const std::string& where, u64 fail
     } else {
         out += "device fault: VK_EXT_device_fault not enabled\n";
     }
-    // the NVIDIA checkpoints
-    u64 last_cp = 0;
+    // the NVIDIA checkpoints (FrameBreak AQ: the async compute lane's queue too)
+    u64 last_cp = 0, lane_cp = 0;
     if (f.vkGetQueueCheckpointDataNV != nullptr) {
-        u32 n = 0;
-        f.vkGetQueueCheckpointDataNV(ctx_.Queue(), &n, nullptr);
-        std::vector<VkCheckpointDataNV> cps(n, VkCheckpointDataNV{.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
-        f.vkGetQueueCheckpointDataNV(ctx_.Queue(), &n, cps.data());
-        out += fmt::format("checkpoints ({}):\n", n);
-        for (const auto& c : cps) {
-            const u64 id = static_cast<u64>(reinterpret_cast<uintptr_t>(c.pCheckpointMarker));
-            last_cp = std::max(last_cp, id);
-            out += fmt::format("  stage {:#x} ({}): command {}\n", static_cast<u32>(c.stage), StageName(c.stage), id);
+        for (const bool lane : {false, true}) {
+            const VkQueue queue = lane ? ctx_.LaneQueue() : ctx_.Queue();
+            if (queue == VK_NULL_HANDLE || (lane && queue == ctx_.Queue())) {
+                continue;
+            }
+            u32 n = 0;
+            f.vkGetQueueCheckpointDataNV(queue, &n, nullptr);
+            std::vector<VkCheckpointDataNV> cps(n, VkCheckpointDataNV{.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+            f.vkGetQueueCheckpointDataNV(queue, &n, cps.data());
+            out += fmt::format("checkpoints{} ({}):\n", lane ? " of the async compute lane" : "", n);
+            for (const auto& c : cps) {
+                const u64 id = static_cast<u64>(reinterpret_cast<uintptr_t>(c.pCheckpointMarker));
+                u64& last = lane ? lane_cp : last_cp;
+                last = std::max(last, id);
+                out += fmt::format("  stage {:#x} ({}): command {}\n", static_cast<u32>(c.stage), StageName(c.stage),
+                                   id);
+            }
         }
     } else {
         out += "checkpoints: VK_NV_device_diagnostic_checkpoints not enabled\n";
     }
-    // the buffer markers: the last command started (top of pipe) and completed (bottom of pipe)
-    u64 started = 0, completed = 0;
+    // the buffer markers: the last command started (top of pipe) and completed (bottom of pipe); AQ: the lane's too
+    u64 started = 0, completed = 0, lane_started = 0, lane_completed = 0;
     if (markers_ != nullptr) {
         started = markers_[0];
         completed = markers_[1];
-        out += fmt::format("buffer markers: last started command {} (low 32 bits), last completed command {}\n",
-                           started, completed);
+        lane_started = markers_[2];
+        lane_completed = markers_[3];
+        out += fmt::format("buffer markers: last started command {} (low 32 bits), last completed command {}; the "
+                           "async compute lane's {} / {}\n",
+                           started, completed, lane_started, lane_completed);
     } else {
         out += "buffer markers: not available\n";
     }
@@ -314,10 +331,17 @@ std::filesystem::path Diagnostics::DeviceLost(const std::string& where, u64 fail
         out += fmt::format("\nthe journal from the last completed command to past the last started one ({}..{}):\n",
                            lo > 8 ? lo - 8 : 1, hi + 16);
         out += RecordLines(lo > 8 ? lo - 8 : 1, hi + 16);
+        if (lane_started != 0 || lane_cp != 0) {
+            const u64 lhi = std::max({lane_started, lane_completed, lane_cp});
+            const u64 llo = std::min(lane_completed != 0 ? lane_completed : lhi, lane_cp != 0 ? lane_cp : lhi);
+            out += fmt::format("\nthe async compute lane's journal from its last completed command to past its last "
+                               "started one ({}..{}):\n", llo > 8 ? llo - 8 : 1, lhi + 16);
+            out += RecordLines(llo > 8 ? llo - 8 : 1, lhi + 16);
+        }
         out += "\nthe last batches submitted (value: commands):\n";
-        for (size_t i = batches_.size() > 32 ? batches_.size() - 32 : 0; i < batches_.size(); ++i) {
-            out += fmt::format("  {}: {}..{}\n", batches_[i].first, batches_[i].second.first,
-                               batches_[i].second.second);
+        for (size_t i = batches_.size() > 48 ? batches_.size() - 48 : 0; i < batches_.size(); ++i) {
+            out += fmt::format("  {}: {}..{}{}\n", batches_[i].first, batches_[i].second.first,
+                               batches_[i].second.second, batch_lanes_[i] != 0 ? " (lane)" : "");
         }
         out += fmt::format("\nthe last 64 commands recorded ({}..{}):\n", next_id_ > 64 ? next_id_ - 64 : 1,
                            next_id_ - 1);

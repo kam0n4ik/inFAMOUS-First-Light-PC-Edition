@@ -336,6 +336,8 @@ public:
     u64 LastUnblockTsc() const { return last_unblock_tsc_; }
     /// FrameBreak AQ: the async compute lane is on (SSPC_FB_ASYNC_COMPUTE=1 and a queue for it).
     bool AsyncLane() const { return aq_; }
+    /// The device-lost report when another thread (the presentation's) saw the loss first (once per run)
+    void ReportDeviceLost(const char* where) { OnDeviceLost(where, timeline_.LastSubmitted()); }
     /// P4.11 soak telemetry: command buffer batches the executor owns (free and in flight).
     u64 BatchObjects() const { return free_.size() + in_flight_.size() + (open_ ? 1 : 0); }
     /// Called at each flip marker queued for presentation (after its batch was submitted), with its timeline value.
@@ -1177,6 +1179,63 @@ private:
                                    ///< 1 while the game waits for its async compute (CriticalCompute), 2 always
     bool aq_cmd_compute_ = false;  ///< the command being recorded is a compute queue's
     bool aq_family_ = false;       ///< the lane is a queue of the compute family: the lane is decided at Begin
+    /// R9 AQ (SSPC_FB_ASYNC_NOTE_READS=1, experiment): the main queue's graphics reads of video memory are noted too - a
+    /// lane batch writing what a main batch in flight still reads waits for it (otherwise only the main batch's writes,
+    /// uploads and compute accesses are, so a lane write over a graphics read of the frame before goes unseen)
+    bool aq_note_reads_ = false;
+    /// AQ: the pages an upload copied noted for the lane's conflicts, the block's other pages too (SSPC_FB_ASYNC_NOTE_UPLOADS=0:
+    /// only the binding's range - A/B only)
+    bool aq_note_uploads_ = true;
+    /// R9 AQ (SSPC_DIAG_AQ_MARKERS=1, diagnostic): a buffer marker before and after every dispatch, per queue (host-visible
+    /// words: [0] main started, [1] main completed, [2] lane started, [3] lane completed), and what each dispatch was - the
+    /// device-lost report lists the dispatches started and not completed on each queue
+    struct AqMarker {
+        u64 batch = 0, cs = 0;
+        u32 queue = 0, groups[3] = {};
+        u8 lane = 0;
+        bool indirect = false;
+        u64 ps = 0; ///< a draw group's (queue 0xFFFF: draws from a pipeline change on; cs its vertex shader)
+        // SSPC_DIAG_AQ_WATCH: the watched shader's first buffer - its guest range, how it was bound, its bytes 0..15 as
+        // the CPU had them when recorded (the GPU's: aq_probe_buf_ at the marker's slot)
+        u64 waddr = 0;
+        u32 wsize = 0, wcpu[4] = {};
+        u8 wpath = 0, wflags = 0;
+    };
+    bool aq_markers_ = false;
+    u64 aq_mark_draw_key_ = ~0ull; ///< the draw group's pipeline and shaders (a new group: a new marker)
+    /// R9 AQ (SSPC_DIAG_AQ_WATCH=<hex cs>, with the markers; diagnostic): that shader's dispatches - the bytes 0..15 of its
+    /// first buffer as the CPU had them and as the GPU had them right before the dispatch, and the commands writing those
+    /// ranges (the device-lost report and the log list them)
+    u64 aq_watch_cs_ = 0;
+    bool aq_watch_capture_ = false; ///< BindStage: the watched dispatch's first buffer wanted
+    struct AqWatchB0 {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        u64 offset = 0, addr = 0, size = 0, avail = 0;
+        u8 path = 0;
+    } aq_watch_b0_;
+    u8 aq_range_path_ = 0; ///< GuestRangeImpl's last path: 1 resident, 2 stream reuse, 3 streamed, 4 prepared, 5 uploaded, 6 written
+    OwnedBuffer aq_probe_buf_{}; ///< 16 bytes per marker slot
+    std::vector<std::pair<u64, u64>> aq_watch_ranges_;
+    u64 aq_watch_lo_ = 0, aq_watch_hi_ = 0;
+    struct AqWriter {
+        u64 batch = 0, addr = 0, size = 0, what = 0;
+        u8 lane = 0, kind = 0; ///< kind: 1 a write, 2 an upload, 3 WRITE_DATA
+    };
+    std::vector<AqWriter> aq_writers_;
+    u32 aq_writer_next_ = 0;
+    u64 aq_what_ = 0; ///< the command recorded: a dispatch's cs, a draw's vs | 1 << 63, 1 WRITE_DATA, 2 DMA, 3 GDS DMA
+    std::deque<u32> aq_watch_pending_; ///< watched markers whose batch has not completed
+    u64 aq_watch_stats_[4] = {};       ///< checked, differ from the CPU's, count past the threads, huge
+    u32 aq_watch_logged_ = 0;
+    bool aq_watch_probe_ = true; ///< SSPC_DIAG_AQ_WATCH_PROBE=0: no GPU copy (no barrier before the watched dispatch)
+    std::unordered_set<u64> aq_writer_kinds_; ///< writers logged (what, kind, lane)
+    void AqWatchWrite(u64 addr, u64 size, u8 kind);
+    void AqWatchDispatch(u32 id);
+    void AqWatchCheck(u64 completed);
+    OwnedBuffer aq_marker_buf_{};
+    std::vector<AqMarker> aq_marker_ring_;
+    u32 aq_marker_next_ = 1;
+    void AqMarkersReport(std::string& out);
     u64 aq_next_wait_main_ = 0;    ///< a held fence's main batch for the next batch (none open at the wait)
     struct AqLast {
         u64 value = 0;

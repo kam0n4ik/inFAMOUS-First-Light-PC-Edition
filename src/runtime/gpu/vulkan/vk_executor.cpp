@@ -368,6 +368,43 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         } else {
             aq_ = true;
             aq_family_ = ctx_.LaneFamily() != ctx_.QueueFamily();
+            if (char am[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_AQ_MARKERS", am, sizeof(am)) == 1 && am[0] == '1' &&
+                                 ctx_.Caps().buffer_markers && Fn().vkCmdWriteBufferMarkerAMD != nullptr) {
+                std::string merr;
+                if (CreateBuffer(ctx_, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, aq_marker_buf_, merr) &&
+                    aq_marker_buf_.mapped != nullptr) {
+                    std::memset(aq_marker_buf_.mapped, 0, 256);
+                    aq_marker_ring_.resize(1u << 16);
+                    aq_markers_ = true;
+                    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_AQ_MARKERS=1 - buffer markers around every dispatch, by "
+                                           "queue, for the device-lost report");
+                    char wv[32] = {};
+                    std::string perr;
+                    if (GetEnvironmentVariableA("SSPC_DIAG_AQ_WATCH", wv, sizeof(wv)) > 0 &&
+                        CreateBuffer(ctx_, u64{16} << 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, aq_probe_buf_, perr,
+                                     true) &&
+                        aq_probe_buf_.mapped != nullptr) {
+                        aq_watch_cs_ = std::strtoull(wv, nullptr, 16);
+                        aq_writers_.resize(4096);
+                        char pv[4] = {};
+                        aq_watch_probe_ = !(GetEnvironmentVariableA("SSPC_DIAG_AQ_WATCH_PROBE", pv, sizeof(pv)) == 1 &&
+                                            pv[0] == '0');
+                        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_AQ_WATCH={:#x} - that shader's first buffer, CPU "
+                                               "and GPU bytes, and its writers", aq_watch_cs_);
+                    }
+                }
+            }
+            // SSPC_FB_ASYNC_NOTE_UPLOADS=0 (A/B only): the uploads' pages past the binding's range not noted
+            if (char nu[4] = {}; GetEnvironmentVariableA("SSPC_FB_ASYNC_NOTE_UPLOADS", nu, sizeof(nu)) == 1 && nu[0] == '0') {
+                aq_note_uploads_ = false;
+                SSPC_LOG(GPU, Warning, "A/B: SSPC_FB_ASYNC_NOTE_UPLOADS=0 - the block uploads' other pages are not noted "
+                                       "for the lane's conflicts (the device-lost behaviour)");
+            }
+            if (char nr[4] = {}; GetEnvironmentVariableA("SSPC_FB_ASYNC_NOTE_READS", nr, sizeof(nr)) == 1 && nr[0] == '1') {
+                aq_note_reads_ = true;
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_ASYNC_NOTE_READS=1 - the main queue's graphics reads noted for "
+                                       "the lane's conflicts");
+            }
             buffers_.DisableLazy(); // (FB-7's kept-back write-backs stay on the main queue: not with the lane)
             char sp[16] = {};
             if (GetEnvironmentVariableA("SSPC_FB_ASYNC_SPLIT", sp, sizeof(sp)) > 0) {
@@ -412,6 +449,8 @@ Executor::~Executor() {
     }
     DestroyBuffer(ctx_, lds_);
     DestroyBuffer(ctx_, lds_lane_);
+    DestroyBuffer(ctx_, aq_marker_buf_);
+    DestroyBuffer(ctx_, aq_probe_buf_);
     DestroyBuffer(ctx_, diag_scratch_);
     for (OwnedBuffer& a : geo_arena_) {
         DestroyBuffer(ctx_, a);
@@ -519,6 +558,7 @@ bool Executor::Begin() {
     cur_.queues.clear();
     cur_.lane = cur_.pool_lane;
     cur_.aq_wait_main_min = std::exchange(aq_next_wait_main_, 0);
+    aq_mark_draw_key_ = ~0ull;
     cur_.aq_main = cur_.aq_wait_all = cur_.aq_images = cur_.aq_gds = cur_.aq_overflow = false;
     cur_.aq_lds = 0;
     cur_.aq_ranges.clear();
@@ -1084,7 +1124,7 @@ void Executor::Flush() {
         return;
     }
     if (diag_ != nullptr) {
-        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
+        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_, cur_.lane);
     }
     submitted_value_.store(cur_.value, std::memory_order_release);
     if (aq_) {
@@ -1256,6 +1296,9 @@ void Executor::Complete(u32 queue, u64 seq) {
 }
 
 void Executor::PollCollect(u64 completed) {
+    if (!aq_watch_pending_.empty()) {
+        AqWatchCheck(completed);
+    }
     ring_.Collect(completed);
     if (shadow_ring_ != nullptr) {
         shadow_ring_->Collect(completed);
@@ -1314,6 +1357,158 @@ std::string DescribeImage(const CachedImage& img) {
                        img.alias_hits != 0 ? " ALIASED" : "");
 }
 
+void Executor::AqMarkersReport(std::string& out) {
+    if (!aq_markers_) {
+        return;
+    }
+    const volatile u32* m = reinterpret_cast<const volatile u32*>(aq_marker_buf_.mapped);
+    for (u32 lane = 0; lane < 2; ++lane) {
+        const u32 started = m[lane * 2], completed = m[lane * 2 + 1];
+        out += fmt::format("\nAQ dispatch markers, {} queue: last started {}, last completed {} (recorded up to {})\n",
+                           lane != 0 ? "the async compute lane's" : "the main", started, completed, aq_marker_next_ - 1);
+        // the dispatches of this queue from a few before the last completed one to a few past the last started one
+        u32 shown = 0;
+        const u32 from = completed > 64 ? completed - 64 : 1;
+        for (u32 id = from; id < aq_marker_next_ && shown < 96; ++id) {
+            const AqMarker& e = aq_marker_ring_[id & (aq_marker_ring_.size() - 1)];
+            if (e.lane != lane || (id > started + 8 && id > completed + 8)) {
+                continue;
+            }
+            ++shown;
+            const char* state = id <= completed ? "done" : id <= started ? "STARTED" : "-";
+            if (e.queue == 0xFFFF) {
+                out += fmt::format("  {} {}: batch {} draws: pipeline {} vs {:#x} ps {:#x}\n", id, state, e.batch,
+                                   e.groups[0], e.cs, e.ps);
+                continue;
+            }
+            out += fmt::format("  {} {}: batch {} q{} cs {:#x} groups {}x{}x{}{}", id, state, e.batch, e.queue, e.cs,
+                               e.groups[0], e.groups[1], e.groups[2], e.indirect ? " indirect" : "");
+            if (e.waddr != 0 && aq_probe_buf_.mapped != nullptr) {
+                u32 g[4];
+                std::memcpy(g, aq_probe_buf_.mapped + u64{id & (aq_marker_ring_.size() - 1)} * 16, 16);
+                out += fmt::format(" | watch b0 {:#x}+{} path {} flags {} cpu [{:#x} {:#x} {:#x} {:#x}] gpu [{:#x} {:#x} "
+                                   "{:#x} {:#x}]",
+                                   e.waddr, e.wsize, e.wpath, e.wflags, e.wcpu[0], e.wcpu[1], e.wcpu[2], e.wcpu[3], g[0],
+                                   g[1], g[2], g[3]);
+            }
+            out += '\n';
+        }
+    }
+    if (aq_watch_cs_ != 0) {
+        out += fmt::format("\nAQ watch {:#x}: {} probes checked, {} differ from the CPU's bytes, {} with a count past the "
+                           "threads, {} huge; {} watched ranges; the last writers of them ({} recorded):\n",
+                           aq_watch_cs_, aq_watch_stats_[0], aq_watch_stats_[1], aq_watch_stats_[2], aq_watch_stats_[3],
+                           aq_watch_ranges_.size(), aq_writer_next_);
+        for (u32 k = aq_writer_next_ > 64 ? aq_writer_next_ - 64 : 0; k < aq_writer_next_; ++k) {
+            const AqWriter& w = aq_writers_[k & (aq_writers_.size() - 1)];
+            out += fmt::format("  batch {}{} kind {} what {:#x} at {:#x}+{}\n", w.batch, w.lane != 0 ? " (lane)" : "",
+                               w.kind, w.what, w.addr, w.size);
+        }
+    }
+}
+
+void Executor::AqWatchWrite(u64 addr, u64 size, u8 kind) {
+    // SSPC_DIAG_AQ_WATCH: a command writing (1), uploading (2) or WRITE_DATA (3) over a watched buffer's range
+    const u64 end = addr + size;
+    if (end <= aq_watch_lo_ || aq_watch_hi_ <= addr) {
+        return;
+    }
+    for (const auto& [b, e] : aq_watch_ranges_) {
+        if (addr < e && b < end) {
+            aq_writers_[aq_writer_next_++ & (aq_writers_.size() - 1)] = {cur_.value, addr, size, aq_what_,
+                                                                         cur_.pool_lane, kind};
+            // each kind of writer once in the log (the command, how it writes, the queue)
+            const u64 key = aq_what_ * 31 + kind * 2 + (cur_.pool_lane != 0 ? 1 : 0);
+            if (aq_writer_kinds_.size() < 64 && aq_writer_kinds_.insert(key).second) {
+                SSPC_LOG(GPU, Warning,
+                         "DIAGNOSTIC AQ watch: writer of a watched range: batch {}{} kind {} what {:#x} at {:#x}+{} "
+                         "(watched {:#x}+{})",
+                         cur_.value, cur_.pool_lane != 0 ? " (lane)" : "", kind, aq_what_, addr, size, b, e - b);
+            }
+            return;
+        }
+    }
+}
+
+void Executor::AqWatchDispatch(u32 id) {
+    // SSPC_DIAG_AQ_WATCH: the watched dispatch's first buffer - the CPU's bytes now, the GPU's right before the dispatch
+    // (copied into the probe's slot after a barrier; 0xCD until the copy ran)
+    const u32 slot = id & (static_cast<u32>(aq_marker_ring_.size()) - 1);
+    AqMarker& e = aq_marker_ring_[slot];
+    const AqWatchB0& b = aq_watch_b0_;
+    e.waddr = b.addr;
+    e.wsize = static_cast<u32>(std::min<u64>(b.size, 0xFFFFFFFFull));
+    e.wpath = b.path;
+    u8 cpu[16] = {};
+    if (GuestMemory* gm = GetGuestMemory(); gm != nullptr) {
+        gm->CopySparse(b.addr, cpu, std::min<u64>(b.size, 16));
+    }
+    std::memcpy(e.wcpu, cpu, 16);
+    e.wflags = static_cast<u8>((buffers_.HostWritePending(b.addr, 16) ? 1 : 0) | (TimelineWritePending(b.addr, 16) ? 2 : 0) |
+                               (buffers_.GpuWritePending(b.addr, 16, timeline_.CompletedCached()) ? 4 : 0));
+    std::memset(aq_probe_buf_.mapped + u64{slot} * 16, 0xCD, 16);
+    const u64 n = aq_watch_probe_ ? std::min<u64>(std::min<u64>(16, b.size), b.avail) : 0;
+    if (n != 0) {
+        const auto& f = Fn();
+        const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                   .pMemoryBarriers = &mb};
+        f.vkCmdPipelineBarrier2(cur_.cb, &dep);
+        const VkBufferCopy region{.srcOffset = b.offset, .dstOffset = u64{slot} * 16, .size = n};
+        f.vkCmdCopyBuffer(cur_.cb, b.buffer, aq_probe_buf_.buffer, 1, &region);
+    }
+    const std::pair<u64, u64> r{b.addr, b.addr + std::max<u64>(b.size, 16)};
+    if (aq_watch_ranges_.size() < 256 && std::ranges::find(aq_watch_ranges_, r) == aq_watch_ranges_.end()) {
+        aq_watch_lo_ = aq_watch_ranges_.empty() ? r.first : std::min(aq_watch_lo_, r.first);
+        aq_watch_hi_ = std::max(aq_watch_hi_, r.second);
+        aq_watch_ranges_.push_back(r);
+    }
+    aq_watch_pending_.push_back(id);
+}
+
+void Executor::AqWatchCheck(u64 completed) {
+    // SSPC_DIAG_AQ_WATCH: the probes of completed batches against the CPU's bytes and the dispatch's threads (logged:
+    // the first 16, then those with a count past the threads or a huge one)
+    while (!aq_watch_pending_.empty()) {
+        const u32 id = aq_watch_pending_.front();
+        const u32 slot = id & (static_cast<u32>(aq_marker_ring_.size()) - 1);
+        const AqMarker& e = aq_marker_ring_[slot];
+        if (e.waddr != 0 && e.batch > completed) {
+            break;
+        }
+        aq_watch_pending_.pop_front();
+        if (e.waddr == 0) {
+            continue; // (overwritten)
+        }
+        u32 g[4];
+        std::memcpy(g, aq_probe_buf_.mapped + u64{slot} * 16, 16);
+        const u64 threads = u64{e.groups[0]} * e.groups[1] * e.groups[2] * 64;
+        const bool differ = std::memcmp(g, e.wcpu, 16) != 0, over = g[3] > threads,
+                   huge = g[3] > 65536 || g[2] > (1u << 24);
+        ++aq_watch_stats_[0];
+        aq_watch_stats_[1] += differ ? 1 : 0;
+        aq_watch_stats_[2] += over ? 1 : 0;
+        aq_watch_stats_[3] += huge ? 1 : 0;
+        if ((aq_watch_stats_[0] <= 16 || over || huge) && aq_watch_logged_ < 64) {
+            ++aq_watch_logged_;
+            SSPC_LOG(GPU, Warning,
+                     "DIAGNOSTIC AQ watch: marker {} batch {}{} cs {:#x} groups {}x{}x{}: b0 {:#x}+{} path {} flags {} cpu "
+                     "[{:#x} {:#x} {:#x} {:#x}] gpu [{:#x} {:#x} {:#x} {:#x}]{}",
+                     id, e.batch, e.lane != 0 ? " (lane)" : "", e.cs, e.groups[0], e.groups[1], e.groups[2], e.waddr,
+                     e.wsize, e.wpath, e.wflags, e.wcpu[0], e.wcpu[1], e.wcpu[2], e.wcpu[3], g[0], g[1], g[2], g[3],
+                     over ? " COUNT PAST THE THREADS" : "");
+        }
+        if ((aq_watch_stats_[0] & 4095) == 0) {
+            SSPC_LOG(GPU, Info, "DIAGNOSTIC AQ watch: {} checked, {} differ from the CPU's, {} past the threads, {} huge",
+                     aq_watch_stats_[0], aq_watch_stats_[1], aq_watch_stats_[2], aq_watch_stats_[3]);
+        }
+    }
+}
+
 void Executor::OnDeviceLost(const char* where, u64 value) {
     if (device_lost_) {
         return;
@@ -1322,7 +1517,7 @@ void Executor::OnDeviceLost(const char* where, u64 value) {
     ctx_.Fail(where, VK_ERROR_DEVICE_LOST);
     std::string in_flight;
     for (const auto& b : in_flight_) {
-        in_flight += fmt::format("  value {}: queues", b.value);
+        in_flight += fmt::format("  value {}{}{}: queues", b.value, b.lane != 0 ? " (lane)" : "", b.done ? " done" : "");
         for (const u32 q : b.queues) {
             in_flight += fmt::format(" {} (work {})", q, b.work[q]);
         }
@@ -1330,6 +1525,7 @@ void Executor::OnDeviceLost(const char* where, u64 value) {
     }
     in_flight += fmt::format("  timeline: completed (last seen) {}, last submitted {}\n", timeline_.CompletedCached(),
                              timeline_.LastSubmitted());
+    AqMarkersReport(in_flight);
     if (diag_ != nullptr) {
         diag_->DeviceLost(where, value, in_flight);
     } else {
@@ -1755,7 +1951,7 @@ u64 Executor::DiagBegin(std::string text) {
     if (diag_ == nullptr || !diag_->Enabled()) {
         return 0;
     }
-    const u64 id = diag_->Begin(cur_.cb, cur_.value, std::move(text));
+    const u64 id = diag_->Begin(cur_.cb, cur_.value, std::move(text), cur_.pool_lane);
     if (batch_first_cmd_ == 0) {
         batch_first_cmd_ = id;
     }
@@ -1765,7 +1961,7 @@ u64 Executor::DiagBegin(std::string text) {
 
 void Executor::DiagEnd(u64 id) {
     if (id != 0) {
-        diag_->End(cur_.cb, id);
+        diag_->End(cur_.cb, id, cur_.pool_lane);
     }
 }
 
@@ -1787,9 +1983,10 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
             buffer = r.buffer;
             offset = r.offset;
             avail = r.size;
-            if (aq_ && aq_cmd_compute_) {
+            if (aq_ && (aq_cmd_compute_ || aq_note_reads_)) {
                 AqNote(addr, size);
             }
+            aq_range_path_ = 1;
             return true;
         }
         // nothing of it in video memory (the CPU wrote it, or it is new): the host's copy is current; a small read
@@ -1832,6 +2029,7 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                         avail = size;
                         ++stats_.stream_reused;
                         stats_.stream_reused_bytes += size;
+                        aq_range_path_ = 2;
                         return true;
                     }
                     verify = memo->hash | 1;
@@ -1862,6 +2060,7 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                 avail = size;
                 ++stats_.streamed;
                 stats_.streamed_bytes += size;
+                aq_range_path_ = 3;
                 if (stream_who_on_ < 0) {
                     char v[4] = {};
                     stream_who_on_ = GetEnvironmentVariableA("SSPC_DIAG_STREAM_WHO", v, sizeof(v)) == 1 && v[0] == '1';
@@ -1938,8 +2137,21 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
     if (!prepared) {
         return false;
     }
-    if (aq_ && (write || aq_cmd_compute_ || buffers_.Stats().uploads != up0)) {
+    if (aq_ && (write || aq_cmd_compute_ || aq_note_reads_ || buffers_.Stats().uploads != up0)) {
         AqNote(addr, size); // (AQ: a write, an upload, or a compute command's access)
+    }
+    if (aq_ && buffers_.Stats().uploads != up0 && aq_note_uploads_) {
+        // AQ: every page the upload copied - the block's other pages P4.9-B brings along too. A batch of the other
+        // queue may write or read them meanwhile (measured: a main batch's block upload put the host's older bytes
+        // over an emitter header the lane had written; the lane's next dispatch read a count of 0x3f800000 and never
+        // finished - device lost)
+        for (const auto& [b, e] : buffers_.LastUploads()) {
+            AqNote(b, e - b);
+        }
+    }
+    aq_range_path_ = write ? 6 : buffers_.Stats().uploads != up0 ? 5 : 4;
+    if (!aq_watch_ranges_.empty() && (write || buffers_.Stats().uploads != up0)) {
+        AqWatchWrite(addr, size, write ? 1 : 2);
     }
     buffer = r.buffer;
     offset = r.offset;
@@ -2046,6 +2258,10 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     if (aq_) {
         AqNote(dst, bytes);
     }
+    if (!aq_watch_ranges_.empty()) {
+        aq_what_ = 1;
+        AqWatchWrite(dst, bytes, 3);
+    }
     if (LabelChanges(kLabelOther | 1)) {
         Label(kLabelOther | 1, "T WRITE_DATA on the timeline");
     }
@@ -2093,6 +2309,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
         return false;
     }
     write_run_ = false;
+    aq_what_ = 2;
     if (LabelChanges(kLabelOther | 2)) {
         Label(kLabelOther | 2, "T DMA copy on the timeline");
     }
@@ -2291,6 +2508,7 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
     }
     cur_.aq_gds = true;
     write_run_ = false;
+    aq_what_ = 3 | (u64{static_cast<u32>(kind)} << 8);
     if (LabelChanges(kLabelOther | 3)) {
         Label(kLabelOther | 3, "T GDS DMA on the timeline");
     }
@@ -2851,6 +3069,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             }
             buf_adjust_[i] = static_cast<u32>(adjust);
             info = {vb, aligned, std::min<u64>(b.size + adjust, vavail + adjust)};
+            if (aq_watch_capture_ && compute && i == 0) {
+                aq_watch_b0_ = {vb, voff, b.address, b.size, vavail, aq_range_path_};
+            }
             if (b.written) {
                 writes_memory = true;
                 images_.InvalidateFromBufferWrite(b.address, b.size);
@@ -4592,6 +4813,9 @@ bool Executor::ZeroCopyBatch(const GS::StageView& vs, std::array<VkBuffer, 16>& 
                 (vb[s] != VK_NULL_HANDLE && vb[s] != r.buffer)) {
                 return false;
             }
+            if (aq_note_reads_) {
+                AqNote(x.address, x.size);
+            }
             vb[s] = r.buffer;
             zc_voff_[k * streams + s] = r.offset;
             vlow[s] = std::min(vlow[s], r.offset);
@@ -4601,6 +4825,9 @@ bool Executor::ZeroCopyBatch(const GS::StageView& vs, std::array<VkBuffer, 16>& 
                 BufferCache::Residency::All ||
             (ib != VK_NULL_HANDLE && ib != r.buffer) || r.offset % isize != 0) {
             return false;
+        }
+        if (aq_note_reads_) {
+            AqNote(d.index_base + u64{d.index_offset} * isize, u64{d.index_count} * isize);
         }
         ib = r.buffer;
         zc_ioff_[k] = r.offset;
@@ -4802,6 +5029,19 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         if (LabelChanges(lkey)) {
             Label(lkey, fmt::format("D p{} vs{:x} ps{:x} @{:x}", prep.pipeline, vs.address, has_ps ? ps.address : 0,
                                     d.packet_addr));
+        }
+    }
+    if (aq_markers_) {
+        // R9 AQ diagnostic: a marker at each pipeline change of the draws - the previous group's commands completed
+        // (bottom of pipe), this group's first draw started (top of pipe)
+        const u64 akey = (u64{prep.pipeline} << 40) ^ vs.address ^ (has_ps ? ps.address << 1 : 0);
+        if (akey != aq_mark_draw_key_) {
+            aq_mark_draw_key_ = akey;
+            const u32 id = aq_marker_next_++;
+            AqMarker& e = aq_marker_ring_[id & (aq_marker_ring_.size() - 1)];
+            e = {cur_.value, vs.address, 0xFFFF, {static_cast<u32>(prep.pipeline), 0, 0}, 0, false, has_ps ? ps.address : 0};
+            f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, aq_marker_buf_.buffer, 4, id - 1);
+            f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, aq_marker_buf_.buffer, 0, id);
         }
     }
     if (has_ps) { // SSPC_DIAG_DUMP_SHADER: a pixel shader too (P4.5)
@@ -5046,6 +5286,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     seg_pending_.clear();
     seg_check_.clear();
     const u64 tb0 = GS::FineTicks();
+    aq_what_ = (1ull << 63) | vs.address;
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
                              d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data(), pc.material[1])) {
         seg_draw_ = false;
@@ -5915,6 +6156,9 @@ bool Executor::RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& of
         buffer = r.buffer;
         offset = r.offset;
         avail = r.size;
+        if (aq_note_reads_) {
+            AqNote(addr, size);
+        }
         return true;
     }
     if (res != BufferCache::Residency::None || size > (16u << 10) || buffers_.HostWritePending(addr, size) ||
@@ -6055,6 +6299,12 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                    r.offset % isize == 0;
             ib = r.buffer;
             io = r.offset;
+            if (lean && aq_note_reads_) {
+                for (u32 i = 0; i < m.streams; ++i) {
+                    AqNote(m.v[i].address, m.v[i].size);
+                }
+                AqNote(m.index_base + u64{m.index_offset} * isize, u64{count} * isize);
+            }
             stats_.run_not_resident += lean ? 0 : 1;
             stats_.run_why[0] += lean ? 0 : 1;
         }
@@ -6557,6 +6807,9 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     info_images_.clear();
     const std::vector<CachedImage*> none;
     const u64 tb0 = GS::FineTicks();
+    aq_what_ = csv.address;
+    aq_watch_capture_ = aq_watch_cs_ != 0 && csv.address == aq_watch_cs_;
+    aq_watch_b0_ = {};
     if (!BindStage(&csv, true, push, writes, buf_infos, img_infos, bound, writes_memory, none)) {
         return;
     }
@@ -6727,6 +6980,16 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         }
         e.images_count = static_cast<u32>(trace_.images.size()) - e.images_begin;
     }
+    const u32 aq_mark = aq_markers_ ? aq_marker_next_++ : 0;
+    if (aq_mark != 0) {
+        aq_marker_ring_[aq_mark & (aq_marker_ring_.size() - 1)] = {
+            cur_.value, csv.address, d.queue, {d.groups[0], d.groups[1], d.groups[2]}, cur_.pool_lane, d.indirect};
+        if (aq_watch_b0_.buffer != VK_NULL_HANDLE) {
+            AqWatchDispatch(aq_mark);
+        }
+        f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, aq_marker_buf_.buffer,
+                                    cur_.pool_lane != 0 ? 8 : 0, aq_mark);
+    }
     if (diag_skip) {
         ++stats_.diag_skipped_dispatches;
     } else if (skip_small && d.queue != 0 && !d.indirect && u64{d.groups[0]} * d.groups[1] * d.groups[2] < 8) {
@@ -6735,6 +6998,10 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         f.vkCmdDispatchIndirect(cur_.cb, argbuf, argoff);
     } else if (!SplitMergeLevels(d, csv, *pipe, push, writes, buf_infos)) {
         f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
+    }
+    if (aq_mark != 0) {
+        f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, aq_marker_buf_.buffer,
+                                    cur_.pool_lane != 0 ? 12 : 4, aq_mark);
     }
     DiagEnd(cid);
     if (prof_) {

@@ -42,11 +42,11 @@ public:
     bool Naming() const { return naming_; }
 
     /// A command recorded into `cb` for submission `batch`: its id (0 when off), with a checkpoint and a "started" marker.
-    u64 Begin(VkCommandBuffer cb, u64 batch, std::string text);
+    u64 Begin(VkCommandBuffer cb, u64 batch, std::string text, u8 lane = 0);
     /// The command `id` recorded: a "completed" marker.
-    void End(VkCommandBuffer cb, u64 id);
+    void End(VkCommandBuffer cb, u64 id, u8 lane = 0);
     /// A batch submitted (its value, the commands in it).
-    void Submitted(u64 batch, u64 first_cmd, u64 last_cmd);
+    void Submitted(u64 batch, u64 first_cmd, u64 last_cmd, u8 lane = 0);
 
     /// Names a Vulkan object for the validation messages (nothing when off).
     void Name(VkObjectType type, u64 handle, const std::string& name);
@@ -73,9 +73,10 @@ private:
     std::vector<Record> ring_; ///< by id % size
     u64 next_id_ = 1;
     std::vector<std::pair<u64, std::pair<u64, u64>>> batches_; ///< last batches: value -> [first, last] command
+    std::vector<u8> batch_lanes_; ///< FrameBreak AQ: batches_'s queues (0 main, 1 the async compute lane)
     VkBuffer marker_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory marker_memory_ = VK_NULL_HANDLE;
-    volatile u32* markers_ = nullptr; ///< [0] started (low 32 bits of the id), [1] completed
+    volatile u32* markers_ = nullptr; ///< [0] started (low 32 bits of the id), [1] completed; [2], [3] the AQ lane's
     std::atomic<bool> lost_{false};
     std::mutex alias_mutex_;
     std::vector<u64> alias_keys_;

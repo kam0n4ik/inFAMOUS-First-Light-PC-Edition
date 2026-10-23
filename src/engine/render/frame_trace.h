@@ -48,8 +48,10 @@ bool InstallEarlySubmitFromEnvironment(u64 eboot_base);
 /// compute wait (0x3ee470's tail call to 0x1695e0, return 0x29cd5b in the main loop) waits for the particles' light DMA
 /// (0x3f3ed0: GPU-made light records copied into the frame's light list), which the frame's graphics reads. The game
 /// thread does not block there: the next graphics submission starts with WAIT_REG_MEM(label >= target)
-/// (Gpu::Gnm::SetGraphicsGate). The first wait (0x3edef0: the CPU reads emitter state) stays. After
-/// InstallCriticalComputeFromEnvironment.
+/// (Gpu::Gnm::SetGraphicsGate). The first wait (0x3edef0: the CPU reads emitter state) stays. Its safe reset (unless
+/// SSPC_R9_REA3_SAFE_RESET=0, A/B only): at SubmitFrame's return - before the frame's tail 0x196c30 resets the compute
+/// queue's command buffer, which the GPU reads in place - the game waits until the queue finished its last submission
+/// (docs/R9_REA3_FIX.md). After InstallCriticalComputeFromEnvironment and InstallEarlySubmitFromEnvironment.
 bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base);
 
 } // namespace SecondSon::Engine::Render::Trace

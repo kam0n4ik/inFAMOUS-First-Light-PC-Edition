@@ -96,6 +96,7 @@ struct CommandProcessor::Queue {
         const u32* data = nullptr;
         bool ring = false;
         u32 ring_offset = 0;
+        u64 seq = 0; ///< CommandProcessor::submit_seq_ when it came
     };
     struct Patch {
         u64 dst = 0;
@@ -141,6 +142,8 @@ struct CommandProcessor::Queue {
     bool blocked = false;
     u64 block_t0 = 0, block_poll = 0; ///< diagnostics: when and on what the queue blocked
     bool block_held = false;          ///< a held fence would meet the wait when it blocked
+    u64 active_seq = 0;               ///< the seq of the submission at depth 1
+    u8 order_state = 0; ///< R9 REA-3 order, the next submission: 1 counted as held, 2 as released
 };
 
 std::string_view DrawKindName(DrawKind kind) {
@@ -292,7 +295,7 @@ bool CommandProcessor::SubmitGraphics(u64 addr, u32 dwords, const u32* data) {
         Fail(q, CpErrorKind::QueueFull, addr, 0, dwords, "graphics submission refused");
         return false;
     }
-    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, false, 0};
+    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, false, 0, ++submit_seq_};
     return true;
 }
 
@@ -354,7 +357,7 @@ bool CommandProcessor::SubmitCompute(u32 vqid, u64 addr, u32 dwords, const u32* 
         return false;
     }
     const u32 offset = q.mapped ? static_cast<u32>((addr - q.ring_addr) / 4) : 0;
-    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, true, offset};
+    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, true, offset, ++submit_seq_};
     return true;
 }
 
@@ -409,9 +412,14 @@ CommandProcessor::NextResult CommandProcessor::Next(Queue& q, u64& addr, std::sp
             if (q.count == 0) {
                 return NextResult::None;
             }
+            if (q.compute && order_compute_ && HeldByOrder(q)) {
+                return NextResult::None;
+            }
             const Queue::Pending s = q.pending[q.head];
             q.head = (q.head + 1) % kMaxPending;
             --q.count;
+            q.active_seq = s.seq;
+            q.order_state = 0;
             q.faulted = false;
             q.budget = 0;
             q.patch_count = 0;
@@ -472,6 +480,39 @@ CommandProcessor::NextResult CommandProcessor::Next(Queue& q, u64& addr, std::sp
         packet = rest.first(pk.dwords);
         return NextResult::Ok;
     }
+}
+
+bool CommandProcessor::HeldByOrder(Queue& q) {
+    // The executor records every queue in one stream: a compute submission the game made after a frame's graphics,
+    // started before that graphics is processed, lands inside it and delays its completion by its own GPU time - the
+    // next frame's async compute (the particles) in one frame of two, the other one without (REA-3's 17/40 ms frames).
+    const Queue& g = *queues_[kGraphicsQueue];
+    u64 first = 0; // the seq of the earliest graphics submission not processed yet (0: none)
+    for (u32 i = 0; i < g.depth; ++i) {
+        if (g.frames[i].pos < g.frames[i].size) {
+            first = g.active_seq;
+            break;
+        }
+    }
+    if (first == 0 && g.count != 0) {
+        first = g.pending[g.head].seq;
+    }
+    if (first == 0 || first > q.pending[q.head].seq) {
+        return false;
+    }
+    if (g.blocked && !(g.block_poll >= order_free_lo_ && g.block_poll < order_free_hi_)) {
+        // (the graphics queue waits for memory - or a register - the compute work may be what writes: no hold)
+        if (q.order_state != 2) {
+            q.order_state = 2;
+            ++stats_.order_released;
+        }
+        return false;
+    }
+    if (q.order_state == 0) {
+        q.order_state = 1;
+        ++stats_.order_held;
+    }
+    return true;
 }
 
 void CommandProcessor::UpdateReadPointer(Queue& q) {

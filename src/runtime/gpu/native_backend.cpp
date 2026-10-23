@@ -962,6 +962,14 @@ bool Backend::Start(const Options& o, std::string& error) {
     executor_->SetMapGeneration(&memory_.map_gen); // P4.7: the frontend's reads keep backing runs between maps
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
+    // R9 REA-3 order (SSPC_R9_REA3_ORDER=1, an experiment, off by default; docs/R9_REA3_FIX.md): a compute submission
+    // starts after the graphics submitted before it, as the game made them
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_R9_REA3_ORDER", v, sizeof(v)) == 1 && v[0] == '1') {
+        cp_->SetComputeOrder(true, label_base_, label_base_ + VideoOut::kMaxBuffers * 8);
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R9_REA3_ORDER=1 - a compute submission starts only after the graphics "
+                               "submitted before it is processed (unless the graphics queue waits for memory other than "
+                               "VideoOut's labels)");
+    }
     FrameLog::Start();
     ShaderTrace::SetOrigin(FrameLog::StartTsc());
     // R9: SSPC_R9_GPROF=1|2 - the gameplay profiler (every thread's CPU time, code samples, counters, marks)
@@ -1499,6 +1507,9 @@ void Backend::Loop() {
         if (ctx_->Failed()) {
             const VkResult result = ctx_->Failure();
             failure_result_.store(result, std::memory_order_release);
+            if (result == VK_ERROR_DEVICE_LOST && executor_) {
+                executor_->ReportDeviceLost("seen by another thread (presentation or a timeline wait)");
+            }
             SSPC_LOG(GPU, Error, "native backend: stopped after VkResult {}; the process exits with code 5",
                      static_cast<int>(result));
             std::thread([] {
@@ -2342,10 +2353,25 @@ std::string Backend::Report() {
         }
         out += cp_->WaitReport();
         out += cp_->FenceReport();
+        if (const auto& cs = cp_->Stats(); cs.order_held != 0 || cs.order_released != 0) {
+            out += fmt::format("R9 REA-3 order: compute submissions held for earlier graphics {}, let start by a graphics "
+                               "wait on other memory {}\n", cs.order_held, cs.order_released);
+        }
+        {
+            u64 set = 0, submitted = 0;
+            Gnm::GraphicsGateCounts(set, submitted);
+            if (set != 0) {
+                out += fmt::format("REA-3 graphics gates: set {}, submitted {}\n", set, submitted);
+            }
+        }
         const VideoOut::Stats vo = VideoOut::GetStats();
         out += fmt::format("videoout: flips requested {}, presented {}, vblanks {}, vblanks a flip waited for its GPU work "
                            "{}\n",
                            vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
+        if (vo.paced != 0) {
+            out += fmt::format("R9-F4 free flips held back by the pacer: {} of {} (held back by the cap {})\n", vo.paced,
+                               vo.free_flips, vo.capped_waits);
+        }
         out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
         out += fmt::format("frontend reads (P4.7): from a kept backing run {}, a run found {}, through the memory "
                            "manager {}\n",

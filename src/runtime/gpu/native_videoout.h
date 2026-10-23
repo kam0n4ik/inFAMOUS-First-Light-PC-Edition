@@ -109,6 +109,7 @@ struct Stats {
     u64 waited_vblanks = 0; ///< vblanks a request waited for its GPU work
     u64 free_flips = 0;     ///< flips shown by the free pacing (not at a vblank)
     u64 capped_waits = 0;   ///< ... of them held back by the cap or the game's flip rate
+    u64 paced = 0;          ///< R9-F4: free flips held back by the pacer (SSPC_R9_PACE)
 };
 Stats GetStats();
 
