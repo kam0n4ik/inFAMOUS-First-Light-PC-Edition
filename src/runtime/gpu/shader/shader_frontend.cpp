@@ -15,6 +15,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/gpu_memory.h"
+#include "runtime/gpu/r8/cp_native_table.h"
 #include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
@@ -255,6 +256,27 @@ bool PlanTouches(const ResourceBindingPlan& p, u64 lo, u64 hi) {
     return false;
 }
 
+/// R8-A2 K1a: an address into [lo, hi) is held by a register pair other than the snapshot pointers (`pointers`) or by a
+/// dword pair of the snapshot itself: a walk that followed it would read the old place after the snapshot moved - the
+/// preparation is not relocatable.
+bool R8PointsInto(std::span<const u32, 16> user_data, u32 pointers, std::span<const u32> snap, u64 lo, u64 hi) {
+    for (u32 i = 0; i + 1 < 16; ++i) {
+        if (((pointers >> i) & 3) == 0) {
+            const u64 a = user_data[i] | (u64{user_data[i + 1]} << 32);
+            if (a >= lo && a < hi) {
+                return true;
+            }
+        }
+    }
+    for (size_t i = 0; i + 1 < snap.size(); ++i) {
+        const u64 a = snap[i] | (u64{snap[i + 1]} << 32);
+        if (a >= lo && a < hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// The user data registers a preparation with reflection `r` depended on: those its SRT walk read (`plan.srt`), those
 /// holding (part of) a descriptor the reflection reads from the flattened user data's first 16 dwords, the fetch
 /// shader's and the vertex buffer tables' pointers. Any other register reaches the shader only through those 16
@@ -383,6 +405,21 @@ ShaderFrontend::ShaderFrontend(const FrontendOptions& options) : options_(option
     if (char v[4] = {}; GetEnvironmentVariableA("SSPC_CC_CS_RUNTIME", v, sizeof(v)) == 1 && v[0] == '0') {
         cs_runtime_keep_ = false;
     }
+    // R8-A2 K1a: the PS reuse (needs the native commit's snapshot table: R8::TableOn reads the same variable)
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_R8_CP_STAGE_REUSE", v, sizeof(v)) > 0) {
+        const std::string_view sv(v);
+        r8_reuse_ = sv == "verify" ? 2 : (sv == "1" || sv == "on") ? 1 : 0;
+        if (r8_reuse_ != 0 && ::SecondSon::Gpu::R8::TableOn()) {
+            r8_.resize(size_t{kR8Ways} << kR8SetBits);
+            r8_ghost_.assign(size_t{kR8Ways} << kR8SetBits, 0);
+            r8_snap_.reserve(1024);
+            SSPC_LOG(GPU, Info, "SSPC_R8_CP_STAGE_REUSE={}: PS preparations reused by their inputs ({} entries{})",
+                     r8_reuse_ == 2 ? "verify" : "on", r8_.size(),
+                     memo_on_ ? "" : "; the stage memo's owner is not this one: no generation entries");
+        } else {
+            r8_reuse_ = 0;
+        }
+    }
     (void)TicksToNs(0); // the TSC calibration (20 ms) now, not at the first draw
     if (options_.async && options_.translate) {
         worker_ = std::thread([this] { WorkerLoop(); });
@@ -422,8 +459,41 @@ std::string ShaderFrontend::MemoReport() const {
 }
 
 std::string ShaderFrontend::NativeReport() const {
+    std::string r8;
+    if (r8_reuse_ != 0) {
+        const R8Stats& q = r8_stats_;
+        u64 cached = 0, bytes = 0;
+        for (const R8Entry& e : r8_) {
+            if (e.view != nullptr) {
+                ++cached;
+                const ResourceBindingPlan& p = e.view->plan;
+                bytes += sizeof(StageView) + p.flat.capacity() * 4 + p.buffers.capacity() * sizeof(BufferBinding) +
+                         p.images.capacity() * sizeof(ImageBinding) + p.samplers.capacity() * sizeof(SamplerBinding) +
+                         e.view->key.words.capacity() * 4 + e.snapshot.capacity() * 4;
+            }
+        }
+        const auto pct = [&](u64 n) {
+            return q.lookups != 0 ? 100.0 * static_cast<double>(n) / static_cast<double>(q.lookups) : 0.0;
+        };
+        r8 = fmt::format(
+            "R8 K1a PS reuse (SSPC_R8_CP_STAGE_REUSE={}): lookups {}, snapshot found {}, snapshots read {}; {} {} "
+            "({:.1f} %: relocatable {}, fixed {}, generation {}); misses: no entry {}, registers {}, generation {}, "
+            "version {}, bytes {}, module not ready {}; prepared and not cached: first sighting {}, not cacheable {}; "
+            "cached {} (relocatable {}, fixed {}, generation {}; views reused {}, entries replaced {}); entries {} of {} "
+            "({:.1f} MiB)",
+            r8_reuse_ == 2 ? "verify" : "1", q.lookups, q.found, q.reads,
+            r8_reuse_ == 2 ? "hits prepared in full and compared" : "hits", r8_reuse_ == 2 ? q.verified : q.hits,
+            pct(r8_reuse_ == 2 ? q.verified : q.hits), q.hits_by[0], q.hits_by[1], q.hits_by[2], q.miss_none,
+            q.miss_regs, q.miss_gen, q.miss_version, q.miss_bytes, q.miss_unready, q.first_seen, q.uncacheable,
+            q.stores, q.stored_by[0], q.stored_by[1], q.stored_by[2], q.views_reused, q.replaced, cached, r8_.size(),
+            static_cast<double>(bytes) / (1 << 20));
+        if (r8_reuse_ == 2) {
+            r8 += fmt::format("; verify: mismatches {}", q.mismatches);
+        }
+        r8 += "\n";
+    }
     if (!native_on_) {
-        return {};
+        return r8;
     }
     const FrontendStats& st = stats_;
     u64 bytes = 0, cached = 0;
@@ -475,7 +545,7 @@ std::string ShaderFrontend::NativeReport() const {
             }
         }
     }
-    return t + "\n";
+    return t + "\n" + r8;
 }
 
 const StageView& ShaderFrontend::Stage(HwStage stage) const {
@@ -971,6 +1041,105 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         fetch = &fe->fetch;
     }
 
+    // R8-A2 K1a: a PS preparation with exactly these inputs taken again (R8Entry: its kinds and what each compares)
+    const bool r8 = r8_reuse_ != 0 && hw == HwStage::Ps && !(engine != nullptr && native_on_);
+    const u64 r8_fver = fe != nullptr ? fe->version : 0;
+    R8Entry* r8_set = nullptr;
+    R8Entry* r8_verify = nullptr; // verify: the entry the full preparation is compared with
+    ::SecondSon::Gpu::R8::SnapshotInfo r8_sn;
+    u32 r8_pmask = 0;
+    bool r8_found = false;
+    std::array<u32, 16> r8_rel{}; // the user data with the snapshot pointers as offsets from its base
+    u64 r8_read_at = 0;           // the bytes in r8_snap_ (0: none read)
+    const auto r8_bytes = [&](u64 at, u32 dwords) -> bool { // (read once per address)
+        if (r8_read_at == at && r8_snap_.size() == dwords) {
+            return true;
+        }
+        r8_snap_.resize(dwords);
+        ++r8_stats_.reads;
+        r8_read_at = memory.Read(at, r8_snap_.data(), u64{dwords} * 4) ? at : 0;
+        return r8_read_at == at;
+    };
+    if (r8) {
+        ++r8_stats_.lookups;
+        const u64 set = ((addr >> 2) ^ (reinterpret_cast<u64>(&first) >> 4)) * 0x9E3779B97F4A7C15ull >>
+                        (64 - kR8SetBits);
+        r8_set = &r8_[set * kR8Ways];
+        r8_found = ::SecondSon::Gpu::R8::Find(user_data, 1 /* the CUE's PS */, r8_sn, r8_pmask) &&
+                   r8_sn.dwords != 0 && r8_sn.dwords <= 1024;
+        if (!r8_found) {
+            r8_pmask = 0;
+        } else {
+            ++r8_stats_.found;
+            std::copy(user_data.begin(), user_data.end(), r8_rel.begin());
+            for (u32 j = 0; j < r8_sn.refs; ++j) {
+                r8_rel[r8_sn.ref_sgpr[j]] = u32{r8_sn.ref_offset[j]} * 4;
+                r8_rel[r8_sn.ref_sgpr[j] + 1u] = 0;
+            }
+        }
+        const u64 gen = memory_gen_.load(std::memory_order_relaxed);
+        bool any = false, gen_differs = false, version = false, bytes = false, unready = false;
+        for (u32 w = 0; w < kR8Ways && r8_verify == nullptr; ++w) {
+            R8Entry& e = r8_set[w];
+            if (e.addr != addr || e.program != s.program || e.first != &first || e.fetch != fe ||
+                e.fetch_version != r8_fver || !(e.start == start)) {
+                continue;
+            }
+            any = true;
+            if (e.kind == 0) {
+                if (!r8_found || r8_pmask != e.pointers || r8_sn.dwords != e.dwords ||
+                    std::memcmp(r8_rel.data(), e.user_data.data(), sizeof(r8_rel)) != 0) {
+                    continue; // (miss_regs)
+                }
+            } else if (std::memcmp(user_data.data(), e.user_data.data(), sizeof(e.user_data)) != 0) {
+                continue; // (miss_regs)
+            } else if (e.kind == 2 && e.memory_gen != gen) {
+                gen_differs = true;
+                continue;
+            }
+            if (r8_found && e.version != 0 && r8_sn.version != 0 && r8_sn.version != e.version) {
+                version = true; // (the pre-filter: another binding version - no read)
+                continue;
+            }
+            const u64 at = e.kind == 0 ? r8_sn.base : e.base;
+            if (e.dwords != 0 && (!r8_bytes(at, e.dwords) ||
+                                  std::memcmp(r8_snap_.data(), e.snapshot.data(), size_t{e.dwords} * 4) != 0)) {
+                bytes = true;
+                continue;
+            }
+            if (e.view->module->state.load(std::memory_order_acquire) != ModuleState::Ready) {
+                ++r8_stats_.miss_unready;
+                unready = true;
+                break;
+            }
+            e.stamp = ++r8_stamp_;
+            if (r8_reuse_ == 2) {
+                r8_verify = &e; // (the full preparation below is the draw's; compared at the end)
+                break;
+            }
+            ++r8_stats_.hits;
+            ++r8_stats_.hits_by[e.kind];
+            shared_[si] = e.view;
+            r8_shared_ = true;
+            ++e.view->module->uses;
+            NoteGpuWrites(*e.view); // (P5.2: its writes happen again with this draw)
+            return StageStatus::Ready;
+        }
+        if (r8_verify == nullptr && !unready) {
+            ++(!any ? r8_stats_.miss_none
+               : bytes ? r8_stats_.miss_bytes
+               : version ? r8_stats_.miss_version
+               : gen_differs ? r8_stats_.miss_gen
+                             : r8_stats_.miss_regs);
+        }
+        // the bytes before the walk (an entry made from this preparation holds them; R8Store reads them again after
+        // it and caches nothing if they moved)
+        if (r8_found && !r8_bytes(r8_sn.base, r8_sn.dwords)) {
+            r8_found = false;
+            r8_pmask = 0;
+        }
+    }
+
     // P5.3 Native Render Frontend: the engine described this stage's resource table - the preparation of a draw with
     // exactly these inputs is taken again (no SRT walk, decoding, key or module search), or this one is cached
     NativeKey nkey;
@@ -1006,9 +1175,13 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         }
     }
     NativeRecorder recorder(memory, nbase, nbase + u64{nkey.dwords} * 4);
+    // (R8-A2 K1a: a miss's reads, checked against the snapshot the table names - none: any read is outside)
+    const u64 r8_lo = r8_found ? r8_sn.base : 0, r8_hi = r8_found ? r8_sn.base + u64{r8_sn.dwords} * 4 : 0;
+    NativeRecorder r8rec(memory, r8_lo, r8_hi);
     CsRecorder csrec(memory);
     const bool cs_diag = cs_repeat_diag_ && hw == HwStage::Cs;
     GuestReader& rmem = nmiss ? static_cast<GuestReader&>(recorder)
+                        : r8 ? static_cast<GuestReader&>(r8rec)
                         : cs_diag ? static_cast<GuestReader&>(csrec)
                                   : memory;
 
@@ -1192,6 +1365,22 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
             }
         }
     }
+    if (r8_verify != nullptr) {
+        ++r8_stats_.verified;
+        if (!SameNative(s, *r8_verify->view)) {
+            ++r8_stats_.mismatches;
+            if (r8_stats_.mismatches <= 8) {
+                SSPC_LOG(GPU, Warning,
+                         "SSPC_R8_CP_STAGE_REUSE=verify: the cached PS preparation (program {:#x}, kind {}, snapshot {} "
+                         "dwords) differs from its full preparation",
+                         addr, r8_verify->kind, r8_verify->dwords);
+            }
+            r8_verify->addr = 0; // (not taken again)
+        }
+    } else if (r8) {
+        R8Store(s, addr, first, fe, r8_fver, start, user_data, r8_found ? &r8_sn : nullptr, r8_pmask, r8_rel,
+                r8rec.Outside(), r8_set, r8_read_at, memory);
+    }
     // (the generation after the reads: a read that waited for a GPU write saw it)
     memo.valid = true;
     memo.memory_gen = memory_gen_;
@@ -1202,6 +1391,116 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     std::memcpy(memo.user_data.data(), user_data.data(), sizeof(memo.user_data));
     NoteGpuWrites(s); // (P5.2)
     return StageStatus::Ready;
+}
+
+void ShaderFrontend::R8Store(const StageView& s, u64 addr, const Module& first, const void* fetch, u64 fetch_version,
+                             const BindingStart& start, std::span<const u32, 16> user_data,
+                             const ::SecondSon::Gpu::R8::SnapshotInfo* sn, u32 pointers,
+                             const std::array<u32, 16>& rel, bool outside, R8Entry* set, u64 read_at,
+                             GuestReader& memory) {
+    // nothing failed, and the walk left the registers' part of the flattened data alone (a shared preparation's are
+    // the draw's own: the executor, or the parallel processor's copy, writes them)
+    if (s.plan.srt.faults != 0 || !s.plan.error.empty() || s.plan.srt.user_data_written || s.plan.flat.size() < 16) {
+        ++r8_stats_.uncacheable;
+        return;
+    }
+    const u32 dwords = sn != nullptr && read_at == sn->base ? sn->dwords : 0;
+    const u64 lo = dwords != 0 ? sn->base : 0, hi = lo + u64{dwords} * 4;
+    const std::span<const u32> bytes(r8_snap_.data(), dwords);
+    // the kind: the walk read nothing outside the snapshot (with none: nothing at all) - relocatable when no resource
+    // and no pointer but the snapshot pointers lies in it; else the memory generation decides
+    u8 kind = 2;
+    if (!outside) {
+        kind = dwords != 0 && pointers != 0 && !PlanTouches(s.plan, lo, hi) &&
+                       !R8PointsInto(user_data, pointers, bytes, lo, hi)
+                   ? 0
+                   : 1;
+    } else if (!memo_on_) {
+        ++r8_stats_.uncacheable; // (the generation is P4.7's: only an owner that reports every memory change)
+        return;
+    }
+    const std::span<const u32, 16> regs = kind == 0 ? std::span<const u32, 16>(rel) : user_data;
+    const u64 gen = memory_gen_.load(std::memory_order_relaxed);
+    // cached at the second sighting of these inputs (the set's last ones prepared and not cached)
+    u64 h = (addr ^ (reinterpret_cast<u64>(&first) << 7) ^ (u64{start.unified} << 48) ^ (u64{start.buffer} << 40) ^
+             kind) * 0x100000001B3ull;
+    for (const u32 w : regs) {
+        h = (h ^ w) * 0x100000001B3ull;
+    }
+    for (const u32 w : bytes) {
+        h = (h ^ w) * 0x100000001B3ull;
+    }
+    h = (h ^ (kind == 2 ? gen : 0) ^ (u64{pointers} << 32)) * 0x100000001B3ull;
+    h |= 1;
+    const size_t set_index = static_cast<size_t>(set - r8_.data()) / kR8Ways;
+    u64* ghost = &r8_ghost_[set_index * kR8Ways];
+    u32 g = 0;
+    while (g < kR8Ways && ghost[g] != h) {
+        ++g;
+    }
+    if (g == kR8Ways) {
+        ghost[r8_stamp_++ % kR8Ways] = h;
+        ++r8_stats_.first_seen;
+        return;
+    }
+    ghost[g] = 0;
+    // the bytes the walk read are still those read before it (else a write raced it: nothing cached)
+    if (dwords != 0) {
+        std::array<u32, 1024> again;
+        if (!memory.Read(lo, again.data(), u64{dwords} * 4) ||
+            std::memcmp(again.data(), bytes.data(), size_t{dwords} * 4) != 0) {
+            ++r8_stats_.uncacheable;
+            return;
+        }
+    }
+    // the way: the same inputs (a generation entry of an older generation), an empty one, the least recently used
+    R8Entry* e = nullptr;
+    for (u32 w = 0; w < kR8Ways && e == nullptr; ++w) {
+        R8Entry& c = set[w];
+        if (c.addr == addr && c.first == &first && c.start == start && c.kind == kind && c.pointers == pointers &&
+            std::memcmp(c.user_data.data(), regs.data(), sizeof(c.user_data)) == 0) {
+            e = &c;
+        }
+    }
+    for (u32 w = 0; w < kR8Ways && e == nullptr; ++w) {
+        if (set[w].addr == 0) {
+            e = &set[w];
+        }
+    }
+    if (e == nullptr) {
+        e = set;
+        for (u32 w = 1; w < kR8Ways; ++w) {
+            e = set[w].stamp < e->stamp ? &set[w] : e;
+        }
+        ++r8_stats_.replaced;
+    }
+    e->addr = addr;
+    e->program = s.program;
+    e->first = &first;
+    e->fetch = fetch;
+    e->fetch_version = fetch_version;
+    e->start = start;
+    std::copy(regs.begin(), regs.end(), e->user_data.begin());
+    e->pointers = kind == 0 ? pointers : 0;
+    e->dwords = dwords;
+    e->base = lo;
+    e->version = dwords != 0 ? sn->version : 0;
+    e->memory_gen = gen;
+    e->kind = kind;
+    e->snapshot.assign(bytes.begin(), bytes.end());
+    e->stamp = ++r8_stamp_;
+    // a view no record holds any more is written again in place (the records' references are only dropped)
+    if (e->view != nullptr && e->view.use_count() == 1) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        ++r8_stats_.views_reused;
+    } else {
+        e->view = std::make_shared<StageView>();
+    }
+    CopyView(*e->view, s);
+    e->view->status = StageStatus::Ready;
+    e->view->native_shared = true;
+    ++r8_stats_.stores;
+    ++r8_stats_.stored_by[kind];
 }
 
 bool ShaderFrontend::NativeKeyOf(HwStage hw, const Cp::EngineTable& t, std::span<const u32, 16> user_data,
@@ -1331,6 +1630,7 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
     prep_ = {};
     shared_[static_cast<size_t>(HwStage::Ps)].reset();
     shared_[static_cast<size_t>(HwStage::Vs)].reset();
+    r8_shared_ = false;
     // P5.3: the engine described the draw, in a pass the Native Render Frontend takes
     const bool native = native_on_ && d.engine_pass != Cp::kNoEnginePass &&
                         ((options_.native_passes >> Engine::Render::PassSlot(d.engine_pass)) & 1) != 0;

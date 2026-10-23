@@ -18,6 +18,7 @@
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/r8/cp_native_diag.h"
 #include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
@@ -290,6 +291,9 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         if (stage_reuse_ != 0) {
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_STAGE_REUSE={} - unchanged draw stages not copied", v);
         }
+    }
+    if (frontend_ != nullptr && !fthread_mode_ && R8::PrepDiag::On()) {
+        r8_diag_ = std::make_unique<R8::PrepDiag>();
     }
 }
 
@@ -1053,6 +1057,10 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     u64 t_copy = 0;
     {
         const GS::FineSample fine(front_fine_counter_);
+        if (r8_diag_ != nullptr) {
+            r8_diag_->Before(*frontend_);
+        }
+        const u64 tf = r8_diag_ != nullptr ? __rdtsc() : 0;
         R8_CP_PROF_ENTER(CpProfile::Front(r.draw.engine_run));
         // (the groups changed at draws the native G-buffer path prepared without the frontend count as changed now)
         const Cp::GroupMask changed = r.draw.changed;
@@ -1061,12 +1069,22 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
         r.draw.changed = changed;
         R8_CP_PROF_LEAVE();
+        if (r8_diag_ != nullptr) {
+            r8_diag_->After(r.draw, *frontend_, reader_, __rdtsc() - tf); // (R8-A2: before the views are copied)
+        }
         R8_CP_PROF_PREPARED(r.draw, frontend_->Stage(GS::HwStage::Vs), frontend_->Stage(GS::HwStage::Ps));
         const u64 tc = srt_diag_ ? __rdtsc() : 0;
         r.prep = prep;
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
         r.stage_shared = frontend_->SharedStage(GS::HwStage::Vs);
         r.ps_shared = frontend_->SharedStage(GS::HwStage::Ps);
+        // R8-A2 K1a: the PS reuse's shared preparation is copied like an own view (run leaders, GEOFAST's template and
+        // FB-6 take a record's own views only); the copy's registers are then the draw's own (CopyStage does not carry
+        // native_shared: the executor would keep those of the draw that made it)
+        const bool r8_ps = frontend_->R8PsShared();
+        if (r8_ps) {
+            r.ps_shared.reset();
+        }
         // FB-6: a view the frontend did not change since the last copy is not copied again (stage_reuse_)
         const auto copy = [&](GS::HwStage hw, GS::StageView& dst, bool shared, u64& copied, bool& same) {
             same = false;
@@ -1084,6 +1102,14 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         };
         copy(GS::HwStage::Vs, r.stage, r.stage_shared != nullptr, copied_gen_vs_, r.vs_same);
         copy(GS::HwStage::Ps, r.ps, r.ps_shared != nullptr, copied_gen_ps_, r.ps_same);
+        if (r8_ps) {
+            if (r.ps_same) { // (cannot be: the frontend's generation moved; kept safe)
+                CopyStage(r.ps, frontend_->Stage(GS::HwStage::Ps));
+                r.ps_same = false;
+            }
+            const auto& ud = r.draw.user_data[static_cast<size_t>(Cp::Stage::Ps)];
+            std::copy_n(ud.begin(), std::min<size_t>(ud.size(), r.ps.plan.flat.size()), r.ps.plan.flat.begin());
+        }
         r.state = prep.ready ? frontend_->Pipelines().Graphics(prep.pipeline) : nullptr;
         t_copy = srt_diag_ ? __rdtsc() - tc : 0;
     }
@@ -3200,6 +3226,9 @@ std::string ParallelCp::Report() const {
     }
     out += "\n";
     out += R6::Report(); // (R6-P: docs/NATIVE_RENDER_R6_CP_OPTIMIZATION.md; empty when off)
+    if (r8_diag_ != nullptr) {
+        out += r8_diag_->Report(); // (R8-A2: docs/NATIVE_ENGINE_R8_CP_OPTIMIZATION.md)
+    }
     if (Failed()) {
         out += "  FAILED: " + failure_ + "\n";
     }

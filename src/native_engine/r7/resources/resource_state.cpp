@@ -16,6 +16,7 @@
 #include "native_engine/r6/cue_dedup.h"
 #include "native_engine/reconstructed/cue_commit.h"
 #include "native_engine/reconstructed/cue_set_buffers.h"
+#include "runtime/gpu/r8/cp_native_table.h"
 
 namespace SecondSon::NativeEngine::R7::Resources {
 
@@ -524,6 +525,10 @@ void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
     if (cs == nullptr) {
         return;
     }
+    // R8-A2: the VS / PS snapshots go to the command processor's thread (cp_native_table.h), versioned only when every
+    // setter and the commit are observed (as Fill vouches)
+    const bool r8 = ::SecondSon::Gpu::R8::TableOn();
+    const bool r8_valid = r8 && TrackingValid();
     for (u32 st = 0; st < kStages; ++st) {
         StageState& s = cs->stage[st];
         if (rings && (st == 3 || st == 4)) {
@@ -590,6 +595,23 @@ void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
         s.snapshot = snap;
         s.dwords = n;
         s.current = true;
+        if (r8 && (st == kCueStageVs || st == kCueStagePs)) {
+            ::SecondSon::Gpu::R8::SnapshotInfo info;
+            info.base = snap;
+            info.cue = cue;
+            info.version = r8_valid ? s.bind_version : 0;
+            info.dwords = n;
+            info.stage = static_cast<u8>(st);
+            info.refs = static_cast<u8>(std::min<u32>(t_cap.refs[st], 7));
+            for (u32 j = 0; j < info.refs; ++j) {
+                info.ref_sgpr[j] = t_cap.ref_sgpr[st][j];
+                info.ref_offset[j] = t_cap.ref_offset[st][j];
+            }
+            if (t_cap.refs[st] > 7) {
+                info.version = 0; // (a pointer the entry cannot hold: Find would take the snapshot for less than it is)
+            }
+            ::SecondSon::Gpu::R8::Publish(info);
+        }
         if (verify) {
             if (s.copy == nullptr) {
                 s.copy = new u8[kCueShadowStride];

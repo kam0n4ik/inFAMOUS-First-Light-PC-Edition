@@ -39,6 +39,10 @@
 #include "runtime/gpu/shader/runtime_params.h"
 #include "runtime/gpu/shader/shader_cache.h"
 
+namespace SecondSon::Gpu::R8 {
+struct SnapshotInfo; // (R8-A2: runtime/gpu/r8/cp_native_table.h)
+}
+
 namespace SecondSon::Gpu::Shader {
 
 class ShaderDiskCache;
@@ -247,8 +251,10 @@ public:
     /// SSPC_DIAG_MEMO_STATS=1: the stage memo's misses by cause (the user data dwords that differ, the input that
     /// changed); empty without it.
     std::string MemoReport() const;
-    /// P5.3: the Native Render Frontend's counts (empty when it is off).
+    /// P5.3: the Native Render Frontend's counts (empty when it is off). R8-A2 K1a: and the PS reuse's (when it is on).
     std::string NativeReport() const;
+    /// R8-A2 K1a: the last draw's PS is a shared preparation the PS reuse gave (SharedStage(Ps) holds it).
+    bool R8PsShared() const { return r8_shared_; }
     /// P4.14: the persistent shader cache (nullptr: none). A program met for the first time gets the modules the cache
     /// has for it (read when first needed instead of translated); new translations are added to it. Before the first
     /// draw.
@@ -470,6 +476,54 @@ private:
     std::array<std::shared_ptr<const StageView>, static_cast<size_t>(HwStage::Count)> shared_{};
     u64 native_frame_ = 1;
     bool native_on_ = false;
+    // R8-A2 K1a (SSPC_R8_CP_STAGE_REUSE=1|verify; docs/NATIVE_ENGINE_R8_CP_OPTIMIZATION.md §8): a PS stage with the
+    // exact inputs of a cached preparation takes it - P5.3's sharing, found without hashing the whole key and without
+    // an allocation on a hit. Direct-mapped by program and layout (sets of kR8Ways). An entry is one of three kinds:
+    //   relocatable - the walk read only the snapshot the native commit published (R8::Find), no resource and no
+    //                 pointer lies in it: the snapshot pointers as offsets from its base, its bytes compared;
+    //   fixed       - the walk read only that snapshot (or nothing), but it is not relocatable: every register by value,
+    //                 the bytes at the same base compared;
+    //   generation  - the walk read memory outside it: every register by value and the memory generation (P4.7's
+    //                 rule, so only with the stage memo's owner), the snapshot's bytes compared as well when there is one.
+    // The snapshot table's binding version is only a pre-filter (an entry may be stale after a CUE reset).
+    static constexpr u32 kR8SetBits = 12, kR8Ways = 4;
+    struct R8Entry {
+        u64 addr = 0; ///< 0: empty
+        const Program* program = nullptr;
+        const Module* first = nullptr; ///< the layout (it determines the runtime parameters: FindLayout compares them)
+        const void* fetch = nullptr;
+        u64 fetch_version = 0;
+        BindingStart start;
+        std::array<u32, 16> user_data{}; ///< by value; relocatable: the snapshot pointers as offsets (high words 0)
+        u32 pointers = 0;                ///< relocatable: the snapshot pointers' registers (0: by value)
+        u32 dwords = 0;                  ///< the snapshot compared (0: none)
+        u64 base = 0;                    ///< fixed / generation: where its bytes are
+        u64 version = 0;                 ///< the table's binding version when it was cached (pre-filter; 0: none)
+        u64 memory_gen = 0;
+        u8 kind = 0; ///< 0 relocatable, 1 fixed, 2 generation
+        std::vector<u32> snapshot;
+        std::shared_ptr<StageView> view;
+        u64 stamp = 0;
+    };
+    struct R8Stats {
+        u64 lookups = 0, found = 0, reads = 0, hits = 0, verified = 0, mismatches = 0;
+        std::array<u64, 3> hits_by{}, stored_by{};
+        u64 miss_none = 0, miss_regs = 0, miss_gen = 0, miss_version = 0, miss_bytes = 0, miss_unready = 0;
+        u64 first_seen = 0, uncacheable = 0, stores = 0, views_reused = 0, replaced = 0;
+    };
+    u32 r8_reuse_ = 0; ///< 0 off, 1 on, 2 verify
+    bool r8_shared_ = false;
+    u64 r8_stamp_ = 0;
+    std::vector<R8Entry> r8_;
+    std::vector<u64> r8_ghost_; ///< per set, the last kR8Ways inputs prepared and not cached (cached at the second)
+    std::vector<u32> r8_snap_;  ///< the snapshot bytes read for this stage
+    R8Stats r8_stats_;
+    /// A PS preparation made in full (the stage's view `s`) into its set: its kind from the walk's reads (`outside`: one
+    /// outside the snapshot `sn`, nullptr: none found), at the second sighting of its inputs.
+    void R8Store(const StageView& s, u64 addr, const Module& first, const void* fetch, u64 fetch_version,
+                 const BindingStart& start, std::span<const u32, 16> user_data,
+                 const ::SecondSon::Gpu::R8::SnapshotInfo* sn, u32 pointers, const std::array<u32, 16>& rel,
+                 bool outside, R8Entry* set, u64 read_at, GuestReader& memory);
 
     DrawPreparation prep_;
     u32 last_vs_ = 0, last_ps_ = 0, last_pipeline_ = 0;

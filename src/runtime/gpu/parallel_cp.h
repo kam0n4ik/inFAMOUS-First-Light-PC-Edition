@@ -57,6 +57,10 @@ namespace SecondSon::Gpu::Native {
 
 namespace GS = Gpu::Shader;
 
+namespace R8 {
+class PrepDiag; // runtime/gpu/r8/cp_native_diag.h
+}
+
 /// Why thread 1 drained the queue (counted).
 enum class DrainReason : u8 {
     RoundEnd,       ///< the backend loop's round ended (polls, flushes, idle waits follow)
@@ -555,6 +559,8 @@ private:
     /// The frontend thread: the held run is complete - every record before `upto` published to thread 2
     void FrontCloseRun(u64 upto);
     GS::ResourceBindingPlan run_plan_; ///< a joining draw's VS plan decoded again (its own constant buffers)
+    /// R8-A2 (SSPC_R8_CP_DIAG=1): the full preparations a reuse by the native engine's snapshot versions would take
+    std::unique_ptr<R8::PrepDiag> r8_diag_;
     std::atomic<u64> run_count_{0}, run_members_{0}, run_leaders_{0}, run_verified_{0}, run_mismatches_{0};
     std::array<std::atomic<u64>, 20> run_refused_{};
     /// Phase 6: G-buffer members tagged with another material (DrawRuns::kMaterialChanged) - refused before their PS is
