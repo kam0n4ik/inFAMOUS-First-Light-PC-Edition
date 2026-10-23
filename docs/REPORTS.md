@@ -1,8 +1,8 @@
 # Reports — inFAMOUS: Second Son PC Edition
 
-Every report of the project in one list, grouped by area, oldest phase first within a group. Reports in `main` are linked relative to this folder; reports that exist only in a branch link to that branch on GitHub. Most reports are written in Russian, the newer ones partly in English. The summary of the current state is the [README](../README.md).
+Every report of the project in one list, grouped by area, oldest phase first within a group. Reports in `main` are linked relative to this folder; reports that exist only in a branch link to that branch on GitHub, the READMEs of the removed `tools/` link to the tag `archive/dev-tools-20261023`. Most reports are written in Russian, the newer ones partly in English. The summary of the current state is the [README](../README.md).
 
-Dates are the last change of the file (2026).
+Updated 2026-10-23: 135 reports, 115 in `main`, 18 only in branches, 2 in the tools archive tag. Dates are the last change of the file (2026).
 
 ## 1. Start, audit, migration plan
 
@@ -86,7 +86,7 @@ Dates are the last change of the file (2026).
 | [SHADER_CACHE.md](SHADER_CACHE.md) | 10-10 | Shader and pipeline cache on the bridge |
 | [PHASE4_SHADER_PRECOMPILER.md](PHASE4_SHADER_PRECOMPILER.md) | 10-15 | Persistent shader cache and the start-up precompiler |
 | [OFFLINE_SHADER_PRECOMPILATION.md](OFFLINE_SHADER_PRECOMPILATION.md) | 10-15 | Shaders found offline in the game's files, predictive precompilation |
-| [../tools/static_shaders/README.md](../tools/static_shaders/README.md) | 10-18 | Static shader / pipeline prediction tools |
+| [tools/static_shaders/README.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/dev-tools-20261023/tools/static_shaders/README.md) | 10-18 | Static shader / pipeline prediction tools (archived with `tools/`; the templates are now `game/data/static_templates.txt`) |
 | [OWN_SHADER_TRANSLATOR.md](OWN_SHADER_TRANSLATOR.md) | 10-19 | Own GCN → SPIR-V translator, now the default |
 
 ## 6. Upscaling and frame generation
@@ -124,9 +124,9 @@ Dates are the last change of the file (2026).
 | [native-reconstruction/NATIVE_MIGRATION_ROADMAP.md](native-reconstruction/NATIVE_MIGRATION_ROADMAP.md) | 10-14 | Step-by-step migration plan |
 | [native-reconstruction/RECONSTRUCTION_PROGRESS.md](native-reconstruction/RECONSTRUCTION_PROGRESS.md) | 10-14 | Reconstruction progress |
 | [native-reconstruction/OPEN_QUESTIONS.md](native-reconstruction/OPEN_QUESTIONS.md) | 10-14 | Open questions |
-| [../tools/native-reconstruction/ghidra/queries/README.md](../tools/native-reconstruction/ghidra/queries/README.md) | 10-20 | Ghidra query snippets |
+| [tools/native-reconstruction/ghidra/queries/README.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/dev-tools-20261023/tools/native-reconstruction/ghidra/queries/README.md) | 10-20 | Ghidra query snippets (archived with `tools/`) |
 
-## 9. Native engine R5–R7 (in `main`)
+## 9. Native engine R5–R8 (in `main`)
 
 | Report | Date | What |
 |---|---|---|
@@ -147,8 +147,23 @@ Dates are the last change of the file (2026).
 | [NATIVE_ENGINE_R7_SHADOWS.md](NATIVE_ENGINE_R7_SHADOWS.md) | 10-21 | R7-S: hand-written shadow engine |
 | [NATIVE_ENGINE_R7_RESOURCES.md](NATIVE_ENGINE_R7_RESOURCES.md) | 10-21 | R7-R: native resource / material / CUE state |
 | [NATIVE_ENGINE_R7_RESULTS.md](NATIVE_ENGINE_R7_RESULTS.md) | 10-21 | **R7 results**: 13 functions at once, 0 mismatches, FPS neutral |
+| [NATIVE_ENGINE_R8_CORE.md](NATIVE_ENGINE_R8_CORE.md) | 10-21 | R8-Core: goals, ownership, interfaces, baseline series of R8 (city 31.0 FPS, CP thread 31.7 ms a frame) |
+| [NATIVE_ENGINE_R8_CP_PROFILE.md](NATIVE_ENGINE_R8_CP_PROFILE.md) | 10-21 | R8-A1: profile of the command processor thread, candidates K1–K8 (best: PS preparation reuse, ≈ 1.7–2.1 ms a frame) |
+| [NATIVE_ENGINE_R8_CP_OPTIMIZATION.md](NATIVE_ENGINE_R8_CP_OPTIMIZATION.md) | 10-21 | R8-A2: the native state channel to the command processor (18.4 k CUE snapshots a frame, found for 76 % of stage preparations), PS reuse K1a (`SSPC_R8_CP_STAGE_REUSE`, off) |
+| [NATIVE_GBUFFER_DRAW_0x1a1770.md](NATIVE_GBUFFER_DRAW_0x1a1770.md) | 10-22 | Native G-buffer draw `0x1a1770` from the engine's CUE state (99.98 % of G-buffer draws): correct, but off the critical path, FPS gain not confirmed |
+| [R8_T2_OPTIMIZATION.md](R8_T2_OPTIMIZATION.md) | 10-23 | **R8 T2**: the Vulkan recording thread; `SSPC_VK_EMIT_BATCH` T2 −2.2 ms, city 39.1 → 41.5 FPS; multithreaded recording designed, not built |
 
-## 10. PC input, interface and settings
+## 10. Gameplay performance (R9, in `main`)
+
+| Report | Date | What |
+|---|---|---|
+| [R9_GAMEPLAY_PERFORMANCE.md](R9_GAMEPLAY_PERFORMANCE.md) | 10-23 | **R9 results**: gameplay profiler and routes; F1 (pipeline cache saved off the shader cache lock) + F3 (vertex heap window): fight 44.5 → 46.0 FPS, 1 % low 7.5 → 25.6, freezes of 1–5 s gone |
+| [R9_HOT_FUNCTIONS.md](R9_HOT_FUNCTIONS.md) | 10-23 | Hot functions of the game and the runtime by scenario: the game's own work on the critical path is flat (≈ 4.3 ms), the frame waits for async compute and the GPU |
+| [R9_VULKAN_MULTITHREADING.md](R9_VULKAN_MULTITHREADING.md) | 10-23 | The Vulkan recording thread (T2) idles 7 ms a frame in gameplay: multithreaded recording not justified, not built |
+| [R9_NATIVE_RECOMPILATION.md](R9_NATIVE_RECOMPILATION.md) | 10-23 | Native replacements of R9: steps away from the universal bridge (cache save, heap window, wait B on the GPU); no game function rewritten |
+| [R9_REA3_FIX.md](R9_REA3_FIX.md) | 10-23 | REA-3 (the game's wait B on the GPU): safe reset ends the hang (20 min clean), AQ device loss fixed; still off — uneven frame pacing |
+
+## 11. PC input, interface and settings
 
 | Report | Date | What |
 |---|---|---|
@@ -161,21 +176,18 @@ Dates are the last change of the file (2026).
 | [PC_EDITION_UI.md](PC_EDITION_UI.md) | 10-20 | Settings in the game's own menu, the mouse in its menus |
 | [PC_SETTINGS_UI.md](PC_SETTINGS_UI.md) | 10-20 | **The redesigned settings window** |
 
-## 11. Branches: work in progress and experiments
+## 12. Branches: work in progress and experiments
 
 Branch reports, linked on GitHub (they are not in `main`).
 
-**R8 — native CP optimization** (in progress):
+**R8 — native CP optimization, directions not merged** (the R8 core, the CP profile, the CP optimization R8-A2, the native G-buffer draw and T2 are in `main`, section 9):
 
 | Report | Branch | What |
 |---|---|---|
-| [NATIVE_ENGINE_R8_CORE.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/feature/native-engine-r8/docs/NATIVE_ENGINE_R8_CORE.md) | `feature/native-engine-r8` | Goals, ownership, interfaces, baseline series of R8 |
-| [NATIVE_ENGINE_R8_CP_PROFILE.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/feature/native-engine-r8/docs/NATIVE_ENGINE_R8_CP_PROFILE.md) | `feature/native-engine-r8`, `feature/r8-cp-profile` | Profile of the command processor thread |
-| [NATIVE_ENGINE_R8_CP_OPTIMIZATION.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/feature/r8-native-cp/docs/NATIVE_ENGINE_R8_CP_OPTIMIZATION.md) | `feature/r8-native-cp` | The native state channel to the command processor, PS reuse design |
 | [NATIVE_ENGINE_R8_RENDER_LAYER.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/feature/r8-render-layer/docs/NATIVE_ENGINE_R8_RENDER_LAYER.md) | `feature/r8-render-layer` | Native render layer: one entry for the CUE commit, mesh / shadow draws |
 | [NATIVE_ENGINE_R8_RECOMPILER.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/feature/r8-recomp/docs/NATIVE_ENGINE_R8_RECOMPILER.md) | `feature/r8-recomp` | CUE audit: the commit's Gnm writers, other user-data writers |
 
-**Fork port** — [`feature/fork-port-prep-workers`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/tree/feature/fork-port-prep-workers): the frontend thread with the city preset, queued occlusion queries and flips, the Vulkan emit thread, potato mode for weak PCs. No separate report yet; the commit messages describe each step.
+**Fork port** — [`feature/fork-port-prep-workers`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/tree/feature/fork-port-prep-workers): the frontend thread with the city preset, queued occlusion queries and flips and the Vulkan emit thread are now in `main` (the R8 / R9 stand runs on them); potato mode for weak PCs is only in the branch. No separate report; the commit messages describe each step.
 
 **Native Rebirth** — a separate native program on the game's data ([`feature/native-rebirth`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/tree/feature/native-rebirth), continued in [`feature/native-missions`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/tree/feature/native-missions)):
 

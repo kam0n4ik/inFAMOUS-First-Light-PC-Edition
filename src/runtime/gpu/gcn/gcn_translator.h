@@ -11,8 +11,10 @@ namespace SecondSon::Gpu::Gcn {
 
 /// Wraps the installed translator (after InstallShaderTranslatorAdapter) for the stages SSPC_OWN_SHADERS names; with
 /// the variable unset, for cs,vs,ps when `by_default` (the game, --predict-shaders), else not (the self-test: the
-/// bridge's adapter is what it tests).
-void InstallOwnTranslatorIfEnabled(bool by_default);
+/// bridge's adapter is what it tests). Without `bridge_fallback` (--predict-shaders) a program it declines is an error,
+/// not the bridge's: the bridge's recompiler stops the process on an ASSERT, and a predicted state can trip one that
+/// the game's never does (the program is then left to the game, which translates it with its real state).
+void InstallOwnTranslatorIfEnabled(bool by_default, bool bridge_fallback = true);
 
 /// Whether the own translator was installed (the native backend's shader cache: its own folder, native_own).
 bool OwnTranslatorInstalled();

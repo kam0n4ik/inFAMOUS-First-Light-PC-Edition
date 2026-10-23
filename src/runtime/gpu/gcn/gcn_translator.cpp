@@ -161,9 +161,9 @@ EmitOptions::VertexInput VertexInputOf(u32 dfmt, u32 nfmt, u32 dst_sel) {
 
 class OwnTranslator final : public GS::ShaderTranslator {
 public:
-    OwnTranslator(GS::ShaderTranslator* fallback, u32 stages)
-        : fallback_(fallback), stages_(stages), only_(HashList("SSPC_OWN_SHADERS_ONLY")),
-          skip_(HashList("SSPC_OWN_SHADERS_SKIP")) {}
+    OwnTranslator(GS::ShaderTranslator* fallback, u32 stages, bool bridge_fallback)
+        : fallback_(fallback), stages_(stages), bridge_fallback_(bridge_fallback),
+          only_(HashList("SSPC_OWN_SHADERS_ONLY")), skip_(HashList("SSPC_OWN_SHADERS_SKIP")) {}
 
     std::string_view Name() const override {
         return "SecondSonPC GCN translator, the bridge's for the rest";
@@ -207,9 +207,21 @@ public:
                 }
                 return res;
             }
+            if (!bridge_fallback_) {
+                GS::TranslationResult res;
+                res.error = GS::TranslationError::UnsupportedOpcode;
+                res.detail = fmt::format("declined by the own translator ({}); the bridge's is not used here", why);
+                return res;
+            }
             if (const u32 n = ++declined_; n <= 400) {
                 SSPC_LOG(GPU, Info, "own GCN translator: {} {:016x} to the bridge's ({})", stage, req.footer_hash, why);
             }
+        }
+        if (!bridge_fallback_) {
+            GS::TranslationResult res;
+            res.error = GS::TranslationError::BadRequest;
+            res.detail = "not a program of the own translator's stages; the bridge's is not used here";
+            return res;
         }
         return fallback_->Translate(req);
     }
@@ -730,6 +742,7 @@ private:
 
     GS::ShaderTranslator* fallback_;
     u32 stages_ = 0; ///< SSPC_OWN_SHADERS: bit 0 compute, 1 vertex, 2 fragment
+    bool bridge_fallback_ = true; ///< false: a declined program is an error (--predict-shaders)
     std::unordered_set<u64> only_, skip_;
     std::atomic<u32> own_{0}, declined_{0}, aux_{0};
 };
@@ -742,7 +755,7 @@ bool OwnTranslatorInstalled() {
     return g_installed.load(std::memory_order_acquire);
 }
 
-void InstallOwnTranslatorIfEnabled(bool by_default) {
+void InstallOwnTranslatorIfEnabled(bool by_default, bool bridge_fallback) {
     const u32 stages = OwnStages(by_default ? 7u : 0u);
     if (stages == 0) {
         if (const char* v = std::getenv("SSPC_OWN_SHADERS"); v != nullptr) {
@@ -755,13 +768,14 @@ void InstallOwnTranslatorIfEnabled(bool by_default) {
         SSPC_LOG(GPU, Warning, "own GCN translator: no translator installed to wrap - not enabled");
         return;
     }
-    static OwnTranslator own(fallback, stages);
+    static OwnTranslator own(fallback, stages, bridge_fallback);
     GS::InstallShaderTranslator(&own);
     g_installed.store(true, std::memory_order_release);
     const char* v = std::getenv("SSPC_OWN_SHADERS");
     SSPC_LOG(GPU, Info, "own GCN translator: enabled for{}{}{} programs (SSPC_OWN_SHADERS={}), {} for the rest",
              (stages & 1) != 0 ? " compute" : "", (stages & 2) != 0 ? " vertex" : "", (stages & 4) != 0 ? " fragment" : "",
-             v != nullptr ? v : "unset: cs,vs,ps by default; =bridge turns it off", fallback->Name());
+             v != nullptr ? v : "unset: cs,vs,ps by default; =bridge turns it off",
+             bridge_fallback ? fallback->Name() : "none (a declined program is not translated)");
 }
 
 } // namespace SecondSon::Gpu::Gcn

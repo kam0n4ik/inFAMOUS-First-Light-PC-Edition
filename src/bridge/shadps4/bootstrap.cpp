@@ -1272,7 +1272,10 @@ GameMetadata ReadGameMetadataShad(Core::FileSys::MntPoints& mnt) {
 /// and translated into the native backend's shader cache, before any guest memory or game code exists.
 int RunPredictShaders(const App::Config& cfg, const std::string& game) {
     InstallShaderTranslatorAdapter();
-    Gpu::Gcn::InstallOwnTranslatorIfEnabled(true); // the modules prepared by the own translator (SSPC_OWN_SHADERS=bridge: the bridge's)
+    // the modules prepared by the own translator (SSPC_OWN_SHADERS=bridge: the bridge's); a program it declines is not
+    // predicted - the bridge's recompiler would stop this process on an ASSERT the predicted state trips (the game
+    // translates such a program itself, with its real state)
+    Gpu::Gcn::InstallOwnTranslatorIfEnabled(true, false);
     Gpu::Native::PredictShadersOptions po;
     po.device_index = cfg.gpu_device;
     po.game_dir = cfg.game_dir;
