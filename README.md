@@ -7,7 +7,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
 > **Status: in development, playable.** The game starts, loads saves and is played through. On the development PC (Ryzen 5 5500, RTX 2060 6 GB), gameplay in the city runs at 46–51 FPS with a 1 % low of 26–28; the test scenes run at 36–53 FPS ([Benchmarks](#benchmarks)).
 
 <p align="center">
-  <img src="docs/images/pc-edition-banner.png" alt="inFAMOUS: Second Son — PC Edition" width="100%">
+  <img src=".github/readme/pc-edition-banner.png" alt="inFAMOUS: Second Son — PC Edition" width="100%">
 </p>
 
 <p align="center">
@@ -52,7 +52,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   - Audio goes out through WASAPI; cutscene video is decoded natively.
   - `play.cmd` backs up your saves before every start.
 - **No PS4 firmware.** The system libraries the game imports are implemented by the project (336 of 417 natively, the rest from the shadPS4 core linked in). Only your own copy of the game is needed.
-- **Measured, not guessed.** Every change is decided by an interleaved A/B on the same build, and experiments that lost are documented too: [135 reports](docs/REPORTS.md).
+- **Measured, not guessed.** Every change is decided by an interleaved A/B on the same build, and experiments that lost are documented too: [135 reports](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md).
 
 ## Installation
 
@@ -65,7 +65,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
    |---|---|
    | `SecondSonPC.exe` | the runtime |
    | `play.cmd` | starts the game with every improvement that is on for players, after backing up the saves |
-   | `play_experimental.cmd` | `play.cmd` plus two faster experiments with less even frame pacing (REA-3 + AQ, [R9_REA3_FIX.md](docs/R9_REA3_FIX.md)) |
+   | `play_experimental.cmd` | `play.cmd` plus two faster experiments with less even frame pacing (REA-3 + AQ, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md)) |
    | `SecondSonPC.toml` | defaults: window, language, keys, PC settings |
    | `data\static_templates.txt` | the data the shader preparation predicts the game's shaders from |
    | `sspc_dlss.dll`, `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `sl.*.dll`, `NvLowLatencyVk.dll` | NVIDIA DLSS 310.9.1, Streamline 2.14.1, Reflex |
@@ -119,28 +119,28 @@ All measurements are interleaved A/B series on one build, usually 3–6 runs per
 | owner's save | a rooftop over the waterfront with traffic |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/current-dark.svg">
-  <img alt="Average FPS and 1 % low by scene" src="docs/benchmarks/current.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/current-dark.svg">
+  <img alt="Average FPS and 1 % low by scene" src=".github/readme/current.svg" width="880">
 </picture>
 
 | Scene | FPS | 1 % low | Preset | Date, runs | Source |
 |---|---:|---:|---|---|---|
-| Traverse (city) | 51.3 | 27.9 | `play.cmd` | 10-23, 6 | [R9](docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `final_trav`, traverse phase |
-| Fight (city) | 46.0 | 25.6 | `play.cmd` | 10-23, 6 | [R9](docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `safe_fight`, fight phase |
-| Beach | 53.1 | 35.5 | `play.cmd` without emitter batching, F1, F3 | 10-22, 3 | [NATIVE_GBUFFER_DRAW_0x1a1770](docs/NATIVE_GBUFFER_DRAW_0x1a1770.md) §9.10 |
+| Traverse (city) | 51.3 | 27.9 | `play.cmd` | 10-23, 6 | [R9](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `final_trav`, traverse phase |
+| Fight (city) | 46.0 | 25.6 | `play.cmd` | 10-23, 6 | [R9](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `safe_fight`, fight phase |
+| Beach | 53.1 | 35.5 | `play.cmd` without emitter batching, F1, F3 | 10-22, 3 | [NATIVE_GBUFFER_DRAW_0x1a1770](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_GBUFFER_DRAW_0x1a1770.md) §9.10 |
 | Harbour | 43.2 | 32.6 | same | 10-22, 3 | same |
 | Village | 37.6 | 30.2 | same | 10-22, 3 | same |
 | Live city | 36.1 | 24.7 | threads of `play.cmd` without native G-buffer, batching, F1, F3 | 10-22, 3 | series `s2_live` (raw series, no separate report) |
-| Owner's save | 30.0 | 21.6 | `play.cmd` | 10-23, 3 | [R9_REA3_FIX](docs/R9_REA3_FIX.md) §2.5 |
+| Owner's save | 30.0 | 21.6 | `play.cmd` | 10-23, 3 | [R9_REA3_FIX](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md) §2.5 |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/fps-ab-dark.svg">
-  <img alt="Average FPS before and after each measured change" src="docs/benchmarks/fps-ab.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/fps-ab-dark.svg">
+  <img alt="Average FPS before and after each measured change" src=".github/readme/fps-ab.svg" width="880">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/low1-ab-dark.svg">
-  <img alt="1 % low FPS before and after each measured change" src="docs/benchmarks/low1-ab.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/low1-ab-dark.svg">
+  <img alt="1 % low FPS before and after each measured change" src=".github/readme/low1-ab.svg" width="880">
 </picture>
 
 The worst frames are where the gameplay work (R9) shows most:
@@ -148,27 +148,27 @@ The worst frames are where the gameplay work (R9) shows most:
 - fight: max frame 3 166 → 82 ms with F1 + F3.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/cp-modes-dark.svg">
-  <img alt="Average FPS by command processor mode" src="docs/benchmarks/cp-modes.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/cp-modes-dark.svg">
+  <img alt="Average FPS by command processor mode" src=".github/readme/cp-modes.svg" width="880">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/upscaling-dark.svg">
-  <img alt="Average FPS by upscaling mode" src="docs/benchmarks/upscaling.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/upscaling-dark.svg">
+  <img alt="Average FPS by upscaling mode" src=".github/readme/upscaling.svg" width="880">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/shader-cache-dark.svg">
-  <img alt="Frames over 100 ms on a first and on a repeat start" src="docs/benchmarks/shader-cache.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/shader-cache-dark.svg">
+  <img alt="Frames over 100 ms on a first and on a repeat start" src=".github/readme/shader-cache.svg" width="880">
 </picture>
 
 **Where the frame time goes.** In gameplay the game's own work on its main thread is flat at about 4.3 ms a frame. The rest of the frame waits for its async compute and for the GPU: in a fight the GPU needs ~17.5 ms and the command processor ~16.5 ms of a ~21 ms frame. In the open city, ~12 000 draws a frame make command processing and Vulkan recording the limit. Upscaling therefore helps little, and frame generation helps most: on the beach, 43–53 game frames become 86–105 shown.
 
-Not counted: no quality setting, light or shadow was lowered for any number here. The chart data and the script that draws them are in [`docs/benchmarks/`](docs/benchmarks/make_charts.py); every report behind them is in [`docs/REPORTS.md`](docs/REPORTS.md).
+Not counted: no quality setting, light or shadow was lowered for any number here. The chart data and the script that draws them are in [`make_charts.py`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/benchmarks/make_charts.py); every report behind them is listed in [`REPORTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md) (tag `archive/docs-20261023`).
 
 ## CPU: native x86-64 and AVX
 
-The PS4's CPU is an 8-core AMD Jaguar, an x86-64 processor. The game's executable was compiled for it, so it is valid code for a PC processor too. SecondSonPC maps it into memory at its PS4 addresses, resolves its imports to its own system libraries and jumps into it, and from then on the game's code runs on the PC's cores like any program's. What the game's modules use (decoded function by function, [PHASE3_P34_EXCEPTIONS_CPU.md](docs/PHASE3_P34_EXCEPTIONS_CPU.md) §5):
+The PS4's CPU is an 8-core AMD Jaguar, an x86-64 processor. The game's executable was compiled for it, so it is valid code for a PC processor too. SecondSonPC maps it into memory at its PS4 addresses, resolves its imports to its own system libraries and jumps into it, and from then on the game's code runs on the PC's cores like any program's. What the game's modules use (decoded function by function, [PHASE3_P34_EXCEPTIONS_CPU.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/PHASE3_P34_EXCEPTIONS_CPU.md) §5):
 
 | Module | Functions | Instructions | Instruction sets |
 |---|---:|---:|---|
@@ -180,15 +180,15 @@ What follows from that:
 
 - **The host CPU needs every set the game uses:** SSE2–SSE4.2, POPCNT, MOVBE, AVX (with the OS saving the `ymm` registers), F16C, BMI1 and LZCNT. `Cpu::HostMeetsGameRequirements` checks them before the game starts and names the missing ones.
 - **AVX runs as AVX.** The game's 397 000 AVX instructions are executed as they are, with no emulation or splitting. `vrsqrtps` and `vrcpps` give the result of the host's CPU, which differs from the Jaguar's only in the last bits of an approximation, as it does between PC CPUs.
-- **SSE4a** (`extrq`) exists only on AMD CPUs, and Ryzen has it. On Intel, SecondSonPC's CPU patcher replaces the 96 `extrq` of the game: 23 are rewritten at load time to jump into a trampoline, and the 73 that are too short for a jump are emulated when they fault ([KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) SSPC-011).
+- **SSE4a** (`extrq`) exists only on AMD CPUs, and Ryzen has it. On Intel, SecondSonPC's CPU patcher replaces the 96 `extrq` of the game: 23 are rewritten at load time to jump into a trampoline, and the 73 that are too short for a jump are emulated when they fault ([KNOWN_ISSUES.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md) SSPC-011).
 - **Thread pointer.** The PS4 keeps the thread pointer in `fs:`; Windows does not. The 3 616 `fs:` accesses are patched to SecondSonPC's per-thread slot at load time.
 - **The rebuilt engine functions speak AVX too.** The native reconstructions of the engine's functions are compiled with `/arch:AVX` and `-ffp-contract=off`. Critical vector operations are inline assembly with the original's operand order and a 3-byte VEX prefix (`{vex3}`), because x86 keeps the NaN payload of the *first* operand and LLVM swaps commutative operands for a shorter encoding. Without that, 5–11 thousand results in 200 000 differed in one NaN bit, and so did the commands the engine sends to the GPU.
-- **The static recompiler v2** lifts the engine's x86-64 with Ghidra's P-code into C++ that is compiled with `/arch:AVX`. AVX and floating-point operations become the same processor instructions, under the current MXCSR. It is checked against the processor itself: 654 instructions × 1 000 states × 5 MXCSR modes, 3.27 million runs with 0 differences. A recompiled function is checked offline (up to 1 million generated cases) before it may be installed ([NATIVE_ENGINE_RECONSTRUCTION.md](docs/NATIVE_ENGINE_RECONSTRUCTION.md) §9.1).
+- **The static recompiler v2** lifts the engine's x86-64 with Ghidra's P-code into C++ that is compiled with `/arch:AVX`. AVX and floating-point operations become the same processor instructions, under the current MXCSR. It is checked against the processor itself: 654 instructions × 1 000 states × 5 MXCSR modes, 3.27 million runs with 0 differences. A recompiled function is checked offline (up to 1 million generated cases) before it may be installed ([NATIVE_ENGINE_RECONSTRUCTION.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_RECONSTRUCTION.md) §9.1).
 - **Hash-pinned.** A rebuilt function names its address in `eboot.bin` and the hash of its original body. On any other executable it is not installed, and the original code runs.
 
 ## Building from source
 
-Only what is needed to build is in this repository: `src/`, `cmake/`, `patches/`, `assets/`, `third_party/spirv_headers`, `CMakeLists.txt` and `build.ps1`. The files that go into the game's folder are in `game/`. The development scripts and the measurement stand that used to live in `tools/` are kept at the tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023). The offline tests are kept at the tag [`archive/tests-20261023`](../../tree/archive/tests-20261023/tests): the reconstructed engine functions and the recompiler checked against the game's `eboot.bin` (the numbers quoted above), and the PC settings.
+This repository holds only what builds SecondSonPC: `src/`, `cmake/`, `patches/`, `assets/`, `third_party/spirv_headers`, `CMakeLists.txt` and `build.ps1`; plus the files that go into the game's folder, in `game/`. The finished build is on the [Releases](../../releases) page. The reports are kept at the tag [`archive/docs-20261023`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/tree/archive/docs-20261023/docs). The development scripts and the measurement stand that used to live in `tools/` are kept at the tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023). The offline tests are kept at the tag [`archive/tests-20261023`](../../tree/archive/tests-20261023/tests): the reconstructed engine functions and the recompiler checked against the game's `eboot.bin` (the numbers quoted above), and the PC settings.
 
 ### What you need
 
@@ -243,7 +243,7 @@ CMake picks up what it finds. `sspc_dlss.dll` is the only binary that links NGX;
 
 ### PlayStation functions the game imports
 
-The game imports 417 system functions. Their owner in the current build (snapshot [`docs/generated/CALLS.md`](docs/generated/CALLS.md)):
+The game imports 417 system functions. Their owner in the current build (snapshot [`generated/CALLS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/generated/CALLS.md)):
 
 | Owner | Functions | Called in a 2-minute gameplay run |
 |---|---:|---:|
@@ -286,10 +286,10 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
   - **F1:** the driver's 827 MiB pipeline cache was saved under the shader cache's lock once a minute, freezing the game for 1–5 s. It is now saved off that lock.
   - **F3:** the vertex heap's window into guest memory is reserved with headroom, and old windows are released, so 2.5 GB re-imports and 220–250 ms stalls are gone.
 
-  Fight 44.5 → 46.0 FPS, 1 % low 7.5 → 25.6, worst frame 3 166 → 82 ms; traverse 47.4 → 51.3, 1 % low 6.1 → 27.9 ([R9_GAMEPLAY_PERFORMANCE.md](docs/R9_GAMEPLAY_PERFORMANCE.md)).
-- **R9 REA-3 and AQ, experimental.** REA-3 has the GPU take the game's second async compute wait of a frame; AQ runs the game's compute on a Vulkan queue of its own. The hang after 16 minutes is fixed by a safe reset, and the device loss with AQ is fixed. With both, the owner's save runs at +11 % FPS, but frames still alternate 17 / 43 ms, so both stay out of `play.cmd` and only `play_experimental.cmd` turns them on ([R9_REA3_FIX.md](docs/R9_REA3_FIX.md)).
+  Fight 44.5 → 46.0 FPS, 1 % low 7.5 → 25.6, worst frame 3 166 → 82 ms; traverse 47.4 → 51.3, 1 % low 6.1 → 27.9 ([R9_GAMEPLAY_PERFORMANCE.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_GAMEPLAY_PERFORMANCE.md)).
+- **R9 REA-3 and AQ, experimental.** REA-3 has the GPU take the game's second async compute wait of a frame; AQ runs the game's compute on a Vulkan queue of its own. The hang after 16 minutes is fixed by a safe reset, and the device loss with AQ is fixed. With both, the owner's save runs at +11 % FPS, but frames still alternate 17 / 43 ms, so both stay out of `play.cmd` and only `play_experimental.cmd` turns them on ([R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md)).
 - **R8 — the command processor thread.**
-  - **Emitter batching:** the Vulkan recording thread publishes its commands once per record. This takes 2.2 ms a frame off it, and the city bench goes 39.1 → 41.5 FPS ([R8_T2_OPTIMIZATION.md](docs/R8_T2_OPTIMIZATION.md)).
+  - **Emitter batching:** the Vulkan recording thread publishes its commands once per record. This takes 2.2 ms a frame off it, and the city bench goes 39.1 → 41.5 FPS ([R8_T2_OPTIMIZATION.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R8_T2_OPTIMIZATION.md)).
   - The frontend and the Vulkan emitter run on threads of their own, with a 128-entry command ring: the live city goes 28.6 → 36.1 FPS.
   - **The native G-buffer draw `0x1a1770`** is prepared from the engine's own state, without walking its shader resources.
   - A profiler of the command processor thread, and a channel that publishes the engine's constant update engine snapshots to it. The reuse of pixel-shader preparations (`SSPC_R8_CP_STAGE_REUSE`) is in, off by default.
@@ -323,7 +323,7 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 | Vehicle-light glow visible through fences and walls | visibility queries always reported "fully visible" | real Vulkan occlusion queries, results given to the game's compute shader |
 | Smoke flickering | the particle sort merged all widths in one dispatch; on the PS4 that is one 64-lane wave, on PC two 32-lane subgroups raced | one dispatch per merge level with a barrier |
 | Wrong lighting colours | colour target component swap was masked out | COMP_SWAP honoured |
-| Races in the game's own code that the PC's timing exposes | — | targeted fixes, [`docs/GAME_FIXES.md`](docs/GAME_FIXES.md) |
+| Races in the game's own code that the PC's timing exposes | — | targeted fixes, [`GAME_FIXES.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/GAME_FIXES.md) |
 
 ### Shader cache and preparation
 
@@ -345,7 +345,7 @@ SecondSonPC's GCN → SPIR-V translator lives in `src/runtime/gpu/gcn/`. It has 
 | Vertex (incl. rect / quad lists) | 133 / 0, 149 / 0 | all valid |
 | Pixel | 369 / 0, 516 / 0 | all valid |
 
-Offline, over all 10 301 GCN programs in the game's files, 7 934 modules were emitted, all valid; the rest need the game's runtime state. Vulkan Validation with Synchronization Validation reported 0 messages. Details: [`docs/OWN_SHADER_TRANSLATOR.md`](docs/OWN_SHADER_TRANSLATOR.md).
+Offline, over all 10 301 GCN programs in the game's files, 7 934 modules were emitted, all valid; the rest need the game's runtime state. Vulkan Validation with Synchronization Validation reported 0 messages. Details: [`OWN_SHADER_TRANSLATOR.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/OWN_SHADER_TRANSLATOR.md).
 
 ## Native engine reconstruction
 
@@ -369,7 +369,7 @@ The native engine work replaces individual engine functions with SecondSonPC's i
 | G-buffer pass and its draws | `0x1a2030`, `0x1a1770`, `0x1a1960` | 6.3 M / 21.3 M draws in `verify`, 0 mismatches |
 | Shadow pass, instanced shadow draw, shadow UVs | `0x43d590`, `0x43d480`, `0x451700` | 17.5 M native shadow draws, 4.4 M UV calls, 0 mismatches |
 
-**Why it gives no FPS by itself.** These functions run on the game's job threads, while the frame waits for command processing, async compute and the GPU. What R5–R7 deliver is an engine whose render path increasingly runs on code the project owns. Using the engine's knowledge to cut command processor work began in R8 (the native G-buffer draw, the CUE snapshot channel). Details: [`docs/NATIVE_ENGINE_RECONSTRUCTION.md`](docs/NATIVE_ENGINE_RECONSTRUCTION.md), [`docs/NATIVE_ENGINE_R7_RESULTS.md`](docs/NATIVE_ENGINE_R7_RESULTS.md).
+**Why it gives no FPS by itself.** These functions run on the game's job threads, while the frame waits for command processing, async compute and the GPU. What R5–R7 deliver is an engine whose render path increasingly runs on code the project owns. Using the engine's knowledge to cut command processor work began in R8 (the native G-buffer draw, the CUE snapshot channel). Details: [`NATIVE_ENGINE_RECONSTRUCTION.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_RECONSTRUCTION.md), [`NATIVE_ENGINE_R7_RESULTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_R7_RESULTS.md).
 
 ## PC settings
 
@@ -382,18 +382,18 @@ The PC options live inside the game's own menu: **Esc (Options) → Settings →
 - Options that need a restart show a badge, and unavailable options say why.
 - The window scales with the game window and DPI, from 800 × 600 to 4K and 21:9.
 
-Details: [`docs/PC_SETTINGS_UI.md`](docs/PC_SETTINGS_UI.md).
+Details: [`PC_SETTINGS_UI.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/PC_SETTINGS_UI.md).
 
 ## Input and button prompts
 
 Keyboard and mouse are handled natively, with PC key bindings. The game draws every button prompt from one icon font, and SecondSonPC redraws the physical-button cells for the active input device. So **all** prompts of the game, in every language, switch between keyboard/mouse, Xbox and PlayStation, without editing strings or files.
 
 <p align="center">
-  <img src="docs/images/prw1.png" alt="Keyboard and mouse prompt adaptations" width="900">
+  <img src=".github/readme/prw1.png" alt="Keyboard and mouse prompt adaptations" width="900">
 </p>
 
 <p align="center">
-  <img src="docs/images/prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
+  <img src=".github/readme/prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
 </p>
 
 ## Branches
@@ -443,11 +443,11 @@ Vulkan 1.3 driver
 ## Known issues
 
 - **Performance.** Dense scenes are bound by CPU-side command processing, Vulkan recording and the game's async compute: the open city runs at ~36 FPS and gameplay at 46–51 FPS on the development PC, far from a locked 60.
-- **Intel CPUs** lack SSE4a. In a forced test on AMD, the 73 short `extrq` emulated through faults cost ~10 % FPS at the start of a scene. A real Intel CPU has not been tested ([SSPC-011](docs/KNOWN_ISSUES.md)).
+- **Intel CPUs** lack SSE4a. In a forced test on AMD, the 73 short `extrq` emulated through faults cost ~10 % FPS at the start of a scene. A real Intel CPU has not been tested ([SSPC-011](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md)).
 - **Tested hardware.** Only one PC was tested: Ryzen 5 5500, RTX 2060 and Windows 10. AMD and Intel GPUs and other drivers are unknown.
 - **Game version.** Only CUSA00004 with update 01.07 (EU) is tested; the engine replacements install only on that executable.
 - **From shadPS4.** Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4, and the build still needs `third_party/shadPS4`.
-- **Memory.** On a PC without a page file, total committed memory can reach the Windows limit in long sessions; keep the page file on. Fixed causes are in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- **Memory.** On a PC without a page file, total committed memory can reach the Windows limit in long sessions; keep the page file on. Fixed causes are in [`KNOWN_ISSUES.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md).
 - **Shader preparation** cannot predict every program: 166 of about 304 000 predicted shader requests are declined by the own translator (for example an `image_sample` whose resource is not known before the game runs). The game translates those the first time it uses them, which can cause one short stutter.
 - **Frame generation** has not been reviewed frame by frame, and input latency with it is not measured.
 - There is no full-campaign compatibility guarantee.
@@ -491,7 +491,7 @@ Vulkan 1.3 driver
 
 ## Reports
 
-Every phase ends with a report: what was measured, what was kept, what was rejected and why. The full list, **135 reports** in `main`, in the branches and in the tools archive, grouped by area, is in **[`docs/REPORTS.md`](docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English.
+Every phase ends with a report: what was measured, what was kept, what was rejected and why. They are not part of the build, so they are not in `main`: the full list, **135 reports** at the tag `archive/docs-20261023`, in the branches and in the tools archive, grouped by area, is in **[`REPORTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English.
 
 ## Contributing
 
