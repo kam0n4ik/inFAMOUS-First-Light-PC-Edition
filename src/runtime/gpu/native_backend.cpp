@@ -25,6 +25,7 @@
 
 #include "base/lifecycle.h"
 #include "base/log.h"
+#include "engine/guest_hooks.h"
 #include "runtime/gpu/backend.h"
 #include "runtime/gpu/command_processor.h"
 #include "runtime/gpu/frame_log.h"
@@ -37,6 +38,7 @@
 #include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
+#include "runtime/gpu/r9/gprof.h"
 #include "runtime/gpu/parallel_cp.h"
 #include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/r8/r8_verify.h"
@@ -276,6 +278,9 @@ public:
     // ---- MemoryListener (the guest memory manager's threads)
     void OnUnmap(u64 addr, u64 size) override {
         Inspector::GuestMap(true);
+        if (Gprof::On()) {
+            Gprof::Add(Gprof::Ctr::GuestUnmaps, 1);
+        }
         memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (guest_) {
@@ -289,6 +294,9 @@ public:
     void OnRegister(u64, u64) override {}
     void OnMap(u64 addr, u64 size) override {
         Inspector::GuestMap(false);
+        if (Gprof::On()) {
+            Gprof::Add(Gprof::Ctr::GuestMaps, 1);
+        }
         memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (images_) {
@@ -956,6 +964,22 @@ bool Backend::Start(const Options& o, std::string& error) {
     VideoOut::BufferLabelAddress(1, label_base_);
     FrameLog::Start();
     ShaderTrace::SetOrigin(FrameLog::StartTsc());
+    // R9: SSPC_R9_GPROF=1|2 - the gameplay profiler (every thread's CPU time, code samples, counters, marks)
+    if (Gprof::On()) {
+        Gprof::SetPoll(
+            [](void* ctx, u64* polled) {
+                const PageTracker::Stats st = static_cast<const PageTracker*>(ctx)->GetStats();
+                const FrameLog::Progress pr = FrameLog::GetProgress();
+                polled[0] = st.faults;
+                polled[1] = st.arms;
+                polled[2] = pr.game;
+                polled[3] = pr.cp;
+                polled[4] = pr.present;
+            },
+            &tracker_);
+        Gprof::Start({.logs_dir = o.logs_dir, .guest_lo = Engine::GuestImageBase(),
+                      .guest_hi = Engine::GuestImageEnd(), .origin_tsc = FrameLog::StartTsc()});
+    }
     // P4.12: SSPC_P412_STALL_TRACE=light|deep[,...] - the stall trace (off otherwise: nothing of it runs); deep mode
     // converts the batches' GPU timestamps with the device's calibrated timestamps (GPU ticks <-> QPC)
     if (ShaderTrace::On()) {
@@ -1861,8 +1885,15 @@ void Backend::Stop() {
     if (disk_) {
         disk_->SetPeriodic(nullptr, nullptr, 0);
     }
+    const u32 saves_before = pcache_ ? pcache_->Saves() : 0;
     if (pcache_ && pcache_->Save()) { // (P4.14: the driver's compiled pipelines for the next run)
-        SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved", static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+        if (pcache_->Saves() == saves_before) {
+            SSPC_LOG(GPU, Info, "pipeline cache: not saved - nothing new since it was {} (R9-F1, {} checks)",
+                     saves_before == 0 ? "loaded" : "last saved", pcache_->SavesSkipped());
+        } else {
+            SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved",
+                     static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+        }
     }
     if (disk_) {
         if (pipelines_) {
@@ -1875,6 +1906,7 @@ void Backend::Stop() {
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
     CpProfile::WriteCsv(options_.logs_dir); // (SSPC_R8_CP_PROFILE_CSV=1)
+    Gprof::Stop(); // (R9; the backend's threads stopped - the game's may still run, the sampler stops first)
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
     StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
     ShaderTrace::Stop(); // (P4.14)
@@ -2154,8 +2186,9 @@ std::string Backend::CacheReport() {
                            p.missing_spirv, p.claimed, p.taken, pre->NeverTaken());
     }
     if (pcache_) {
-        out += fmt::format("pipeline cache (driver): at start {}; saved {} times, last {:.1f} MiB\n", pcache_->LoadNote(),
-                           pcache_->Saves(), static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+        out += fmt::format("pipeline cache (driver): at start {}; saved {} times, last {:.1f} MiB; skipped {} (R9-F1: "
+                           "nothing new)\n", pcache_->LoadNote(), pcache_->Saves(),
+                           static_cast<double>(pcache_->SavedBytes()) / (1 << 20), pcache_->SavesSkipped());
     }
     if (!game_index_.Empty()) {
         // the packs this run's programs are in (observed, not guessed from the packs' names)

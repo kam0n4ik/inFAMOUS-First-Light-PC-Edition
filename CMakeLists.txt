@@ -210,6 +210,11 @@ foreach(_r8 core profile cp render recomp verify)
 endforeach()
 target_sources(sspc_runtime PRIVATE ${SSPC_R8_CORE_SOURCES} ${SSPC_R8_PROFILE_SOURCES} ${SSPC_R8_CP_SOURCES}
                ${SSPC_R8_RENDER_SOURCES} ${SSPC_R8_RECOMP_SOURCES} ${SSPC_R8_VERIFY_SOURCES})
+# R9 (docs/R9_GAMEPLAY_PERFORMANCE.md): the same, one list per R9 part (cmake/r9/<part>.cmake)
+foreach(_r9 profile)
+    include(${CMAKE_SOURCE_DIR}/cmake/r9/${_r9}.cmake)
+endforeach()
+target_sources(sspc_runtime PRIVATE ${SSPC_R9_PROFILE_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation

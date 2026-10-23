@@ -64,6 +64,7 @@
 #include "bridge/shadps4/track_diag.h"
 #include "engine/game_clock_probe.h"
 #include "runtime/gpu/r8/r8_verify_frame.h"
+#include "runtime/gpu/r9/gprof.h"
 #include "engine/guest_hooks.h"
 #include "engine/game_fixes.h"
 #include "engine/job_system.h"
@@ -1003,8 +1004,9 @@ void StartFrameLog(const std::filesystem::path& file) {
 ///   mouse_left | mouse_right | mouse_middle   the same for a mouse button
 ///   move:<dx>:<dy>    relative mouse movement spread evenly over `hold` s (10 ms steps)
 ///   shot              one frame of the game -> <logs>\shots\<seconds>s.png (bridge screenshot)
+///   mark:<label>      R9 gameplay profiler (SSPC_R9_GPROF): a marked moment (the phase of a scripted fight/flight)
 void StartTestInput(const std::string& spec, const std::filesystem::path& logs_dir) {
-    enum class Kind { KeyDown, KeyUp, ButtonDown, ButtonUp, Move, Shot };
+    enum class Kind { KeyDown, KeyUp, ButtonDown, ButtonUp, Move, Shot, Mark };
     struct Event {
         double at;
         Kind kind;
@@ -1030,6 +1032,8 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
         const double hold = has_hold ? std::strtod(rest + 1, nullptr) : 0.15;
         if (what == "shot") {
             timeline.push_back({at, Kind::Shot, {}, 0, 0, 0, fmt::format("{:g}s", at)});
+        } else if (what.starts_with("mark:")) {
+            timeline.push_back({at, Kind::Mark, {}, 0, 0, 0, what.substr(5)});
         } else if (what.starts_with("move:")) {
             float dx = 0.0f, dy = 0.0f;
             if (std::sscanf(what.c_str(), "move:%f:%f", &dx, &dy) != 2) {
@@ -1112,6 +1116,9 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.motion.xrel = ev.dx;
                 e.motion.yrel = ev.dy;
                 SDL_PushEvent(&e);
+                break;
+            case Kind::Mark:
+                Gpu::Gprof::Mark(ev.label);
                 break;
             case Kind::Shot: {
                 // The bridge saves the next presented frame into its screenshots folder; the new

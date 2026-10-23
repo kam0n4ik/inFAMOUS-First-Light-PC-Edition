@@ -55,6 +55,7 @@ public:
     u64 LoadedBytes() const { return loaded_bytes_; }
     u64 SavedBytes() const { return saved_bytes_.load(); }
     u32 Saves() const { return saves_.load(); }
+    u32 SavesSkipped() const { return skipped_.load(); } ///< R9-F1: the driver's data as large as the last one
 
     /// Self-test: the next Save() stops after writing `bytes` of the temporary file (an interrupted save).
     void TestTearNextSave(u64 bytes) { tear_ = bytes; }
@@ -69,6 +70,9 @@ private:
     u64 loaded_bytes_ = 0;
     std::atomic<u64> saved_bytes_{0};
     std::atomic<u32> saves_{0};
+    std::atomic<u32> skipped_{0};
+    u64 last_bytes_ = 0; ///< R9-F1: the driver's data loaded or last saved (save_mutex_)
+    bool SaveR9(); ///< R9-F1 (SSPC_R9_PCACHE=1): SaveOwned without the copies, skipped when the size is the same
     std::mutex save_mutex_;
     u64 tear_ = 0;
     bool crash_after_tear_ = false; ///< SSPC_DIAG_PIPELINE_CACHE_TEAR
