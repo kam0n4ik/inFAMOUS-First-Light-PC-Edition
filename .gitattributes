@@ -2,3 +2,5 @@
 patches/** -text
 # Windows command scripts
 *.cmd text eol=crlf
+# the player's notes beside play.cmd
+game/*.txt text eol=crlf

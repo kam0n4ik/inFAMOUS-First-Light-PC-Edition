@@ -98,6 +98,16 @@ New-Item -ItemType Directory -Force $dist | Out-Null
 Copy-Item $exePath, (Join-Path $bld "bin\*.dll") $dist
 Copy-Item -Recurse (Join-Path $bld "bin\fonts") $dist
 Copy-Item -Recurse (Join-Path $root "game\*") $dist
+# the vendors' licences of the upscaler DLLs shipped beside the executable
+$ups = Join-Path $root "third_party\upscalers"
+foreach ($l in @(@("ngx\LICENSE.txt", "NVIDIA-DLSS-SDK.txt"), @("ffx-api\LICENSE.txt", "AMD-FidelityFX-SDK.txt"),
+                 @("streamline\license.txt", "NVIDIA-Streamline.txt"))) {
+    $from = Join-Path $ups $l[0]
+    if (Test-Path $from) {
+        New-Item -ItemType Directory -Force (Join-Path $dist "licenses") | Out-Null
+        Copy-Item $from (Join-Path $dist "licenses\$($l[1])")
+    }
+}
 $zip = Join-Path $root "dist\SecondSonPC-win64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip
