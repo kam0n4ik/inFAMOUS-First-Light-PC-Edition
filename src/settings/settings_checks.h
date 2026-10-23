@@ -1,7 +1,7 @@
 // SecondSonPC — self-tests of the PC settings (no game, no window): registry, user settings file (save, restore,
 // corrupt files, atomic writes), the settings service (ranges, restart, reset, appliers), key bindings and conflicts,
 // keyboard/mouse additions, controller tuning, device switching, the menu model. Run by --selftest (group Settings)
-// and by the standalone tests/settings_tests program. Own code.
+// (and by the standalone settings tests, tag archive/tests-20261023). Own code.
 #pragma once
 
 #include <filesystem>

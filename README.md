@@ -188,7 +188,7 @@ What follows from that:
 
 ## Building from source
 
-Only what is needed to build is in this repository: `src/`, `cmake/`, `patches/`, `assets/`, `tests/`, `third_party/spirv_headers`, `CMakeLists.txt` and `build.ps1`. The files that go into the game's folder are in `game/`. The development scripts and the measurement stand that used to live in `tools/` are kept at the tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023).
+Only what is needed to build is in this repository: `src/`, `cmake/`, `patches/`, `assets/`, `third_party/spirv_headers`, `CMakeLists.txt` and `build.ps1`. The files that go into the game's folder are in `game/`. The development scripts and the measurement stand that used to live in `tools/` are kept at the tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023). The offline tests are kept at the tag [`archive/tests-20261023`](../../tree/archive/tests-20261023/tests): the reconstructed engine functions and the recompiler checked against the game's `eboot.bin` (the numbers quoted above), and the PC settings.
 
 ### What you need
 

@@ -307,91 +307,14 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/ui/settings_menu.cpp
 )
 # Settings and draw commands are written with designated initializers that leave the other fields at their defaults.
-set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp tests/settings_tests/main.cpp
+set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp
                             PROPERTIES COMPILE_OPTIONS "-Wno-missing-designated-field-initializers")
 target_sources(sspc_runtime PRIVATE ${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp src/ui/prompt_service.cpp)
 target_link_libraries(sspc_runtime PUBLIC d2d1 dwrite windowscodecs ole32)
 target_sources(shadps4 PRIVATE ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/settings_host.cpp) # the bridge's live settings
 
-# Standalone tests of the PC settings and screenshots of the menu: SecondSonPC's sources only, no bridge, no game
-# (cmake --build <dir> --target sspc_settings_tests; tests/settings_tests/main.cpp).
-add_executable(sspc_settings_tests EXCLUDE_FROM_ALL
-    tests/settings_tests/main.cpp
-    ${SSPC_PC_SETTINGS_SOURCES}
-    src/app/config.cpp
-    src/base/log.cpp
-    src/runtime/language.cpp
-    src/input/settings.cpp
-    src/input/keyboard_mouse.cpp
-    src/input/motion.cpp
-)
-target_include_directories(sspc_settings_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(sspc_settings_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_compile_options(sspc_settings_tests PRIVATE /utf-8 /W4)
-target_link_libraries(sspc_settings_tests PRIVATE fmt::fmt toml11::toml11 SDL3::SDL3 d2d1 dwrite windowscodecs ole32 uuid)
-set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# Standalone tests of the reconstructed engine code (src/engine; docs/native-reconstruction): no bridge, no game
-# (cmake --build <dir> --target sspc_engine_tests; tests/engine_tests/main.cpp [--bench]).
-add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
-    tests/engine_tests/main.cpp
-    src/runtime/psf/param_sfo.cpp
-    src/runtime/gpu/gcn/spirv_builder.cpp
-    src/engine/guest_hooks.cpp
-    src/engine/guest_probe.cpp
-    src/engine/job_system.cpp
-    src/engine/particles/smoke_quality.cpp
-    src/engine/render/dcb_scan.cpp
-    src/engine/render/native_draw.cpp
-    src/engine/render/native_render_layer.cpp
-    src/engine/render/native_render_ops.cpp
-    src/engine/render/native_state.cpp
-    src/engine/render/pass_graph.cpp
-    src/engine/ui/game_menu.cpp
-    src/runtime/gpu/pm4.cpp
-    src/base/log.cpp
-)
-target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/spirv_headers/include)
-target_compile_definitions(sspc_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-target_compile_options(sspc_engine_tests PRIVATE /utf-8 /W4)
-target_link_libraries(sspc_engine_tests PRIVATE fmt::fmt)
-set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# Standalone tests of Native Engine Reconstruction (src/native_engine; docs/NATIVE_ENGINE_RECONSTRUCTION.md): the ABI
-# boundary, clones, the registry's modes, and - given the game's eboot.bin - each reconstruction against the eboot's own
-# code (cmake --build <dir> --target sspc_native_engine_tests; tests/native_engine_tests/main.cpp).
-add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
-    tests/native_engine_tests/main.cpp
-    tests/native_engine_tests/lift_check.cpp
-    tests/native_engine_tests/gbuffer_tests.cpp
-    tests/native_engine_tests/shadow_tests.cpp
-    src/native_engine/guest_code_clone.cpp
-    src/native_engine/native_engine_verify.cpp
-    src/native_engine/native_function_registry.cpp
-    src/native_engine/native_measure.cpp
-    src/native_engine/reconstructed/cue_set_buffers.cpp
-    src/native_engine/reconstructed/cue_commit.cpp
-    src/native_engine/reconstructed/material_bind.cpp
-    src/native_engine/reconstructed/frame_scratch.cpp
-    src/native_engine/reconstructed/gbuffer_draw_constants.cpp
-    src/native_engine/reconstructed/object_constants.cpp
-    src/native_engine/reconstructed/shadow_instance_uv.cpp
-    src/engine/guest_hooks.cpp
-    src/engine/guest_probe.cpp
-    src/loader/image_file.cpp
-    src/base/log.cpp
-)
-target_sources(sspc_native_engine_tests PRIVATE ${SSPC_R6_CORE_TEST_SOURCES} ${SSPC_R6_GBUFFER_TEST_SOURCES}
-               ${SSPC_R6_SHADOWS_TEST_SOURCES} ${SSPC_R7_CORE_TEST_SOURCES} ${SSPC_R7_GBUFFER_TEST_SOURCES}
-               ${SSPC_R7_SHADOWS_TEST_SOURCES} ${SSPC_R7_RESOURCES_TEST_SOURCES} ${SSPC_R8_CORE_TEST_SOURCES}
-               ${SSPC_R8_PROFILE_TEST_SOURCES} ${SSPC_R8_CP_TEST_SOURCES} ${SSPC_R8_RENDER_TEST_SOURCES}
-               ${SSPC_R8_RECOMP_TEST_SOURCES} ${SSPC_R8_VERIFY_TEST_SOURCES})
-target_include_directories(sspc_native_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(sspc_native_engine_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-target_compile_options(sspc_native_engine_tests PRIVATE /utf-8 /W4)
-target_link_libraries(sspc_native_engine_tests PRIVATE fmt::fmt Zydis::Zydis xbyak::xbyak)
-set_target_properties(sspc_native_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# The standalone tests (sspc_settings_tests, sspc_engine_tests, sspc_native_engine_tests: the PC settings, and the
+# reconstructed engine code against the game's eboot.bin) are not in this tree: tag archive/tests-20261023.
 
 # Upscaling and frame generation (docs/UPSCALING_FRAME_GENERATION.md). The vendors' SDKs are not part of the sources:
 # they are put into third_party/upscalers by hand (README.md, Building from source: NVIDIA DLSS SDK headers +
@@ -437,4 +360,3 @@ add_custom_target(sspc_fonts ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_sspc_fonts} ${CMAKE_BINARY_DIR}/bin/fonts
     COMMENT "SecondSonPC: menu fonts")
 add_dependencies(shadps4 sspc_fonts)
-add_dependencies(sspc_settings_tests sspc_fonts)
