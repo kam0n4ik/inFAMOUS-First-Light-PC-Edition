@@ -45,7 +45,9 @@ $head = (git -C $shad rev-parse HEAD 2>$null)
 if ($head -ne $shadCommit) {
     Invoke-Logged "checkout shadPS4 $($shadCommit.Substring(0, 10))" "git -C `"$shad`" checkout --quiet $shadCommit"
 }
-Invoke-Logged "shadPS4 submodules" "git -C `"$shad`" submodule update --init --recursive --jobs 8"
+# (--force: an update stopped by a network error leaves the submodules it had cloned but not yet checked out empty, and
+# a rerun without it takes them as up to date; patches\shadps4 change only shadPS4's src/, never a submodule)
+Invoke-Logged "shadPS4 submodules" "git -C `"$shad`" submodule update --init --recursive --force --jobs 8"
 
 # 2. compiler environment
 $haveEnv = $env:INCLUDE -and $env:LIB -and (Get-Command link.exe -ErrorAction SilentlyContinue)
