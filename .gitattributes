@@ -1,0 +1,4 @@
+# The shadPS4 patches are applied byte for byte by the configure step (git apply): never converted on checkout
+patches/** -text
+# Windows command scripts
+*.cmd text eol=crlf
