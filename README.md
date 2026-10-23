@@ -1,46 +1,249 @@
 # inFAMOUS: Second Son — PC Edition
 
-**A Windows PC port project for inFAMOUS: Second Son.**
+**inFAMOUS: Second Son on Windows, on a PC runtime of its own.**
 
-An independent engineering project that runs the original PlayStation 4 game on Windows on its own runtime: its own loader, kernel, memory, threading, system services, GPU command processor, Vulkan backend, GCN shader translator and — function by function — native reconstructions of the game engine's own render code.
+The original PlayStation 4 game runs on Windows on SecondSonPC; its executable and data are left unchanged. SecondSonPC brings its own loader, kernel, memory manager and system services, its own GPU command processor, Vulkan 1.3 backend and GCN → SPIR-V shader translator, and native replacements of selected functions of the game's engine. The game's own x86-64 code runs directly on the PC's processor: there is no CPU emulation.
 
-> **Status: in development, playable.** The game starts, loads saves and is played on the project's own runtime, Vulkan backend and shader translator. Most PlayStation system services are native; what still comes from shadPS4 is listed exactly below. On the development machine the open city runs at ~32 FPS, the other test scenes at 36–55 FPS (table under [Performance](#performance)).
+> **Status: in development, playable.** The game starts, loads saves and is played through. On the development PC (Ryzen 5 5500, RTX 2060 6 GB), gameplay in the city runs at 46–51 FPS with a 1 % low of 26–28; the test scenes run at 36–53 FPS ([Benchmarks](#benchmarks)).
 
 <p align="center">
-  <img src="pc-edition-banner.png"
-       alt="inFAMOUS: Second Son — PC Edition"
-       width="100%">
+  <img src="docs/images/pc-edition-banner.png" alt="inFAMOUS: Second Son — PC Edition" width="100%">
 </p>
 
 <p align="center">
+  <a href="#installation">Installation</a> ·
+  <a href="#requirements">Requirements</a> ·
+  <a href="#what-makes-it-different">Advantages</a> ·
+  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="#cpu-native-x86-64-and-avx">CPU and AVX</a> ·
+  <a href="#building-from-source">Building</a> ·
   <a href="#where-the-project-is">Status</a> ·
-  <a href="#what-is-new">What is new</a> ·
-  <a href="#graphics">Graphics</a> ·
-  <a href="#own-shader-translator">Shader translator</a> ·
-  <a href="#native-engine-reconstruction">Native engine</a> ·
-  <a href="#performance">Performance</a> ·
   <a href="#pc-settings">PC settings</a> ·
-  <a href="#input-and-button-prompts">Input</a> ·
-  <a href="#work-in-progress-and-experiments">Branches</a> ·
-  <a href="#reports">Reports</a> ·
-  <a href="#roadmap">Roadmap</a>
+  <a href="#known-issues">Known issues</a> ·
+  <a href="#reports">Reports</a>
 </p>
 
 ---
 
-## Overview
+## What makes it different
 
-The project began as a launcher on top of the shadPS4 emulator core and has been replacing it piece by piece. Today the game runs on SecondSonPC's own code for nearly everything that matters at run time; shadPS4 is still linked into the build and provides a shrinking set of functions (below).
+- **The game's code runs natively on your CPU.** The PS4's processor is an x86-64 AMD Jaguar, so the game's executable is ordinary x86-64 code: 2.3 million instructions, 397 000 of them AVX. SecondSonPC loads it like a native program. There is no interpreter, no JIT and no binary translation, and every instruction runs at the CPU's full speed. Only what touches PS4-specific state is patched once at load time: thread-pointer (`fs:`) accesses (3 616 sites) and, on Intel CPUs, AMD's SSE4a ([CPU: native x86-64 and AVX](#cpu-native-x86-64-and-avx)).
+- **A GPU path built for a PC processor.** The game's PM4 command buffers go through SecondSonPC's command processor, which is spread over four threads:
+  - packet parsing;
+  - draw preparation;
+  - Vulkan recording;
+  - Vulkan submission.
 
-It is not a remake and not a source-code reconstruction of the whole game: the original executable and assets are used unchanged. The project replaces the platform underneath them and, since October 2026, also re-implements selected functions of the engine itself, each one checked call by call against the original.
+  Then:
+  - The 5 600–12 000 draws of a frame are pipelined across cores.
+  - Runs of draws that differ only in geometry are recorded as one unit (CITY-OPT).
+  - A frame is handed over as soon as the game finishes it.
+  - Memory waits whose condition always holds skip the guest read.
+- **No shader-compile stutter after the first start.**
+  - The game's shaders are predicted from its own pack files and compiled once, before the game starts.
+  - Translated SPIR-V and the driver's pipeline cache are kept on disk.
+  - The pipeline cache is saved without blocking the renderer (R9 F1), which removed 1–5 s freezes once a minute.
+- **Free frame pacing.** Frame pacing is not tied to the PS4's 59.94 Hz vblank. The frame-rate limit is 30, 60, 90, 120, 144, 165, 240 or unlimited, and the game's clock was measured to be independent of FPS. The 1 % lows went from 29 to 47–49 FPS on the beach and in the harbour.
+- **DLSS, FSR 3.1, FSR 3.1 frame generation and NVIDIA Reflex inside the game's frame.** Motion vectors, depth and jitter are taken from the game. The HUD is drawn afterwards at full resolution.
+- **The engine's own functions, rebuilt and proven.** 18 render functions of the engine (G-buffer and shadow passes, materials, the constant update engine) have SecondSonPC implementations. They are hand-written or produced by the project's static recompiler (Ghidra P-code → C++, AVX), and each is verified call by call against the original in the running game: 0 mismatches over tens of millions of calls.
+- **PC-native around the game.**
+  - Settings live inside the game's own menu.
+  - Keyboard and mouse are supported, and every button prompt is redrawn for keyboard, Xbox or PlayStation.
+  - Audio goes out through WASAPI; cutscene video is decoded natively.
+  - `play.cmd` backs up your saves before every start.
+- **No PS4 firmware.** The system libraries the game imports are implemented by the project (336 of 417 natively, the rest from the shadPS4 core linked in). Only your own copy of the game is needed.
+- **Measured, not guessed.** Every change is decided by an interleaved A/B on the same build, and experiments that lost are documented too: [135 reports](docs/REPORTS.md).
 
-All numbers in this file were measured on the development machine (RTX 2060 6 GB, Ryzen 5 5500, Windows 10, 32 GB RAM) in fixed test scenes — the open city, the village, the beach and the harbour — unless stated otherwise. Every report behind them is listed in [`docs/REPORTS.md`](docs/REPORTS.md).
+## Installation
+
+**This project does not distribute the game, its executable, assets or any copyrighted content.** You need your own, legally obtained copy of inFAMOUS: Second Son and must prepare its files yourself.
+
+1. **The game's folder.** You need a decrypted dump of your copy of **CUSA00004** with **update 01.07** applied: one folder that holds `eboot.bin`, `sce_module`, `sce_sys` and `art` (about 30 GB). The European release is the one that was tested; its folder has the marker file `++ retail 0212.1422 i3_eu ship ++`. No PS4 firmware files are needed.
+2. **SecondSonPC.** Download `SecondSonPC-win64.zip` from [Releases](../../releases), or [build it](#building-from-source), and copy everything in it **into the game's folder**, next to `eboot.bin`. None of the game's files are replaced. The zip contains:
+
+   | File | What |
+   |---|---|
+   | `SecondSonPC.exe` | the runtime |
+   | `play.cmd` | starts the game with every improvement that is on for players, after backing up the saves |
+   | `play_experimental.cmd` | `play.cmd` plus two faster experiments with less even frame pacing (REA-3 + AQ, [R9_REA3_FIX.md](docs/R9_REA3_FIX.md)) |
+   | `SecondSonPC.toml` | defaults: window, language, keys, PC settings |
+   | `data\static_templates.txt` | the data the shader preparation predicts the game's shaders from |
+   | `sspc_dlss.dll`, `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `sl.*.dll`, `NvLowLatencyVk.dll` | NVIDIA DLSS 310.9.1, Streamline 2.14.1, Reflex |
+   | `amd_fidelityfx_vk.dll` | AMD FidelityFX SDK 1.1.4 (FSR 3.1 upscaling and frame generation) |
+   | `fonts\`, `licenses\` | the menu fonts and the vendors' licences |
+   | `SecondSonPC-README.txt` | these steps in short |
+
+3. **The Visual C++ runtime.** Install the [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it is not installed yet.
+4. **Start `play.cmd`.**
+   - On the first start a console window prepares the game's shaders: they are compiled before the game starts. This happens once and takes a few minutes. Later starts take about two seconds.
+   - It runs again only after a driver or SecondSonPC update.
+5. **PC settings:** in the game, open **Esc (Options) → Settings → "Additional settings"**.
+
+Where things are kept:
+
+| Path | What |
+|---|---|
+| `userdata\` (in the game's folder) | saves; `play.cmd` copies them to `userdata\savedata_backups\<date_time>` before every start |
+| `%LOCALAPPDATA%\SecondSonPC\settings.toml` | your changes from the in-game settings window (they override `SecondSonPC.toml`) |
+| `cache\shaders\` | prepared shaders and the driver's pipeline cache (about 1 GB; safe to delete, it is prepared again) |
+| `logs\SecondSonPC.log` | the log; attach it to a bug report |
+
+To keep SecondSonPC outside the game's folder, set `[Game] path` in `SecondSonPC.toml` to the game's folder instead of `"."`.
+
+## Requirements
+
+| | Required | Tested |
+|---|---|---|
+| OS | Windows 10 or 11, 64-bit | Windows 10 Pro 22H2 (19045) |
+| CPU | x86-64 with SSE2–SSE4.2, POPCNT, **AVX**, F16C, BMI1, LZCNT, MOVBE: any AMD Ryzen, or an Intel Core of the 4th generation (Haswell) or later. Pentium and Celeron models without AVX cannot run it. SecondSonPC checks this at start and names what is missing. 6 cores / 12 threads recommended. | AMD Ryzen 5 5500 (6 cores / 12 threads) |
+| GPU | Vulkan 1.3 with dynamic rendering, push descriptors, robustness2, a vertex attribute divisor, tessellation shaders, swapchain maintenance 1 | NVIDIA GeForce RTX 2060 6 GB, driver 596.21 |
+| VRAM | 6 GB | 6 GB |
+| RAM | 32 GB was tested, smaller amounts were not; keep the Windows page file on (the game maps several GB of guest memory) | 32 GB |
+| Disk | the game (~30 GB) + about 1 GB for the shader cache | — |
+| DLSS | NVIDIA GeForce RTX; DLSS frame generation is not implemented | RTX 2060 |
+| FSR 3.1 | any GPU above | RTX 2060 |
+
+AMD and Intel GPUs have not been tested. An Intel CPU has not been tested either; see [Known issues](#known-issues) for its expected cost.
+
+## Benchmarks
+
+All measurements are interleaved A/B series on one build, usually 3–6 runs per side with the median shown. The stand is a Ryzen 5 5500, RTX 2060 6 GB and 32 GB RAM, with the game rendering at 1920 × 1080 internally. The test scenes:
+
+| Scene | What |
+|---|---|
+| fight / traverse | live gameplay in the city: powers, or running and dashing with sharp camera turns (R9 routes) |
+| beach | heavy foliage |
+| harbour | the docks |
+| village | fires and smoke |
+| live city / city bench | the open city from a save; the bench route opens the map at 75 s |
+| owner's save | a rooftop over the waterfront with traffic |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/current-dark.svg">
+  <img alt="Average FPS and 1 % low by scene" src="docs/benchmarks/current.svg" width="880">
+</picture>
+
+| Scene | FPS | 1 % low | Preset | Date, runs | Source |
+|---|---:|---:|---|---|---|
+| Traverse (city) | 51.3 | 27.9 | `play.cmd` | 10-23, 6 | [R9](docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `final_trav`, traverse phase |
+| Fight (city) | 46.0 | 25.6 | `play.cmd` | 10-23, 6 | [R9](docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `safe_fight`, fight phase |
+| Beach | 53.1 | 35.5 | `play.cmd` without emitter batching, F1, F3 | 10-22, 3 | [NATIVE_GBUFFER_DRAW_0x1a1770](docs/NATIVE_GBUFFER_DRAW_0x1a1770.md) §9.10 |
+| Harbour | 43.2 | 32.6 | same | 10-22, 3 | same |
+| Village | 37.6 | 30.2 | same | 10-22, 3 | same |
+| Live city | 36.1 | 24.7 | threads of `play.cmd` without native G-buffer, batching, F1, F3 | 10-22, 3 | series `s2_live` (raw series, no separate report) |
+| Owner's save | 30.0 | 21.6 | `play.cmd` | 10-23, 3 | [R9_REA3_FIX](docs/R9_REA3_FIX.md) §2.5 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/fps-ab-dark.svg">
+  <img alt="Average FPS before and after each measured change" src="docs/benchmarks/fps-ab.svg" width="880">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/low1-ab-dark.svg">
+  <img alt="1 % low FPS before and after each measured change" src="docs/benchmarks/low1-ab.svg" width="880">
+</picture>
+
+The worst frames are where the gameplay work (R9) shows most:
+- traverse: max frame 4 645 → 156 ms with F1;
+- fight: max frame 3 166 → 82 ms with F1 + F3.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/cp-modes-dark.svg">
+  <img alt="Average FPS by command processor mode" src="docs/benchmarks/cp-modes.svg" width="880">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/upscaling-dark.svg">
+  <img alt="Average FPS by upscaling mode" src="docs/benchmarks/upscaling.svg" width="880">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/shader-cache-dark.svg">
+  <img alt="Frames over 100 ms on a first and on a repeat start" src="docs/benchmarks/shader-cache.svg" width="880">
+</picture>
+
+**Where the frame time goes.** In gameplay the game's own work on its main thread is flat at about 4.3 ms a frame. The rest of the frame waits for its async compute and for the GPU: in a fight the GPU needs ~17.5 ms and the command processor ~16.5 ms of a ~21 ms frame. In the open city, ~12 000 draws a frame make command processing and Vulkan recording the limit. Upscaling therefore helps little, and frame generation helps most: on the beach, 43–53 game frames become 86–105 shown.
+
+Not counted: no quality setting, light or shadow was lowered for any number here. The chart data and the script that draws them are in [`docs/benchmarks/`](docs/benchmarks/make_charts.py); every report behind them is in [`docs/REPORTS.md`](docs/REPORTS.md).
+
+## CPU: native x86-64 and AVX
+
+The PS4's CPU is an 8-core AMD Jaguar, an x86-64 processor. The game's executable was compiled for it, so it is valid code for a PC processor too. SecondSonPC maps it into memory at its PS4 addresses, resolves its imports to its own system libraries and jumps into it, and from then on the game's code runs on the PC's cores like any program's. What the game's modules use (decoded function by function, [PHASE3_P34_EXCEPTIONS_CPU.md](docs/PHASE3_P34_EXCEPTIONS_CPU.md) §5):
+
+| Module | Functions | Instructions | Instruction sets |
+|---|---:|---:|---|
+| `eboot.bin` | 42 483 | 2 313 273 | **AVX 396 817**, BMI 1 365, SSE2, SSE4a 96, F16C 13; `vrsqrtps` 2 699, `vrcpps` 1 684, `popcnt` 132, `lzcnt` 129, `movbe` 16 |
+| `libc.prx` | 2 442 | 163 524 | AVX, BMI, `lzcnt`, `movbe` |
+| `libSceFios2.prx` | 730 | 71 274 | AVX, BMI |
+
+What follows from that:
+
+- **The host CPU needs every set the game uses:** SSE2–SSE4.2, POPCNT, MOVBE, AVX (with the OS saving the `ymm` registers), F16C, BMI1 and LZCNT. `Cpu::HostMeetsGameRequirements` checks them before the game starts and names the missing ones.
+- **AVX runs as AVX.** The game's 397 000 AVX instructions are executed as they are, with no emulation or splitting. `vrsqrtps` and `vrcpps` give the result of the host's CPU, which differs from the Jaguar's only in the last bits of an approximation, as it does between PC CPUs.
+- **SSE4a** (`extrq`) exists only on AMD CPUs, and Ryzen has it. On Intel, SecondSonPC's CPU patcher replaces the 96 `extrq` of the game: 23 are rewritten at load time to jump into a trampoline, and the 73 that are too short for a jump are emulated when they fault ([KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) SSPC-011).
+- **Thread pointer.** The PS4 keeps the thread pointer in `fs:`; Windows does not. The 3 616 `fs:` accesses are patched to SecondSonPC's per-thread slot at load time.
+- **The rebuilt engine functions speak AVX too.** The native reconstructions of the engine's functions are compiled with `/arch:AVX` and `-ffp-contract=off`. Critical vector operations are inline assembly with the original's operand order and a 3-byte VEX prefix (`{vex3}`), because x86 keeps the NaN payload of the *first* operand and LLVM swaps commutative operands for a shorter encoding. Without that, 5–11 thousand results in 200 000 differed in one NaN bit, and so did the commands the engine sends to the GPU.
+- **The static recompiler v2** lifts the engine's x86-64 with Ghidra's P-code into C++ that is compiled with `/arch:AVX`. AVX and floating-point operations become the same processor instructions, under the current MXCSR. It is checked against the processor itself: 654 instructions × 1 000 states × 5 MXCSR modes, 3.27 million runs with 0 differences. A recompiled function is checked offline (up to 1 million generated cases) before it may be installed ([NATIVE_ENGINE_RECONSTRUCTION.md](docs/NATIVE_ENGINE_RECONSTRUCTION.md) §9.1).
+- **Hash-pinned.** A rebuilt function names its address in `eboot.bin` and the hash of its original body. On any other executable it is not installed, and the original code runs.
+
+## Building from source
+
+Only what is needed to build is in this repository: `src/`, `cmake/`, `patches/`, `assets/`, `tests/`, `third_party/spirv_headers`, `CMakeLists.txt` and `build.ps1`. The files that go into the game's folder are in `game/`. The development scripts and the measurement stand that used to live in `tools/` are kept at the tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023).
+
+### What you need
+
+| Tool | Version | Note |
+|---|---|---|
+| Git | any recent | `build.ps1` clones shadPS4 with its submodules (~4 GB) |
+| Visual Studio 2022 or Build Tools 2022 | workload *Desktop development with C++*, with a Windows 11 SDK (10.0.26100 is used) | the MSVC STL and the SDK's headers and libraries; also brings CMake and Ninja |
+| LLVM | **20** or later (20.1.8 is used) | `clang-cl` and `lld-link`; MSVC's `cl.exe` is not supported |
+| CMake | 3.24 or later | the one of Visual Studio is fine |
+| Ninja | any recent | the one of Visual Studio is fine |
+| Disk | ~8 GB | sources, shadPS4 with submodules, the build |
+
+### Steps
+
+```powershell
+git clone https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition.git
+cd inFAMOUS-Second-Son-PC-Edition
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+`build.ps1` does all of it:
+
+1. It clones shadPS4 into `third_party\shadPS4` at the pinned commit `0fe263a4760d` with its submodules. The CMake configure step applies the project's 34 patches from `patches\shadps4` to it.
+2. It sets up the compiler environment. In a *Developer PowerShell* the current one is used; otherwise `build.ps1` runs `vcvars64.bat` of the newest Visual Studio found by `vswhere` (or `-VsPath`).
+3. It configures with Ninja, `clang-cl` and LLD and builds the target `shadps4`, which produces `build\bin\SecondSonPC.exe`. `clang-cl` comes from `-LlvmPath`, `PATH`, `C:\Program Files\LLVM\bin` or Visual Studio's LLVM.
+4. It packs `dist\SecondSonPC\`, everything that goes into the game's folder, and `dist\SecondSonPC-win64.zip` of the same.
+
+A first build takes about 12 minutes on 12 threads. Options: `-Config RelWithDebInfo|Release|Debug`, `-Fresh` (configure again), `-NoPackage`. The log is `build\build.log`.
+
+### DLSS and FSR (optional)
+
+The vendors' SDKs are not part of the sources. Without them the build works, with no DLSS / FSR (the settings say why). For upscaling, put them into `third_party\upscalers` before the build:
+
+```text
+third_party\upscalers\
+  ngx\include\nvsdk_ngx*.h      NVIDIA DLSS SDK 310.9.1: its headers
+  ngx\lib\nvsdk_ngx_s.lib       its static NGX library (x64)
+  ngx\LICENSE.txt
+  ffx-api\include\ffx_api\*.h   AMD FidelityFX SDK 1.1.4: the FidelityFX API headers
+  ffx-api\LICENSE.txt
+  streamline\include\sl*.h      NVIDIA Streamline 2.14.1: its headers
+  streamline\license.txt
+  bin\                          the runtime DLLs: nvngx_dlss.dll, nvngx_dlssg.dll (DLSS SDK),
+                                amd_fidelityfx_vk.dll (FidelityFX SDK, signed prebuilt),
+                                sl.common.dll, sl.dlss_g.dll, sl.interposer.dll, sl.pcl.dll, sl.reflex.dll,
+                                NvLowLatencyVk.dll (Streamline)
+```
+
+CMake picks up what it finds. `sspc_dlss.dll` is the only binary that links NGX; `SecondSonPC.exe` loads it at run time.
 
 ## Where the project is
 
 ### PlayStation functions the game imports
 
-The game imports 417 system functions. Their owner in the current build (snapshot `docs/generated/CALLS.md`, 2026-10-18):
+The game imports 417 system functions. Their owner in the current build (snapshot [`docs/generated/CALLS.md`](docs/generated/CALLS.md)):
 
 | Owner | Functions | Called in a 2-minute gameplay run |
 |---|---:|---:|
@@ -48,217 +251,174 @@ The game imports 417 system functions. Their owner in the current build (snapsho
 | shadPS4 (bridge) | 61 | 8 |
 | shadPS4 common stub | 20 | 1 |
 
-The bridge functions the game actually calls: `sceAjmInitialize`, `sceAjmModuleRegister` (audio decoding), `sceCommonDialogInitialize`, `sceNetInit`, `sceNetPoolCreate`, `sceNetInetNtop`, `sceLibcHeapGetTraceInfo`, `fflush`; the common stub: `vprintf`.
+The bridge functions the game actually calls:
+- `sceAjmInitialize`, `sceAjmModuleRegister` (ATRAC9 audio decoding);
+- `sceCommonDialogInitialize`;
+- `sceNetInit`, `sceNetPoolCreate`, `sceNetInetNtop`;
+- `sceLibcHeapGetTraceInfo`, `fflush`;
+- the common stub `vprintf`.
+
+shadPS4 is also what the build is assembled on: its CMake target, its third-party libraries (SDL3, Vulkan headers, VMA, fmt, toml11, xbyak, Zydis) and, as A/B references only, its renderer (`--gpu-backend bridge`) and shader recompiler (`SSPC_OWN_SHADERS=bridge`). Building without it is on the [roadmap](#roadmap).
 
 ### Components
 
 | Component | State |
 |---|---|
-| Executable, loader (SELF/ELF, relocations, TLS, NID table) | Own |
-| Kernel: threads, synchronization, time, event queues, virtual / direct memory | Own, on by default |
-| Exception handling, CPU patcher (TCB / FS patches) | Own, on by default |
-| File system, system / user services, PlayGo, app content | Own |
-| Save data (`param.sfo` byte-identical to the bridge's in tests) | Own |
-| Audio output (WASAPI) | Own |
-| Video decoding (`sceVideodec*`, cutscenes) | Own |
-| Offline network, NP, trophies, HTTP | Own (offline behaviour) |
-| Keyboard / mouse input, pad API, button prompts | Own |
-| PC settings window inside the game's own menu | Own |
-| GPU: PM4 command processor | Own |
-| GPU: Vulkan backend (default `--gpu-backend sspc`) | Own |
-| Shader translation GCN → SPIR-V | Own, by default for compute, vertex and pixel programs; shadPS4's recompiler is kept only as an A/B reference (`SSPC_OWN_SHADERS=bridge`) |
-| Engine render functions (G-buffer and shadow passes, materials, constant update engine) | Own reconstructions of 18 engine functions, verified in game; off by default (`SSPC_NATIVE_ENGINE`) |
-| Ajm / ATRAC9 audio decoding | shadPS4 |
-| Common dialogs, a few network / libc functions | shadPS4 |
-| Build without `third_party/shadPS4` | Not yet |
+| Executable, loader (SELF/ELF, relocations, TLS, NID table) | own |
+| Kernel: threads, synchronization, time, event queues, virtual / direct memory | own |
+| Exception handling, CPU patcher (`fs:` patches, SSE4a) | own |
+| File system, system / user services, PlayGo, app content | own |
+| Save data | own |
+| Audio output (WASAPI), video decoding (`sceVideodec*`, cutscenes) | own |
+| Offline network, NP, trophies, HTTP | own (offline behaviour) |
+| Keyboard / mouse input, pad API, button prompts | own |
+| PC settings window inside the game's menu | own |
+| GPU: PM4 command processor (graphics + async compute), Vulkan backend | own, default |
+| Shader translation GCN → SPIR-V | own, default for compute, vertex and pixel programs; shadPS4's recompiler only as an A/B reference and for the programs the own translator declines |
+| Engine render functions (G-buffer and shadow passes, materials, constant update engine) | 18 own reconstructions, verified in game; off by default (`SSPC_NATIVE_ENGINE`) except the native G-buffer draw `0x1a1770` in `play.cmd` |
+| Ajm / ATRAC9 audio decoding, common dialogs, a few network / libc functions | shadPS4 |
 
-## What is new
+### What is new
 
-Newest first. Everything below is in `main` unless marked as a branch.
+**October 2026, the last week** (all in `main`):
 
-**October 2026, second half**
+- **R9 — gameplay, not just standing scenes.** A gameplay profiler and fixed routes (fight, traverse, a player's save), on top of which two changes went into `play.cmd`:
+  - **F1:** the driver's 827 MiB pipeline cache was saved under the shader cache's lock once a minute, freezing the game for 1–5 s. It is now saved off that lock.
+  - **F3:** the vertex heap's window into guest memory is reserved with headroom, and old windows are released, so 2.5 GB re-imports and 220–250 ms stalls are gone.
 
-- **Native engine, R5–R7.** 18 functions of the engine's render path — the G-buffer and shadow passes, their draws, material setup, the constant update engine (CUE) setters and its commit, object constants, the frame allocator — now have SecondSonPC implementations, hand-written or produced by the project's own static recompiler. Each runs in the real game in `verify` mode (both paths, compared), `guarded` mode (native with sampled checks and automatic fallback) or `native` mode. All 13 functions of R7 at once: **0 mismatches, 0 fallbacks** (for example 47.4 M native CUE commits with 185 k compared). FPS is unchanged — measured, explained [below](#native-engine-reconstruction).
-- **Static recompiler v2.** Engine functions are translated from Ghidra P-code to C++ and built into a DLL: AVX, floating point, wide values and calls to other engine functions are supported; a recompiled function is checked against the original instructions offline before it may be installed.
-- **Faster command processor in the city (R6-P).** Memory waits whose condition holds for any value no longer read guest memory: **city 28.8 → 32.8 FPS (+3.97), 1 % low +4.9, command processing −4.2 ms**; part of the city preset since `6167315`, neutral elsewhere.
-- **CITY-OPT Phase 6.** The G-buffer's instanced draws join the engine draw runs: **city 27.9 → 31.6 FPS**, 1 % low 24.2 → 26.6.
-- **CITY-OPT Phases 3–5.** The engine's own draw functions tag their draws; runs of draws that differ only in geometry are prepared and recorded as one unit: **city 25.3 → 29.4 FPS**.
-- **PC settings window, redesigned.** One compact window with seven pages, opened from the game's own *Settings* screen; live changes, restart badges, gamepad / mouse / keyboard navigation, the FPS counter on the native backend ([PC settings](#pc-settings)).
-- **One launcher with every measured improvement** — `play_unlimited.cmd` (the city preset plus the frame-rate limit from the settings). Before it carried the full preset the city ran at 24.8 FPS with DLSS; with it **31.9 FPS**, 1 % low 19.6 → 26.9.
-- **Own shader translator by default** for compute, vertex and pixel programs; 0 programs fall back to the bridge in the test scenes.
-- **Shader cache and preparation window.** Translated shaders and Vulkan pipelines are stored on disk and predicted in advance from the game's own data files; a repeat start takes ~2 s.
-- **Branches in progress:** R8 — taking work off the command processor thread with the native engine's knowledge; the *fork port* — the frontend on its own thread, an opt-in potato mode for weak PCs and a second Vulkan recording thread; *Native Rebirth* — a separate native program that plays the prologue's first mission from the original data. See [Work in progress and experiments](#work-in-progress-and-experiments).
+  Fight 44.5 → 46.0 FPS, 1 % low 7.5 → 25.6, worst frame 3 166 → 82 ms; traverse 47.4 → 51.3, 1 % low 6.1 → 27.9 ([R9_GAMEPLAY_PERFORMANCE.md](docs/R9_GAMEPLAY_PERFORMANCE.md)).
+- **R9 REA-3 and AQ, experimental.** REA-3 has the GPU take the game's second async compute wait of a frame; AQ runs the game's compute on a Vulkan queue of its own. The hang after 16 minutes is fixed by a safe reset, and the device loss with AQ is fixed. With both, the owner's save runs at +11 % FPS, but frames still alternate 17 / 43 ms, so both stay out of `play.cmd` and only `play_experimental.cmd` turns them on ([R9_REA3_FIX.md](docs/R9_REA3_FIX.md)).
+- **R8 — the command processor thread.**
+  - **Emitter batching:** the Vulkan recording thread publishes its commands once per record. This takes 2.2 ms a frame off it, and the city bench goes 39.1 → 41.5 FPS ([R8_T2_OPTIMIZATION.md](docs/R8_T2_OPTIMIZATION.md)).
+  - The frontend and the Vulkan emitter run on threads of their own, with a 128-entry command ring: the live city goes 28.6 → 36.1 FPS.
+  - **The native G-buffer draw `0x1a1770`** is prepared from the engine's own state, without walking its shader resources.
+  - A profiler of the command processor thread, and a channel that publishes the engine's constant update engine snapshots to it. The reuse of pixel-shader preparations (`SSPC_R8_CP_STAGE_REUSE`) is in, off by default.
+- **R5–R7 — native engine.** 18 engine render functions have SecondSonPC implementations, and the static recompiler v2 handles AVX, floating point and calls. All 13 functions of R7 at once: 0 mismatches, 0 fallbacks, FPS neutral (explained under [Native engine](#native-engine-reconstruction)).
+- **R6-P and CITY-OPT (city).** Trivial memory waits no longer read guest memory, which took the city from 28.8 to 32.8 FPS. The engine's draw functions tag their draws, and runs of them are recorded as one unit: 25.3 → 29.4 FPS (Phase 5) and 27.9 → 31.6 FPS (Phase 6).
+- **The repository** now holds only what is needed to build plus the files for the game's folder, with `build.ps1` and a release package.
 
-**October 2026, first half**
-
-- **Own Vulkan backend is the default.** The game's GPU command buffers are processed by SecondSonPC's PM4 command processor and recorded into Vulkan by its own executor; the bridge renderer is only a fallback (`--gpu-backend bridge`).
-- **Upscaling and frame generation.** DLSS Super Resolution, AMD FSR 3.1 Super Resolution and FSR 3.1 Frame Generation inside the game's frame.
-- **Frame pacing.** The emulated 59.94 Hz vblank was the cap of the 1 % lows; the presenter now paces freely with a frame-rate limit (default 60, up to unlimited). The game's clock was measured to be independent of FPS.
-- **Rendering fixes:** light glow through walls (real occlusion queries), flickering smoke (particle sort race), lighting colour channels.
-- **Button prompts follow the input device** — keyboard/mouse, Xbox or PlayStation.
-- **Native audio output (WASAPI), video decoding and save data.**
+**October 2026, earlier**:
+- the own Vulkan backend and own shader translator became the default;
+- shader cache and prediction;
+- DLSS / FSR 3.1 and FSR frame generation;
+- free frame pacing;
+- rendering fixes (light glow through walls, flickering smoke, lighting colours);
+- button prompts for each input device;
+- WASAPI audio, video decoding and saves became native.
 
 ## Graphics
 
 ### Own command processor and Vulkan backend
 
-- PM4 packets of the game's command buffers are decoded and executed by SecondSonPC (graphics and async compute queues).
-- Resources, descriptors, GPU memory import, synchronization, barriers by ranges, write-back of GPU results the game reads.
-- Two-thread mode: command processing and Vulkan recording on separate threads.
-- Early frame submission: the frame is handed to the command processor as soon as the game has finished it, not one frame later (`SSPC_P54_EARLY_SUBMIT`, in the native preset; village +17.6 % FPS when introduced).
+- The PM4 packets of the game's command buffers (graphics and async compute) are decoded and executed by SecondSonPC.
+- It handles resources, descriptors, GPU memory import, synchronization, barriers by ranges, and write-back of the GPU results the game reads.
+- Threads: packet parsing (`GpuNative`), draw preparation (`GpuFrontend`), Vulkan recording (`GpuRecord`), and Vulkan submission (`GpuEmit`).
+- Early frame submission: the frame goes to the command processor as soon as the game has finished it.
 - Vulkan Validation and Synchronization Validation were clean in the documented test scenes.
 
 ### Rendering fixes
 
 | Problem | Cause | Fix |
 |---|---|---|
-| Vehicle-light glow visible through fences and walls | visibility queries always reported "fully visible" | real Vulkan occlusion queries, results given to the game's compute shader (`146a3bd`) |
-| Smoke flickering | the particle sort merged all widths in one dispatch; on PS4 that is one 64-lane wave, on PC two 32-lane subgroups raced | one dispatch per merge level with a barrier (`01a3edd`) |
+| Vehicle-light glow visible through fences and walls | visibility queries always reported "fully visible" | real Vulkan occlusion queries, results given to the game's compute shader |
+| Smoke flickering | the particle sort merged all widths in one dispatch; on the PS4 that is one 64-lane wave, on PC two 32-lane subgroups raced | one dispatch per merge level with a barrier |
 | Wrong lighting colours | colour target component swap was masked out | COMP_SWAP honoured |
-| Races in the game's own code that the PC's timing exposes | — | targeted fixes, `docs/GAME_FIXES.md` |
+| Races in the game's own code that the PC's timing exposes | — | targeted fixes, [`docs/GAME_FIXES.md`](docs/GAME_FIXES.md) |
 
-### Shader cache, pipeline prediction
+### Shader cache and preparation
 
-- Disk cache of translated SPIR-V with reflection, plus `VkPipelineCache` (`vulkan.bin`) with device/driver checks.
-- Static prediction: shader programs, descriptor layouts and pipeline states are derived from the game's pack files and engine structures. Hold-out accuracy for whole pipelines of render passes: 87–90 %; compute ~87 % of keys.
-- A preparation window builds them before the game starts (a repeat start takes ~2 s).
+- There is a disk cache of translated SPIR-V with reflection, plus the driver's `VkPipelineCache` with device and driver checks.
+- Static prediction derives shader programs, descriptor layouts and pipeline states from the game's pack files and engine structures. Hold-out accuracy for whole render-pass pipelines is 87–90 %, and ~87 % of compute keys.
+- The preparation window builds them before the game starts. It runs once, and again after a driver or SecondSonPC update.
 
 ### Upscaling and frame generation
 
-Native backend only. The upscaler replaces the game's own (PS4 Pro-style) scaling pass; the HUD is drawn afterwards at full resolution and never goes through the upscaler. Motion vectors, reversed depth and jitter are taken from the game's frame.
-
-| Mode (RTX 2060) | Village FPS / 1 % low | Beach FPS / 1 % low |
-|---|---|---|
-| Native | 35.4 / 25.8 | 41.6 / 28.0 |
-| DLSS Quality | 36.3 / 27.8 | 38.8 / 26.8 |
-| FSR Quality | 38.7 / 29.2 | 44.7 / 29.3 |
-| FSR Performance | 40.7 / 29.2 | 45.3 / 29.3 |
-
-(Measured on 2026-10-15, before the city work; the frame is CPU-bound, so upscaling helps little.) FSR 3.1 Frame Generation: beach 43–53 game frames/s → 86–105 shown; the HUD is kept out of generated frames. DLSS Frame Generation is not implemented (needs RTX 40/50). Generated frames still need visual review.
+Upscaling works on the native backend. The upscaler replaces the game's own (PS4 Pro-style) scaling pass, and the HUD is drawn afterwards at full resolution. Motion vectors, reversed depth and jitter come from the game's frame. The modes are DLSS Super Resolution, FSR 3.1 Super Resolution, FSR 3.1 Frame Generation (with the HUD kept out of generated frames) and NVIDIA Reflex. DLSS Frame Generation is not implemented (it needs an RTX 40/50).
 
 ## Own shader translator
 
-SecondSonPC's GCN → SPIR-V translator (`src/runtime/gpu/gcn/`): decoder, control-flow graph, structurization, resource analysis with its own SRT walk, and a SPIR-V emitter. It follows the bridge's binding and interface conventions, so its modules can be mixed with the bridge's in one pipeline, and decides per program: an instruction or shape it does not handle sends that program to the bridge's recompiler with the reason logged.
-
-**It is the default** for compute, vertex and pixel programs. `SSPC_OWN_SHADERS` selects a subset (`cs`, `vs`, `ps` in any combination); `SSPC_OWN_SHADERS=bridge` (`play_rea_bridge.cmd`) uses the bridge's recompiler for everything — kept as the A/B reference.
+SecondSonPC's GCN → SPIR-V translator lives in `src/runtime/gpu/gcn/`. It has a decoder, a control-flow graph, structurization, resource analysis with its own SRT walk, and a SPIR-V emitter. It follows the bridge's binding conventions, so its modules can be mixed with the bridge's in one pipeline. It decides per program, and a program it does not handle goes to the bridge's recompiler with the reason logged.
 
 | Stage | Own / sent to the bridge (2- and 6-minute gameplay runs) | `spirv-val` |
 |---|---:|---|
 | Compute | 95 / 0, 103 / 0 | all valid |
 | Vertex (incl. rect / quad lists) | 133 / 0, 149 / 0 | all valid |
 | Pixel | 369 / 0, 516 / 0 | all valid |
-| Auxiliary tessellation stages for rect / quad lists | 10 quad modules in game | all valid |
 
-Offline, over all 10 301 GCN programs in the game's files: 7 934 modules emitted in the offline test form, all valid (the rest need the game's runtime state, which only the game supplies). Vulkan Validation with Synchronization Validation: 0 messages with the own stages. The picture was checked in game against the bridge's translation. Details: `docs/OWN_SHADER_TRANSLATOR.md`.
+Offline, over all 10 301 GCN programs in the game's files, 7 934 modules were emitted, all valid; the rest need the game's runtime state. Vulkan Validation with Synchronization Validation reported 0 messages. Details: [`docs/OWN_SHADER_TRANSLATOR.md`](docs/OWN_SHADER_TRANSLATOR.md).
 
 ## Native engine reconstruction
 
-The game's executable is x86-64 code that runs directly on the PC's CPU. The native engine work replaces individual **engine functions** with SecondSonPC's own implementations, in memory, after loading — the files on disk are never changed.
+The native engine work replaces individual engine functions with SecondSonPC's implementations, in memory, after loading; the files on disk are never changed.
 
-How a function is replaced:
+- A registry entry names the function by its `eboot.bin` offset and pins it by a hash of its original body.
+- The entry is redirected to SecondSonPC's implementation, and a relocated clone of the original stays callable.
+- Each function runs in one of three modes:
+  - `verify`: both run, and every write and every call to other engine code is compared;
+  - `guarded`: native, with sampled comparisons; a mismatch switches the function back to the original;
+  - `native`.
+- Implementations are hand-written C++ or recompiled (Ghidra P-code → C++), and are verified offline first.
+- `SSPC_NATIVE_ENGINE=verify|guarded|native` with `SSPC_NATIVE_ENGINE_FUNCS=<names>` turns them on. `play.cmd` uses only the native G-buffer draw preparation `SSPC_NATIVE_GBUFFER=native`.
 
-- A registry entry names the function by its eboot offset and pins it by a hash of its original body; on a different executable nothing is installed.
-- The entry is redirected to SecondSonPC's implementation; a relocated clone of the original stays callable.
-- Modes per function: `verify` (both run, every write and every call to other engine code is compared), `guarded` (native, with sampled comparisons; a mismatch switches the function back to the original on the fly), `native`.
-- Implementations are hand-written C++ or produced by the static recompiler (Ghidra P-code → C++ → DLL) and verified offline against the original instructions first (tens to hundreds of thousands of generated cases per function).
-- Everything is off by default: `SSPC_NATIVE_ENGINE=verify|guarded|native` with `SSPC_NATIVE_ENGINE_FUNCS=<names>`.
+| Area | Functions (eboot offsets) | In-game check |
+|---|---|---|
+| Object constants, frame allocator | `0x11c890`, `0x1f0870` | 19.0 M / 21.2 M calls in `verify`, 0 mismatches |
+| Constant update engine: setters | `0x16aa0`, `0x16b70`, `0x169d0`, `0x16d10`, `0x16eb0`, `0x16c40`, `0x16de0` | e.g. 219 M calls of the first two in `verify`, 0 mismatches |
+| Constant update engine: commit | `0x14ad0` | 47.4 M native, 185 k compared, 0 mismatches |
+| Material setup, draw constants | `0x448640`, `0x11e5d0` | 15.4 M / 9.0 M calls in `verify`, 0 mismatches |
+| G-buffer pass and its draws | `0x1a2030`, `0x1a1770`, `0x1a1960` | 6.3 M / 21.3 M draws in `verify`, 0 mismatches |
+| Shadow pass, instanced shadow draw, shadow UVs | `0x43d590`, `0x43d480`, `0x451700` | 17.5 M native shadow draws, 4.4 M UV calls, 0 mismatches |
 
-Verified in the game (city, CITY-OPT preset):
-
-| Area | Functions (eboot offsets) | Implementation | In-game check |
-|---|---|---|---|
-| Object constants, frame allocator | `0x11c890`, `0x1f0870` | hand-written and recompiled | 19.0 M / 21.2 M calls in `verify`, 0 mismatches |
-| Constant update engine: setters | `0x16aa0`, `0x16b70`, `0x169d0`, `0x16d10`, `0x16eb0`, `0x16c40`, `0x16de0` | hand-written and recompiled | e.g. 219 M calls of the first two in `verify`, 0 mismatches |
-| Constant update engine: commit | `0x14ad0` | recompiled | 47.4 M native, 185 k compared, 0 mismatches |
-| Material setup, draw constants | `0x448640`, `0x11e5d0` | hand-written and recompiled | 15.4 M / 9.0 M calls in `verify`, 0 mismatches |
-| G-buffer pass and its draws | `0x1a2030`, `0x1a1770`, `0x1a1960` | hand-written | draws: 6.3 M / 21.3 M in `verify`, 0 mismatches; the pass loop on every branch the city reaches (rarer branches go to the original) |
-| Shadow pass, instanced shadow draw, shadow UVs | `0x43d590`, `0x43d480`, `0x451700` | hand-written and recompiled | 17.5 M native shadow draws, 4.4 M UV calls, 0 mismatches |
-
-**Results.** All 13 functions of R7 together, final A/B against the preset in four scenes (3 interleaved rounds each): city +0.21, village −0.82, beach +0.22, harbour +1.39 FPS — within the run-to-run spread, i.e. **neither faster nor slower**. The frame is limited by the command processor thread (~30 ms of a ~31 ms city frame), while these engine functions run on the game's own job threads. What R5–R7 deliver is correctness infrastructure and an engine whose render path increasingly runs on code the project owns; turning that knowledge into less command-processor work is the goal of R8 (in progress, below). Details: `docs/NATIVE_ENGINE_RECONSTRUCTION.md`, `docs/NATIVE_ENGINE_FUNCTIONS.md`, `docs/NATIVE_RENDER_R6_RESULTS.md`, `docs/NATIVE_ENGINE_R7_RESULTS.md`.
-
-## Performance
-
-The frame is limited by **CPU-side command processing and Vulkan recording**, not by the GPU: the open city issues ~12 000 draws per frame, the GPU needs ~18 ms of it. Cutscenes with ~1 200 draws run at 60–90 FPS.
-
-Current state (measurement stand with the switches of `play_unlimited.cmd`; base side of the R7 final A/B, 2026-10-21, 3 runs per scene):
-
-| Scene | FPS | 1 % low | Command processor thread | Draws / frame |
-|---|---:|---:|---:|---:|
-| City | 32.1 | 27.9 | 30.6 ms | 11 975 |
-| Village | 35.6 | 26.4 | 20.9 ms | 4 284 |
-| Beach | 55.3 | 39.1 | 15.3 ms | 5 580 |
-| Harbour | 43.6 | 25.0 | 18.5 ms | 5 264 |
-
-Measured improvements (interleaved A/B, n ≥ 3, before → after):
-
-| Change | City | Beach | Harbour | Village |
-|---|---|---|---|---|
-| GPU optimizations (`3da31cf`) | — | 48.1 → 55.1 FPS | 42.6 → 49.9 FPS | 37.3 → 38.6 FPS |
-| Free frame pacing, 1 % low (`2f984a9`) | — | 29.4 → 48.8 | 29.4 → 46.8 | 29.3 → 35.3 |
-| CITY-OPT Phase 5: engine draw runs | 25.3 → 29.4 FPS | — | — | — |
-| CITY-OPT Phase 6: G-buffer runs | 27.9 → 31.6 FPS | not slower | — | unchanged |
-| R6-P: trivial memory waits skip the read | 28.8 → 32.8 FPS | neutral | neutral | neutral |
-
-**City (CITY-OPT, `SSPC_CITY_PERFORMANCE=1`).** The city's ~12 000 draws per frame went through command processing and Vulkan recording one by one. The engine's two main draw functions (meshes and shadow casters, ~70 % of the draws) are now tagged by small hash-pinned probes in the driver NOP that follows every draw — no extra command dword, the game's code unchanged — and a run of tagged draws that differ only in geometry and instance constants is one record: the first draw is prepared and recorded in full, the others only bind their own vertices, indices and constants. Phase 6 brings the G-buffer's instanced draws (`0x1a1770`) into runs too, re-walking a member's shader resources when the constant update engine moved its table, and a probe on the material setup (`0x448640`) turns a material change into an immediate refusal. Checked: every joined draw also prepared in full and compared (23.1 M members, 0 different), the command processor's registers against the recording thread's copy, Vulkan Validation + Sync (0 messages), frame captures (depth and shadow maps bit-exact). Details: `docs/CITY_PERFORMANCE.md`, `docs/CITY_ENGINE_OPTIMIZATION.md`, `docs/CITY_ENGINE_RESOURCES.md`.
-
-**Rejected by measurement** (documented so they are not repeated): the P5.3 hybrid native render bridge in the city (−4.4 FPS), CUE snapshot reuse (+0.00 FPS on top of R6-P), the R7 native G-buffer transport (−1.6 FPS), compute queue priority (village 1 % low 29 → 20), BBPort's GPU library as the backend (25 vs 40 FPS in the village, missing smoke and fire), the uncharted_pc / bbport optimization ports (threaded recording −14…−19 % recording time but no proven FPS; draw-preparation workers and LTO −11…−12 % on the beach; PGO neutral).
-
-Performance work is done by controlled A/B runs; rejected experiments are documented (`docs/GPU_OPTIMIZATION.md`, `docs/FRAMEBREAK.md`, `docs/LIGHTING_PROFILE.md`, the R6/R7 result reports). No quality setting, light or shadow is reduced to gain FPS; the potato mode on the fork-port branch is a separate, opt-in user choice.
+**Why it gives no FPS by itself.** These functions run on the game's job threads, while the frame waits for command processing, async compute and the GPU. What R5–R7 deliver is an engine whose render path increasingly runs on code the project owns. Using the engine's knowledge to cut command processor work began in R8 (the native G-buffer draw, the CUE snapshot channel). Details: [`docs/NATIVE_ENGINE_RECONSTRUCTION.md`](docs/NATIVE_ENGINE_RECONSTRUCTION.md), [`docs/NATIVE_ENGINE_R7_RESULTS.md`](docs/NATIVE_ENGINE_R7_RESULTS.md).
 
 ## PC settings
 
-The PC options live inside the game's own menu: **Esc (Options) → Settings → "Additional settings"** (the line that used to read "HDR Rendering — Unavailable"; the game's files are not changed — the string is replaced as it is read). The window is drawn over the game in the game's own style:
+The PC options live inside the game's own menu: **Esc (Options) → Settings → "Additional settings"**. This is the line that used to read "HDR Rendering — Unavailable"; the string is replaced as it is read, and the game's files are not changed.
 
-- seven pages — **Graphics, Display, Controls, Keys, Audio, Game, Advanced**;
-- toggles, sliders, drop-down lists, two key cells per action; keyboard, mouse and gamepad navigation, prompts for the last device used;
-- changes apply immediately where the subsystem allows it (upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, frame-rate limit, mouse and motion settings, volume); window mode, size and monitor changes ask for confirmation for 15 s; options that need a restart show a badge and the value in effect now;
-- unavailable options say why (another backend or hardware needed);
-- the window scales with the game window and DPI (layout checked from 800 × 600 to 4K and 21:9);
-- defaults in `SecondSonPC.toml`, the user's changes in `%LOCALAPPDATA%\SecondSonPC\settings.toml` (keys from other versions are kept).
+- There are seven pages: **Graphics, Display, Controls, Keys, Audio, Game, Advanced**.
+- The window works with keyboard, mouse and gamepad navigation, with prompts for the last device used.
+- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, frame-rate limit, mouse and motion settings, volume.
+- Window mode, size and monitor changes ask for confirmation for 15 s.
+- Options that need a restart show a badge, and unavailable options say why.
+- The window scales with the game window and DPI, from 800 × 600 to 4K and 21:9.
 
-Details: `docs/PC_SETTINGS_UI.md`.
-
-## Native audio, video and saves
-
-- **Audio output** through WASAPI (`245d86d`); `--bridge audio` switches back to the bridge's output.
-- **Video decoding** (`sceVideodec*`) is native; cutscenes play.
-- **Save data**: existing saves load and autosaves are written; tests always run on copies of the user's saves.
+Details: [`docs/PC_SETTINGS_UI.md`](docs/PC_SETTINGS_UI.md).
 
 ## Input and button prompts
 
-Keyboard and mouse are handled natively, with PC key bindings. The game draws every button prompt from one icon font; SecondSonPC redraws the physical-button cells for the active input device, so **all** prompts of the game — static and composite, in every language — switch between keyboard/mouse, Xbox and PlayStation without editing strings or replacing the original files on disk.
+Keyboard and mouse are handled natively, with PC key bindings. The game draws every button prompt from one icon font, and SecondSonPC redraws the physical-button cells for the active input device. So **all** prompts of the game, in every language, switch between keyboard/mouse, Xbox and PlayStation, without editing strings or files.
 
 <p align="center">
-  <img src="prw1.png" alt="Keyboard and mouse prompt adaptations for inFAMOUS: Second Son PC Edition" width="900">
+  <img src="docs/images/prw1.png" alt="Keyboard and mouse prompt adaptations" width="900">
 </p>
 
 <p align="center">
-  <img src="prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
+  <img src="docs/images/prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
 </p>
 
-The original PlayStation icons stay when a PlayStation controller is used.
+## Branches
 
-## Work in progress and experiments
-
-Work that is not in `main` yet lives in branches of this repository:
+`main` is the playable build. Work that is not in it lives in branches:
 
 | Branch | What | State |
 |---|---|---|
-| [`feature/native-engine-r8`](../../tree/feature/native-engine-r8) (+ `feature/r8-cp-profile`, `r8-native-cp`, `r8-render-layer`, `r8-recomp`, `r8-verify`) | **R8: native CP optimization.** A profiler of the command processor thread (`SSPC_R8_CP_PROFILE`), a channel that publishes the engine's CUE snapshots to the command processor (18.4 k per frame, found for 76 % of full stage preparations), a deterministic verification mode (fixed 1/30 s step, frame comparison), one native entry for the CUE commit, a CUE audit | in progress; first finding: reusing pixel-shader preparations by the engine's state is worth only ~0.75 ms per frame without touching the shader frontend — the design for the larger cut is under review |
-| [`feature/fork-port-prep-workers`](../../tree/feature/fork-port-prep-workers) | **Fork port.** Ideas from the axylpup shadPS4 fork for Second Son: the shader frontend on its own thread now keeps the whole city preset (runs, GEOFAST, async acquire), occlusion queries and flips queued, a second Vulkan recording thread (`SSPC_VK_EMIT_THREAD`). **Potato mode for weak PCs** — `[Graphics] potatoMode`, live in the settings window: level 1 drops the spot-light shadow atlas (headlights, street lamps), 2 also the sun's far shadow cascade, 3 also small objects' shadows, 4 also small instanced G-buffer objects (HUD and map kept) | 14 minutes of play without a crash in front mode; the thread's remaining cost is waiting (memory waits, GDS), not preparation; the emit thread is not measured yet |
-| [`feature/native-missions`](../../tree/feature/native-missions) (on top of [`feature/native-rebirth`](../../tree/feature/native-rebirth)) | **Native Rebirth.** A separate native program (`native/`) that does not run the game's executable or shadPS4: it reads the game's packages itself (all 1 621 parse), renders the world with its own Vulkan renderer, plays Delsin's original animation clips (the `'70AE'` format decoded, 2 034 clips), walks on the original Havok collision, loads the original mission data (65 mission packages, 59 graffiti packages) and runs the prologue's stencil-art graffiti mission end to end | research vertical slice, not the game: no game lighting, no original animation graph, parts of the cannery approximated; 510–730 FPS in its scenes, Vulkan Validation 0, ASan clean |
-| [`experiment/bbport-gpu`](../../tree/experiment/bbport-gpu) | BBPort's GPU library (Bloodborne PC fork) as the game's GPU backend | rejected: 25 vs 40 FPS in the village, smoke and fire missing, VRAM at its budget |
-| [`feature/uncharted-bbport-optimizations`](../../tree/feature/uncharted-bbport-optimizations) | uncharted_pc / bbport techniques ported: threaded Vulkan recording, draw-preparation workers, LTO, PGO | measured; nothing taken into `main` (verdicts above) |
+| [`feature/native-engine-r8`](../../tree/feature/native-engine-r8) (+ `feature/r8-cp-profile`, `r8-native-cp`, `r8-render-layer`, `r8-recomp`, `r8-verify`) | R8 directions: the native render layer, a CUE audit, a deterministic verification mode | the R8 core, profile, CP channel, native G-buffer draw and emitter batching are in `main`; the rest is research |
+| [`feature/fork-port-prep-workers`](../../tree/feature/fork-port-prep-workers) | ideas from the axylpup shadPS4 fork; **potato mode** for weak PCs (`[Graphics] potatoMode` levels 1–4: fewer shadow maps and small objects) | the frontend and emitter threads are in `main`; potato mode only in the branch |
+| [`feature/native-missions`](../../tree/feature/native-missions) (on top of [`feature/native-rebirth`](../../tree/feature/native-rebirth)) | **Native Rebirth**: a separate native program that reads the game's packages itself, renders with its own Vulkan renderer, plays Delsin's original animations on the original Havok collision and runs the prologue's graffiti mission | research vertical slice, not the game |
+| [`experiment/bbport-gpu`](../../tree/experiment/bbport-gpu) | BBPort's GPU library as the backend | rejected: 25 vs 40 FPS, effects missing |
+| [`feature/uncharted-bbport-optimizations`](../../tree/feature/uncharted-bbport-optimizations) | uncharted_pc / bbport techniques: threaded recording, preparation workers, LTO, PGO | measured, nothing taken |
+
+The tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023) keeps the removed development scripts: A/B stand, measurement routes, analysis tools, the `play_*.cmd` variants.
 
 ## Architecture
 
 ```text
 Original PS4 game (eboot.bin + modules, unchanged on disk)
-        |
+        |  x86-64 code runs natively on the PC's CPU
         v
 SecondSonPC loader and runtime
         +-- kernel: threads, sync, time, event queues
-        +-- virtual / direct memory, exception handling, CPU patcher
+        +-- virtual / direct memory, exception handling, CPU patcher (fs:, SSE4a)
         +-- file system, system / user services, PlayGo
         +-- save data, WASAPI audio, video decoding
         +-- offline network / NP / trophies
@@ -266,30 +426,30 @@ SecondSonPC loader and runtime
         +-- [shadPS4 bridge: Ajm, common dialogs, a few net / libc functions]
         |
         +-- native engine: hash-pinned replacements of engine functions
-        |     (hand-written / recompiled; verify, guarded, native; off by default)
-        |
+        |     (hand-written / recompiled with AVX; verify, guarded, native)
         v
 SecondSonPC GPU
-        +-- PM4 command processor (graphics + async compute)
+        +-- PM4 command processor: parse | prepare | record | submit threads
         +-- shader frontend: SRT walk, resource plans, specialization keys
-        +-- GCN -> SPIR-V: own translator (default; bridge recompiler as A/B reference)
-        +-- engine draw runs: hash-pinned probes tag the engine's draws (CITY-OPT)
-        +-- shader + pipeline disk cache, static pipeline prediction
+        +-- GCN -> SPIR-V: own translator (bridge recompiler for declined programs)
+        +-- engine draw runs (CITY-OPT), native G-buffer draw preparation
+        +-- shader + pipeline disk cache, static shader prediction
         +-- Vulkan executor: descriptors, memory import, barriers, write-back
-        +-- presenter: frame pacing, DLSS / FSR upscaling, FSR frame generation
-        |
+        +-- presenter: frame pacing, DLSS / FSR upscaling, FSR frame generation, Reflex
         v
-Vulkan driver
+Vulkan 1.3 driver
 ```
 
 ## Known issues
 
-- FPS is bound by CPU command processing in dense scenes (foliage, city streets): ~32 FPS in the open city on the development machine, far from 60.
-- The native engine functions are off by default and give no FPS on their own yet.
-- Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4; the build still needs `third_party/shadPS4`.
-- On a machine without a page file, total committed memory can reach the Windows limit in long sessions (32 GB RAM); fixed causes are documented in `docs/KNOWN_ISSUES.md`, long-session soak testing continues.
-- Frame generation has not been reviewed frame by frame; input latency with it is not measured.
-- No full-campaign compatibility guarantee.
+- **Performance.** Dense scenes are bound by CPU-side command processing, Vulkan recording and the game's async compute: the open city runs at ~36 FPS and gameplay at 46–51 FPS on the development PC, far from a locked 60.
+- **Intel CPUs** lack SSE4a. In a forced test on AMD, the 73 short `extrq` emulated through faults cost ~10 % FPS at the start of a scene. A real Intel CPU has not been tested ([SSPC-011](docs/KNOWN_ISSUES.md)).
+- **Tested hardware.** Only one PC was tested: Ryzen 5 5500, RTX 2060 and Windows 10. AMD and Intel GPUs and other drivers are unknown.
+- **Game version.** Only CUSA00004 with update 01.07 (EU) is tested; the engine replacements install only on that executable.
+- **From shadPS4.** Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4, and the build still needs `third_party/shadPS4`.
+- **Memory.** On a PC without a page file, total committed memory can reach the Windows limit in long sessions; keep the page file on. Fixed causes are in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- **Frame generation** has not been reviewed frame by frame, and input latency with it is not measured.
+- There is no full-campaign compatibility guarantee.
 
 ## Roadmap
 
@@ -300,74 +460,63 @@ Vulkan driver
 - [ ] Ajm / ATRAC9 decoding
 - [ ] Common dialogs, remaining network and libc functions
 
-### Graphics
-- [x] Own PM4 command processor and Vulkan backend (default)
-- [x] Occlusion queries, smoke and lighting fixes
-- [x] Shader / pipeline disk cache, static pipeline prediction, preparation window
-- [x] DLSS / FSR 3.1 upscaling, FSR 3.1 frame generation
+### Graphics and performance
+- [x] Own PM4 command processor and Vulkan backend (default), four threads
+- [x] Shader / pipeline disk cache, static prediction, preparation window
+- [x] DLSS / FSR 3.1 upscaling, FSR 3.1 frame generation, Reflex
 - [x] Free frame pacing
-- [x] City: draw runs from the engine's draw functions (CITY-OPT, phases 1–6)
-- [x] Trivial memory waits without guest reads (R6-P, in the city preset)
-- [ ] Less command-processor work for the remaining draws (R8 — the current FPS limit)
-- [ ] Potato mode for weak PCs in `main` (branch `feature/fork-port-prep-workers`)
-
-### Own shader translator
-- [x] Compute programs
-- [x] Vertex programs
-- [x] Pixel programs: interpolation, colour / depth exports, implicit-LOD sampling
-- [x] Rect / quad lists and auxiliary stages (quad lists seen in game; rect lists only validated offline)
-- [x] Own translator by default
-- [ ] Other districts, fights and story scenes run through the own translator
+- [x] City: draw runs (CITY-OPT 1–6), trivial waits (R6-P), emitter batching (R8)
+- [x] Gameplay: no pipeline-cache freezes (F1), no vertex heap re-imports (F3)
+- [ ] REA-3 / AQ with even frame pacing (then into `play.cmd`)
+- [ ] Less command processor work for the remaining draws
+- [ ] Potato mode for weak PCs in `main`
 
 ### Native engine
-- [x] Function registry, hash-pinned install, verify / guarded / native modes, fallback
+- [x] Function registry, hash-pinned install, verify / guarded / native, fallback
 - [x] Static recompiler v2 (AVX, floating point, calls)
-- [x] G-buffer and shadow passes, materials, CUE setters and commit — verified in game
+- [x] G-buffer and shadow passes, materials, CUE setters and commit, verified in game
+- [x] The engine's state used by the command processor (native G-buffer draw, CUE channel)
 - [ ] The native render layer submits its draws without the game's command buffer
-- [ ] The engine's state used by the command processor to skip work (R8)
 
 ### PC experience
 - [x] PC settings window in the game's menu
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
-- [ ] A tested public build with an installer
+- [x] A release package for the game's folder (`build.ps1`, `play.cmd`)
+- [ ] Tested on more hardware (AMD / Intel GPUs, Intel CPUs)
 
 ### Independence
 - [ ] Remove the bridge (`src/bridge/shadps4`)
 - [ ] Build without `third_party/shadPS4`
-- [ ] Validate gameplay, saves, audio, video and graphics against a controlled baseline
-
-## Installation
-
-**This project does not distribute the original game, its executable, assets, firmware or any copyrighted content.** A legally obtained copy of the game is required; you prepare your own game files.
-
-Development builds are started with the scripts in the repository root. `play_unlimited.cmd` starts the game with every measured improvement (the native command processor preset, the city preset, the frame-rate limit from the settings); `play.cmd`, `play_native.cmd`, `play_rea.cmd`, `play_rea_own.cmd` and `play_rea_bridge.cmd` are narrower variants used for A/B. Their names and arguments change during development. Requirements: 64-bit Windows, a Vulkan 1.3 GPU and driver, the user's own game files. A tested public build and its setup procedure are not published yet.
 
 ## Reports
 
-Every phase of the project ends with a report: what was measured, what was kept, what was rejected and why. The full list — about 120 reports in `main` and in the branches above, grouped by area — is in **[`docs/REPORTS.md`](docs/REPORTS.md)**. Most reports are written in Russian, the newer ones partly in English.
+Every phase ends with a report: what was measured, what was kept, what was rejected and why. The full list, **135 reports** in `main`, in the branches and in the tools archive, grouped by area, is in **[`docs/REPORTS.md`](docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English.
 
 ## Contributing
 
-Reproducible bug reports, traces and documentation fixes are welcome. For performance changes: record a baseline, change one thing at a time, check rendering and Vulkan validation, report average FPS and 1 % lows, and document failed experiments. Do not submit game dumps or any proprietary game content.
+Reproducible bug reports with `logs\SecondSonPC.log`, traces and documentation fixes are welcome. For performance changes:
+- record a baseline;
+- change one thing at a time;
+- check rendering and Vulkan validation;
+- report average FPS and 1 % lows;
+- document failed experiments.
+
+Do not submit game dumps or any proprietary game content.
 
 ## Legal notice
 
-This is an independent, unofficial project and is not affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment or Sucker Punch Productions.
+This is an independent, unofficial project and is not affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment or Sucker Punch Productions. inFAMOUS and inFAMOUS: Second Son are trademarks and/or copyrighted works of their respective owners. No original game content is distributed by this repository; users must supply their own legally obtained game files.
 
-inFAMOUS and inFAMOUS: Second Son are trademarks and/or copyrighted works of their respective owners.
-
-No original game content is distributed by this repository. Users must supply their own legally obtained game files.
-
-Third-party components, including the parts of shadPS4 still used during the migration, remain under their own licences.
+Third-party components remain under their own licences. These include shadPS4 (GPL-2.0) and its libraries; the NVIDIA DLSS SDK, Streamline and Reflex; and the AMD FidelityFX SDK, whose licence texts are in `licenses\` of the release package. The Roboto fonts are under the OFL / Apache 2.0.
 
 ## Acknowledgements
 
-- The shadPS4 project, whose emulator core the port started from.
+- The shadPS4 project, whose emulator core the port started from and still builds on.
 - The axylpup shadPS4 fork for Second Son, whose split of command processing inspired the fork-port branch.
 - The BBPort (Bloodborne PC) and uncharted_pc projects, whose techniques were measured here.
-- The authors and maintainers of the open-source tools and Vulkan libraries used here, Ghidra among them.
+- Ghidra, LLVM and the authors of the open-source Vulkan tools and libraries used here.
 - Researchers documenting PlayStation 4 hardware, GCN and executable formats.
 
 ## Disclaimer
 
-Experimental software: features may be incomplete and regressions may occur. Back up your save data before testing a development build.
+This is experimental software: features may be incomplete and regressions may occur. Back up your save data; `play.cmd` does it before every start.

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="372" viewBox="0 0 880 372" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-label="1 % low FPS: smoothness">
+<title>1 % low FPS: smoothness</title>
+<rect x="0.5" y="0.5" width="879" height="371" rx="10" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="24.0" y="34.0" font-size="18" fill="#0b0b0b" font-weight="600" text-anchor="start">1 % low FPS: smoothness</text>
+<text x="24.0" y="56.0" font-size="13" fill="#52514e" font-weight="400" text-anchor="start">The slowest 1 % of frames; higher means fewer stutters</text>
+<text x="24.0" y="356.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">Ryzen 5 5500, RTX 2060 6 GB, 1920x1080 internal. FB-2: docs/FRAMEBREAK.md; R9: docs/R9_GAMEPLAY_PERFORMANCE.md; R8: docs/R8_T2_OPTIMIZATION.md.</text>
+<circle cx="29" cy="76" r="5" fill="#b4b2a9"/>
+<text x="40.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">before</text>
+<circle cx="107.0" cy="76" r="5" fill="#2a78d6"/>
+<text x="118.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">after</text>
+<line x1="324.0" y1="92" x2="324.0" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="324.0" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">0</text>
+<line x1="401.2" y1="92" x2="401.2" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="401.2" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">10</text>
+<line x1="478.4" y1="92" x2="478.4" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="478.4" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">20</text>
+<line x1="555.6" y1="92" x2="555.6" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="555.6" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">30</text>
+<line x1="632.8" y1="92" x2="632.8" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="632.8" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">40</text>
+<line x1="710.0" y1="92" x2="710.0" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="710.0" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">50</text>
+<text x="722.0" y="332.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">FPS</text>
+<text x="24.0" y="106.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start">Free frame pacing (FB-2)</text>
+<text x="310.0" y="106.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">beach</text>
+<line x1="551.0" y1="102" x2="700.7" y2="102" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="551.0" cy="102" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title>Free frame pacing (FB-2) (beach), before: 29.4 FPS</title></circle>
+<circle cx="700.7" cy="102" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>Free frame pacing (FB-2) (beach), after: 48.8 FPS</title></circle>
+<text x="722.0" y="106.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">29.4 → 48.8</text>
+<text x="814.0" y="106.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+66 %</text>
+<text x="24.0" y="138.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="138.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">harbour</text>
+<line x1="551.0" y1="134" x2="685.3" y2="134" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="551.0" cy="134" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title> (harbour), before: 29.4 FPS</title></circle>
+<circle cx="685.3" cy="134" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title> (harbour), after: 46.8 FPS</title></circle>
+<text x="722.0" y="138.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">29.4 → 46.8</text>
+<text x="814.0" y="138.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+59 %</text>
+<text x="24.0" y="170.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="170.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">village</text>
+<line x1="550.2" y1="166" x2="596.5" y2="166" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="550.2" cy="166" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title> (village), before: 29.3 FPS</title></circle>
+<circle cx="596.5" cy="166" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title> (village), after: 35.3 FPS</title></circle>
+<text x="722.0" y="170.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">29.3 → 35.3</text>
+<text x="814.0" y="170.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+20 %</text>
+<text x="24.0" y="202.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start">Emitter batching (R8 T2)</text>
+<text x="310.0" y="202.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">city bench</text>
+<line x1="569.0" y1="198" x2="592.7" y2="198" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="569.0" cy="198" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title>Emitter batching (R8 T2) (city bench), before: 31.7 FPS</title></circle>
+<circle cx="592.7" cy="198" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>Emitter batching (R8 T2) (city bench), after: 34.8 FPS</title></circle>
+<text x="722.0" y="202.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">31.7 → 34.8</text>
+<text x="814.0" y="202.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+10 %</text>
+<text x="24.0" y="234.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start">F1: pipeline cache save off-thread (R9)</text>
+<text x="310.0" y="234.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">traverse</text>
+<line x1="379.4" y1="230" x2="526.3" y2="230" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="379.4" cy="230" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title>F1: pipeline cache save off-thread (R9) (traverse), before: 7.2 FPS</title></circle>
+<circle cx="526.3" cy="230" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>F1: pipeline cache save off-thread (R9) (traverse), after: 26.2 FPS</title></circle>
+<text x="722.0" y="234.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">7.2 → 26.2</text>
+<text x="814.0" y="234.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+265 %</text>
+<text x="24.0" y="266.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start">F1 + F3 (R9)</text>
+<text x="310.0" y="266.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">fight</text>
+<line x1="381.9" y1="262" x2="521.6" y2="262" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="381.9" cy="262" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title>F1 + F3 (R9) (fight), before: 7.5 FPS</title></circle>
+<circle cx="521.6" cy="262" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>F1 + F3 (R9) (fight), after: 25.6 FPS</title></circle>
+<text x="722.0" y="266.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">7.5 → 25.6</text>
+<text x="814.0" y="266.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+241 %</text>
+<text x="24.0" y="298.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="298.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="end">traverse</text>
+<line x1="371.1" y1="294" x2="539.4" y2="294" stroke="#c3c2b7" stroke-width="2"/>
+<circle cx="371.1" cy="294" r="5" fill="#b4b2a9" stroke="#fcfcfb" stroke-width="2"><title> (traverse), before: 6.1 FPS</title></circle>
+<circle cx="539.4" cy="294" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title> (traverse), after: 27.9 FPS</title></circle>
+<text x="722.0" y="298.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">6.1 → 27.9</text>
+<text x="814.0" y="298.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">+357 %</text>
+</svg>

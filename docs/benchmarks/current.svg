@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="466" viewBox="0 0 880 466" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-label="Where it stands now">
+<title>Where it stands now</title>
+<rect x="0.5" y="0.5" width="879" height="465" rx="10" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="24.0" y="34.0" font-size="18" fill="#0b0b0b" font-weight="600" text-anchor="start">Where it stands now</text>
+<text x="24.0" y="56.0" font-size="13" fill="#52514e" font-weight="400" text-anchor="start">The newest multi-run measurement of each scene (median of 3-6 runs); presets differ slightly, see the table</text>
+<text x="24.0" y="450.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">Ryzen 5 5500, RTX 2060 6 GB, 1920x1080 internal. Fight / traverse / save: R9 2026-10-23; beach / harbour / village / live city: 2026-10-22.</text>
+<rect x="24" y="71" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="40.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">average FPS</text>
+<rect x="137.0" y="71" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="153.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">1 % low</text>
+<line x1="194.0" y1="90" x2="194.0" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="194.0" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">0</text>
+<line x1="296.7" y1="90" x2="296.7" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="296.7" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">10</text>
+<line x1="399.3" y1="90" x2="399.3" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="399.3" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">20</text>
+<line x1="502.0" y1="90" x2="502.0" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="502.0" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">30</text>
+<line x1="604.7" y1="90" x2="604.7" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="604.7" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">40</text>
+<line x1="707.3" y1="90" x2="707.3" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="707.3" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">50</text>
+<line x1="810.0" y1="90" x2="810.0" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="810.0" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">60</text>
+<text x="832.0" y="422.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">FPS</text>
+<text x="182.0" y="115.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">traverse (R9)</text>
+<path d="M194.0,96.0 H717.1 Q721.1,96.0 721.1,100.0 V106.0 Q721.1,110.0 717.1,110.0 H194.0 Z" fill="#2a78d6"><title>traverse (R9), average FPS: 51.3 FPS</title></path>
+<text x="727.1" y="107.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">51.3</text>
+<path d="M194.0,112.0 H476.3 Q480.3,112.0 480.3,116.0 V122.0 Q480.3,126.0 476.3,126.0 H194.0 Z" fill="#eb6834"><title>traverse (R9), 1 % low: 27.9 FPS</title></path>
+<text x="486.3" y="123.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">27.9</text>
+<text x="182.0" y="161.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">fight (R9)</text>
+<path d="M194.0,142.0 H662.7 Q666.7,142.0 666.7,146.0 V152.0 Q666.7,156.0 662.7,156.0 H194.0 Z" fill="#2a78d6"><title>fight (R9), average FPS: 46.0 FPS</title></path>
+<text x="672.7" y="153.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">46.0</text>
+<path d="M194.0,158.0 H452.4 Q456.4,158.0 456.4,162.0 V168.0 Q456.4,172.0 452.4,172.0 H194.0 Z" fill="#eb6834"><title>fight (R9), 1 % low: 25.6 FPS</title></path>
+<text x="462.4" y="169.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">25.6</text>
+<text x="182.0" y="207.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">beach</text>
+<path d="M194.0,188.0 H735.6 Q739.6,188.0 739.6,192.0 V198.0 Q739.6,202.0 735.6,202.0 H194.0 Z" fill="#2a78d6"><title>beach, average FPS: 53.1 FPS</title></path>
+<text x="745.6" y="199.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">53.1</text>
+<path d="M194.0,204.0 H554.1 Q558.1,204.0 558.1,208.0 V214.0 Q558.1,218.0 554.1,218.0 H194.0 Z" fill="#eb6834"><title>beach, 1 % low: 35.5 FPS</title></path>
+<text x="564.1" y="215.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">35.5</text>
+<text x="182.0" y="253.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">harbour</text>
+<path d="M194.0,234.0 H633.4 Q637.4,234.0 637.4,238.0 V244.0 Q637.4,248.0 633.4,248.0 H194.0 Z" fill="#2a78d6"><title>harbour, average FPS: 43.2 FPS</title></path>
+<text x="643.4" y="245.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">43.2</text>
+<path d="M194.0,250.0 H524.9 Q528.9,250.0 528.9,254.0 V260.0 Q528.9,264.0 524.9,264.0 H194.0 Z" fill="#eb6834"><title>harbour, 1 % low: 32.6 FPS</title></path>
+<text x="534.9" y="261.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">32.6</text>
+<text x="182.0" y="299.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">village</text>
+<path d="M194.0,280.0 H576.0 Q580.0,280.0 580.0,284.0 V290.0 Q580.0,294.0 576.0,294.0 H194.0 Z" fill="#2a78d6"><title>village, average FPS: 37.6 FPS</title></path>
+<text x="586.0" y="291.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">37.6</text>
+<path d="M194.0,296.0 H499.8 Q503.8,296.0 503.8,300.0 V306.0 Q503.8,310.0 499.8,310.0 H194.0 Z" fill="#eb6834"><title>village, 1 % low: 30.2 FPS</title></path>
+<text x="509.8" y="307.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">30.2</text>
+<text x="182.0" y="345.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">live city</text>
+<path d="M194.0,326.0 H560.2 Q564.2,326.0 564.2,330.0 V336.0 Q564.2,340.0 560.2,340.0 H194.0 Z" fill="#2a78d6"><title>live city, average FPS: 36.1 FPS</title></path>
+<text x="570.2" y="337.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">36.1</text>
+<path d="M194.0,342.0 H443.5 Q447.5,342.0 447.5,346.0 V352.0 Q447.5,356.0 443.5,356.0 H194.0 Z" fill="#eb6834"><title>live city, 1 % low: 24.7 FPS</title></path>
+<text x="453.5" y="353.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">24.7</text>
+<text x="182.0" y="391.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">owner's save, rooftop</text>
+<path d="M194.0,372.0 H497.9 Q501.9,372.0 501.9,376.0 V382.0 Q501.9,386.0 497.9,386.0 H194.0 Z" fill="#2a78d6"><title>owner's save, rooftop, average FPS: 30.0 FPS</title></path>
+<text x="507.9" y="383.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">30.0</text>
+<path d="M194.0,388.0 H411.6 Q415.6,388.0 415.6,392.0 V398.0 Q415.6,402.0 411.6,402.0 H194.0 Z" fill="#eb6834"><title>owner's save, rooftop, 1 % low: 21.6 FPS</title></path>
+<text x="421.6" y="399.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">21.6</text>
+<line x1="194" y1="90" x2="194" y2="406" stroke="#c3c2b7" stroke-width="1"/>
+</svg>

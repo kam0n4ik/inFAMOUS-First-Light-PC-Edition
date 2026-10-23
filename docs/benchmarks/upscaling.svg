@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="374" viewBox="0 0 880 374" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-label="Upscaling modes">
+<title>Upscaling modes</title>
+<rect x="0.5" y="0.5" width="879" height="373" rx="10" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="24.0" y="34.0" font-size="18" fill="#0b0b0b" font-weight="600" text-anchor="start">Upscaling modes</text>
+<text x="24.0" y="56.0" font-size="13" fill="#52514e" font-weight="400" text-anchor="start">Average FPS, 1 run of 90 s per mode (2026-10-15); the frame is bound by the CPU, so the gain is small</text>
+<text x="24.0" y="358.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">Ryzen 5 5500, RTX 2060 6 GB, 1920x1080 internal. docs/UPSCALING_FRAME_GENERATION.md; frame generation doubles shown frames (beach 43-53 -&gt; 86-105).</text>
+<rect x="24" y="71" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="40.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">village</text>
+<rect x="109.0" y="71" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="125.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">beach</text>
+<line x1="174.0" y1="90" x2="174.0" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="174.0" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">0</text>
+<line x1="301.2" y1="90" x2="301.2" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="301.2" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">10</text>
+<line x1="428.4" y1="90" x2="428.4" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="428.4" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">20</text>
+<line x1="555.6" y1="90" x2="555.6" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="555.6" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">30</text>
+<line x1="682.8" y1="90" x2="682.8" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="682.8" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">40</text>
+<line x1="810.0" y1="90" x2="810.0" y2="314" stroke="#e1e0d9" stroke-width="1"/>
+<text x="810.0" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">50</text>
+<text x="832.0" y="330.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">FPS</text>
+<text x="162.0" y="115.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">Native</text>
+<path d="M174.0,96.0 H620.3 Q624.3,96.0 624.3,100.0 V106.0 Q624.3,110.0 620.3,110.0 H174.0 Z" fill="#2a78d6"><title>Native, village: 35.4 FPS</title></path>
+<text x="630.3" y="107.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">35.4</text>
+<path d="M174.0,112.0 H699.2 Q703.2,112.0 703.2,116.0 V122.0 Q703.2,126.0 699.2,126.0 H174.0 Z" fill="#eb6834"><title>Native, beach: 41.6 FPS</title></path>
+<text x="709.2" y="123.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">41.6</text>
+<text x="162.0" y="161.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">DLSS Quality</text>
+<path d="M174.0,142.0 H631.7 Q635.7,142.0 635.7,146.0 V152.0 Q635.7,156.0 631.7,156.0 H174.0 Z" fill="#2a78d6"><title>DLSS Quality, village: 36.3 FPS</title></path>
+<text x="641.7" y="153.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">36.3</text>
+<path d="M174.0,158.0 H663.5 Q667.5,158.0 667.5,162.0 V168.0 Q667.5,172.0 663.5,172.0 H174.0 Z" fill="#eb6834"><title>DLSS Quality, beach: 38.8 FPS</title></path>
+<text x="673.5" y="169.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">38.8</text>
+<text x="162.0" y="207.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">DLSS Performance</text>
+<path d="M174.0,188.0 H620.3 Q624.3,188.0 624.3,192.0 V198.0 Q624.3,202.0 620.3,202.0 H174.0 Z" fill="#2a78d6"><title>DLSS Performance, village: 35.4 FPS</title></path>
+<text x="630.3" y="199.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">35.4</text>
+<path d="M174.0,204.0 H666.1 Q670.1,204.0 670.1,208.0 V214.0 Q670.1,218.0 666.1,218.0 H174.0 Z" fill="#eb6834"><title>DLSS Performance, beach: 39.0 FPS</title></path>
+<text x="676.1" y="215.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">39.0</text>
+<text x="162.0" y="253.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">FSR 3.1 Quality</text>
+<path d="M174.0,234.0 H662.3 Q666.3,234.0 666.3,238.0 V244.0 Q666.3,248.0 662.3,248.0 H174.0 Z" fill="#2a78d6"><title>FSR 3.1 Quality, village: 38.7 FPS</title></path>
+<text x="672.3" y="245.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">38.7</text>
+<path d="M174.0,250.0 H738.6 Q742.6,250.0 742.6,254.0 V260.0 Q742.6,264.0 738.6,264.0 H174.0 Z" fill="#eb6834"><title>FSR 3.1 Quality, beach: 44.7 FPS</title></path>
+<text x="748.6" y="261.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">44.7</text>
+<text x="162.0" y="299.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">FSR 3.1 Performance</text>
+<path d="M174.0,280.0 H687.7 Q691.7,280.0 691.7,284.0 V290.0 Q691.7,294.0 687.7,294.0 H174.0 Z" fill="#2a78d6"><title>FSR 3.1 Performance, village: 40.7 FPS</title></path>
+<text x="697.7" y="291.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">40.7</text>
+<path d="M174.0,296.0 H746.2 Q750.2,296.0 750.2,300.0 V306.0 Q750.2,310.0 746.2,310.0 H174.0 Z" fill="#eb6834"><title>FSR 3.1 Performance, beach: 45.3 FPS</title></path>
+<text x="756.2" y="307.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">45.3</text>
+<line x1="174" y1="90" x2="174" y2="314" stroke="#c3c2b7" stroke-width="1"/>
+</svg>

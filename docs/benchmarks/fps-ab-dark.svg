@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="596" viewBox="0 0 880 596" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-label="Average FPS: measured A/B steps">
+<title>Average FPS: measured A/B steps</title>
+<rect x="0.5" y="0.5" width="879" height="595" rx="10" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
+<text x="24.0" y="34.0" font-size="18" fill="#f0efec" font-weight="600" text-anchor="start">Average FPS: measured A/B steps</text>
+<text x="24.0" y="56.0" font-size="13" fill="#c3c2b7" font-weight="400" text-anchor="start">Each row is its own A/B series of one build (median of 2-6 runs); rows are not one timeline</text>
+<text x="24.0" y="580.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">Ryzen 5 5500, RTX 2060 6 GB, 1920x1080 internal. Sources: docs/REPORTS.md (P4.11, NATIVE_CP CP-7, GPU_OPTIMIZATION, CITY_ENGINE_*, R6, R8_T2, R9).</text>
+<circle cx="29" cy="76" r="5" fill="#6b6a65"/>
+<text x="40.0" y="80.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">before</text>
+<circle cx="107.0" cy="76" r="5" fill="#3987e5"/>
+<text x="118.0" y="80.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">after</text>
+<line x1="324.0" y1="92" x2="324.0" y2="538" stroke="#2c2c2a" stroke-width="1"/>
+<text x="324.0" y="556.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">20</text>
+<line x1="420.5" y1="92" x2="420.5" y2="538" stroke="#2c2c2a" stroke-width="1"/>
+<text x="420.5" y="556.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">30</text>
+<line x1="517.0" y1="92" x2="517.0" y2="538" stroke="#2c2c2a" stroke-width="1"/>
+<text x="517.0" y="556.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">40</text>
+<line x1="613.5" y1="92" x2="613.5" y2="538" stroke="#2c2c2a" stroke-width="1"/>
+<text x="613.5" y="556.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">50</text>
+<line x1="710.0" y1="92" x2="710.0" y2="538" stroke="#2c2c2a" stroke-width="1"/>
+<text x="710.0" y="556.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">60</text>
+<text x="722.0" y="556.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">FPS</text>
+<text x="24.0" y="106.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">Parallel command processor (P4.11)</text>
+<text x="310.0" y="106.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">beach</text>
+<line x1="455.9" y1="102" x2="554.7" y2="102" stroke="#383835" stroke-width="2"/>
+<circle cx="455.9" cy="102" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>Parallel command processor (P4.11) (beach), before: 33.7 FPS</title></circle>
+<circle cx="554.7" cy="102" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>Parallel command processor (P4.11) (beach), after: 43.9 FPS</title></circle>
+<text x="722.0" y="106.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">33.7 → 43.9</text>
+<text x="814.0" y="106.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+30 %</text>
+<text x="24.0" y="138.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">Native command processor (CP-7)</text>
+<text x="310.0" y="138.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">beach</text>
+<line x1="458.6" y1="134" x2="592.8" y2="134" stroke="#383835" stroke-width="2"/>
+<circle cx="458.6" cy="134" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>Native command processor (CP-7) (beach), before: 34.0 FPS</title></circle>
+<circle cx="592.8" cy="134" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>Native command processor (CP-7) (beach), after: 47.9 FPS</title></circle>
+<text x="722.0" y="138.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">34.0 → 47.9</text>
+<text x="814.0" y="138.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+41 %</text>
+<text x="24.0" y="170.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="170.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">harbour</text>
+<line x1="429.8" y1="166" x2="542.7" y2="166" stroke="#383835" stroke-width="2"/>
+<circle cx="429.8" cy="166" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title> (harbour), before: 31.0 FPS</title></circle>
+<circle cx="542.7" cy="166" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title> (harbour), after: 42.7 FPS</title></circle>
+<text x="722.0" y="170.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">31.0 → 42.7</text>
+<text x="814.0" y="170.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+38 %</text>
+<text x="24.0" y="202.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="202.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">village</text>
+<line x1="423.1" y1="198" x2="491.6" y2="198" stroke="#383835" stroke-width="2"/>
+<circle cx="423.1" cy="198" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title> (village), before: 30.3 FPS</title></circle>
+<circle cx="491.6" cy="198" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title> (village), after: 37.4 FPS</title></circle>
+<text x="722.0" y="202.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">30.3 → 37.4</text>
+<text x="814.0" y="202.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+23 %</text>
+<text x="24.0" y="234.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">GPU optimizations (GPU-1..6)</text>
+<text x="310.0" y="234.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">beach</text>
+<line x1="595.1" y1="230" x2="662.9" y2="230" stroke="#383835" stroke-width="2"/>
+<circle cx="595.1" cy="230" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>GPU optimizations (GPU-1..6) (beach), before: 48.1 FPS</title></circle>
+<circle cx="662.9" cy="230" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>GPU optimizations (GPU-1..6) (beach), after: 55.1 FPS</title></circle>
+<text x="722.0" y="234.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">48.1 → 55.1</text>
+<text x="814.0" y="234.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+15 %</text>
+<text x="24.0" y="266.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="266.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">harbour</text>
+<line x1="542.4" y1="262" x2="612.9" y2="262" stroke="#383835" stroke-width="2"/>
+<circle cx="542.4" cy="262" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title> (harbour), before: 42.6 FPS</title></circle>
+<circle cx="612.9" cy="262" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title> (harbour), after: 49.9 FPS</title></circle>
+<text x="722.0" y="266.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">42.6 → 49.9</text>
+<text x="814.0" y="266.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+17 %</text>
+<text x="24.0" y="298.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="298.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">village</text>
+<line x1="490.8" y1="294" x2="503.0" y2="294" stroke="#383835" stroke-width="2"/>
+<circle cx="490.8" cy="294" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title> (village), before: 37.3 FPS</title></circle>
+<circle cx="503.0" cy="294" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title> (village), after: 38.5 FPS</title></circle>
+<text x="722.0" y="298.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">37.3 → 38.5</text>
+<text x="814.0" y="298.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+3 %</text>
+<text x="24.0" y="330.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">Engine draw runs (CITY-OPT P5)</text>
+<text x="310.0" y="330.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">city</text>
+<line x1="375.1" y1="326" x2="414.7" y2="326" stroke="#383835" stroke-width="2"/>
+<circle cx="375.1" cy="326" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>Engine draw runs (CITY-OPT P5) (city), before: 25.3 FPS</title></circle>
+<circle cx="414.7" cy="326" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>Engine draw runs (CITY-OPT P5) (city), after: 29.4 FPS</title></circle>
+<text x="722.0" y="330.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">25.3 → 29.4</text>
+<text x="814.0" y="330.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+16 %</text>
+<text x="24.0" y="362.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">G-buffer runs (CITY-OPT P6)</text>
+<text x="310.0" y="362.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">city</text>
+<line x1="400.2" y1="358" x2="435.9" y2="358" stroke="#383835" stroke-width="2"/>
+<circle cx="400.2" cy="358" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>G-buffer runs (CITY-OPT P6) (city), before: 27.9 FPS</title></circle>
+<circle cx="435.9" cy="358" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>G-buffer runs (CITY-OPT P6) (city), after: 31.6 FPS</title></circle>
+<text x="722.0" y="362.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">27.9 → 31.6</text>
+<text x="814.0" y="362.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+13 %</text>
+<text x="24.0" y="394.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">Trivial CP polls (R6-P)</text>
+<text x="310.0" y="394.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">city bench</text>
+<line x1="408.9" y1="390" x2="447.2" y2="390" stroke="#383835" stroke-width="2"/>
+<circle cx="408.9" cy="390" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>Trivial CP polls (R6-P) (city bench), before: 28.8 FPS</title></circle>
+<circle cx="447.2" cy="390" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>Trivial CP polls (R6-P) (city bench), after: 32.8 FPS</title></circle>
+<text x="722.0" y="394.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">28.8 → 32.8</text>
+<text x="814.0" y="394.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+14 %</text>
+<text x="24.0" y="426.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">Frontend + emit threads, ring 128</text>
+<text x="310.0" y="426.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">live city</text>
+<line x1="407.4" y1="422" x2="479.0" y2="422" stroke="#383835" stroke-width="2"/>
+<circle cx="407.4" cy="422" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>Frontend + emit threads, ring 128 (live city), before: 28.6 FPS</title></circle>
+<circle cx="479.0" cy="422" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>Frontend + emit threads, ring 128 (live city), after: 36.1 FPS</title></circle>
+<text x="722.0" y="426.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">28.6 → 36.1</text>
+<text x="814.0" y="426.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+26 %</text>
+<text x="24.0" y="458.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">Emitter batching (R8 T2)</text>
+<text x="310.0" y="458.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">city bench</text>
+<line x1="508.6" y1="454" x2="531.9" y2="454" stroke="#383835" stroke-width="2"/>
+<circle cx="508.6" cy="454" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>Emitter batching (R8 T2) (city bench), before: 39.1 FPS</title></circle>
+<circle cx="531.9" cy="454" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>Emitter batching (R8 T2) (city bench), after: 41.5 FPS</title></circle>
+<text x="722.0" y="458.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">39.1 → 41.5</text>
+<text x="814.0" y="458.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+6 %</text>
+<text x="24.0" y="490.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start">F1 + F3 (R9)</text>
+<text x="310.0" y="490.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">fight</text>
+<line x1="560.3" y1="486" x2="575.3" y2="486" stroke="#383835" stroke-width="2"/>
+<circle cx="560.3" cy="486" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title>F1 + F3 (R9) (fight), before: 44.5 FPS</title></circle>
+<circle cx="575.3" cy="486" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title>F1 + F3 (R9) (fight), after: 46.0 FPS</title></circle>
+<text x="722.0" y="490.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">44.5 → 46.0</text>
+<text x="814.0" y="490.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+3 %</text>
+<text x="24.0" y="522.0" font-size="13" fill="#f0efec" font-weight="400" text-anchor="start"></text>
+<text x="310.0" y="522.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="end">traverse</text>
+<line x1="588.5" y1="518" x2="626.4" y2="518" stroke="#383835" stroke-width="2"/>
+<circle cx="588.5" cy="518" r="5" fill="#6b6a65" stroke="#1a1a19" stroke-width="2"><title> (traverse), before: 47.4 FPS</title></circle>
+<circle cx="626.4" cy="518" r="5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"><title> (traverse), after: 51.3 FPS</title></circle>
+<text x="722.0" y="522.0" font-size="12" fill="#f0efec" font-weight="400" text-anchor="start">47.4 → 51.3</text>
+<text x="814.0" y="522.0" font-size="12" fill="#c3c2b7" font-weight="400" text-anchor="start">+8 %</text>
+</svg>

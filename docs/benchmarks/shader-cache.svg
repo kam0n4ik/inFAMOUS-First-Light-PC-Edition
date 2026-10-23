@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="282" viewBox="0 0 880 282" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-label="First start against a repeat start">
+<title>First start against a repeat start</title>
+<rect x="0.5" y="0.5" width="879" height="281" rx="10" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="24.0" y="34.0" font-size="18" fill="#0b0b0b" font-weight="600" text-anchor="start">First start against a repeat start</text>
+<text x="24.0" y="56.0" font-size="13" fill="#52514e" font-weight="400" text-anchor="start">Frames over 100 ms in a 90 s run (P4.14 shader cache + precompiler, 2026-10-12)</text>
+<text x="24.0" y="266.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">First start: 26-42 s of pipelines compiled while playing; repeat start: 0. docs/PHASE4_SHADER_PRECOMPILER.md.</text>
+<rect x="24" y="71" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="40.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">first start</text>
+<rect x="137.0" y="71" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="153.0" y="80.0" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">repeat start</text>
+<line x1="114.0" y1="90" x2="114.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="114.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">0</text>
+<line x1="230.0" y1="90" x2="230.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="230.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">10</text>
+<line x1="346.0" y1="90" x2="346.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="346.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">20</text>
+<line x1="462.0" y1="90" x2="462.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="462.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">30</text>
+<line x1="578.0" y1="90" x2="578.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="578.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">40</text>
+<line x1="694.0" y1="90" x2="694.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="694.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">50</text>
+<line x1="810.0" y1="90" x2="810.0" y2="222" stroke="#e1e0d9" stroke-width="1"/>
+<text x="810.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="middle">60</text>
+<text x="832.0" y="238.0" font-size="11" fill="#898781" font-weight="400" text-anchor="start">frames</text>
+<text x="102.0" y="115.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">village</text>
+<path d="M114.0,96.0 H724.8 Q728.8,96.0 728.8,100.0 V106.0 Q728.8,110.0 724.8,110.0 H114.0 Z" fill="#2a78d6"><title>village, first start: 53 frames</title></path>
+<text x="734.8" y="107.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">53</text>
+<path d="M114.0,112.0 H156.4 Q160.4,112.0 160.4,116.0 V122.0 Q160.4,126.0 156.4,126.0 H114.0 Z" fill="#eb6834"><title>village, repeat start: 4 frames</title></path>
+<text x="166.4" y="123.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">4</text>
+<text x="102.0" y="161.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">beach</text>
+<path d="M114.0,142.0 H597.2 Q601.2,142.0 601.2,146.0 V152.0 Q601.2,156.0 597.2,156.0 H114.0 Z" fill="#2a78d6"><title>beach, first start: 42 frames</title></path>
+<text x="607.2" y="153.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">42</text>
+<path d="M114.0,158.0 H156.4 Q160.4,158.0 160.4,162.0 V168.0 Q160.4,172.0 156.4,172.0 H114.0 Z" fill="#eb6834"><title>beach, repeat start: 4 frames</title></path>
+<text x="166.4" y="169.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">4</text>
+<text x="102.0" y="207.0" font-size="13" fill="#0b0b0b" font-weight="400" text-anchor="end">harbour</text>
+<path d="M114.0,188.0 H527.6 Q531.6,188.0 531.6,192.0 V198.0 Q531.6,202.0 527.6,202.0 H114.0 Z" fill="#2a78d6"><title>harbour, first start: 36 frames</title></path>
+<text x="537.6" y="199.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">36</text>
+<path d="M114.0,204.0 H144.8 Q148.8,204.0 148.8,208.0 V214.0 Q148.8,218.0 144.8,218.0 H114.0 Z" fill="#eb6834"><title>harbour, repeat start: 3 frames</title></path>
+<text x="154.8" y="215.0" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="start">3</text>
+<line x1="114" y1="90" x2="114" y2="222" stroke="#c3c2b7" stroke-width="1"/>
+</svg>
