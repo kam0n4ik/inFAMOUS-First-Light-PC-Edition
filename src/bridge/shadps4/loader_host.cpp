@@ -187,8 +187,12 @@ public:
                          "tables: trusted up to their last ret/jmp); {} FS instructions past that left to first use",
                          r.undecodable, r.functions, segment, r.left_to_runtime);
             }
-            SSPC_LOG(Loader, Info, "{} of {} functions at {:#x} keep data below rsp (red zone)", r.red_zone_functions,
-                     r.functions, segment);
+            SSPC_LOG(Loader, Info,
+                     "{} of {} functions at {:#x} keep data below rsp (red zone); {} of them entered through "
+                     "vzeroupper, left as they were: {} with 256-bit instructions, {} with calls, {} with an entry "
+                     "a jump does not fit",
+                     r.red_zone_functions, r.functions, segment, r.red_zone_cleaned, r.red_zone_wide,
+                     r.red_zone_calls, r.red_zone_entry);
             return {r.functions, r.patched, r.unsupported};
         }
         if (NativeExceptions() && !Core::WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {

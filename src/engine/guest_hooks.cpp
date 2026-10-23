@@ -9,6 +9,8 @@
 #include <fmt/format.h>
 #include <windows.h>
 
+#include "runtime/cpu/fs_patcher.h"
+
 namespace SecondSon::Engine {
 
 namespace {
@@ -53,6 +55,7 @@ void AddPristineCode(u64 address, const void* data, u64 size) {
 
 bool VerifyGuestFunction(u64 module_base, const GuestFunction& f, std::string& error) {
     const u64 at = module_base + f.rva;
+    Cpu::RestoreRedZoneEntries(at, std::min<u64>(16, f.size)); // (the red-zone vzeroupper entry, fs_patcher.h)
     for (const Pristine& p : g_pristine) {
         if (at < p.address || at + f.size > p.address + p.bytes.size()) {
             continue;
@@ -87,6 +90,7 @@ bool VerifyGuestFunction(u64 module_base, const GuestFunction& f, std::string& e
 }
 
 bool InstallJump(u64 at, const void* target, std::string& error) {
+    Cpu::RestoreRedZoneEntries(at, 14);
     u8 code[14] = {0xFF, 0x25, 0, 0, 0, 0}; // jmp qword [rip+0]
     const u64 dest = reinterpret_cast<u64>(target);
     std::memcpy(code + 6, &dest, sizeof(dest));

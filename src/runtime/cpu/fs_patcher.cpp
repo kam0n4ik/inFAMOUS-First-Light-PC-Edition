@@ -345,6 +345,102 @@ bool IsSse4aMnemonic(ZydisMnemonic mnemonic) {
            mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
 }
 
+// ------------------------------------------------------------------- red zone: a clean AVX state
+
+/// The kernel builds an exception's frame right below the faulting rsp; with the AVX state in use its
+/// extended-state area lies over the 128 bytes a System V leaf function may keep there (exceptions.cpp,
+/// XStateOverRedZone). Intel processors keep that state in use from a 256-bit instruction until a vzeroupper,
+/// which the game's code (built for Jaguar) hardly ever runs: there 156 of 158 access violations resolved in
+/// guest code had it over the red zone, and one inside such a function destroyed a pointer it kept at
+/// [rsp-0x38] (a fatal report from an Intel family 6 model 0xB7 on Windows 11: eboot.bin+0x1cf8f9 read 0).
+/// A red-zone function without 256-bit instructions and calls is entered through vzeroupper: the upper halves
+/// of ymm0-15 are dead at its entry (System V: every vector register is caller-saved, and the function reads
+/// none as 256-bit) and nothing in it makes them live again, so no AVX area is written while its red zone is
+/// live (the self-test NativeExceptions(red zone): 128 bytes intact with the state clean).
+/// SSPC_RED_ZONE_VZEROUPPER=0 turns it off.
+bool RedZoneVzeroupper() {
+    static const bool on = [] {
+        char v[4] = {};
+        return !(GetEnvironmentVariableA("SSPC_RED_ZONE_VZEROUPPER", v, sizeof(v)) == 1 && v[0] == '0');
+    }();
+    return on;
+}
+
+/// 256-bit (or wider) vector instruction: it may leave the upper halves of the ymm registers in use.
+bool IsWideVector(const ZydisDecodedInstruction& insn) {
+    return (insn.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX || insn.encoding == ZYDIS_INSTRUCTION_ENCODING_EVEX ||
+            insn.encoding == ZYDIS_INSTRUCTION_ENCODING_XOP) &&
+           insn.avx.vector_length > 128;
+}
+
+/// How many bytes of whole instructions from a function's entry a jump replaces (at least 5), moved as they
+/// are into the trampoline: none relative (rip-relative operand or branch), none a control transfer, none an
+/// FS or SSE4a site (patched on their own). 0: the entry cannot be moved.
+u64 MovableEntry(u64 entry, u64 end) {
+    u64 pc = entry;
+    while (pc - entry < kNearJump) {
+        ZydisDecodedInstruction insn;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (pc >= end ||
+            !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&Decoder(), reinterpret_cast<const void*>(pc), end - pc, &insn, ops))) {
+            return 0;
+        }
+        if ((insn.attributes & (ZYDIS_ATTRIB_IS_RELATIVE | ZYDIS_ATTRIB_HAS_SEGMENT_FS | ZYDIS_ATTRIB_HAS_SEGMENT_GS)) !=
+                0 ||
+            IsSse4aMnemonic(insn.mnemonic)) {
+            return 0;
+        }
+        switch (insn.meta.category) {
+        case ZYDIS_CATEGORY_COND_BR:
+        case ZYDIS_CATEGORY_UNCOND_BR:
+        case ZYDIS_CATEGORY_CALL:
+        case ZYDIS_CATEGORY_RET:
+        case ZYDIS_CATEGORY_INTERRUPT:
+        case ZYDIS_CATEGORY_SYSCALL:
+        case ZYDIS_CATEGORY_SYSRET:
+        case ZYDIS_CATEGORY_SYSTEM:
+            return 0;
+        default:
+            break;
+        }
+        pc += insn.length;
+    }
+    return pc - entry <= 16 ? pc - entry : 0; // (JumpBytes: 16 bytes)
+}
+
+/// The entries sent through vzeroupper with their original bytes (RestoreRedZoneEntries).
+struct RedZoneEntry {
+    u64 entry;
+    u64 moved;
+    std::array<u8, 16> original;
+};
+std::vector<RedZoneEntry> g_red_zone_entries;
+SRWLOCK g_red_zone_lock = SRWLOCK_INIT;
+
+/// vzeroupper, the entry's `moved` bytes as they are (MovableEntry: position-independent), a jump back.
+u64 MakeVzeroupperTrampoline(Module& m, u64 entry, u64 moved) {
+    if (m.free_end - m.cursor < kTrampolineMax) {
+        return 0;
+    }
+    const u64 at = m.cursor;
+    Emitter e(reinterpret_cast<u8*>(at), kTrampolineMax, at);
+    e.Byte(0xC5); // vzeroupper
+    e.Byte(0xF8);
+    e.Byte(0x77);
+    for (u64 i = 0; i < moved; ++i) {
+        e.Byte(reinterpret_cast<const u8*>(entry)[i]);
+    }
+    e.Jump(entry + moved);
+    const u64 size = e.Size();
+    if (size == 0) {
+        return 0;
+    }
+    m.cursor += (size + 15) & ~u64{15};
+    g_trampoline_bytes.fetch_add(size, std::memory_order_relaxed);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
+    return at;
+}
+
 /// Replaces the `size` bytes at `code` while other threads may execute them (as Linux text_poke_bp):
 /// int3 into the first byte, the rest, then the first byte; FlushProcessWriteBuffers after each step
 /// interrupts every processor running a thread of this process, which serializes its instruction
@@ -865,6 +961,9 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
         u64 unsupported_before_end = 0; // ... before the last unconditional transfer (see below)
         u64 last_transfer_end = f.begin;
         RedZoneScan red_zone;
+        bool wide = false;           // a 256-bit instruction
+        bool calls = false;          // a call
+        u64 entry_target = ~u64{0};  // the lowest branch target in (entry, entry + 16)
         u64 pc = f.begin;
         while (pc < f.end) {
             ZydisDecodedInstruction insn;
@@ -875,6 +974,16 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
                 break;
             }
             red_zone.Add(insn, ops);
+            wide = wide || IsWideVector(insn);
+            calls = calls || insn.meta.category == ZYDIS_CATEGORY_CALL;
+            if ((insn.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0 && insn.operand_count_visible >= 1 &&
+                ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                ZyanU64 target = 0;
+                if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &ops[0], pc, &target)) && target > f.begin &&
+                    target < f.begin + 16) {
+                    entry_target = std::min<u64>(entry_target, target);
+                }
+            }
             if ((insn.attributes & ZYDIS_ATTRIB_HAS_SEGMENT_FS) != 0) {
                 bool fs_relative = false;
                 if (const auto fs = DecodeFs(reinterpret_cast<const u8*>(pc), f.end - pc, &fs_relative)) {
@@ -918,6 +1027,31 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
         if (red_zone.Uses()) {
             Exceptions::MarkRedZoneFunction(f.begin, f.end);
             ++r.red_zone_functions;
+        }
+        // Entered through vzeroupper (RedZoneVzeroupper). The entry's instructions are no FS or SSE4a site
+        // (MovableEntry), so the patches below never overlap the jump; no branch lands inside it.
+        // The game's own code only: the system libraries (libc.prx: hand-written routines with more than one entry)
+        // are left as they were.
+        if (red_zone.Uses() && RedZoneVzeroupper() && std::strcmp(m->name, "eboot.bin") == 0) {
+            u64 moved = 0;
+            if (wide) {
+                ++r.red_zone_wide;
+            } else if (calls) {
+                ++r.red_zone_calls;
+            } else if ((moved = MovableEntry(f.begin, trusted_end)) == 0 || entry_target < f.begin + moved) {
+                ++r.red_zone_entry;
+            } else if (const u64 trampoline = MakeVzeroupperTrampoline(*m, f.begin, moved)) {
+                RedZoneEntry saved{f.begin, moved, {}};
+                std::memcpy(saved.original.data(), reinterpret_cast<const void*>(f.begin), moved);
+                AcquireSRWLockExclusive(&g_red_zone_lock);
+                g_red_zone_entries.push_back(saved);
+                ReleaseSRWLockExclusive(&g_red_zone_lock);
+                const auto jump = JumpBytes(f.begin, trampoline);
+                std::memcpy(reinterpret_cast<void*>(f.begin), jump.data(), moved); // not running yet
+                ++r.red_zone_cleaned;
+            } else {
+                ++r.red_zone_entry;
+            }
         }
         // SSE4a (P3.4): movnt* in place, the rest into trampolines; what a jump does not fit is executed from
         // its illegal-instruction exception (made to trap here on a host that has SSE4a, forced mode only).
@@ -976,6 +1110,30 @@ StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const Functi
         g_unsupported.fetch_add(r.unsupported, std::memory_order_relaxed);
     }
     return r;
+}
+
+u64 RestoreRedZoneEntries(u64 address, u64 size) {
+    u64 restored = 0;
+    AcquireSRWLockExclusive(&g_red_zone_lock);
+    for (auto& e : g_red_zone_entries) {
+        if (e.moved == 0 || e.entry >= address + size || e.entry + e.moved <= address) {
+            continue;
+        }
+        auto* code = reinterpret_cast<void*>(e.entry);
+        DWORD old = 0;
+        if (!VirtualProtect(code, e.moved, PAGE_EXECUTE_READWRITE, &old)) {
+            continue;
+        }
+        std::memcpy(code, e.original.data(), e.moved);
+        DWORD unused = 0;
+        VirtualProtect(code, e.moved, old, &unused);
+        FlushInstructionCache(GetCurrentProcess(), code, e.moved);
+        SSPC_LOG(Cpu, Info, "red zone: the entry {:#x} given back its original bytes (hooked or verified)", e.entry);
+        e.moved = 0;
+        ++restored;
+    }
+    ReleaseSRWLockExclusive(&g_red_zone_lock);
+    return restored;
 }
 
 Stats GetStats() {

@@ -91,6 +91,13 @@ struct StaticResult {
     u64 undecodable = 0;     // functions whose decoding did not end exactly at their end (data in the range)
     u64 left_to_runtime = 0; // FS instructions found past the trusted part of such a function
     u64 red_zone_functions = 0; // functions that keep data below rsp (marked for the exception dispatcher)
+    // ... of them entered through vzeroupper (the AVX state clean while their red zone is live: an exception there
+    // leaves it alone), and those left as they were: 256-bit instructions or calls inside, or an entry the jump
+    // does not fit
+    u64 red_zone_cleaned = 0;
+    u64 red_zone_wide = 0;
+    u64 red_zone_calls = 0;
+    u64 red_zone_entry = 0;
     // SSE4a (P3.4), only while it is emulated (SetSse4aEmulation):
     u64 sse4a_trampolines = 0;     // extrq/insertq of 5+ bytes rewritten to jump to a trampoline
     u64 sse4a_inplace = 0;         // movntss/movntsd rewritten to movss/movsd
@@ -110,6 +117,11 @@ struct FunctionRange {
 /// (ret/jmp/ud2/int3/hlt) before decoding stopped; sites beyond are left to the run-time path. The
 /// module must be registered and must not be running.
 StaticResult PatchModuleStatically(u64 segment, u64 size, std::span<const FunctionRange> functions);
+
+/// Gives back the original bytes of every red-zone entry PatchModuleStatically sent through vzeroupper whose jump
+/// overlaps [address, address + size): for code that verifies or hooks a guest function's entry (engine/guest_hooks:
+/// probes, native replacements) before the guest runs. Returns how many entries were restored.
+u64 RestoreRedZoneEntries(u64 address, u64 size);
 
 /// P3.4: only marks the functions that keep data below rsp (Exceptions::MarkRedZoneFunction) — when the
 /// bridge's patcher owns the code and PatchModuleStatically does not run. Returns how many were marked.
