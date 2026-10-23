@@ -75,7 +75,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
 
 3. **The Visual C++ runtime.** Install the [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it is not installed yet.
 4. **Start `play.cmd`.**
-   - On the first start a console window prepares the game's shaders: they are compiled before the game starts. This happens once and takes a few minutes. Later starts take about two seconds.
+   - On the first start a console window prepares the game's shaders: they are compiled before the game starts. This happens once: on the development PC (6 cores / 12 threads) it took 5.5 minutes from an empty cache, about 13 400 pipelines. Later starts skip it in under two seconds.
    - It runs again only after a driver or SecondSonPC update.
 5. **PC settings:** in the game, open **Esc (Options) → Settings → "Additional settings"**.
 
@@ -85,7 +85,7 @@ Where things are kept:
 |---|---|
 | `userdata\` (in the game's folder) | saves; `play.cmd` copies them to `userdata\savedata_backups\<date_time>` before every start |
 | `%LOCALAPPDATA%\SecondSonPC\settings.toml` | your changes from the in-game settings window (they override `SecondSonPC.toml`) |
-| `cache\shaders\` | prepared shaders and the driver's pipeline cache (about 1 GB; safe to delete, it is prepared again) |
+| `cache\shaders\` | prepared shaders and the driver's pipeline cache (about 1.6 GB; safe to delete, it is prepared again) |
 | `logs\SecondSonPC.log` | the log; attach it to a bug report |
 
 To keep SecondSonPC outside the game's folder, set `[Game] path` in `SecondSonPC.toml` to the game's folder instead of `"."`.
@@ -99,7 +99,7 @@ To keep SecondSonPC outside the game's folder, set `[Game] path` in `SecondSonPC
 | GPU | Vulkan 1.3 with dynamic rendering, push descriptors, robustness2, a vertex attribute divisor, tessellation shaders, swapchain maintenance 1 | NVIDIA GeForce RTX 2060 6 GB, driver 596.21 |
 | VRAM | 6 GB | 6 GB |
 | RAM | 32 GB was tested, smaller amounts were not; keep the Windows page file on (the game maps several GB of guest memory) | 32 GB |
-| Disk | the game (~30 GB) + about 1 GB for the shader cache | — |
+| Disk | the game (~30 GB) + about 1.6 GB for the shader cache | — |
 | DLSS | NVIDIA GeForce RTX; DLSS frame generation is not implemented | RTX 2060 |
 | FSR 3.1 | any GPU above | RTX 2060 |
 
@@ -448,6 +448,7 @@ Vulkan 1.3 driver
 - **Game version.** Only CUSA00004 with update 01.07 (EU) is tested; the engine replacements install only on that executable.
 - **From shadPS4.** Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4, and the build still needs `third_party/shadPS4`.
 - **Memory.** On a PC without a page file, total committed memory can reach the Windows limit in long sessions; keep the page file on. Fixed causes are in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- **Shader preparation** cannot predict every program: 166 of about 304 000 predicted shader requests are declined by the own translator (for example an `image_sample` whose resource is not known before the game runs). The game translates those the first time it uses them, which can cause one short stutter.
 - **Frame generation** has not been reviewed frame by frame, and input latency with it is not measured.
 - There is no full-campaign compatibility guarantee.
 

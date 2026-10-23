@@ -11,7 +11,8 @@ if not exist "%~dp0eboot.bin" (
     pause
     exit /b 1
 )
-tasklist /fi "imagename eq SecondSonPC.exe" 2>nul | find /i "SecondSonPC.exe" >nul
+rem Windows' own find by its path: with Git's Unix tools in PATH a bare "find" is the Unix one
+"%SystemRoot%\System32\tasklist.exe" /fi "imagename eq SecondSonPC.exe" 2>nul | "%SystemRoot%\System32\find.exe" /i "SecondSonPC.exe" >nul
 if not errorlevel 1 (
     echo SecondSonPC.exe is already running.
     pause
