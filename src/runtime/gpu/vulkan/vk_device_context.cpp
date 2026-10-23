@@ -5,6 +5,7 @@
 #include "runtime/gpu/upscale/upscalers.h"
 
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 
 #include <algorithm>
 #include <atomic>
@@ -430,6 +431,11 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
                          Has(dexts, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
         denable.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
     }
+    // R9 AQ (SSPC_DIAG_AQ_MARKERS=1, diagnostic): buffer markers around the dispatches without the rest of --gpu-native-diag
+    if (char am[4] = {}; !options.diagnostics && GetEnvironmentVariableA("SSPC_DIAG_AQ_MARKERS", am, sizeof(am)) == 1 &&
+                         am[0] == '1' && Has(dexts, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+        denable.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+    }
     if (options.diagnostics) {
         // SSPC_DIAG_NV_CONFIG=off: without NVIDIA's diagnostics config (resource tracking may change the driver's
         // behaviour; a diagnostic experiment)
@@ -816,6 +822,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     if (!error.empty()) {
         return nullptr;
     }
+    Emit::Install(f);
     if (caps.external_memory_host && f.vkGetMemoryHostPointerPropertiesEXT == nullptr) {
         caps.external_memory_host = false;
     }

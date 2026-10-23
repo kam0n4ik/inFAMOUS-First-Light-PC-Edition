@@ -13,6 +13,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/diag_request.h"
+#include "runtime/gpu/r9/gprof.h"
 
 namespace SecondSon::Input {
 
@@ -327,6 +328,19 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         if (down && sc == SDL_SCANCODE_F10) {
             result.hotkey = Hotkey::ToggleFps;
             break;
+        }
+        // R9 gameplay profiler (SSPC_R9_GPROF): the player marks what is happening now
+        if (down && Gpu::Gprof::On()) {
+            const char* mark = sc == SDL_SCANCODE_F5    ? "calm"
+                               : sc == SDL_SCANCODE_F6  ? "fight"
+                               : sc == SDL_SCANCODE_F7  ? "traversal"
+                               : sc == SDL_SCANCODE_F9  ? "effects"
+                               : sc == SDL_SCANCODE_F12 ? "stutter"
+                                                        : nullptr;
+            if (mark != nullptr) {
+                Gpu::Gprof::Mark(mark);
+                break;
+            }
         }
         // DIAGNOSTIC (SSPC_DIAG_TEX_KEY=1): F8 dumps the textures of the next frame (runtime/gpu/diag_request.h)
         static const bool tex_key = [] {

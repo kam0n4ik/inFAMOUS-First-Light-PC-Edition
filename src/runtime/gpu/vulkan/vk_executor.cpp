@@ -28,6 +28,7 @@
 #include "runtime/gpu/image_layout.h"
 #include "runtime/gpu/menu_focus.h"
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/vulkan/vk_reflex.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/stall_trace.h"
@@ -93,6 +94,98 @@ private:
     u64& ticks_;
     u64 t0_;
 };
+
+/// TexMemo's binding flags and key (BindStage; a run member's own textures - DrawRunMembers)
+u32 TexFlags(const GS::ImageBinding& im) {
+    return (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
+}
+u64 TexMemoKey(const std::array<u32, 8>& raw, u32 flags) {
+    u64 key = flags;
+    for (const u32 w : raw) {
+        key = (key ^ w) * 0x100000001B3ull;
+    }
+    return key;
+}
+
+/// The layout a draw reads a texture in (RecordDraw's barriers move it there outside rendering)
+VkImageLayout TextureLayout(const CachedImage* img) {
+    const bool storage =
+        (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) && img->gpu_written && img->current == VK_IMAGE_LAYOUT_GENERAL;
+    return storage ? VK_IMAGE_LAYOUT_GENERAL
+           : img->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+/// SSPC_CITY_GB_RUN_MATERIAL=verify: what a graphics binding refers to, a hash of its guest description (never 0)
+u64 HashWords(u64 h, const u32* w, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        h = (h ^ w[i]) * 0x100000001B3ull;
+    }
+    return h | 1;
+}
+/// ... the registers a stage reads through its flattened user data (a VS: not its vertex tables' or offsets' - the run's
+/// draws are recorded with the first one's there, CITY-OPT Phase 5)
+u32 FlatRegisters(const GS::StageView& st) {
+    const GS::ShaderReflection& refl = st.module->result.reflection;
+    const GS::FetchShader& fetch = refl.fetch;
+    u32 skip = 0;
+    for (const GS::FetchAttribute& at : fetch.attributes) {
+        skip |= at.sgpr_base + 1 < 16 ? 3u << at.sgpr_base : 0u;
+    }
+    if (fetch.sgpr_base < 16) {
+        skip &= ~(3u << fetch.sgpr_base); // (the fetch shader's own address: the same in every draw of a run)
+    }
+    skip |= fetch.vertex_offset_sgpr >= 0 && fetch.vertex_offset_sgpr < 16 ? 1u << fetch.vertex_offset_sgpr : 0u;
+    skip |= fetch.instance_offset_sgpr >= 0 && fetch.instance_offset_sgpr < 16 ? 1u << fetch.instance_offset_sgpr : 0u;
+    return refl.user_data_used & ~skip;
+}
+u64 FlatHash(const u32* flat, size_t n, u32 registers) {
+    u64 h = 0xF1A7;
+    for (u32 i = 0; i < 16 && i < n; ++i) {
+        h = (h ^ ((registers >> i) & 1 ? flat[i] : 0u)) * 0x100000001B3ull;
+    }
+    return n > 16 ? HashWords(h, flat + 16, n - 16) : h | 1;
+}
+u64 BufferHash(const GS::BufferBinding& b) {
+    const u32 w[] = {static_cast<u32>(b.kind), static_cast<u32>(b.address), static_cast<u32>(b.address >> 32),
+                     static_cast<u32>(b.size), static_cast<u32>(b.size >> 32), b.desc.raw[0], b.desc.raw[1],
+                     b.desc.raw[2], b.desc.raw[3], (b.written ? 1u : 0u) | (b.formatted ? 2u : 0u),
+                     static_cast<u32>(b.status)};
+    return HashWords(0xB0F, w, std::size(w));
+}
+u64 ImageHash(const GS::ImageBinding& im) {
+    const u32 w[] = {TexFlags(im), im.count, (im.fmask ? 1u : 0u) | (im.atomic ? 2u : 0u), static_cast<u32>(im.status)};
+    const u64 h = HashWords(0x1A6, w, std::size(w));
+    return im.status != GS::ResourceStatus::Ok ? h : HashWords(h, im.desc.raw.data(), 8); // (a null one: no T#)
+}
+u64 SamplerHash(const GS::SamplerBinding& sm) {
+    const GS::SamplerDesc d = sm.status != GS::ResourceStatus::Ok ? GS::SamplerDesc{} : sm.desc;
+    return HashWords(0x5A3, d.raw.data(), 4);
+}
+/// ... every binding of a stage's plan into `out` (by binding; a stage without a module is not bound - RecordDraw's
+/// has_ps: a draw without a pixel shader)
+void StageHashes(const GS::StageView& st, std::vector<u64>& out) {
+    if (st.module == nullptr) {
+        return;
+    }
+    const auto put = [&](u32 binding, u64 h) {
+        if (binding >= out.size()) {
+            out.resize(binding + 1, 0);
+        }
+        out[binding] = h;
+    };
+    const u32 registers = FlatRegisters(st);
+    for (const GS::BufferBinding& b : st.plan.buffers) {
+        put(b.binding, b.kind == GS::BufferKind::Flatbuf ? FlatHash(st.plan.flat.data(), st.plan.flat.size(), registers)
+                                                         : BufferHash(b));
+    }
+    for (const GS::ImageBinding& im : st.plan.images) {
+        put(im.binding, ImageHash(im));
+    }
+    for (const GS::SamplerBinding& sm : st.plan.samplers) {
+        put(sm.binding, SamplerHash(sm));
+    }
+}
 
 constexpr u32 kQuerySlots = 1024; ///< batches in flight stay far below
 constexpr u32 kProfBatches = 64, kProfPerBatch = 2048; ///< the profiler's pool: batch slots x timestamps
@@ -275,6 +368,43 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         } else {
             aq_ = true;
             aq_family_ = ctx_.LaneFamily() != ctx_.QueueFamily();
+            if (char am[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_AQ_MARKERS", am, sizeof(am)) == 1 && am[0] == '1' &&
+                                 ctx_.Caps().buffer_markers && Fn().vkCmdWriteBufferMarkerAMD != nullptr) {
+                std::string merr;
+                if (CreateBuffer(ctx_, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, aq_marker_buf_, merr) &&
+                    aq_marker_buf_.mapped != nullptr) {
+                    std::memset(aq_marker_buf_.mapped, 0, 256);
+                    aq_marker_ring_.resize(1u << 16);
+                    aq_markers_ = true;
+                    SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_AQ_MARKERS=1 - buffer markers around every dispatch, by "
+                                           "queue, for the device-lost report");
+                    char wv[32] = {};
+                    std::string perr;
+                    if (GetEnvironmentVariableA("SSPC_DIAG_AQ_WATCH", wv, sizeof(wv)) > 0 &&
+                        CreateBuffer(ctx_, u64{16} << 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, aq_probe_buf_, perr,
+                                     true) &&
+                        aq_probe_buf_.mapped != nullptr) {
+                        aq_watch_cs_ = std::strtoull(wv, nullptr, 16);
+                        aq_writers_.resize(4096);
+                        char pv[4] = {};
+                        aq_watch_probe_ = !(GetEnvironmentVariableA("SSPC_DIAG_AQ_WATCH_PROBE", pv, sizeof(pv)) == 1 &&
+                                            pv[0] == '0');
+                        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_AQ_WATCH={:#x} - that shader's first buffer, CPU "
+                                               "and GPU bytes, and its writers", aq_watch_cs_);
+                    }
+                }
+            }
+            // SSPC_FB_ASYNC_NOTE_UPLOADS=0 (A/B only): the uploads' pages past the binding's range not noted
+            if (char nu[4] = {}; GetEnvironmentVariableA("SSPC_FB_ASYNC_NOTE_UPLOADS", nu, sizeof(nu)) == 1 && nu[0] == '0') {
+                aq_note_uploads_ = false;
+                SSPC_LOG(GPU, Warning, "A/B: SSPC_FB_ASYNC_NOTE_UPLOADS=0 - the block uploads' other pages are not noted "
+                                       "for the lane's conflicts (the device-lost behaviour)");
+            }
+            if (char nr[4] = {}; GetEnvironmentVariableA("SSPC_FB_ASYNC_NOTE_READS", nr, sizeof(nr)) == 1 && nr[0] == '1') {
+                aq_note_reads_ = true;
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_ASYNC_NOTE_READS=1 - the main queue's graphics reads noted for "
+                                       "the lane's conflicts");
+            }
             buffers_.DisableLazy(); // (FB-7's kept-back write-backs stay on the main queue: not with the lane)
             char sp[16] = {};
             if (GetEnvironmentVariableA("SSPC_FB_ASYNC_SPLIT", sp, sizeof(sp)) > 0) {
@@ -319,6 +449,8 @@ Executor::~Executor() {
     }
     DestroyBuffer(ctx_, lds_);
     DestroyBuffer(ctx_, lds_lane_);
+    DestroyBuffer(ctx_, aq_marker_buf_);
+    DestroyBuffer(ctx_, aq_probe_buf_);
     DestroyBuffer(ctx_, diag_scratch_);
     for (OwnedBuffer& a : geo_arena_) {
         DestroyBuffer(ctx_, a);
@@ -426,6 +558,7 @@ bool Executor::Begin() {
     cur_.queues.clear();
     cur_.lane = cur_.pool_lane;
     cur_.aq_wait_main_min = std::exchange(aq_next_wait_main_, 0);
+    aq_mark_draw_key_ = ~0ull;
     cur_.aq_main = cur_.aq_wait_all = cur_.aq_images = cur_.aq_gds = cur_.aq_overflow = false;
     cur_.aq_lds = 0;
     cur_.aq_ranges.clear();
@@ -571,6 +704,16 @@ void Executor::EndRendering() {
         Fn().vkCmdEndRendering(cur_.cb);
         rendering_ = false;
         render_ = RenderKey{};
+    }
+}
+
+void Executor::SegSync() {
+    const u64 g = images_.Generation();
+    if (g != seg_gen_ || cur_.value != seg_value_) {
+        ++tex_seg_;
+        ++stats_.tex_seg_segments;
+        seg_gen_ = g;
+        seg_value_ = cur_.value;
     }
 }
 
@@ -981,7 +1124,7 @@ void Executor::Flush() {
         return;
     }
     if (diag_ != nullptr) {
-        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
+        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_, cur_.lane);
     }
     submitted_value_.store(cur_.value, std::memory_order_release);
     if (aq_) {
@@ -1153,6 +1296,9 @@ void Executor::Complete(u32 queue, u64 seq) {
 }
 
 void Executor::PollCollect(u64 completed) {
+    if (!aq_watch_pending_.empty()) {
+        AqWatchCheck(completed);
+    }
     ring_.Collect(completed);
     if (shadow_ring_ != nullptr) {
         shadow_ring_->Collect(completed);
@@ -1211,6 +1357,158 @@ std::string DescribeImage(const CachedImage& img) {
                        img.alias_hits != 0 ? " ALIASED" : "");
 }
 
+void Executor::AqMarkersReport(std::string& out) {
+    if (!aq_markers_) {
+        return;
+    }
+    const volatile u32* m = reinterpret_cast<const volatile u32*>(aq_marker_buf_.mapped);
+    for (u32 lane = 0; lane < 2; ++lane) {
+        const u32 started = m[lane * 2], completed = m[lane * 2 + 1];
+        out += fmt::format("\nAQ dispatch markers, {} queue: last started {}, last completed {} (recorded up to {})\n",
+                           lane != 0 ? "the async compute lane's" : "the main", started, completed, aq_marker_next_ - 1);
+        // the dispatches of this queue from a few before the last completed one to a few past the last started one
+        u32 shown = 0;
+        const u32 from = completed > 64 ? completed - 64 : 1;
+        for (u32 id = from; id < aq_marker_next_ && shown < 96; ++id) {
+            const AqMarker& e = aq_marker_ring_[id & (aq_marker_ring_.size() - 1)];
+            if (e.lane != lane || (id > started + 8 && id > completed + 8)) {
+                continue;
+            }
+            ++shown;
+            const char* state = id <= completed ? "done" : id <= started ? "STARTED" : "-";
+            if (e.queue == 0xFFFF) {
+                out += fmt::format("  {} {}: batch {} draws: pipeline {} vs {:#x} ps {:#x}\n", id, state, e.batch,
+                                   e.groups[0], e.cs, e.ps);
+                continue;
+            }
+            out += fmt::format("  {} {}: batch {} q{} cs {:#x} groups {}x{}x{}{}", id, state, e.batch, e.queue, e.cs,
+                               e.groups[0], e.groups[1], e.groups[2], e.indirect ? " indirect" : "");
+            if (e.waddr != 0 && aq_probe_buf_.mapped != nullptr) {
+                u32 g[4];
+                std::memcpy(g, aq_probe_buf_.mapped + u64{id & (aq_marker_ring_.size() - 1)} * 16, 16);
+                out += fmt::format(" | watch b0 {:#x}+{} path {} flags {} cpu [{:#x} {:#x} {:#x} {:#x}] gpu [{:#x} {:#x} "
+                                   "{:#x} {:#x}]",
+                                   e.waddr, e.wsize, e.wpath, e.wflags, e.wcpu[0], e.wcpu[1], e.wcpu[2], e.wcpu[3], g[0],
+                                   g[1], g[2], g[3]);
+            }
+            out += '\n';
+        }
+    }
+    if (aq_watch_cs_ != 0) {
+        out += fmt::format("\nAQ watch {:#x}: {} probes checked, {} differ from the CPU's bytes, {} with a count past the "
+                           "threads, {} huge; {} watched ranges; the last writers of them ({} recorded):\n",
+                           aq_watch_cs_, aq_watch_stats_[0], aq_watch_stats_[1], aq_watch_stats_[2], aq_watch_stats_[3],
+                           aq_watch_ranges_.size(), aq_writer_next_);
+        for (u32 k = aq_writer_next_ > 64 ? aq_writer_next_ - 64 : 0; k < aq_writer_next_; ++k) {
+            const AqWriter& w = aq_writers_[k & (aq_writers_.size() - 1)];
+            out += fmt::format("  batch {}{} kind {} what {:#x} at {:#x}+{}\n", w.batch, w.lane != 0 ? " (lane)" : "",
+                               w.kind, w.what, w.addr, w.size);
+        }
+    }
+}
+
+void Executor::AqWatchWrite(u64 addr, u64 size, u8 kind) {
+    // SSPC_DIAG_AQ_WATCH: a command writing (1), uploading (2) or WRITE_DATA (3) over a watched buffer's range
+    const u64 end = addr + size;
+    if (end <= aq_watch_lo_ || aq_watch_hi_ <= addr) {
+        return;
+    }
+    for (const auto& [b, e] : aq_watch_ranges_) {
+        if (addr < e && b < end) {
+            aq_writers_[aq_writer_next_++ & (aq_writers_.size() - 1)] = {cur_.value, addr, size, aq_what_,
+                                                                         cur_.pool_lane, kind};
+            // each kind of writer once in the log (the command, how it writes, the queue)
+            const u64 key = aq_what_ * 31 + kind * 2 + (cur_.pool_lane != 0 ? 1 : 0);
+            if (aq_writer_kinds_.size() < 64 && aq_writer_kinds_.insert(key).second) {
+                SSPC_LOG(GPU, Warning,
+                         "DIAGNOSTIC AQ watch: writer of a watched range: batch {}{} kind {} what {:#x} at {:#x}+{} "
+                         "(watched {:#x}+{})",
+                         cur_.value, cur_.pool_lane != 0 ? " (lane)" : "", kind, aq_what_, addr, size, b, e - b);
+            }
+            return;
+        }
+    }
+}
+
+void Executor::AqWatchDispatch(u32 id) {
+    // SSPC_DIAG_AQ_WATCH: the watched dispatch's first buffer - the CPU's bytes now, the GPU's right before the dispatch
+    // (copied into the probe's slot after a barrier; 0xCD until the copy ran)
+    const u32 slot = id & (static_cast<u32>(aq_marker_ring_.size()) - 1);
+    AqMarker& e = aq_marker_ring_[slot];
+    const AqWatchB0& b = aq_watch_b0_;
+    e.waddr = b.addr;
+    e.wsize = static_cast<u32>(std::min<u64>(b.size, 0xFFFFFFFFull));
+    e.wpath = b.path;
+    u8 cpu[16] = {};
+    if (GuestMemory* gm = GetGuestMemory(); gm != nullptr) {
+        gm->CopySparse(b.addr, cpu, std::min<u64>(b.size, 16));
+    }
+    std::memcpy(e.wcpu, cpu, 16);
+    e.wflags = static_cast<u8>((buffers_.HostWritePending(b.addr, 16) ? 1 : 0) | (TimelineWritePending(b.addr, 16) ? 2 : 0) |
+                               (buffers_.GpuWritePending(b.addr, 16, timeline_.CompletedCached()) ? 4 : 0));
+    std::memset(aq_probe_buf_.mapped + u64{slot} * 16, 0xCD, 16);
+    const u64 n = aq_watch_probe_ ? std::min<u64>(std::min<u64>(16, b.size), b.avail) : 0;
+    if (n != 0) {
+        const auto& f = Fn();
+        const VkMemoryBarrier2 mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                   .pMemoryBarriers = &mb};
+        f.vkCmdPipelineBarrier2(cur_.cb, &dep);
+        const VkBufferCopy region{.srcOffset = b.offset, .dstOffset = u64{slot} * 16, .size = n};
+        f.vkCmdCopyBuffer(cur_.cb, b.buffer, aq_probe_buf_.buffer, 1, &region);
+    }
+    const std::pair<u64, u64> r{b.addr, b.addr + std::max<u64>(b.size, 16)};
+    if (aq_watch_ranges_.size() < 256 && std::ranges::find(aq_watch_ranges_, r) == aq_watch_ranges_.end()) {
+        aq_watch_lo_ = aq_watch_ranges_.empty() ? r.first : std::min(aq_watch_lo_, r.first);
+        aq_watch_hi_ = std::max(aq_watch_hi_, r.second);
+        aq_watch_ranges_.push_back(r);
+    }
+    aq_watch_pending_.push_back(id);
+}
+
+void Executor::AqWatchCheck(u64 completed) {
+    // SSPC_DIAG_AQ_WATCH: the probes of completed batches against the CPU's bytes and the dispatch's threads (logged:
+    // the first 16, then those with a count past the threads or a huge one)
+    while (!aq_watch_pending_.empty()) {
+        const u32 id = aq_watch_pending_.front();
+        const u32 slot = id & (static_cast<u32>(aq_marker_ring_.size()) - 1);
+        const AqMarker& e = aq_marker_ring_[slot];
+        if (e.waddr != 0 && e.batch > completed) {
+            break;
+        }
+        aq_watch_pending_.pop_front();
+        if (e.waddr == 0) {
+            continue; // (overwritten)
+        }
+        u32 g[4];
+        std::memcpy(g, aq_probe_buf_.mapped + u64{slot} * 16, 16);
+        const u64 threads = u64{e.groups[0]} * e.groups[1] * e.groups[2] * 64;
+        const bool differ = std::memcmp(g, e.wcpu, 16) != 0, over = g[3] > threads,
+                   huge = g[3] > 65536 || g[2] > (1u << 24);
+        ++aq_watch_stats_[0];
+        aq_watch_stats_[1] += differ ? 1 : 0;
+        aq_watch_stats_[2] += over ? 1 : 0;
+        aq_watch_stats_[3] += huge ? 1 : 0;
+        if ((aq_watch_stats_[0] <= 16 || over || huge) && aq_watch_logged_ < 64) {
+            ++aq_watch_logged_;
+            SSPC_LOG(GPU, Warning,
+                     "DIAGNOSTIC AQ watch: marker {} batch {}{} cs {:#x} groups {}x{}x{}: b0 {:#x}+{} path {} flags {} cpu "
+                     "[{:#x} {:#x} {:#x} {:#x}] gpu [{:#x} {:#x} {:#x} {:#x}]{}",
+                     id, e.batch, e.lane != 0 ? " (lane)" : "", e.cs, e.groups[0], e.groups[1], e.groups[2], e.waddr,
+                     e.wsize, e.wpath, e.wflags, e.wcpu[0], e.wcpu[1], e.wcpu[2], e.wcpu[3], g[0], g[1], g[2], g[3],
+                     over ? " COUNT PAST THE THREADS" : "");
+        }
+        if ((aq_watch_stats_[0] & 4095) == 0) {
+            SSPC_LOG(GPU, Info, "DIAGNOSTIC AQ watch: {} checked, {} differ from the CPU's, {} past the threads, {} huge",
+                     aq_watch_stats_[0], aq_watch_stats_[1], aq_watch_stats_[2], aq_watch_stats_[3]);
+        }
+    }
+}
+
 void Executor::OnDeviceLost(const char* where, u64 value) {
     if (device_lost_) {
         return;
@@ -1219,7 +1517,7 @@ void Executor::OnDeviceLost(const char* where, u64 value) {
     ctx_.Fail(where, VK_ERROR_DEVICE_LOST);
     std::string in_flight;
     for (const auto& b : in_flight_) {
-        in_flight += fmt::format("  value {}: queues", b.value);
+        in_flight += fmt::format("  value {}{}{}: queues", b.value, b.lane != 0 ? " (lane)" : "", b.done ? " done" : "");
         for (const u32 q : b.queues) {
             in_flight += fmt::format(" {} (work {})", q, b.work[q]);
         }
@@ -1227,6 +1525,7 @@ void Executor::OnDeviceLost(const char* where, u64 value) {
     }
     in_flight += fmt::format("  timeline: completed (last seen) {}, last submitted {}\n", timeline_.CompletedCached(),
                              timeline_.LastSubmitted());
+    AqMarkersReport(in_flight);
     if (diag_ != nullptr) {
         diag_->DeviceLost(where, value, in_flight);
     } else {
@@ -1652,7 +1951,7 @@ u64 Executor::DiagBegin(std::string text) {
     if (diag_ == nullptr || !diag_->Enabled()) {
         return 0;
     }
-    const u64 id = diag_->Begin(cur_.cb, cur_.value, std::move(text));
+    const u64 id = diag_->Begin(cur_.cb, cur_.value, std::move(text), cur_.pool_lane);
     if (batch_first_cmd_ == 0) {
         batch_first_cmd_ = id;
     }
@@ -1662,7 +1961,7 @@ u64 Executor::DiagBegin(std::string text) {
 
 void Executor::DiagEnd(u64 id) {
     if (id != 0) {
-        diag_->End(cur_.cb, id);
+        diag_->End(cur_.cb, id, cur_.pool_lane);
     }
 }
 
@@ -1684,9 +1983,10 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
             buffer = r.buffer;
             offset = r.offset;
             avail = r.size;
-            if (aq_ && aq_cmd_compute_) {
+            if (aq_ && (aq_cmd_compute_ || aq_note_reads_)) {
                 AqNote(addr, size);
             }
+            aq_range_path_ = 1;
             return true;
         }
         // nothing of it in video memory (the CPU wrote it, or it is new): the host's copy is current; a small read
@@ -1729,6 +2029,7 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                         avail = size;
                         ++stats_.stream_reused;
                         stats_.stream_reused_bytes += size;
+                        aq_range_path_ = 2;
                         return true;
                     }
                     verify = memo->hash | 1;
@@ -1759,6 +2060,7 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
                 avail = size;
                 ++stats_.streamed;
                 stats_.streamed_bytes += size;
+                aq_range_path_ = 3;
                 if (stream_who_on_ < 0) {
                     char v[4] = {};
                     stream_who_on_ = GetEnvironmentVariableA("SSPC_DIAG_STREAM_WHO", v, sizeof(v)) == 1 && v[0] == '1';
@@ -1835,8 +2137,21 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
     if (!prepared) {
         return false;
     }
-    if (aq_ && (write || aq_cmd_compute_ || buffers_.Stats().uploads != up0)) {
+    if (aq_ && (write || aq_cmd_compute_ || aq_note_reads_ || buffers_.Stats().uploads != up0)) {
         AqNote(addr, size); // (AQ: a write, an upload, or a compute command's access)
+    }
+    if (aq_ && buffers_.Stats().uploads != up0 && aq_note_uploads_) {
+        // AQ: every page the upload copied - the block's other pages P4.9-B brings along too. A batch of the other
+        // queue may write or read them meanwhile (measured: a main batch's block upload put the host's older bytes
+        // over an emitter header the lane had written; the lane's next dispatch read a count of 0x3f800000 and never
+        // finished - device lost)
+        for (const auto& [b, e] : buffers_.LastUploads()) {
+            AqNote(b, e - b);
+        }
+    }
+    aq_range_path_ = write ? 6 : buffers_.Stats().uploads != up0 ? 5 : 4;
+    if (!aq_watch_ranges_.empty() && (write || buffers_.Stats().uploads != up0)) {
+        AqWatchWrite(addr, size, write ? 1 : 2);
     }
     buffer = r.buffer;
     offset = r.offset;
@@ -1943,6 +2258,10 @@ bool Executor::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u6
     if (aq_) {
         AqNote(dst, bytes);
     }
+    if (!aq_watch_ranges_.empty()) {
+        aq_what_ = 1;
+        AqWatchWrite(dst, bytes, 3);
+    }
     if (LabelChanges(kLabelOther | 1)) {
         Label(kLabelOther | 1, "T WRITE_DATA on the timeline");
     }
@@ -1990,6 +2309,7 @@ bool Executor::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
         return false;
     }
     write_run_ = false;
+    aq_what_ = 2;
     if (LabelChanges(kLabelOther | 2)) {
         Label(kLabelOther | 2, "T DMA copy on the timeline");
     }
@@ -2053,8 +2373,7 @@ void Executor::OcclusionResetSlots(const std::vector<u32>& slots) {
     }
 }
 
-bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
-    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb);
+bool Executor::ZpassShapeOk(u64 dst, u32 db_mask, u32 stride) {
     // SSPC_OCCLUSION=off: the earlier behaviour (every query reads as visible), for A/B
     static const bool off = [] {
         char v[16] = {};
@@ -2062,8 +2381,14 @@ bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 str
     }();
     // 16-byte DB records {begin, end} for DBs 0..n-1 (the game: 8 or 16), in guest memory
     const u32 dbs = static_cast<u32>(std::popcount(db_mask));
-    if (off || stride != 16 || dbs == 0 || dbs > 16 || db_mask != (1u << dbs) - 1u || (dst & 7) != 0 ||
-        dst >= (1ull << 40)) {
+    return !off && stride == 16 && dbs != 0 && dbs <= 16 && db_mask == (1u << dbs) - 1u && (dst & 7) == 0 &&
+           dst < (1ull << 40);
+}
+
+bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb);
+    const u32 dbs = static_cast<u32>(std::popcount(db_mask));
+    if (!ZpassShapeOk(dst, db_mask, stride)) {
         ++occ_refused_;
         return false;
     }
@@ -2183,6 +2508,7 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
     }
     cur_.aq_gds = true;
     write_run_ = false;
+    aq_what_ = 3 | (u64{static_cast<u32>(kind)} << 8);
     if (LabelChanges(kLabelOther | 3)) {
         Label(kLabelOther | 3, "T GDS DMA on the timeline");
     }
@@ -2702,7 +3028,10 @@ bool Executor::PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bin
 bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                          std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& buffers,
                          std::vector<VkDescriptorImageInfo>& image_infos, std::vector<CachedImage*>& bound,
-                         bool& writes_memory, const std::vector<CachedImage*>& targets, const u32* user_data) {
+                         bool& writes_memory, const std::vector<CachedImage*>& targets, const u32* user_data,
+                         u64 material) {
+    R8_CP_PROF(compute ? CpProfile::Sec::T2Bind
+                       : CpProfile::BySource(CpProfile::Sec::T2Bind, CpProfile::Sec::T2BindMesh, CpProfile::t_source));
     const auto& s = *static_cast<const GS::StageView*>(stage_view);
     const GS::ResourceBindingPlan& plan = s.plan;
     const GS::ShaderReflection& refl = s.module->result.reflection;
@@ -2740,6 +3069,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             }
             buf_adjust_[i] = static_cast<u32>(adjust);
             info = {vb, aligned, std::min<u64>(b.size + adjust, vavail + adjust)};
+            if (aq_watch_capture_ && compute && i == 0) {
+                aq_watch_b0_ = {vb, voff, b.address, b.size, vavail, aq_range_path_};
+            }
             if (b.written) {
                 writes_memory = true;
                 images_.InvalidateFromBufferWrite(b.address, b.size);
@@ -2863,24 +3195,177 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                           .pBufferInfo = nullptr});
     }
     // images
+    const bool gb_parts = !compute && CpProfile::On() && (CpProfile::t_source & 3) == 3; // (R8: a 0x1a1770 draw's parts)
+    if (gb_parts) {
+        CpProfile::Enter(CpProfile::Sec::T2GbBindImages);
+    }
     const VkPipelineStageFlags2 shader_stage = compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : kGraphicsShaders;
     images_.ApplyPendingInvalidations(); // before the memo's dirty checks below
+    const bool seg = seg_draw_ && !compute; // (SSPC_TEX_SEGMENT: a draw's textures checked once a segment)
+    if (seg) {
+        SegSync();
+    }
+    const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
+    const float lod = !compute && jitter_draw_ ? lod_bias_ : 0.0f;
+    const auto image_flags = [](const GS::ImageBinding& im) { return TexFlags(im); };
+    const auto sampler_desc = [](const GS::SamplerBinding& sm) {
+        return sm.status != GS::ResourceStatus::Ok ? GS::SamplerDesc{} : sm.desc;
+    };
+    // SSPC_NATIVE_GBUFFER: a native 0x1a1770 stage's images and samplers as kept for its material (GbBind)
+    GbBind* gb = nullptr;
+    const u64 gb_epoch = images_.Epoch();
+    u32 lod_bits = 0;
+    std::memcpy(&lod_bits, &lod, 4);
+    if (gb_mode_ == GbMode::Unread) {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_NATIVE_GBUFFER_BIND", v, sizeof(v));
+        const std::string_view sv(v, n < sizeof(v) ? n : 0);
+        // (off by default: R8, city - images 533 -> 536 ns a stage, samplers 81 -> 60; the cost per texture is its
+        // image's state - validity, Touch, layout - not the lookup; docs/NATIVE_GBUFFER_DRAW_0x1a1770.md 9.8)
+        gb_mode_ = sv == "on" ? GbMode::On : sv == "verify" ? GbMode::Verify : GbMode::Off;
+        if (gb_mode_ != GbMode::Off) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_NATIVE_GBUFFER_BIND={} - the native G-buffer stages' material "
+                                   "bindings kept{}",
+                     sv, gb_mode_ == GbMode::Verify ? ", each hit made again in full and compared" : "");
+        }
+    }
+    bool gb_checking = false; // (verify: a hit's bindings, made again below)
+    size_t gb_i0 = 0, gb_w0 = 0, gb_b0 = 0, gb_n0 = 0;
+    if (material != 0 && gb_mode_ != GbMode::Off && !compute && !up_display_draw_ &&
+        plan.images.size() <= kGbMaxImages && plan.samplers.size() <= kGbMaxSamplers) {
+        if (gb_bind_.empty()) {
+            gb_bind_.resize(kGbBinds);
+        }
+        gb = &gb_bind_[(material * 0x9E3779B97F4A7C15ull) >> 53];
+        bool hit = gb->id == material && gb->module == s.module && gb->epoch == gb_epoch && gb->lod == lod_bits &&
+                   gb->images == plan.images.size() && gb->samplers == plan.samplers.size();
+        for (size_t i = 0; hit && i < plan.images.size(); ++i) {
+            const auto& im = plan.images[i];
+            if (im.count > 1 || im.fmask || im.storage) {
+                hit = false; // (one sampled view each - a null one too: its descriptor type and count are the binding's)
+            } else if (im.status != GS::ResourceStatus::Ok) {
+                hit = gb->flags[i] == kGbNull;
+                continue;
+            }
+            const CachedImage* m = gb->img[i];
+            hit = hit && gb->flags[i] == image_flags(im) && gb->raw[i] == im.desc.raw &&
+                  ((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written));
+        }
+        for (size_t i = 0; hit && i < plan.samplers.size(); ++i) {
+            hit = gb->sraw[i] == sampler_desc(plan.samplers[i]).raw;
+        }
+        if (hit) {
+            ++stats_.gb_bind_hits;
+            gb_i0 = image_infos.size();
+            gb_w0 = writes.size();
+            gb_b0 = bound.size();
+            gb_n0 = info_images_.size();
+            for (size_t i = 0; i < plan.images.size(); ++i) {
+                const auto& im = plan.images[i];
+                const size_t first = image_infos.size();
+                CachedImage* m = gb->img[i];
+                VkDescriptorImageInfo ii{VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+                if (gb->flags[i] != kGbNull) {
+                    images_.Touch(*m, cur_.value); // what Find records
+                    const bool feedback = std::ranges::find(targets, m) != targets.end();
+                    ii = {VK_NULL_HANDLE, gb->view[i],
+                          feedback                     ? VK_IMAGE_LAYOUT_GENERAL
+                          : m->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    bound.push_back(m);
+                } else {
+                    m = nullptr;
+                }
+                image_infos.push_back(ii);
+                info_images_.push_back(m);
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstBinding = im.binding,
+                                  .descriptorCount = 1,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                  .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+            }
+            if (gb_parts) {
+                CpProfile::Leave();
+                CpProfile::Enter(CpProfile::Sec::T2GbBindSamplers);
+            }
+            for (size_t i = 0; i < plan.samplers.size(); ++i) {
+                VkSampler vs = gb->smp[i];
+                if (vs == VK_NULL_HANDLE) {
+                    const bool depth = i < refl.samplers.size() && refl.samplers[i].is_depth;
+                    vs = images_.Sampler(sampler_desc(plan.samplers[i]), depth, border_base, lod);
+                    if (vs == VK_NULL_HANDLE) {
+                        vs = images_.Sampler(GS::SamplerDesc{}, depth, 0);
+                    }
+                }
+                const size_t first = image_infos.size();
+                image_infos.push_back({vs, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
+                info_images_.push_back(nullptr);
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstBinding = plan.samplers[i].binding,
+                                  .descriptorCount = 1,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                                  .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+            }
+            if (gb_mode_ != GbMode::Verify) {
+                if (gb_parts) {
+                    CpProfile::Leave();
+                }
+                return true;
+            }
+            // verify: set aside, the full lookups below make them again (compared at the end)
+            gb_check_infos_.assign(image_infos.begin() + gb_i0, image_infos.end());
+            gb_check_writes_.assign(writes.begin() + gb_w0, writes.end());
+            gb_check_bound_.assign(bound.begin() + gb_b0, bound.end());
+            gb_check_info_images_.assign(info_images_.begin() + gb_n0, info_images_.end());
+            image_infos.resize(gb_i0);
+            writes.resize(gb_w0);
+            bound.resize(gb_b0);
+            info_images_.resize(gb_n0);
+            gb_checking = true;
+            if (gb_parts) {
+                CpProfile::Leave();
+                CpProfile::Enter(CpProfile::Sec::T2GbBindImages);
+            }
+        } else {
+            ++stats_.gb_bind_misses;
+        }
+        // kept below when every image, null or not, is one sampled view (no FMask, not storage)
+        gb_new_.images = static_cast<u8>(plan.images.size());
+        gb_new_.samplers = static_cast<u8>(plan.samplers.size());
+        if (gb_checking) {
+            gb = nullptr; // (verify: the entry stays as it was)
+        }
+        for (const auto& im : plan.images) {
+            if (gb == nullptr || im.count > 1 || im.fmask || im.storage) {
+                gb = nullptr;
+                break;
+            }
+        }
+    }
+    u32 image_index = 0;
     for (const auto& im : plan.images) {
+        const u32 gi = image_index++;
         const u32 count = std::max<u32>(im.count, 1);
         const size_t first = image_infos.size();
         bool null_image = im.status != GS::ResourceStatus::Ok;
         CachedImage* img = nullptr;
         // the memo: one view (a dynamic mip index binds every level: not memoized), the same T# and binding flags
         const bool memo_able = !null_image && count == 1 && !im.fmask;
-        const u32 flags = (im.depth ? 1u : 0u) | (im.array ? 2u : 0u) | (im.storage ? 4u : 0u) | (im.view_type << 3);
+        const u32 flags = image_flags(im);
+        if (gb != nullptr) {
+            gb_new_.flags[gi] = null_image ? kGbNull : flags;
+            gb_new_.raw[gi] = im.desc.raw;
+            gb_new_.img[gi] = nullptr;
+            gb_new_.view[gi] = VK_NULL_HANDLE;
+        }
+        if (im.storage) {
+            ++tex_seg_; // (SSPC_TEX_SEGMENT: an image a shader writes - no stamp of before is taken again)
+        }
         u64 memo_key = 0;
         TexMemo* memo = nullptr;
         if (memo_able) {
-            memo_key = flags;
-            for (const u32 w : im.desc.raw) {
-                memo_key = (memo_key ^ w) * 0x100000001B3ull;
-            }
-            auto& slot = tex_slot_[GS::LookupMemoSlot(memo_key)];
+            memo_key = TexMemoKey(im.desc.raw, flags);
+            auto& slot = tex_slot_[TexSlot(memo_key)];
             if (slot.second != nullptr && slot.first == memo_key) {
                 memo = slot.second;
                 if (GS::LookupMemoVerify()) {
@@ -2895,10 +3380,48 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 }
             }
             CachedImage* m = memo->img;
+            if (seg && m != nullptr && memo->seg == tex_seg_ && !im.storage && memo->epoch == images_.Epoch() &&
+                memo->raw == im.desc.raw && memo->flags == flags && std::ranges::find(targets, m) == targets.end()) {
+                // checked in this segment: valid, touched, in its layout, read there since its barrier - none of that
+                // can have changed (the image cache's generation is the same), the image is not looked at again
+                ++stats_.tex_seg_hits;
+                if (seg_mode_ != SegMode::Verify) {
+                    image_infos.push_back({VK_NULL_HANDLE, memo->view, memo->seg_layout});
+                    info_images_.push_back(nullptr); // (no layout fix-up: it is in seg_layout)
+                    if (gb != nullptr) {
+                        gb_new_.img[gi] = m;
+                        gb_new_.view[gi] = memo->view;
+                    }
+                    writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                      .dstBinding = im.binding,
+                                      .descriptorCount = 1,
+                                      .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                      .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+                    continue;
+                }
+                // verify: the image as the full path below finds it (before its Touch), then that path taken
+                const bool valid = (m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written);
+                const bool same = valid && m->current == memo->seg_layout && m->current == TextureLayout(m) &&
+                                  ImageCache::ReadSince(*m, kGraphicsShaders, VK_ACCESS_2_SHADER_READ_BIT) &&
+                                  m->last_seq == cur_.value && m->last_frame == images_.Frame();
+                ++stats_.tex_seg_verified;
+                if (!same && stats_.tex_seg_mismatches++ < 16) {
+                    SSPC_LOG(GPU, Warning,
+                             "SSPC_TEX_SEGMENT=verify: img{} {:#x} stamped in segment {} differs: valid {} layout {} "
+                             "(stamped {}, texture {}) stage {:#x} access {:#x} seq {} (batch {}) frame {} ({})",
+                             m->id, m->layout.guest_address, tex_seg_, valid, static_cast<int>(m->current),
+                             static_cast<int>(memo->seg_layout), static_cast<int>(TextureLayout(m)), m->stage, m->access,
+                             m->last_seq, cur_.value, m->last_frame, images_.Frame());
+                }
+                seg_check_.push_back({static_cast<u32>(image_infos.size()), memo->seg_layout});
+            }
             if (m != nullptr && memo->epoch == images_.Epoch() && memo->raw == im.desc.raw && memo->flags == flags &&
                 ((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written))) {
                 ++stats_.tex_memo_hits;
                 images_.Touch(*m, cur_.value); // what Find records
+                if (seg && !im.storage) {
+                    seg_pending_.push_back({memo, m}); // (stamped once the draw's barriers are recorded)
+                }
                 if (im.storage) {
                     m->gpu_written = true;
                 }
@@ -2918,6 +3441,10 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 image_infos.push_back(ii);
                 info_images_.push_back(m);
                 bound.push_back(m);
+                if (gb != nullptr) {
+                    gb_new_.img[gi] = m;
+                    gb_new_.view[gi] = memo->view;
+                }
                 if (im.storage) {
                     writes_memory = true;
                 }
@@ -2940,6 +3467,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
             stats_.t_image += GS::FineTicks() - ti0;
             if (img == nullptr) {
                 Skipped(Skip::Image, err);
+                if (gb_parts) {
+                    CpProfile::Leave();
+                }
                 return false;
             }
         }
@@ -2949,6 +3479,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 ImageViewDesc vd = TSharpView(im.desc, im.depth, im.array, im.storage);
                 if (!vd.supported) {
                     Skipped(Skip::Image, std::string(vd.reason));
+                    if (gb_parts) {
+                        CpProfile::Leave();
+                    }
                     return false;
                 }
                 if (count > 1) {
@@ -2964,7 +3497,14 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                                            tl.size.height});
                 }
                 if (memo != nullptr && ii.imageView != VK_NULL_HANDLE) {
-                    *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView};
+                    *memo = {im.desc.raw, flags, images_.Epoch(), img, ii.imageView}; // (no stamp)
+                    if (seg && !im.storage) {
+                        seg_pending_.push_back({memo, img});
+                    }
+                }
+                if (gb != nullptr && count == 1) {
+                    gb_new_.img[gi] = img;
+                    gb_new_.view[gi] = ii.imageView;
                 }
                 const bool feedback = std::ranges::find(targets, img) != targets.end();
                 ii.imageLayout = (im.storage || feedback) ? VK_IMAGE_LAYOUT_GENERAL
@@ -2990,17 +3530,21 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         (void)shader_stage;
     }
     // samplers
-    const u64 border_base = u64{regs.Get(kTaBcBase)} << 8;
+    if (gb_parts) {
+        CpProfile::Leave();
+        CpProfile::Enter(CpProfile::Sec::T2GbBindSamplers);
+    }
     for (size_t i = 0; i < plan.samplers.size(); ++i) {
         const auto& sm = plan.samplers[i];
         const bool depth = i < refl.samplers.size() && refl.samplers[i].is_depth;
-        GS::SamplerDesc desc = sm.desc;
-        if (sm.status != GS::ResourceStatus::Ok) {
-            desc = {};
-        }
-        VkSampler vs = images_.Sampler(desc, depth, border_base, !compute && jitter_draw_ ? lod_bias_ : 0.0f);
+        const GS::SamplerDesc desc = sampler_desc(sm);
+        VkSampler vs = images_.Sampler(desc, depth, border_base, lod);
         if (vs == VK_NULL_HANDLE) {
             vs = images_.Sampler(GS::SamplerDesc{}, depth, 0); // the bridge's fallback: the default S#
+        }
+        if (gb != nullptr) {
+            gb_new_.sraw[i] = desc.raw;
+            gb_new_.smp[i] = desc.BorderColorType() == 3 ? VK_NULL_HANDLE : vs; // (a custom colour: read each time)
         }
         const size_t first = image_infos.size();
         image_infos.push_back({vs, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
@@ -3010,6 +3554,43 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                           .descriptorCount = 1,
                           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
                           .pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(first)});
+    }
+    // (kept only when every image has its view and the image cache's epoch held: what the next draw checks)
+    if (gb_checking) {
+        const auto same_write = [](const VkWriteDescriptorSet& a, const VkWriteDescriptorSet& b) {
+            return a.dstBinding == b.dstBinding && a.descriptorCount == b.descriptorCount &&
+                   a.descriptorType == b.descriptorType && a.pImageInfo == b.pImageInfo;
+        };
+        const auto same_info = [](const VkDescriptorImageInfo& a, const VkDescriptorImageInfo& b) {
+            return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout;
+        };
+        const bool same =
+            std::ranges::equal(gb_check_infos_, std::span(image_infos).subspan(gb_i0), same_info) &&
+            std::ranges::equal(gb_check_writes_, std::span(writes).subspan(gb_w0), same_write) &&
+            std::ranges::equal(gb_check_bound_, std::span(bound).subspan(gb_b0)) &&
+            std::ranges::equal(gb_check_info_images_, std::span(info_images_).subspan(gb_n0));
+        ++stats_.gb_bind_verified;
+        if (!same && stats_.gb_bind_mismatches++ < 16) {
+            SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER_BIND=verify: program {:#x} material {:#x}: the kept bindings "
+                                   "differ from the full lookups ({} / {} image infos, {} / {} writes, {} / {} bound)",
+                     s.address, material, gb_check_infos_.size(), image_infos.size() - gb_i0, gb_check_writes_.size(),
+                     writes.size() - gb_w0, gb_check_bound_.size(), bound.size() - gb_b0);
+        }
+    }
+    bool gb_complete = gb != nullptr && images_.Epoch() == gb_epoch;
+    for (u32 i = 0; gb_complete && i < gb_new_.images; ++i) {
+        gb_complete = gb_new_.flags[i] == kGbNull || (gb_new_.img[i] != nullptr && gb_new_.view[i] != VK_NULL_HANDLE);
+    }
+    if (gb_complete) {
+        gb_new_.id = material;
+        gb_new_.module = s.module;
+        gb_new_.epoch = gb_epoch;
+        gb_new_.lod = lod_bits;
+        *gb = gb_new_;
+        ++stats_.gb_bind_kept;
+    }
+    if (gb_parts) {
+        CpProfile::Leave();
     }
     return true;
 }
@@ -4232,6 +4813,9 @@ bool Executor::ZeroCopyBatch(const GS::StageView& vs, std::array<VkBuffer, 16>& 
                 (vb[s] != VK_NULL_HANDLE && vb[s] != r.buffer)) {
                 return false;
             }
+            if (aq_note_reads_) {
+                AqNote(x.address, x.size);
+            }
             vb[s] = r.buffer;
             zc_voff_[k * streams + s] = r.offset;
             vlow[s] = std::min(vlow[s], r.offset);
@@ -4241,6 +4825,9 @@ bool Executor::ZeroCopyBatch(const GS::StageView& vs, std::array<VkBuffer, 16>& 
                 BufferCache::Residency::All ||
             (ib != VK_NULL_HANDLE && ib != r.buffer) || r.offset % isize != 0) {
             return false;
+        }
+        if (aq_note_reads_) {
+            AqNote(d.index_base + u64{d.index_offset} * isize, u64{d.index_count} * isize);
         }
         ib = r.buffer;
         zc_ioff_[k] = r.offset;
@@ -4332,7 +4919,35 @@ bool Executor::DrawPreparedBatch(std::span<const BatchDraw> draws) {
     return true;
 }
 
+namespace {
+/// R8 profile (SSPC_R8_CP_PROFILE): a 0x1a1770 draw's record by its stage (CpProfile::Sec::T2Gb*) - one section open at
+/// a time, the last one left at the record's end (any return)
+class GBufferRecordStages {
+public:
+    GBufferRecordStages() : on_(CpProfile::On() && (CpProfile::t_source & 3) == 3) { // (3: DrawRuns::Source::GBuffer)
+        if (on_) {
+            CpProfile::Enter(CpProfile::Sec::T2GbHead);
+        }
+    }
+    ~GBufferRecordStages() {
+        if (on_) {
+            CpProfile::Leave();
+        }
+    }
+    void Next(CpProfile::Sec s) {
+        if (on_) {
+            CpProfile::Leave();
+            CpProfile::Enter(s);
+        }
+    }
+
+private:
+    bool on_;
+};
+} // namespace
+
 void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc, u64 t0) {
+    GBufferRecordStages gb;
     stream_pipe_ = 0;
     run_ok_ = false;
     ++stats_.draws;
@@ -4416,6 +5031,19 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
                                     d.packet_addr));
         }
     }
+    if (aq_markers_) {
+        // R9 AQ diagnostic: a marker at each pipeline change of the draws - the previous group's commands completed
+        // (bottom of pipe), this group's first draw started (top of pipe)
+        const u64 akey = (u64{prep.pipeline} << 40) ^ vs.address ^ (has_ps ? ps.address << 1 : 0);
+        if (akey != aq_mark_draw_key_) {
+            aq_mark_draw_key_ = akey;
+            const u32 id = aq_marker_next_++;
+            AqMarker& e = aq_marker_ring_[id & (aq_marker_ring_.size() - 1)];
+            e = {cur_.value, vs.address, 0xFFFF, {static_cast<u32>(prep.pipeline), 0, 0}, 0, false, has_ps ? ps.address : 0};
+            f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, aq_marker_buf_.buffer, 4, id - 1);
+            f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, aq_marker_buf_.buffer, 0, id);
+        }
+    }
     if (has_ps) { // SSPC_DIAG_DUMP_SHADER: a pixel shader too (P4.5)
         DiagDumpShader(ps.address, ps.program != nullptr ? &ps.program->code : nullptr, ps.module->result.spirv,
                        ps.runtime, prep.pipeline);
@@ -4446,6 +5074,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
 
     // targets
+    gb.Next(CpProfile::Sec::T2GbTargets);
     std::vector<CachedImage*>& targets = scratch_.targets;
     targets.clear();
     RenderKey key;
@@ -4622,6 +5251,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         }
     }
     // resources
+    gb.Next(CpProfile::Sec::T2GbBind);
     PushData push{};
     const u32 vte = regs.Get(kPaClVteCntl);
     push.xscale = (vte & 1) ? F(regs, kViewport0) : 1.0f;
@@ -4640,9 +5270,26 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     bound.clear();
     bool writes_memory = false;
     info_images_.clear();
+    if (seg_mode_ == SegMode::Unread) {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_TEX_SEGMENT", v, sizeof(v));
+        const std::string_view sv(v, n < sizeof(v) ? n : 0);
+        seg_mode_ = sv == "on" || sv == "1" ? SegMode::On : sv == "verify" ? SegMode::Verify : SegMode::Off;
+        if (seg_mode_ != SegMode::Off) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_TEX_SEGMENT={} - a draw's textures checked once a segment{}", sv,
+                     seg_mode_ == SegMode::Verify ? ", each segment hit checked in full and the full path taken" : "");
+        }
+    }
+    // (not where a diagnostic looks at the draw's bound images, nor the upscaler's display draw)
+    seg_draw_ = seg_mode_ != SegMode::Off && !up_display_draw_ && !trace_.Active() && !histo_.active && !prof_ &&
+                !texdump_.active && insp_catalog_ == nullptr && (diag_ == nullptr || !diag_->Enabled());
+    seg_pending_.clear();
+    seg_check_.clear();
     const u64 tb0 = GS::FineTicks();
+    aq_what_ = (1ull << 63) | vs.address;
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
-                             d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data())) {
+                             d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data(), pc.material[1])) {
+        seg_draw_ = false;
         return;
     }
     if (instanced && !GatherInstanced(std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4))) {
@@ -4651,7 +5298,8 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         inst_bind_.clear();
     }
     const bool vs_bound = BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
-                                    d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data());
+                                    d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data(), pc.material[0]);
+    seg_draw_ = false;
     inst_runs_.clear(); // (the copies' descriptors: a run of the multi-draw after the first binds them further on)
     for (const auto& [index, info] : inst_bind_) {
         inst_runs_.push_back({vs.plan.buffers[index - vs.start.buffer].binding, info});
@@ -4672,6 +5320,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     if (has_ps) {
         NoteOrderRange(&ps.plan, ps.address, d.queue, false);
     }
+    gb.Next(CpProfile::Sec::T2GbVertex);
     ts = GS::FineTicks();
     // SSPC_CITY_BATCH: the batch's geometry (DrawPreparedBatch) in place of this draw's - not with a memory write, an
     // occlusion query, the upscaler's display draw or a diagnostic that looks at single draws
@@ -4782,6 +5431,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
 
     stage(stats_.t_vertex);
+    gb.Next(CpProfile::Sec::T2GbLayout);
     {
         // SSPC_DIAG_GEOM=<VS address hex>:<first flip>:<flips> (CITY-OPT Phase 3, diagnostics): every range of that VS's
         // draws - address, size, content hash, residency, why it is not cached - to logs\geom\geom.tsv
@@ -4909,13 +5559,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     if (depth_img != nullptr && want(depth_img, depth_layout)) {
         need_transition = true;
     }
-    const auto texture_layout = [](const CachedImage* img) {
-        const bool storage = (img->usage & VK_IMAGE_USAGE_STORAGE_BIT) && img->gpu_written &&
-                             img->current == VK_IMAGE_LAYOUT_GENERAL;
-        return storage ? VK_IMAGE_LAYOUT_GENERAL
-               : img->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    };
+    const auto texture_layout = [](const CachedImage* img) { return TextureLayout(img); };
     for (CachedImage* img : bound) {
         // a texture in another layout (rendered, uploaded, stored) needs its barrier outside rendering; one already
         // read in its layout does not (storage writes since are ordered by pending_writes_' global barrier)
@@ -4962,6 +5606,30 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
             img_infos[i].imageLayout = info_images_[i]->current;
         }
     }
+    // SSPC_TEX_SEGMENT: verify - a segment hit's layout as the full path left it; the draw's textures stamped, after
+    // its barriers (the generation they changed is the new segment's)
+    for (const SegCheck& c : seg_check_) {
+        if (c.info < img_infos.size() && img_infos[c.info].imageLayout != c.layout && stats_.tex_seg_mismatches++ < 16) {
+            SSPC_LOG(GPU, Warning, "SSPC_TEX_SEGMENT=verify: a segment hit's layout {} differs from the full path's {}",
+                     static_cast<int>(c.layout), static_cast<int>(img_infos[c.info].imageLayout));
+        }
+    }
+    if (!seg_pending_.empty()) {
+        SegSync();
+        const u64 epoch = images_.Epoch(), frame = images_.Frame();
+        for (const auto& [memo, img] : seg_pending_) {
+            if (memo->img == img && memo->epoch == epoch && std::ranges::find(targets, img) == targets.end() &&
+                ((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written)) &&
+                img->current == TextureLayout(img) &&
+                ImageCache::ReadSince(*img, kGraphicsShaders, VK_ACCESS_2_SHADER_READ_BIT) &&
+                img->last_seq == cur_.value && img->last_frame == frame) {
+                memo->seg = tex_seg_;
+                memo->seg_layout = img->current;
+                ++stats_.tex_seg_stamped;
+            }
+        }
+        seg_pending_.clear();
+    }
     for (auto& w : writes) {
         if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             continue;
@@ -4977,6 +5645,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         }
     }
     stage(stats_.t_layout);
+    gb.Next(CpProfile::Sec::T2GbEmit);
     if (!rendering_) {
         std::array<VkRenderingAttachmentInfo, 8> colors{};
         for (u32 i = 0; i < key.color_count; ++i) {
@@ -5305,6 +5974,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
             // (push descriptors are updated binding by binding within one layout: a member pushes only its own)
             run_push_desc_ = pipe->push_descriptors && push_layout_ == pipe->layout &&
                              (!bind_shadow_ || desc_layout_ == pipe->layout);
+            run_feedback_ = feedback_any;
         }
     } else {
         f.vkCmdDraw(cur_.cb, d.index_count, instances, vertex_offset, instance_offset);
@@ -5431,6 +6101,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
     if (writes_memory) {
         MarkWrites(0);
+        ++tex_seg_; // (SSPC_TEX_SEGMENT: what it wrote may be a texture's memory - its invalidation applied later)
     }
     const u64 draw_ticks = GS::Ticks() - t0;
     stats_.record_ns += GS::TicksToNs(draw_ticks);
@@ -5485,6 +6156,9 @@ bool Executor::RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& of
         buffer = r.buffer;
         offset = r.offset;
         avail = r.size;
+        if (aq_note_reads_) {
+            AqNote(addr, size);
+        }
         return true;
     }
     if (res != BufferCache::Residency::None || size > (16u << 10) || buffers_.HostWritePending(addr, size) ||
@@ -5507,6 +6181,7 @@ bool Executor::RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& of
 
 void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedCommand& pc,
                               std::span<const Cp::RunMember> members, std::span<const u32> member_flat) {
+    R8_CP_PROF(CpProfile::BySource(CpProfile::Sec::T2Run, CpProfile::Sec::T2RunMesh, CpProfile::t_source));
     const auto& f = Fn();
     const GS::StageView& vs = *pc.stage;
     const GS::FetchShader& fetch = vs.module->result.reflection.fetch;
@@ -5515,6 +6190,92 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
     const VkIndexType it = idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     std::vector<VkBuffer>& vbufs = scratch_.vbufs;
     std::vector<VkDeviceSize>& voffs = scratch_.voffs;
+    if (run_check_ < 0) {
+        // (any of the runs' verify modes: the frontend's check of a member's description, this one of its recording)
+        run_check_ = 0;
+        for (const char* name :
+             {"SSPC_CITY_GB_RUN_MATERIAL", "SSPC_CITY_ENGINE_OPT", "SSPC_CITY_ENGINE_GBUFFER_RUNS"}) {
+            char v[16] = {};
+            const DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+            run_check_ |= std::string_view(v, n < sizeof(v) ? n : 0) == "verify" ? 1 : 0;
+        }
+    }
+    const bool check = run_check_ == 1;
+    if (check) {
+        run_desc_.clear(); // (the run's first draw's: RecordDraw pushed them all)
+        StageHashes(vs, run_desc_);
+        if (pc.ps != nullptr) {
+            StageHashes(*pc.ps, run_desc_);
+        }
+    }
+    // a member's own views: the run's VS with its geometry, its registers and its own constant blocks, the run's PS
+    // with its registers, its own constant blocks (CITY-OPT Phase 6) and its own T#s / S#s (SSPC_CITY_GB_RUN_MATERIAL)
+    const auto own_views = [&](const Cp::RunMember& m) {
+        if (run_view_ == nullptr) {
+            run_view_ = std::make_unique<GS::StageView>();
+        }
+        *run_view_ = vs;
+        std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), run_view_->plan.flat.begin());
+        if (m.vs_flat_at != Cp::RunMember::kNoFlat &&
+            u64{m.vs_flat_at} + run_view_->plan.flat.size() <= member_flat.size()) {
+            std::copy_n(member_flat.begin() + m.vs_flat_at, run_view_->plan.flat.size(), run_view_->plan.flat.begin());
+        }
+        for (u32 i = 0; i < m.streams; ++i) {
+            GS::VertexBinding& v = run_view_->plan.vertices[i];
+            v.read = m.v[i].read;
+            v.desc.raw = m.v[i].desc;
+            v.address = m.v[i].address;
+            v.size = m.v[i].size;
+        }
+        for (u32 k = 0; k < m.buffers; ++k) {
+            GS::BufferBinding& bb = run_view_->plan.buffers[m.b[k].index];
+            bb.address = m.b[k].address;
+            bb.size = m.b[k].size;
+            bb.desc.raw = m.b[k].desc;
+        }
+        PreparedCommand p = pc;
+        p.stage = run_view_.get();
+        if (m.own_ps && pc.ps != nullptr) {
+            if (run_ps_view_ == nullptr) {
+                run_ps_view_ = std::make_unique<GS::StageView>();
+            }
+            *run_ps_view_ = *pc.ps;
+            GS::ResourceBindingPlan& plan = run_ps_view_->plan;
+            std::copy(m.ps_user_data.begin(), m.ps_user_data.end(), plan.flat.begin());
+            if (m.ps_flat_at != Cp::RunMember::kNoFlat && u64{m.ps_flat_at} + plan.flat.size() <= member_flat.size()) {
+                std::copy_n(member_flat.begin() + m.ps_flat_at, plan.flat.size(), plan.flat.begin());
+            }
+            for (u32 k = 0; k < m.ps_buffers; ++k) {
+                GS::BufferBinding& bb = plan.buffers[m.pb[k].index];
+                bb.address = m.pb[k].address;
+                bb.size = m.pb[k].size;
+                bb.desc.raw = m.pb[k].desc;
+            }
+            if (m.sharps_at != Cp::RunMember::kNoFlat &&
+                u64{m.sharps_at} + 8 * std::popcount(m.img_mask) + 4 * std::popcount(m.smp_mask) <= member_flat.size() &&
+                static_cast<size_t>(std::bit_width(m.img_mask)) <= plan.images.size() &&
+                static_cast<size_t>(std::bit_width(m.smp_mask)) <= plan.samplers.size()) {
+                const u32* at = member_flat.data() + m.sharps_at;
+                for (u32 mk = m.img_mask; mk != 0; mk &= mk - 1, at += 8) {
+                    std::copy_n(at, 8, plan.images[std::countr_zero(mk)].desc.raw.begin());
+                }
+                for (u32 mk = m.smp_mask; mk != 0; mk &= mk - 1, at += 4) {
+                    std::copy_n(at, 4, plan.samplers[std::countr_zero(mk)].desc.raw.begin());
+                }
+                p.material[1] = 0; // (GbBind: the run's material is not its)
+            }
+            p.ps = run_ps_view_.get();
+        }
+        return p;
+    };
+    const float lod = jitter_draw_ ? lod_bias_ : 0.0f; // (BindStage's for the run's first draw)
+    bool invalidations = false; // (ApplyPendingInvalidations before the members' own textures' memo checks)
+    // a member's own descriptors (written in full before each use)
+    constexpr size_t kMaxBufferWrites = 2 * (Cp::RunMember::kMaxBuffers + 1); // (VS and PS: buffers + flattened data)
+    constexpr size_t kMaxImageWrites = 2 * Cp::RunMember::kMaxSharpIndex;   // (its own images and samplers)
+    std::array<VkDescriptorBufferInfo, kMaxBufferWrites> infos;
+    std::array<VkDescriptorImageInfo, kMaxImageWrites> iinfos;
+    std::array<VkWriteDescriptorSet, kMaxBufferWrites + kMaxImageWrites> ws;
     for (const Cp::RunMember& m : members) {
         const u64 t0 = GS::Ticks();
         const u32 count = std::min(m.index_count, m.max_index_size);
@@ -5538,28 +6299,33 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                    r.offset % isize == 0;
             ib = r.buffer;
             io = r.offset;
+            if (lean && aq_note_reads_) {
+                for (u32 i = 0; i < m.streams; ++i) {
+                    AqNote(m.v[i].address, m.v[i].size);
+                }
+                AqNote(m.index_base + u64{m.index_offset} * isize, u64{count} * isize);
+            }
             stats_.run_not_resident += lean ? 0 : 1;
             stats_.run_why[0] += lean ? 0 : 1;
         }
         // its own constant blocks and user data (the shadow casters' instances): descriptors of their own, pushed over
         // the run's (the shadow of what this command buffer has pushed decides what is pushed)
-        u32 nw = 0;
-        constexpr size_t kMaxWrites = 2 * (Cp::RunMember::kMaxBuffers + 1); // (VS and PS: buffers + flattened data)
-        std::array<VkDescriptorBufferInfo, kMaxWrites> infos{};
-        std::array<VkWriteDescriptorSet, kMaxWrites> ws{};
+        u32 nw = 0, nb = 0, ni = 0;
         PushData push = push_last_;
+        if (check) {
+            run_check_own_.clear();
+        }
         if (lean && (m.buffers != 0 || m.own_user_data || m.own_ps)) {
             lean = run_push_desc_ && push_layout_ == run_layout_ && (!bind_shadow_ || desc_layout_ == run_layout_);
             stats_.run_why[1] += lean ? 0 : 1;
             const u64 align = std::max<u64>(ctx_.Caps().min_storage_buffer_alignment, 4);
             const auto add = [&](u32 binding, VkBuffer buf, u64 offset, u64 range) {
-                infos[nw] = {buf, offset, range};
-                ws[nw] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                          .dstBinding = binding,
-                          .descriptorCount = 1,
-                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                          .pBufferInfo = &infos[nw]};
-                ++nw;
+                infos[nb] = {buf, offset, range};
+                ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                            .dstBinding = binding,
+                            .descriptorCount = 1,
+                            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            .pBufferInfo = &infos[nb++]};
             };
             // a stage's own constant blocks (the run's plan index, range, V#) at its bindings
             const auto own_buffers = [&](const GS::StageView& st, std::span<const Cp::RunMember::Buffer> own) {
@@ -5576,6 +6342,13 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                         }
                         add(st.plan.buffers[own[k].index].binding, buf, aligned,
                             std::min<u64>(own[k].size + adjust, avail + adjust));
+                        if (check) {
+                            GS::BufferBinding bb = st.plan.buffers[own[k].index];
+                            bb.address = own[k].address;
+                            bb.size = own[k].size;
+                            bb.desc.raw = own[k].desc;
+                            run_check_own_.push_back({bb.binding, BufferHash(bb)});
+                        }
                     }
                 }
             };
@@ -5598,6 +6371,144 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                         std::memcpy(sl.data, user_data.data(), user_data.size() * 4);
                     }
                     add(fb->binding, sl.buffer, sl.offset, bytes);
+                    if (check) { // (the bytes pushed, read back)
+                        run_check_own_.push_back({fb->binding, FlatHash(reinterpret_cast<const u32*>(sl.data),
+                                                                        st.plan.flat.size(), FlatRegisters(st))});
+                    }
+                }
+            };
+            // its own textures and samplers (SSPC_CITY_GB_RUN_MATERIAL): an image's view as BindStage's memo keeps it -
+            // valid as BindStage takes it, already in the layout the run's draw reads it in (no barrier inside
+            // rendering), not one of the targets -, an S#'s sampler as BindStage makes it
+            const auto own_sharps = [&](const GS::StageView& st) {
+                const u32 n_img = static_cast<u32>(std::popcount(m.img_mask));
+                const u32 n_smp = static_cast<u32>(std::popcount(m.smp_mask));
+                lean = m.sharps_at != Cp::RunMember::kNoFlat && regs_ != nullptr && st.module != nullptr &&
+                       u64{m.sharps_at} + 8 * n_img + 4 * n_smp <= member_flat.size() &&
+                       static_cast<size_t>(std::bit_width(m.img_mask)) <= st.plan.images.size() &&
+                       static_cast<size_t>(std::bit_width(m.smp_mask)) <= st.plan.samplers.size();
+                u32 why = ~0u;
+                if (lean && (run_feedback_ || pending_writes_)) {
+                    why = run_feedback_ ? 2 : 3;
+                    lean = false;
+                }
+                if (lean && n_img != 0 && !invalidations) {
+                    images_.ApplyPendingInvalidations(); // (as BindStage before its memo's checks)
+                    invalidations = true;
+                }
+                // SSPC_TEX_SEGMENT: an image stamped in this segment taken from its stamp (on), checked (verify)
+                const bool seg = lean && n_img != 0 && seg_mode_ != SegMode::Off;
+                if (seg) {
+                    SegSync();
+                }
+                const u32* at = lean ? member_flat.data() + m.sharps_at : nullptr;
+                const u64 epoch = images_.Epoch();
+                for (u32 mk = m.img_mask; mk != 0 && lean; mk &= mk - 1, at += 8) {
+                    const GS::ImageBinding& im = st.plan.images[std::countr_zero(mk)];
+                    std::array<u32, 8> raw;
+                    std::copy_n(at, 8, raw.begin());
+                    const u32 flags = TexFlags(im);
+                    const u64 key = TexMemoKey(raw, flags);
+                    TexMemo* memo = nullptr;
+                    if (const auto& slot = tex_slot_[TexSlot(key)]; slot.second != nullptr && slot.first == key) {
+                        memo = slot.second;
+                    } else if (const auto mi = tex_memo_.find(key); mi != tex_memo_.end()) {
+                        memo = &mi->second;
+                    }
+                    CachedImage* img = memo != nullptr ? memo->img : nullptr;
+                    const bool seg_hit = seg && img != nullptr && memo->seg == tex_seg_ && !im.storage &&
+                                         memo->epoch == epoch && memo->raw == raw && memo->flags == flags &&
+                                         std::ranges::find(scratch_.targets, img) == scratch_.targets.end();
+                    if (seg_hit && seg_mode_ == SegMode::On) {
+                        ++stats_.tex_seg_member_hits;
+                        iinfos[ni] = {VK_NULL_HANDLE, memo->view, memo->seg_layout};
+                        ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstBinding = im.binding,
+                                    .descriptorCount = 1,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                    .pImageInfo = &iinfos[ni++]};
+                        if (check) {
+                            GS::ImageBinding ib = im;
+                            ib.desc.raw = raw;
+                            run_check_own_.push_back({im.binding, ImageHash(ib)});
+                        }
+                        continue;
+                    }
+                    if (seg_hit) { // (verify: what the full checks below take - the stamp's layout, the image touched)
+                        ++stats_.tex_seg_member_hits;
+                        ++stats_.tex_seg_verified;
+                        const bool same =
+                            ((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written)) &&
+                            img->current == TextureLayout(img) && img->current == memo->seg_layout &&
+                            img->last_seq == cur_.value && img->last_frame == images_.Frame();
+                        if (!same && stats_.tex_seg_mismatches++ < 16) {
+                            SSPC_LOG(GPU, Warning,
+                                     "SSPC_TEX_SEGMENT=verify: a run member's img{} {:#x} stamped in segment {} differs: "
+                                     "layout {} (stamped {}) seq {} (batch {})",
+                                     img->id, img->layout.guest_address, tex_seg_, static_cast<int>(img->current),
+                                     static_cast<int>(memo->seg_layout), img->last_seq, cur_.value);
+                        }
+                    }
+                    if (img == nullptr || memo->epoch != epoch || memo->raw != raw || memo->flags != flags ||
+                        !((img->gpu_written && !img->memory_newer) || (img->uploaded && !img->dirty && !img->gpu_written))) {
+                        why = 0; // (BindStage would find it, maybe upload it)
+                    } else if (img->current != TextureLayout(img)) {
+                        why = 1; // (a barrier first)
+                    } else if (std::ranges::find(scratch_.targets, img) != scratch_.targets.end()) {
+                        why = 2; // (the attachments in the general layout)
+                    } else {
+                        images_.Touch(*img, cur_.value); // what Find records
+                        if (seg && !im.storage &&
+                            ImageCache::ReadSince(*img, kGraphicsShaders, VK_ACCESS_2_SHADER_READ_BIT)) {
+                            memo->seg = tex_seg_; // (inside rendering: no barrier since - checked as a draw's are)
+                            memo->seg_layout = img->current;
+                            ++stats_.tex_seg_stamped;
+                        }
+                        iinfos[ni] = {VK_NULL_HANDLE, memo->view, img->current};
+                        ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstBinding = im.binding,
+                                    .descriptorCount = 1,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                    .pImageInfo = &iinfos[ni++]};
+                        if (check) {
+                            GS::ImageBinding ib = im;
+                            ib.desc.raw = raw;
+                            run_check_own_.push_back({im.binding, ImageHash(ib)});
+                        }
+                        continue;
+                    }
+                    lean = false;
+                }
+                const GS::ShaderReflection* refl = lean ? &st.module->result.reflection : nullptr;
+                const u64 border_base = lean ? u64{regs_->Get(kTaBcBase)} << 8 : 0;
+                for (u32 mk = m.smp_mask; mk != 0 && lean; mk &= mk - 1, at += 4) {
+                    const u32 i = static_cast<u32>(std::countr_zero(mk));
+                    GS::SamplerDesc desc;
+                    std::copy_n(at, 4, desc.raw.begin());
+                    const bool depth = i < refl->samplers.size() && refl->samplers[i].is_depth;
+                    VkSampler s = images_.Sampler(desc, depth, border_base, lod);
+                    if (s == VK_NULL_HANDLE) {
+                        s = images_.Sampler(GS::SamplerDesc{}, depth, 0); // the bridge's fallback: the default S#
+                    }
+                    iinfos[ni] = {s, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+                    ws[nw++] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .dstBinding = st.plan.samplers[i].binding,
+                                .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                                .pImageInfo = &iinfos[ni++]};
+                    if (check) {
+                        GS::SamplerBinding sb = st.plan.samplers[i];
+                        sb.desc = desc;
+                        run_check_own_.push_back({sb.binding, SamplerHash(sb)});
+                    }
+                }
+                stats_.run_why[4] += lean ? 0 : 1;
+                if (!lean && why < stats_.run_sharp_why.size()) {
+                    ++stats_.run_sharp_why[why];
+                }
+                if (lean) {
+                    stats_.run_sharp_images += n_img;
+                    stats_.run_sharp_samplers += n_smp;
                 }
             };
             own_buffers(vs, std::span(m.b.data(), m.buffers));
@@ -5611,6 +6522,9 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                 }
                 if (lean && m.own_ps_user_data) {
                     own_flat(*pc.ps, m.ps_user_data, m.ps_flat_at);
+                }
+                if (lean && (m.img_mask | m.smp_mask) != 0) {
+                    own_sharps(*pc.ps);
                 }
             }
             stats_.run_not_resident += lean ? 0 : 1;
@@ -5628,50 +6542,16 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
             d.vgt_index_offset = m.vgt_index_offset;
             d.changed = m.changed;
             d.user_data[static_cast<size_t>(Cp::Stage::Vs)] = m.vs_user_data;
-            if (run_view_ == nullptr) {
-                run_view_ = std::make_unique<GS::StageView>();
-            }
-            *run_view_ = vs;
-            std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), run_view_->plan.flat.begin());
-            if (m.vs_flat_at != Cp::RunMember::kNoFlat &&
-                u64{m.vs_flat_at} + run_view_->plan.flat.size() <= member_flat.size()) {
-                std::copy_n(member_flat.begin() + m.vs_flat_at, run_view_->plan.flat.size(), run_view_->plan.flat.begin());
-            }
-            for (u32 i = 0; i < m.streams; ++i) {
-                GS::VertexBinding& v = run_view_->plan.vertices[i];
-                v.read = m.v[i].read;
-                v.desc.raw = m.v[i].desc;
-                v.address = m.v[i].address;
-                v.size = m.v[i].size;
-            }
-            for (u32 k = 0; k < m.buffers; ++k) {
-                GS::BufferBinding& bb = run_view_->plan.buffers[m.b[k].index];
-                bb.address = m.b[k].address;
-                bb.size = m.b[k].size;
-                bb.desc.raw = m.b[k].desc;
-            }
-            PreparedCommand p = pc;
-            p.stage = run_view_.get();
             if (m.own_ps && pc.ps != nullptr) {
-                // (CITY-OPT Phase 6: its PS registers and constant blocks)
-                d.user_data[static_cast<size_t>(Cp::Stage::Ps)] = m.ps_user_data;
-                if (run_ps_view_ == nullptr) {
-                    run_ps_view_ = std::make_unique<GS::StageView>();
+                d.user_data[static_cast<size_t>(Cp::Stage::Ps)] = m.ps_user_data; // (CITY-OPT Phase 6)
+            }
+            const PreparedCommand p = own_views(m);
+            if (check) {
+                run_desc_.clear(); // (RecordDraw pushes them all)
+                StageHashes(*p.stage, run_desc_);
+                if (p.ps != nullptr) {
+                    StageHashes(*p.ps, run_desc_);
                 }
-                *run_ps_view_ = *pc.ps;
-                std::copy(m.ps_user_data.begin(), m.ps_user_data.end(), run_ps_view_->plan.flat.begin());
-                if (m.ps_flat_at != Cp::RunMember::kNoFlat &&
-                    u64{m.ps_flat_at} + run_ps_view_->plan.flat.size() <= member_flat.size()) {
-                    std::copy_n(member_flat.begin() + m.ps_flat_at, run_ps_view_->plan.flat.size(),
-                                run_ps_view_->plan.flat.begin());
-                }
-                for (u32 k = 0; k < m.ps_buffers; ++k) {
-                    GS::BufferBinding& bb = run_ps_view_->plan.buffers[m.pb[k].index];
-                    bb.address = m.pb[k].address;
-                    bb.size = m.pb[k].size;
-                    bb.desc.raw = m.pb[k].desc;
-                }
-                p.ps = run_ps_view_.get();
             }
             ++stats_.run_own;
             stencil_override_ = m.own_stencil;
@@ -5680,6 +6560,41 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
             RecordDraw(d, p, t0);
             stencil_override_ = false;
             continue;
+        }
+        if (check) {
+            // =verify: the bindings it is recorded with - those the run's draws before it left, its own over them -
+            // against those it has recorded on its own (its views)
+            for (const auto& [binding, h] : run_check_own_) {
+                if (binding >= run_desc_.size()) {
+                    run_desc_.resize(binding + 1, 0);
+                }
+                run_desc_[binding] = h;
+            }
+            const PreparedCommand p = own_views(m);
+            run_expect_.clear();
+            StageHashes(*p.stage, run_expect_);
+            if (p.ps != nullptr) {
+                StageHashes(*p.ps, run_expect_);
+            }
+            const size_t n = std::max(run_desc_.size(), run_expect_.size());
+            run_desc_.resize(n, 0);
+            run_expect_.resize(n, 0);
+            ++stats_.run_checked;
+            u32 differ = 0, first = 0;
+            for (u32 k = 0; k < n; ++k) {
+                if (run_desc_[k] != run_expect_[k]) {
+                    first = differ == 0 ? k : first;
+                    ++differ;
+                }
+            }
+            if (differ != 0) {
+                if (++stats_.run_check_mismatches <= 12) {
+                    SSPC_LOG(GPU, Warning, "SSPC_CITY_GB_RUN_MATERIAL=verify: run member at {:#x} (of the draw at {:#x}) "
+                                           "recorded with {} bindings that differ from its own (first: binding {})",
+                             m.packet_addr, lead.packet_addr, differ, first);
+                }
+                run_desc_.swap(run_expect_);
+            }
         }
         if (bind_shadow_ && vb_valid_ && vbufs == vb_last_ && voffs == vb_off_last_) {
             ++stats_.vb_binds_skipped;
@@ -5706,8 +6621,12 @@ void Executor::DrawRunMembers(const Cp::DrawDescriptor& lead, const PreparedComm
                 }
                 DescShadow& sh = desc_shadow_[ws[k].dstBinding];
                 sh.valid = true;
-                sh.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                sh.buffer = infos[k];
+                sh.type = ws[k].descriptorType;
+                if (ws[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    sh.buffer = *ws[k].pBufferInfo;
+                } else {
+                    sh.image = *ws[k].pImageInfo;
+                }
             }
             stats_.desc_pushed += nw;
         }
@@ -5888,6 +6807,9 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     info_images_.clear();
     const std::vector<CachedImage*> none;
     const u64 tb0 = GS::FineTicks();
+    aq_what_ = csv.address;
+    aq_watch_capture_ = aq_watch_cs_ != 0 && csv.address == aq_watch_cs_;
+    aq_watch_b0_ = {};
     if (!BindStage(&csv, true, push, writes, buf_infos, img_infos, bound, writes_memory, none)) {
         return;
     }
@@ -6058,6 +6980,16 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         }
         e.images_count = static_cast<u32>(trace_.images.size()) - e.images_begin;
     }
+    const u32 aq_mark = aq_markers_ ? aq_marker_next_++ : 0;
+    if (aq_mark != 0) {
+        aq_marker_ring_[aq_mark & (aq_marker_ring_.size() - 1)] = {
+            cur_.value, csv.address, d.queue, {d.groups[0], d.groups[1], d.groups[2]}, cur_.pool_lane, d.indirect};
+        if (aq_watch_b0_.buffer != VK_NULL_HANDLE) {
+            AqWatchDispatch(aq_mark);
+        }
+        f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, aq_marker_buf_.buffer,
+                                    cur_.pool_lane != 0 ? 8 : 0, aq_mark);
+    }
     if (diag_skip) {
         ++stats_.diag_skipped_dispatches;
     } else if (skip_small && d.queue != 0 && !d.indirect && u64{d.groups[0]} * d.groups[1] * d.groups[2] < 8) {
@@ -6066,6 +6998,10 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         f.vkCmdDispatchIndirect(cur_.cb, argbuf, argoff);
     } else if (!SplitMergeLevels(d, csv, *pipe, push, writes, buf_infos)) {
         f.vkCmdDispatch(cur_.cb, d.groups[0], d.groups[1], d.groups[2]);
+    }
+    if (aq_mark != 0) {
+        f.vkCmdWriteBufferMarkerAMD(cur_.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, aq_marker_buf_.buffer,
+                                    cur_.pool_lane != 0 ? 12 : 4, aq_mark);
     }
     DiagEnd(cid);
     if (prof_) {

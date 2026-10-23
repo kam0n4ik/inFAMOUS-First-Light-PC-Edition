@@ -126,6 +126,10 @@ struct DrawDescriptor {
     u8 engine_run = 0;
     /// CITY-OPT Phase 6: the tag says the engine set another material since the context's last G-buffer draw
     bool engine_material = false;
+    /// SSPC_NATIVE_GBUFFER: the tag carried engine descriptors (kNativeDesc); this is their ring sequence number
+    /// (DrawRuns::EngineDescCopy). Valid only when `engine_run` is the G-buffer source and `engine_native_present`.
+    bool engine_native_present = false;
+    u32 engine_native = 0;
 };
 
 /// CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT): a draw that joined the run of the engine's tagged draw before it
@@ -172,6 +176,13 @@ struct RunMember {
     /// state in Vulkan, not the pipeline's): set before its draw
     bool own_stencil = false;
     u32 stencil_ref = 0, stencil_ref_bf = 0;
+    /// SSPC_CITY_GB_RUN_MATERIAL: a G-buffer member whose material differs (0x448640): its PS images / samplers (bits of
+    /// the first draw's plan indices) whose T# / S# differ from the first draw's - and those the member before it had
+    /// as its own (their T# / S# again: what an earlier member pushed over the run's is replaced); their descriptors in
+    /// the run's store at `sharps_at`: 8 dwords a T# for each image bit, then 4 a S# for each sampler bit, ascending.
+    static constexpr u32 kMaxSharpIndex = 32;
+    u32 img_mask = 0, smp_mask = 0;
+    u32 sharps_at = kNoFlat;
 };
 
 struct DispatchDescriptor {
@@ -367,6 +378,9 @@ struct Counters {
     /// longer; P4.6: the GPU thread's polling granularity)
     std::array<u64, 10> block_hist{};
     u64 waits_met_held = 0; ///< Isolated: WAIT_REG_MEM met in the GPU's order by a held fence (waits_by_held_fences)
+    /// R9 REA-3 order (SetComputeOrder): compute submissions that waited for the graphics submitted before them; the
+    /// ones the graphics queue's wait on other memory let start at once
+    u64 order_held = 0, order_released = 0;
     u64 timeline_writes = 0; ///< Isolated: WRITE_DATA / DMA fills the executor recorded on the GPU's timeline
     u64 timeline_copies = 0; ///< Isolated: DMA_DATA memory-to-memory copies the executor recorded on the timeline
     u64 timeline_gds = 0;    ///< Isolated: DMA_DATA to/from GDS the executor recorded on the timeline (P4.6)
@@ -504,6 +518,14 @@ public:
     void SetObserver(PacketObserver* observer) {
         observer_ = observer;
     }
+    /// R9 REA-3 order (SSPC_R9_REA3_ORDER=1): a compute submission starts only after every graphics submission made
+    /// before it - the order the game made them in, where the executor records both queues in one stream - unless the
+    /// graphics queue is blocked on memory outside [free_lo, free_hi) (VideoOut's labels: the presenter frees them).
+    void SetComputeOrder(bool on, u64 free_lo, u64 free_hi) {
+        order_compute_ = on;
+        order_free_lo_ = free_lo;
+        order_free_hi_ = free_hi;
+    }
 
 private:
     struct Queue;
@@ -534,6 +556,8 @@ public:
 
 private:
     NextResult Next(Queue& q, u64& addr, std::span<const u32>& packet, Pm4::Packet& pk);
+    /// R9 REA-3 order: the compute queue's next submission waits for graphics submitted before it.
+    bool HeldByOrder(Queue& q);
     void UpdateReadPointer(Queue& q);
     StepStatus Fail(Queue& q, CpErrorKind kind, u64 addr, u8 opcode, u32 dwords, std::string detail);
     StepStatus Execute(Queue& q, Frame& f, u64 addr, std::span<const u32> p);
@@ -626,6 +650,9 @@ private:
     PacketObserver* observer_ = nullptr;
     CpError last_error_;
     Counters stats_;
+    bool order_compute_ = false; ///< R9 REA-3 order (SetComputeOrder)
+    u64 order_free_lo_ = 0, order_free_hi_ = 0;
+    u64 submit_seq_ = 0; ///< the submissions of every queue, numbered as they come (the game's order)
     /// Occlusion counting (EVENT_WRITE index 1): PIXEL_PIPE_STAT_CONTROL's DB mask and stride (bytes), and the
     /// count a ZPASS_DONE / PIXEL_PIPE_STAT_DUMP writes (it only grows: every query reads as visible)
     u32 pipe_stat_mask_ = 0xFF;

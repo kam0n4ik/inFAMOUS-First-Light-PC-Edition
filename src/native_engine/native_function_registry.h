@@ -96,7 +96,7 @@ const FunctionSpec& Function(u32 index);
 
 /// Hot-path call counters, per thread (no shared cache line on the hot path); summed by the reporter.
 enum Counter : u32 { kCallsNative = 0, kCallsOriginal = 1, kCallsChecked = 2, kCounters = 3 };
-inline constexpr u32 kMaxFunctions = 48; // R6: room for the geometry/shadow engines' functions
+inline constexpr u32 kMaxFunctions = 64; // R6: room for the geometry/shadow engines' functions; R8: and the CP's
 
 struct ThreadCounters {
     std::atomic<u64> counters[kMaxFunctions][kCounters]{};

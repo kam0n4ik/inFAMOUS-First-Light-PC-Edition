@@ -1,10 +1,13 @@
 // SecondSonPC — the backend's timeline, stream ring and guest buffers (P4.4). See vk_resources.h.
+#include <windows.h>
+
 #include "runtime/gpu/vulkan/vk_resources.h"
 
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/page_tracker.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -29,6 +32,22 @@ constexpr u64 AlignDown(u64 v, u64 a) {
 
 constexpr u64 kWindowAlign = 16ull << 20;
 constexpr u64 kWindowSize = 32ull << 20;
+constexpr u64 kHeapWindowMin = 256ull << 20; ///< R9-F3: a range this large is a heap binding (BufferCache::kHeapMin)
+constexpr u64 kHeapHeadroom = 64ull << 20;   ///< R9-F3: imported past a heap binding's end where the pages allow
+
+/// The bytes from p on (at most `want`) that are committed and writable: what an import of host memory accepts.
+u64 CommittedWritable(const u8* p, u64 want) {
+    u64 got = 0;
+    while (got < want) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p + got, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0 || (mbi.Protect & PAGE_GUARD) != 0) {
+            break;
+        }
+        got = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<u64>(p);
+    }
+    return std::min(got, want);
+}
 constexpr VkBufferUsageFlags kGuestUsage =
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -593,7 +612,7 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
     const u64 align = std::max<u64>(ctx_.Caps().min_imported_host_alignment, 4096);
     struct Try {
         u64 base, size;
-        bool exact;
+        bool exact, headroom;
     };
     Try tries[3]{};
     u32 ntries = 0;
@@ -627,19 +646,48 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
         lo = run_begin;
         hi = AlignDown(run_begin + run_size, align);
     }
-    const auto add = [&](u64 b, u64 e, bool exact) {
+    const auto add = [&](u64 b, u64 e, bool exact, bool headroom) {
         b = std::max(b, lo);
         e = std::min(e, hi);
         const bool repeat = ntries != 0 && tries[ntries - 1].base == b && tries[ntries - 1].size == e - b;
         if (b <= addr && end <= e && ntries < 3 && !repeat) {
-            tries[ntries++] = {b, e - b, exact};
+            tries[ntries++] = {b, e - b, exact, headroom};
         }
     };
     const u64 wbase = AlignDown(addr, kWindowAlign);
-    add(wbase, wbase + kWindowSize, false);
-    add(wbase, wbase + kWindowAlign, false);
-    add(AlignDown(addr, align), AlignUp(end, align), true);
+    add(wbase, wbase + kWindowSize, false, false);
+    add(wbase, wbase + kWindowAlign, false, false);
+    // R9-F3 (SSPC_R9_HEAP_WINDOW=1): the engine's 2.5 GiB vertex-data heap binding grows a page at a time as meshes
+    // stream in; each longer binding missed every window and imported the whole heap again (~100 ms of the recording
+    // thread), the old windows staying imported until the driver refused more (OUT_OF_DEVICE_MEMORY at ~14 GiB, then
+    // REA-7 bound an older prefix). A heap range's window reaches up to kHeapHeadroom past its end, over the run's
+    // committed writable pages only (what the guest has there: an import changes no page), and replaces the windows of
+    // its base that it covers (destroyed once their work completed, as dropped ones).
+    static const bool heap_window = [] {
+        const char* v = std::getenv("SSPC_R9_HEAP_WINDOW");
+        const bool on = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (on) {
+            SSPC_LOG(GPU, Warning, "R9-F3: SSPC_R9_HEAP_WINDOW=1 - heap bindings (>= 256 MiB) imported with up to {} MiB "
+                                   "past their end, replacing the shorter windows of their base", kHeapHeadroom >> 20);
+        }
+        return on;
+    }();
+    const bool heap = heap_window && backed && size >= kHeapWindowMin;
+    if (heap && AlignUp(end, align) < hi) {
+        const u64 e = AlignUp(end, align);
+        const u64 extra = AlignDown(CommittedWritable(run_host + (e - run_begin), std::min(hi - e, kHeapHeadroom)), align);
+        if (extra != 0) {
+            add(AlignDown(addr, align), e + extra, true, true);
+        }
+    }
+    add(AlignDown(addr, align), AlignUp(end, align), true, false);
     std::string error;
+    // SSPC_R9_IMPORTS=1: every import of 64 MiB or more and every failed one, with the driver's time (R9: the fight's
+    // 200 ms frames were the recording thread in vkAllocateMemory of ~2.5 GB host-pointer windows)
+    static const bool log_imports = [] {
+        const char* v = std::getenv("SSPC_R9_IMPORTS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
     for (u32 i = 0; i < ntries; ++i) {
         Window w;
         u8* host = reinterpret_cast<u8*>(tries[i].base);
@@ -657,7 +705,40 @@ bool GuestBuffers::Get(u64 addr, u64 size, u64 seq, View& out, Failure& failure)
                          static_cast<const void*>(run_host));
             }
         }
-        if (Import(tries[i].base, tries[i].size, host, w, error)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool imported = Import(tries[i].base, tries[i].size, host, w, error);
+        if (log_imports && (!imported || tries[i].size >= (64ull << 20))) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            // after the window's end: the backing run (the addresses still host-contiguous) and its committed pages
+            const u8* after = host + tries[i].size;
+            u64 committed_after = 0;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(after, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT) {
+                committed_after = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<u64>(after);
+            }
+            SSPC_LOG(GPU, Info, "R9 import {} [{:#x}, +{:#x}) for [{:#x}, +{:#x}){}{}{}: {:.1f} ms; windows {} ({} MiB); "
+                                "after it: run +{:#x}, committed +{:#x}",
+                     imported ? "of" : "FAILED", tries[i].base, tries[i].size, addr, size, backed ? " backed" : "",
+                     tries[i].exact ? " exact" : "", tries[i].headroom ? " +headroom" : "", ms, stats_.windows,
+                     stats_.bytes >> 20, backed ? hi - std::min(hi, tries[i].base + tries[i].size) : 0, committed_after);
+        }
+        if (imported && heap) {
+            // R9-F3: the windows of this base that the new one covers leave the lookup (the cached ones may be among them)
+            last_get_ = nullptr;
+            last_backing_ = nullptr;
+            for (auto it = windows_.lower_bound(w.base); it != windows_.end() && it->first == w.base;) {
+                if (it->second.size <= w.size) {
+                    ++stats_.superseded;
+                    --stats_.windows;
+                    stats_.bytes -= it->second.size;
+                    retired_.push_back(it->second);
+                    it = windows_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (imported) {
             w.backing = backed;
             w.host = host;
             w.last_seq = seq;

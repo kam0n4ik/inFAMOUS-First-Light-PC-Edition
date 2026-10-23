@@ -21,6 +21,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/inspector.h"
+#include "runtime/gpu/r9/gprof.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/content_patch.h"
 #include "runtime/filesystem/directory.h"
@@ -745,15 +746,23 @@ std::string ThreadName() {
 /// A read the Performance Inspector counts (P4.8; off: the call alone).
 template <typename F>
 s64 CountedRead(F&& read) {
-    if (!Gpu::Inspector::On()) {
+    const bool insp = Gpu::Inspector::On();
+    if (!insp && !Gpu::Gprof::On()) {
         return read();
     }
     const auto t0 = std::chrono::steady_clock::now();
     const s64 r = read();
-    Gpu::Inspector::FileRead(r > 0 ? static_cast<u64>(r) : 0,
-                             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                  std::chrono::steady_clock::now() - t0)
-                                                  .count()));
+    const u64 bytes = r > 0 ? static_cast<u64>(r) : 0;
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (insp) {
+        Gpu::Inspector::FileRead(bytes, ns);
+    }
+    if (Gpu::Gprof::On()) { // (R9: the gameplay profiler's counters)
+        Gpu::Gprof::Add(Gpu::Gprof::Ctr::FileReadBytes, bytes);
+        Gpu::Gprof::Add(Gpu::Gprof::Ctr::FileReadNs, ns);
+        Gpu::Gprof::Add(Gpu::Gprof::Ctr::FileReads, 1);
+    }
     return r;
 }
 

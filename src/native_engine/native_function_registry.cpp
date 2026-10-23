@@ -27,6 +27,10 @@
 #include "native_engine/r7/r7_gbuffer.h"
 #include "native_engine/r7/r7_resources.h"
 #include "native_engine/r7/r7_shadows.h"
+// R8: the same per R8 branch that adds functions (docs/NATIVE_ENGINE_R8_CORE.md §3)
+#include "native_engine/r8/r8_core.h"
+#include "native_engine/r8/r8_recomp.h"
+#include "native_engine/r8/r8_render.h"
 
 namespace SecondSon::NativeEngine {
 
@@ -57,6 +61,10 @@ const FunctionSpec* const kFunctions[] = {
     SSPC_R7_SHADOWS_SPECS
     SSPC_R7_RESOURCES_SPECS
     SSPC_R7_CORE_SPECS
+    // R8 (r8/r8_*.h): the reconstructions the CP and the Native Render Layer need
+    SSPC_R8_RECOMP_SPECS
+    SSPC_R8_RENDER_SPECS
+    SSPC_R8_CORE_SPECS
 };
 constexpr u32 kFunctionCount = static_cast<u32>(std::size(kFunctions));
 static_assert(kFunctionCount <= kMaxFunctions);

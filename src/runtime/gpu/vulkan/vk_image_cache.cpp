@@ -226,6 +226,7 @@ void ImageCache::ApplyInvalidations() {
         }
         ranges.swap(pending_inval_);
     }
+    ++gen_; // (images' flags may change)
     // only the images that can overlap each range (by address; it walked every image for every range: 7.8% of the GPU
     // thread's samples, f1)
     std::vector<CachedImage*> unmapped;
@@ -406,6 +407,7 @@ bool ImageCache::DetilePipeline(const TilingParams& p, VkPipeline& out, std::str
 bool ImageCache::Upload(CachedImage& img, VkCommandBuffer cb, u64 seq, std::string& error) {
     const auto& f = Fn();
     const ImageLayout& l = img.layout;
+    ++gen_; // (its texels and flags)
     GuestBuffers::View src{};
     GuestBuffers::Failure failure{};
     BufferCache::Range resident{};
@@ -837,6 +839,7 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
         // texels are memory's - uploaded before this use (a target too: a draw covering part of it keeps the rest).
         // A multisampled image cannot take a buffer copy: it keeps its texels (as the bridge's RefreshImage).
         match->memory_newer = false;
+        ++gen_;
         if (layout.num_samples <= 1 && match->layout.num_samples <= 1) {
             if (before_upload_ != nullptr) {
                 before_upload_(before_upload_ctx_);
@@ -861,6 +864,7 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
     if ((target || use == Use::Storage) && !match->gpu_written) {
         match->gpu_written = true;
         match->superseded = false;
+        ++gen_;
         TrackGpuWritten(*match);
         // other GPU-written images over this memory hold what was there before: retired once unused for a while
         const u64 a = layout.guest_address, e = a + layout.guest_size;
@@ -986,7 +990,13 @@ bool ImageCache::Transition(VkCommandBuffer cb, CachedImage& img, VkImageLayout 
     img.stage = stage;
     img.access = access;
     ++stats_.barriers;
+    ++gen_;
     return true;
+}
+
+bool ImageCache::ReadSince(const CachedImage& img, VkPipelineStageFlags2 stage, VkAccessFlags2 access) {
+    return (img.access & kWriteAccess) == 0 && (access & kWriteAccess) == 0 && (img.stage & stage) == stage &&
+           (img.access & access) == access;
 }
 
 VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, u64 border_color_base, float extra_lod_bias) {

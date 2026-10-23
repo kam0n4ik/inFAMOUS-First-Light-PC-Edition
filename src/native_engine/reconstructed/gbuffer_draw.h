@@ -41,6 +41,7 @@
 // table equals the previous one) and times the call, the commit and the draw; a reporter logs it every 10 s.
 #pragma once
 
+#include <array>
 #include <string>
 
 #include "native_engine/native_function_registry.h"
@@ -85,6 +86,68 @@ extern const GTrace::CalleeSpec kCalleeSpecs[kCallees];
 /// The hand-written reconstructions (System V; counted by the dispatcher).
 SSPC_SYSV_ABI void InstancedNative(u64 material, u64 r, u64 records, u64 n, u64 mesh);
 SSPC_SYSV_ABI void MeshNative(u64 material, u64 r, u64 instance);
+
+// --- the Native Engine G-buffer path (SSPC_NATIVE_GBUFFER): the engine's descriptors of a draw ------------------
+//
+// Describe() reads the descriptors a 0x1a1770 draw binds straight from the engine's source structures - the instance
+// records' V# built by 0x61e260 from (records, n), the vertex-stream V#s from mesh+0x60, the optional vertex-format V#
+// from 0x45f590, the per-draw constant buffer the context holds at R+0xde20+8 - and the CUE API slot and user-data
+// layout offset each goes to. It runs the verified Instanced path with recording setters: the pure callees (0x61e260,
+// 0x45f590, 0x27530) run for real, the CUE setters and the draw are recorded, not performed. No SRT walk, no reading
+// of the committed register snapshot: this is the engine's own data, the point of the native path. The material's PS
+// textures/samplers/constants (0x448640) are the stable, per-material part and are not captured here (material_bind.h;
+// the command processor's cache holds them per material - docs/NATIVE_GBUFFER_DRAW_0x1a1770.md).
+struct DescResource {
+    u8 stage = 0;     ///< the CUE stage (VS = 2, PS = 1, CS = 0; from 0x27530)
+    u8 kind = 0;      ///< 0 a buffer (SetBuffers), 1 a vertex stream (SetVertexBuffers), 2 the draw constant buffer
+    u8 slot = 0;      ///< the CUE API slot it was set at
+    u8 direct = 0;    ///< the layout entry had bit 15 (a direct SET_SH_REG user-data region, not a shadow offset)
+    u16 offset = 0xffff; ///< the stage's user-data dword offset the layout maps the slot to (entry & 0x3fff); 0xffff: the slot is unused by the shader
+    u16 pad = 0;
+    std::array<u32, 4> desc{}; ///< the descriptor (a V#: 4 dwords of 16 bytes)
+};
+inline constexpr u32 kMaxDescResources = 40; ///< 1 vformat + 1 instance + up to kMaxStreams vertex + 2 constants
+
+struct DrawDescription {
+    bool followed = false; ///< Describe reproduced the draw (false: a case it does not follow - the full path is used)
+    u32 n = 0;             ///< instance count (0x1a1770's `n`)
+    u32 index_count = 0;   ///< mesh + 0x68
+    u64 index_base = 0;    ///< mesh + 0x58
+    u32 count = 0;         ///< DescResource entries filled
+    std::array<DescResource, kMaxDescResources> res{};
+};
+
+/// Fill `out` with the engine descriptors of a 0x1a1770 draw (its source structures, through the Instanced formulas),
+/// with recording setters and no draw. Needs Prepare() or EnsurePureCallees(); false when they are not ready. Call
+/// after the original draw ran (the context's stencil and constant-buffer state are then already the draw's).
+bool Describe(u64 material, u64 r, u64 records, u64 n, u64 mesh, DrawDescription& out);
+
+/// A stage's constant-update-engine state at the draw's commit. 0x14ad0 (the CUE commit, docs §9) copies a dirty
+/// stage's shadow - cue+0x90+stage*0x1800, its layout's first L[0] dwords (L = [cue+0xc180+stage*8]) - whole to new
+/// frame memory and points the stage's user-data registers into that copy: register L[7] at +0, L[8]/L[9] at
+/// L16[0x16]/L16[0x1a], L[10]/L[11] at L16[0x1c]/L16[0x1e], L[5] at L16[0x18], L[6] at L16[0x20] (dwords; 0xff: no
+/// register). So what the shader's SRT walk reads through those registers is this shadow, which Capture takes after
+/// the engine's draw (the commit ran; nothing writes the shadow between the commit and the draw). Registers given
+/// other memory - L[12] (cue+0x78), L[4] (cue+0xc120+stage*8) - and the dwords L[13]/L[14]/L[15] are not in it.
+inline constexpr u32 kMaxShadowDwords = 512;
+inline constexpr u32 kShadowPointers = 7;
+struct StageShadow {
+    u64 layout = 0;   ///< L: the stage's layout (the CUE's per-shader user-data layout)
+    u16 dwords = 0;   ///< L[0]: the dwords the commit copies (0: an empty layout - its registers are direct entries)
+    bool captured = false; ///< false: no layout, or more than kMaxShadowDwords
+    std::array<u8, kShadowPointers> reg{};   ///< the user-data register given the copy + off[i] dwords (0xff: none)
+    std::array<u16, kShadowPointers> off{};
+    std::array<u32, kMaxShadowDwords> shadow{}; ///< [0, dwords): the copy the stage's registers point into
+};
+/// Capture `stage`'s (VS 2, PS 1) CUE state of context `r` into `out`; false when it has no layout or too many dwords.
+bool CaptureStage(u64 r, u32 stage, StageShadow& out);
+/// CaptureStage so far: [0] no layout (refused), [1] an empty layout (captured: nothing copied), [2] more than
+/// kMaxShadowDwords (refused); [3] the most dwords a layout had.
+std::array<u64, 4> CaptureRefusals();
+
+/// Set the module base and the pure callees Describe needs (0x45f590, 0x61e260, 0x27530) if Prepare() has not already;
+/// a lighter setup than Prepare for the Native Engine G-buffer path, which uses no recording clones.
+void EnsurePureCallees(u64 module_base);
 
 /// For tests and the install: callee addresses at module_base, the recording clones, the recompiled implementations
 /// when selected. False with `error` when a clone cannot be made.

@@ -6,6 +6,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <exception>
 
@@ -17,8 +18,10 @@
 #include "runtime/gpu/gpu_memory.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 #include "runtime/kernel/clock.h"
@@ -51,6 +54,7 @@ bool Overlaps(const std::vector<std::pair<u64, u64>>& ranges, u64 lo, u64 hi, u6
 
 /// What the executor reads of a stage the frontend prepared (not its specialization key).
 void CopyStage(GS::StageView& d, const GS::StageView& s) {
+    R8_CP_PROF(CpProfile::Sec::CopyStage);
     d.status = s.status;
     d.address = s.address;
     d.program = s.program;
@@ -182,8 +186,8 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
             SSPC_LOG(GPU, Info, "SSPC_CITY_BATCH={}: draws differing only in their geometry are recorded as one draw", sv);
         }
     }
-    if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
-                         GetEnvironmentVariableA("SSPC_CITY_GEOFAST", v, sizeof(v)) > 0) {
+    // (front mode - the frontend thread: GEOFAST and the runs are that thread's, against its replica)
+    if (char v[16] = {}; frontend_ != nullptr && GetEnvironmentVariableA("SSPC_CITY_GEOFAST", v, sizeof(v)) > 0) {
         const std::string_view sv(v);
         geofast_ = sv == "1" ? 1 : sv == "verify" ? 2 : 0;
         if (geofast_ == 2) {
@@ -226,8 +230,8 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         SSPC_LOG(GPU, Info, "SSPC_DIAG_PREP_CENSUS={}: the draws of flips {}..{} by program (gpu_native.txt)", v,
                  census_first_, census_end_ - 1);
     }
-    if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
-                         GetEnvironmentVariableA("SSPC_CITY_ENGINE_OPT", v, sizeof(v)) > 0 && v[0] != '0' &&
+    if (char v[16] = {}; frontend_ != nullptr && GetEnvironmentVariableA("SSPC_CITY_ENGINE_OPT", v, sizeof(v)) > 0 &&
+                         v[0] != '0' &&
                          std::string_view(v) != "ahead") { // (=ahead: the processor's RunAhead only - A/B)
         runs_ = std::string_view(v) == "verify" ? 2 : 1;
         if (std::string_view(v).starts_with("ab:")) { // (image A/B: runs in odd blocks of n flips only)
@@ -243,11 +247,43 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
             }
             SSPC_LOG(GPU, Info, "SSPC_CITY_ENGINE_GBUFFER_RUNS={}: runs of the instanced mesh draws (0x1a1770) too, their "
                                 "members with their own PS constant buffers (CITY-OPT Phase 6)", g);
+            if (char m[16] = {}; GetEnvironmentVariableA("SSPC_CITY_GB_RUN_MATERIAL", m, sizeof(m)) > 0 && m[0] != '0') {
+                gmat_ = std::string_view(m) == "verify" ? 2 : 1;
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CITY_GB_RUN_MATERIAL={} - G-buffer members of another material "
+                                       "join their run with their own PS textures and samplers{}",
+                         m, gmat_ == 2 ? " (verify: each also prepared in full and compared)" : "");
+            }
         }
     }
-    async_acquire_ =options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
+    if (fthread_mode_) {
+        // SSPC_FP_RUN_HOLD_US (default 50): a held run with no record to join is published after this long (thread 1
+        // waiting for thread 2 publishes it at once)
+        char v[16] = {};
+        const u64 us = GetEnvironmentVariableA("SSPC_FP_RUN_HOLD_US", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) : 50;
+        f_hold_ticks_ = Kernel::Clock::TscFrequency() / 1'000'000 * us;
+        SSPC_LOG(GPU, Info, "front mode: thread 1 parses the packets only; the frontend thread prepares the draws{}{} "
+                            "(a held run published after {} us without a record)",
+                 geofast_ != 0 ? ", takes the geometry-only ones from the draw before" : "",
+                 runs_ != 0 ? " and builds the runs" : "", us);
+    }
+    u64 ring = fthread_mode_ ? kSlots : 1024;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_CP_RING", v, sizeof(v)) > 0) {
+        ring = std::bit_ceil(std::clamp<u64>(std::strtoull(v, nullptr, 10), 64, kSlots));
+    }
+    slot_mask_ = ring - 1;
+    depth_limit_ = ring;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_CP_QUEUE_DEPTH", v, sizeof(v)) > 0) {
+        depth_limit_ = std::clamp<u64>(std::strtoull(v, nullptr, 10), 16, ring);
+    }
+    SSPC_LOG(GPU, Info, "parallel CP: a ring of {} records (SSPC_CP_RING), at most {} queued ahead of thread 2 "
+                        "(SSPC_CP_QUEUE_DEPTH), {} bytes a record",
+             ring, depth_limit_, sizeof(Record));
+    // (front mode too: the hook's frontend invalidations reach the frontend thread as events of the next record -
+    // Backend::FrontendInvalidate - in stream order)
+    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
     journal_changes_only_ = options.journal_changes_only;
-    async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
+    // (front mode: the frontend thread begins the frontend's frame when it passes the flip record - FrontStep)
+    async_flip_ = options.async_flip && frontend_ != nullptr;
     if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
                          GetEnvironmentVariableA("SSPC_FB_STAGE_REUSE", v, sizeof(v)) > 0) {
         stage_reuse_ = std::string_view(v) == "verify" ? 2 : v[0] == '1' ? 1 : 0;
@@ -319,13 +355,16 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
         R6::Bump(R6::Count().run_closed_by[static_cast<u32>(kind) & (R6::kKinds - 1)]); // (R6-P diagnostics)
     }
     CloseRun(); // (a held run's first draw goes before any other record)
-    if (next_ - head_.load(std::memory_order_acquire) >= kSlots) {
-        WaitHead(next_ - kSlots + 1, true, kWhyFull); // backpressure: the oldest slot executed
+    if (next_ - head_.load(std::memory_order_acquire) >= depth_limit_) {
+        WaitHead(next_ - depth_limit_ + 1, true, kWhyFull); // backpressure: the oldest slot executed
     }
-    Record& r = slots_[next_ & (kSlots - 1)];
+    Record& r = slots_[next_ & slot_mask_];
     r.kind = kind;
     r.front_memo = pending_front_memo_; // (frontend thread: told before it prepares this record)
     pending_front_memo_ = false;
+    r.run_barrier = pending_run_barrier_;
+    pending_run_barrier_ = false;
+    r.joined = false;
     r.memory_changed = pending_memory_changed_;
     if (pending_memory_changed_) {
         pending_memory_changed_ = false;
@@ -335,7 +374,7 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
 }
 
 void ParallelCp::PushRecord(bool keep_journal_end) {
-    Record& r = slots_[next_ & (kSlots - 1)];
+    Record& r = slots_[next_ & slot_mask_];
     if (!keep_journal_end) {
         r.journal_end = jtail_; // every register write of the stream before the record
     }
@@ -362,8 +401,14 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
     if (h >= target) {
         return;
     }
+    R8_CP_PROF(full ? (why == kWhyJournal ? CpProfile::Sec::WaitJournal : CpProfile::Sec::WaitFull) : CpProfile::Drain(why));
     const u64 h0 = h;
     const u64 t0 = __rdtsc();
+    // (R8: a full queue while the frontend thread holds a run - filed apart below)
+    const bool held = full && fthread_mode_ && f_hold_lead_.load(std::memory_order_relaxed) != 0;
+    if (fthread_mode_) {
+        f_flush_.store(1, std::memory_order_seq_cst); // (front mode: a run the frontend thread holds is published now)
+    }
     while (h < target && __rdtsc() - t0 < spin_ticks_) {
         _mm_pause();
         h = head_.load(std::memory_order_acquire);
@@ -378,11 +423,18 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
         t1_wait_target_.store(0, std::memory_order_relaxed);
         h = head_.load(std::memory_order_acquire);
     }
+    if (fthread_mode_) {
+        f_flush_.store(0, std::memory_order_relaxed);
+    }
     const u64 t1 = __rdtsc();
     const u64 ticks = t1 - t0;
     if (full) {
         t1_.t1_full_ticks += ticks;
         ++t1_.t1_full_waits;
+        if (held) {
+            t1_full_held_.store(t1_full_held_.load(std::memory_order_relaxed) + ticks, std::memory_order_relaxed);
+            t1_full_held_n_.store(t1_full_held_n_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        }
     } else {
         t1_.t1_drain_ticks += ticks;
         if (why < t1_.drain_ticks_by.size()) {
@@ -398,6 +450,7 @@ void ParallelCp::WaitHead(u64 target, bool full, u16 why) {
 }
 
 void ParallelCp::ApplyPending() {
+    R8_CP_PROF(CpProfile::Sec::ApplyPending);
     ApplyJournal(jtail_);
     if (has_deferred_.load(std::memory_order_acquire)) {
         ApplyDeferred(~0ull);
@@ -511,6 +564,7 @@ void ParallelCp::MemoryChanged() {
 
 void ParallelCp::DeferInvalidateIfCached(u64 addr, u64 bytes) {
     CloseRun(); // (before: the first record after the write - after a held run's first draw)
+    pending_run_barrier_ = fthread_mode_; // (front mode: the frontend thread's run ends before that record)
     std::scoped_lock lock{deferred_mutex_};
     // (a compute ring's read pointer is written after each packet: the same range again is not queued twice)
     if (deferred_.empty() || deferred_.back().before != next_ || deferred_.back().addr != addr ||
@@ -542,6 +596,7 @@ void ParallelCp::JournalReserve(u32 words) {
 }
 
 void ParallelCp::OnWrite(Cp::Space space, u32 offset, const u32* values, u32 count) {
+    R8_CP_PROF_LIGHT(CpProfile::Light::JournalWrite);
     const u32 words = 2 + count;
     JournalReserve(words);
     u32* w = JournalAt(jtail_);
@@ -686,6 +741,7 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
 
 bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> user_data,
                                std::span<const std::array<u32, 4>> vertex_reads, GS::ResourceBindingPlan& out) {
+    R8_CP_PROF(CpProfile::Sec::Redecode);
     // a stage without an SRT walk: its plan is the registers' decoding alone (ResolveResources with an empty walk);
     // CITY-OPT Phase 6 (resources_): one with a walk whose output stays - the registers it read are the same
     if (v.program == nullptr || v.module == nullptr || v.plan.flat.size() < 16 || !v.plan.error.empty() ||
@@ -767,6 +823,7 @@ bool ParallelCp::RedecodeStage(const GS::StageView& v, std::span<const u32, 16> 
 }
 
 bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
+    R8_CP_PROF(CpProfile::Sec::GeoFast);
     const auto no = [&](u8 why) {
         geofast_why_ = why;
         return false;
@@ -775,7 +832,7 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
         frontend_->MemoryGeneration() != geofast_gen_) {
         return no(1);
     }
-    const Record& p = slots_[(index - 1) & (kSlots - 1)];
+    const Record& p = slots_[(index - 1) & slot_mask_];
     if (p.kind != Kind::Draw || !p.prepared || !p.prep.ready || p.state == nullptr || p.stage_shared != nullptr ||
         p.ps_shared != nullptr) {
         return no(2);
@@ -930,9 +987,11 @@ bool ParallelCp::PrepareGeometryOnly(const Record& r, u64 index, Record& out) {
 }
 
 void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs) {
+    R8_CP_PROF(CpProfile::Sec::PrepDraw);
     r.prepared = false;
     r.census_key = 0;
     r.vs_same = r.ps_same = false;
+    r.material = {};
     r.stage_shared.reset();
     r.ps_shared.reset();
     r.state = nullptr;
@@ -956,12 +1015,53 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         }
         return;
     }
+    // SSPC_NATIVE_GBUFFER (native_gbuffer_prep.h): a 0x1a1770 draw with the engine's record - guarded / native prepare it
+    // from the engine's state (no SRT walk); verify and guarded's samples prepare it in full below and compare
+    namespace DR = Engine::Render::DrawRuns;
+    const DR::EngineDraw* engine = nullptr;
+    bool ngb_check = false;
+    u64 ngb_targets = 0;
+    if (ngb_.On() && r.draw.engine_run == static_cast<u8>(DR::Source::GBuffer)) {
+        // (the colour/depth target registers, which the stages' runtime parameters and the pipeline read: by content)
+        ngb_targets = (regs.GroupHash(Cp::Group::ColorTarget) * 0x9E3779B97F4A7C15ull) ^
+                      regs.GroupHash(Cp::Group::DepthTarget);
+        engine = r.draw.engine_native_present ? DR::EngineDescPeek(r.draw.engine_native) : nullptr;
+        ngb_.NoteRecord(engine != nullptr);
+        ngb_check = engine != nullptr && (ngb_.mode() == NativeGBuffer::Mode::Verify || ngb_.SampleCheck());
+        if (engine != nullptr && ngb_.Takes() && !ngb_check) {
+            R8_CP_PROF_ENTER(CpProfile::Sec::FrontNative);
+            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep,
+                                         r.state, r.stage, r.ps, r.material) &&
+                            DR::EngineDescStill(r.draw.engine_native); // (the slot not reused while it was read)
+            R8_CP_PROF_LEAVE();
+            if (!ok) {
+                r.material = {};
+            } else {
+                r.prepared = true;
+                // the frontend skipped this draw: its next preparation sees the register groups changed meanwhile
+                ngb_pending_ |= r.draw.changed;
+                copied_gen_vs_ = copied_gen_ps_ = kNoGen; // (FB-6: the frontend's views are not this draw's)
+                geofast_prev_ = index;
+                geofast_gen_ = frontend_->MemoryGeneration();
+                Bump(fc_.ticks, __rdtsc() - t0);
+                return;
+            }
+        }
+    }
     const bool check = geofast_ == 2 && PrepareGeometryOnly(r, index, *geofast_check_);
     const u8 why = geofast_why_;
     u64 t_copy = 0;
     {
         const GS::FineSample fine(front_fine_counter_);
+        R8_CP_PROF_ENTER(CpProfile::Front(r.draw.engine_run));
+        // (the groups changed at draws the native G-buffer path prepared without the frontend count as changed now)
+        const Cp::GroupMask changed = r.draw.changed;
+        r.draw.changed |= ngb_pending_;
+        ngb_pending_ = 0;
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
+        r.draw.changed = changed;
+        R8_CP_PROF_LEAVE();
+        R8_CP_PROF_PREPARED(r.draw, frontend_->Stage(GS::HwStage::Vs), frontend_->Stage(GS::HwStage::Ps));
         const u64 tc = srt_diag_ ? __rdtsc() : 0;
         r.prep = prep;
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
@@ -978,6 +1078,7 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
             same = stage_reuse_ != 0 && gen == copied;
             if (!same || stage_reuse_ == 2) {
                 CopyStage(dst, frontend_->Stage(hw));
+                R8_CP_PROF_COPY(gen == copied);
             }
             copied = gen;
         };
@@ -987,6 +1088,16 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
         t_copy = srt_diag_ ? __rdtsc() - tc : 0;
     }
     r.prepared = true;
+    // SSPC_NATIVE_GBUFFER: the full preparation is its key's template; verify / guarded's samples compare the engine
+    // build with it (the full one is what the draw uses)
+    if (engine != nullptr && r.stage_shared == nullptr && r.ps_shared == nullptr &&
+        DR::EngineDescStill(r.draw.engine_native)) {
+        R8_CP_PROF(CpProfile::Sec::FrontNative);
+        const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
+        const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
+        ngb_.AfterFull(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep, r.state, dv, dp,
+                       ngb_check);
+    }
     if (srt_diag_) {
         // (a view not copied is the frontend's current one)
         const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
@@ -1173,6 +1284,7 @@ void ParallelCp::PrepareDispatch(Record& r, u64 index) {
     }
     const u64 t0 = __rdtsc();
     {
+        R8_CP_PROF(CpProfile::Sec::FrontDispatch);
         const GS::FineSample fine(front_fine_counter_);
         r.prep = frontend_->PrepareDispatch(r.dispatch, std::span<const u32, Cp::kComputeCount>(r.cs.values), reader_);
         const u64 tc = GS::FineTicks();
@@ -1209,9 +1321,11 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
             Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
         }
     } else if (p_.Idle()) {
+        R8_CP_PROF(CpProfile::Sec::FrontSync);
         p_.ApplyPending();
         Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0); // (exact: TimelineReader's check)
     } else if (p_.MayBeGpuWritten(addr, bytes) || p_.exec_.KeptBack(addr, bytes)) { // (FB-7: kept back)
+        R8_CP_PROF(CpProfile::Sec::FrontSync);
         Bump(p_.fc_.read_hits);
         p_.Drain(DrainReason::FrontendRead);
         Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
@@ -1245,6 +1359,7 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
 // ---- either thread (never both at once: thread 1 only while the queue is drained)
 
 void ParallelCp::ApplyJournal(u64 end) {
+    R8_CP_PROF(CpProfile::Sec::Journal);
     u64 pos = jhead_.load(std::memory_order_relaxed);
     while (pos < end) {
         const u32* w = JournalAt(pos);
@@ -1288,6 +1403,7 @@ void ParallelCp::ApplyDeferred(u64 before) {
 // ---- P5.3D: the frontend thread (between thread 1 and thread 2)
 
 void ParallelCp::FrontApplyJournal(u64 end) {
+    R8_CP_PROF(CpProfile::Sec::Journal);
     u64 pos = fjhead_.load(std::memory_order_relaxed);
     while (pos < end) {
         const u32* w = JournalAt(pos);
@@ -1382,22 +1498,87 @@ void ParallelCp::ApplyFrontEvents(u64 upto) {
     has_fe_.store(!fe_.empty(), std::memory_order_release);
 }
 
+bool ParallelCp::FrontTryJoin(Record& r, u64 index) {
+    (void)index;
+    R8_CP_PROF(CpProfile::Sec::JoinRun);
+    if (r.kind != Kind::Draw || r.memory_changed || r.front_memo || r.run_barrier || !RunTagged(r.draw) ||
+        !JoinRun(r.draw, freplica_)) {
+        return false;
+    }
+    // its draw is recorded with the run's first one; thread 2 replays its registers (after the run's draws, as the
+    // journal behind a held record is in thread 1's runs)
+    r.kind = Kind::Journal;
+    r.prepared = false;
+    r.joined = true;
+    Bump(f_run_joined_);
+    return true;
+}
+
+void ParallelCp::FrontCloseRun(u64 upto) {
+    if (!f_run_open_) {
+        return;
+    }
+    f_run_open_ = false;
+    f_hold_lead_.store(0, std::memory_order_relaxed);
+    const Record& r = slots_[f_run_lead_ & slot_mask_];
+    if (!r.members.empty()) {
+        geofast_prev_ = ~0ull; // (the draw before the next one is the run's last, not this record's)
+        run_count_.store(run_count_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        run_members_.store(run_members_.load(std::memory_order_relaxed) + r.members.size(), std::memory_order_relaxed);
+    }
+    // published at once: the record being prepared may wait for thread 2 to get to it (FrontReader::Read)
+    if (upto > fhead_.load(std::memory_order_relaxed)) {
+        fhead_.store(upto, std::memory_order_seq_cst);
+        if (t2_waiting_.load(std::memory_order_seq_cst) != 0) {
+            fhead_.notify_one();
+        }
+    }
+}
+
 void ParallelCp::FrontStep(Record& r, u64 index) {
-    f_current_ = index;
+    // (front mode: while a run is held, its first draw is the record thread 2 stops before - a read of memory a GPU
+    // write may still be pending for waits for thread 2 to get there, not to this record)
+    f_current_ = f_run_open_ ? f_run_lead_ : index;
     ApplyFrontEvents(index); // what thread 1 told the frontend before this record
     if (r.front_memo) {
         frontend_->GuestMemoryChanged(); // (a change thread 1 met before this record: stream order)
     }
     FrontApplyJournal(r.journal_end); // the registers as they were at the record's packet
+    if (f_run_open_) {
+        if (FrontTryJoin(r, index)) {
+            return;
+        }
+        FrontCloseRun(index);
+        f_current_ = index;
+    }
     switch (r.kind) {
     case Kind::Draw:
         PrepareDraw(r, index, freplica_);
+        if (runs_ != 0 && RunTagged(r.draw) && (runs_ab_ == 0 || (VideoOut::NextFlipId() / runs_ab_) % 2 == 1) &&
+            RunLeaderOk(r)) {
+            // front mode: held - the tagged draws after it may join (fhead_ stays at it until the run is complete)
+            f_run_open_ = true;
+            f_run_lead_ = index;
+            f_hold_lead_.store(index + 1, std::memory_order_relaxed);
+            run_gen_ = frontend_->MemoryGeneration();
+            run_leaders_.store(run_leaders_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        }
         break;
     case Kind::Dispatch:
         PrepareDispatch(r, index);
         break;
     case Kind::Copy:
+    case Kind::Write:
+    case Kind::Zpass:
         AddGpuWrite(r.dst, r.dst + r.bytes, index, kLookup); // (until thread 2 recorded it: the frontend's reads wait)
+        break;
+    case Kind::Gds:
+        if (r.gds_kind == Cp::DmaKind::GdsToMemory) {
+            AddGpuWrite(r.src, r.src + r.bytes, index, kLookup); // (SSPC_CP_ASYNC_WRITES: as a queued copy)
+        }
+        break;
+    case Kind::Flip:
+        frontend_->NewFrame(); // (SSPC_CP_ASYNC_FLIP: the frontend's frame begins at the marker, in stream order)
         break;
     default:
         break;
@@ -1410,10 +1591,28 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
 
 void ParallelCp::FrontLoop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuFrontend");
+    R8_CP_PROF_THREAD(Front);
     u64 k = fhead_.load(std::memory_order_relaxed);
     for (;;) {
         u64 t = tail_.load(std::memory_order_acquire);
+        R8_CP_PROF_FRAME_POLL(); // (R8 profiler: the processor's frame moved on - the frontend's row so far is that frame's)
+        if (t == k && f_run_open_) {
+            R8_CP_PROF(CpProfile::Sec::T2Idle); // (a held run waiting for its next member)
+            // front mode: a held run never waits blocked - published when thread 1 waits for thread 2 (a drain,
+            // backpressure: no record comes before thread 2 got further) or after f_hold_ticks_ without a record
+            const u64 w0 = __rdtsc();
+            while (t == k && f_flush_.load(std::memory_order_acquire) == 0 && __rdtsc() - w0 < f_hold_ticks_) {
+                _mm_pause();
+                t = tail_.load(std::memory_order_acquire);
+            }
+            if (t == k) {
+                Bump(f_flush_.load(std::memory_order_acquire) != 0 ? f_run_closed_flush_ : f_run_closed_idle_);
+                FrontCloseRun(k);
+            }
+            Bump(fc_.idle, __rdtsc() - w0);
+        }
         if (t == k) {
+            R8_CP_PROF(CpProfile::Sec::T2Idle); // (the frontend thread waiting for records)
             const u64 w0 = __rdtsc();
             while (t == k && __rdtsc() - w0 < spin_ticks_) {
                 _mm_pause();
@@ -1431,7 +1630,7 @@ void ParallelCp::FrontLoop() {
             Bump(fc_.idle, __rdtsc() - w0);
         }
         const u64 b0 = __rdtsc();
-        Record& r = slots_[k & (kSlots - 1)];
+        Record& r = slots_[k & slot_mask_];
         const bool stop = r.kind == Kind::Stop;
         if (!stop && !failed_.load(std::memory_order_relaxed)) {
             try {
@@ -1444,11 +1643,18 @@ void ParallelCp::FrontLoop() {
                 Fail("parallel command processor: the frontend thread threw");
             }
         }
+        if (stop || failed_.load(std::memory_order_relaxed)) {
+            FrontCloseRun(k); // (nothing joins any more: the held first draw is published, this record below)
+        }
         Bump(fc_.busy, __rdtsc() - b0);
         ++k;
-        fhead_.store(k, std::memory_order_seq_cst); // (the record's preparation published to thread 2)
-        if (t2_waiting_.load(std::memory_order_seq_cst) != 0) {
-            fhead_.notify_one();
+        // (the record's preparation published to thread 2 - front mode: up to a held run's first draw)
+        const u64 publish = f_run_open_ ? f_run_lead_ : k;
+        if (publish != fhead_.load(std::memory_order_relaxed)) {
+            fhead_.store(publish, std::memory_order_seq_cst);
+            if (t2_waiting_.load(std::memory_order_seq_cst) != 0) {
+                fhead_.notify_one();
+            }
         }
         if (stop) {
             break;
@@ -1461,6 +1667,9 @@ void ParallelCp::FrontLoop() {
 void ParallelCp::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuRecord");
     StallTrace::RegisterThread(StallTrace::Role::Record);
+    R8_CP_PROF_THREAD(Record);
+    Vk::Emit::SetProducerThread();
+    Vk::Emit::EnableBatching(); // (SSPC_VK_EMIT_BATCH=1: its commands handed to the emitter once a record)
     const bool trace_records = StallTrace::DeepRecords();
     u64 h = head_.load(std::memory_order_relaxed);
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
@@ -1476,6 +1685,10 @@ void ParallelCp::Loop() {
     for (;;) {
         u64 t = source.load(std::memory_order_acquire);
         if (t == h) {
+            // (R8: a wait at the first draw of a run the frontend thread holds - it is still joining the members - filed
+            // apart; read at the wait's start)
+            const bool held = fthread_mode_ && f_hold_lead_.load(std::memory_order_relaxed) == h + 1;
+            R8_CP_PROF(held ? CpProfile::Sec::T2IdleHeld : CpProfile::Sec::T2Idle);
             const u64 w0 = __rdtsc();
             while (t == h && __rdtsc() - w0 < spin_ticks_) {
                 _mm_pause();
@@ -1493,12 +1706,17 @@ void ParallelCp::Loop() {
             }
             const u64 w1 = __rdtsc();
             add(t2_idle_, w1 - w0);
+            if (held) {
+                add(t2_idle_held_, w1 - w0);
+                add(t2_idle_held_n_, 1);
+            }
             // P4.12: waited for record h - thread 1 pushed it at push_tsc_[h] (deep), the wake-up is the rest
             StallTrace::Span(StallTrace::Ev::RecordWait, w0, w1, push_tsc_ != nullptr ? push_tsc_[h & (kRecRing - 1)] : 0,
                              static_cast<u32>(h));
         }
+        R8_CP_PROF_FRAME_POLL();
         const u64 b0 = __rdtsc();
-        Record& r = slots_[h & (kSlots - 1)];
+        Record& r = slots_[h & slot_mask_];
         const bool stop = r.kind == Kind::Stop;
         const u16 kind = static_cast<u16>(r.kind); // (before Execute: a record is not touched by thread 1 until head_ moves)
         const u64 queue = r.kind == Kind::Dispatch ? r.dispatch.queue : 0; // (P5.4: the guest queue in the trace)
@@ -1508,6 +1726,7 @@ void ParallelCp::Loop() {
             if (lazy) {
                 exec_.ServeKeptBack();
             }
+            Vk::Emit::Publish(); // (before the record is published as executed: thread 1 may use the executor then)
             if (rec_value_ != nullptr) {
                 for (u64 k = 0; k <= extra; ++k) {
                     rec_value_[(h + k) & (kRecRing - 1)].store(exec_.RecordedValue(), std::memory_order_relaxed);
@@ -1571,6 +1790,32 @@ void ParallelCp::RunGds(const Record& r) {
     exec_.CompleteRefusedWork(r.queue, r.seq);
 }
 
+void ParallelCp::RunZpass(const Record& r) {
+    const u32 db_mask = r.gds_offset, stride = r.pattern;
+    if (exec_.ZpassOnTimeline(r.queue, r.seq, r.dst, db_mask, stride)) {
+        return;
+    }
+    // refused when it ran (an import): what the processor does after a refusal - every DB record gets a count that
+    // only grows (the query reads as visible), here in stream order
+    exec_.Synchronize(r.queue);
+    zpass_fallback_count_ += 0x10000;
+    const u64 value = zpass_fallback_count_ | (1ull << 63);
+    bool ok = write_fallback_ != nullptr;
+    for (u32 db = 0; db < 16 && ok; ++db) {
+        if ((db_mask >> db & 1) != 0) {
+            ok = write_fallback_(write_ctx_, r.dst + u64{db} * stride, &value, sizeof(value));
+        }
+    }
+    if (!ok) {
+        SSPC_LOG(GPU, Error, "parallel command processor: a queued occlusion query's counts at {:#x} could be neither "
+                             "recorded nor written by the CPU (its work completes)", r.dst);
+    } else {
+        exec_.GuestMemoryChanged();
+    }
+    write_fallbacks_.store(write_fallbacks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    exec_.CompleteRefusedWork(r.queue, r.seq);
+}
+
 void ParallelCp::RunCopy(const Record& r) {
     const u32 every = ForcedCopyFallbackEvery();
     const bool forced = every != 0 && ++forced_fallback_n_ % every == 0;
@@ -1608,6 +1853,11 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
         return 0; // consumed, not executed: thread 1's drains still complete; the backend stops at its next check
     }
     try {
+        // (a draw's sections by the engine function that wrote it: BindStage and DrawRunMembers read the source)
+        CpProfile::t_source = r.kind == Kind::Draw ? static_cast<u8>(r.draw.engine_run & 3) : u8{0};
+        R8_CP_PROF(r.kind == Kind::Draw ? CpProfile::BySource(CpProfile::Sec::T2Draw, CpProfile::Sec::T2DrawMesh,
+                                                              CpProfile::t_source)
+                                        : CpProfile::RecordSection(static_cast<u32>(r.kind)));
         // (stage 2: thread 1 tells the frontend about guest memory changes in stream order; nothing from here)
         exec_.SetMemoBumps(frontend_ == nullptr);
         ApplyJournal(r.journal_end);
@@ -1630,7 +1880,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                 Vk::PreparedCommand pc;
                 if (r.prepared) {
                     pc = {&r.prep, &ReuseView(r.stage, r.stage_shared != nullptr, r.vs_same, last_vs_),
-                          &ReuseView(r.ps, r.ps_shared != nullptr, r.ps_same, last_ps_), r.state};
+                          &ReuseView(r.ps, r.ps_shared != nullptr, r.ps_same, last_ps_), r.state, r.material};
                     if (r.stage_shared != nullptr) {
                         pc.stage = &r.Vs();
                     }
@@ -1648,7 +1898,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     batch_items_.push_back({&r.draw, pc});
                     batch_end_ = 0;
                     while (batch_items_.size() < kMaxBatch && index + batch_items_.size() < avail) {
-                        Record& f = slots_[(index + batch_items_.size()) & (kSlots - 1)];
+                        Record& f = slots_[(index + batch_items_.size()) & slot_mask_];
                         if (f.kind != Kind::Draw || !f.prepared || f.memory_changed || !f.members.empty()) {
                             break;
                         }
@@ -1666,7 +1916,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                     for (u64 k = 1; k <= extra; ++k) {
                         // each draw's registers (only theirs changed: VS user data, index, draw parameters); not
                         // recorded as one: each on its own after its registers, as Execute does it
-                        ApplyJournal(slots_[(index + k) & (kSlots - 1)].journal_end);
+                        ApplyJournal(slots_[(index + k) & slot_mask_].journal_end);
                         if (!one) {
                             exec_.DrawPrepared(*batch_items_[k].draw, batch_items_[k].prepared);
                         }
@@ -1677,6 +1927,16 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
                         // SSPC_CITY_ENGINE_OPT: the run's other draws on its state (their registers: the journal
                         // after this record's, applied with the next record)
                         exec_.DrawRunMembers(r.draw, pc, r.members, r.member_flat);
+                        if (fthread_mode_) {
+                            // front mode: the members' own records (published with this one, right after it) - their
+                            // registers now, one step for thread 2 instead of a record each
+                            while (index + 1 + extra < avail && slots_[(index + 1 + extra) & slot_mask_].joined) {
+                                ++extra;
+                            }
+                            if (extra != 0) {
+                                ApplyJournal(slots_[(index + extra) & slot_mask_].journal_end);
+                            }
+                        }
                         if (r.members.capacity() > 32) {
                             if (R6::Opt().run_pool) {
                                 R6::GiveMembers(r.members); // (R6-P: to thread 1's next long run)
@@ -1738,6 +1998,9 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
         case Kind::Gds:
             RunGds(r);
             break;
+        case Kind::Zpass:
+            RunZpass(r);
+            break;
         case Kind::RoundEnd:
             // CP-9: what the loop does after a drained round end - a held fence's batch submitted, completed batches
             // collected (their completions kept for thread 1)
@@ -1768,15 +2031,14 @@ void ParallelCp::Fail(std::string text) {
 // ---- Cp::GpuWork (thread 1)
 
 void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
-    // (Phase 6: 0x1a1770's tag - SSPC_DIAG_ENGINE_SRT - leads or joins a run only with SSPC_CITY_ENGINE_GBUFFER_RUNS)
-    const bool tagged = draw.engine_run != 0 &&
-                        (draw.engine_run != static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) || GRunsNow());
+    const bool tagged = RunTagged(draw);
     if (run_open_) {
+        R8_CP_PROF(CpProfile::Sec::JoinRun);
         const u64 tj = srt_diag_ ? __rdtsc() : 0;
-        const bool joined = tagged && JoinRun(draw);
+        const bool joined = tagged && JoinRun(draw, cp_->Registers());
         if (srt_diag_ && tagged) {
             // (Phase 6 diagnostics: a member's cost, and the cost of an attempt that did not join)
-            SrtDiag& sd = srt_by_[slots_[next_ & (kSlots - 1)].draw.engine_run & 3];
+            SrtDiag& sd = srt_by_[slots_[next_ & slot_mask_].draw.engine_run & 3];
             Bump(joined ? sd.t_join : sd.t_refused, __rdtsc() - tj);
             Bump(joined ? sd.joins : sd.refusals);
         }
@@ -1789,6 +2051,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
         }
         CloseRun();
     }
+    R8_CP_PROF(CpProfile::Sec::ParDraw);
     Record& r = BeginRecord(Kind::Draw);
     r.draw = draw;
     r.members.clear();
@@ -1800,7 +2063,7 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
         PrepareDraw(r, next_, cp_->Registers()); // (as they are at the draw's packet)
     }
     ++t1_.draws;
-    if (runs_ != 0 && tagged && (runs_ab_ == 0 || (VideoOut::NextFlipId() / runs_ab_) % 2 == 1) &&
+    if (runs_ != 0 && !fthread_mode_ && tagged && (runs_ab_ == 0 || (VideoOut::NextFlipId() / runs_ab_) % 2 == 1) &&
         RunLeaderOk(r)) {
         // SSPC_CITY_ENGINE_OPT: held - the tagged draws after it may join; its registers are the journal so far
         r.journal_end = jtail_;
@@ -1817,13 +2080,19 @@ void ParallelCp::CloseRun() {
         return;
     }
     run_open_ = false;
-    Record& r = slots_[next_ & (kSlots - 1)];
+    Record& r = slots_[next_ & slot_mask_];
     if (!r.members.empty()) {
         geofast_prev_ = ~0ull; // (the draw before the next one is the run's last, not this record's)
         run_count_.store(run_count_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         run_members_.store(run_members_.load(std::memory_order_relaxed) + r.members.size(), std::memory_order_relaxed);
     }
     PushRecord(true);
+}
+
+bool ParallelCp::RunTagged(const Cp::DrawDescriptor& d) const {
+    // (Phase 6: 0x1a1770's tag - SSPC_DIAG_ENGINE_SRT - leads or joins a run only with SSPC_CITY_ENGINE_GBUFFER_RUNS)
+    return d.engine_run != 0 &&
+           (d.engine_run != static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer) || GRunsNow());
 }
 
 bool ParallelCp::GRunsNow() const {
@@ -1873,11 +2142,11 @@ bool ParallelCp::RunLeaderOk(const Record& r) const {
     return true;
 }
 
-bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
-    Record& lead = slots_[next_ & (kSlots - 1)];
+bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& regs) {
+    Record& lead = RunLead();
     const size_t flat_mark = lead.member_flat.size();
     const auto no = [&](u32 why) {
-        if (run_open_) {
+        if (RunHeld()) {
             lead.member_flat.resize(flat_mark); // (a refused member's flattened data dropped - the run still held)
         }
         auto& c = run_refused_[why];
@@ -1887,7 +2156,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     if (lead.members.size() + 1 >= kMaxRun) {
         return no(1);
     }
-    if (frontend_->MemoryGeneration() != run_gen_ || pending_memory_changed_) {
+    if (frontend_->MemoryGeneration() != run_gen_ || (!fthread_mode_ && pending_memory_changed_)) {
         return no(2);
     }
     const Cp::DrawDescriptor& a = lead.draw;
@@ -1898,9 +2167,10 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     // Phase 6: a G-buffer run - its members may differ in PS user data too (each one's PS plan decoded again below)
     const bool g = GRunsNow() && a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer);
     if (g && b.engine_material) {
-        // (the engine set another material for it: its PS reads other descriptors - not walked again to see that)
+        // (the engine set another material for it: its PS reads other descriptors - not walked again to see that;
+        // SSPC_CITY_GB_RUN_MATERIAL: walked again below, its own images and samplers)
         Bump(run_material_);
-        if (gruns_ != 2) {
+        if (gruns_ != 2 && gmat_ == 0) {
             return no(16);
         }
     }
@@ -1913,6 +2183,11 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
             SrtDiag& sd = srt_by_[a.engine_run & 3];
             for (u32 k = 0; k < sd.groups.size(); ++k) {
                 Bump(sd.groups[k], (other >> k) & 1);
+            }
+        }
+        if (g) { // (a G-buffer member: which groups ended the run - the report)
+            for (Cp::GroupMask o = other; o != 0; o &= o - 1) {
+                Bump(gb_groups_[std::countr_zero(o) & 63]);
             }
         }
         return no(3);
@@ -1989,7 +2264,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
         m.v[i].address = addr;
         m.v[i].size = size;
     }
-    if (!run_open_ || frontend_->MemoryGeneration() != run_gen_) {
+    if (!RunHeld() || frontend_->MemoryGeneration() != run_gen_) {
         return no(10); // (a read drained the queue: the run was published meanwhile)
     }
     if (own) {
@@ -2001,7 +2276,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
         if (!RedecodeStage(pv, b.user_data[vs], std::span(reads.data(), m.streams), run_plan_)) {
             return no(12);
         }
-        if (!run_open_ || frontend_->MemoryGeneration() != run_gen_) {
+        if (!RunHeld() || frontend_->MemoryGeneration() != run_gen_) {
             return no(10); // (a walk's read drained the queue)
         }
         const GS::ResourceBindingPlan& x = pv.plan;
@@ -2053,34 +2328,87 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
             lead.member_flat.insert(lead.member_flat.end(), y.flat.begin(), y.flat.end());
         }
     }
+    u32 own_img = 0, own_smp = 0; // (SSPC_CITY_GB_RUN_MATERIAL: its own T#s / S#s, without those it has again)
+    bool ps_redecoded = false;
     if (g && a.user_data[ps] != b.user_data[ps]) {
         // Phase 6: its PS plan from its registers (RedecodeStage: the walk's output again, the same module and binding
         // numbers) - the same images and samplers; only read-only constant blocks of the same format elsewhere
         const GS::StageView& pp = lead.ps;
-        if (!RedecodeStage(pp, b.user_data[ps], {}, run_ps_plan_)) {
+        // SSPC_CITY_GB_RUN_MATERIAL: the plan from its engine record's CUE state - the walk's plan without walking the
+        // material's tables again (NativeGBuffer::MemberPlan; the walk's cost, R8: most of the member's on the
+        // frontend); no map: the walk
+        u8 planned = NativeGBuffer::kPlanNone;
+        if (gmat_ != 0 && ngb_.On() && b.engine_native_present) {
+            namespace DR = Engine::Render::DrawRuns;
+            if (const DR::EngineDraw* e = DR::EngineDescPeek(b.engine_native); e != nullptr) {
+                planned = ngb_.MemberPlan(pp, e->ps, b.user_data[ps], run_ps_plan_);
+                if (planned != NativeGBuffer::kPlanNone && !DR::EngineDescStill(b.engine_native)) {
+                    planned = NativeGBuffer::kPlanNone; // (the slot reused while it was read: walked)
+                }
+            }
+            if (gmat_ == 2 && planned != NativeGBuffer::kPlanNone) {
+                // verify: the walk's plan too (what the member would have had)
+                const bool walked = RedecodeStage(pp, b.user_data[ps], {}, run_ps_check_);
+                ngb_.CheckMemberPlan(planned, walked, run_ps_plan_, run_ps_check_);
+            }
+        }
+        if (planned == NativeGBuffer::kPlanOther) {
+            return no(12); // (another module or other bindings: the walk's plan is the same)
+        }
+        if (planned == NativeGBuffer::kPlanNone && !RedecodeStage(pp, b.user_data[ps], {}, run_ps_plan_)) {
             return no(12);
         }
-        if (!run_open_ || frontend_->MemoryGeneration() != run_gen_) {
+        if (!RunHeld() || frontend_->MemoryGeneration() != run_gen_) {
             return no(10); // (a walk's read drained the queue)
         }
         const GS::ResourceBindingPlan& x = pp.plan;
         const GS::ResourceBindingPlan& y = run_ps_plan_;
         bool same = x.images.size() == y.images.size() && x.samplers.size() == y.samplers.size() &&
                     x.buffers.size() == y.buffers.size() && x.vertices.empty() && y.vertices.empty();
+        // SSPC_CITY_GB_RUN_MATERIAL: an image or sampler of the same kind with another T# / S# is the member's own (one
+        // sampled view of a real image; a null one binds the null descriptor whatever its T#, a sampler with a bad S#
+        // the default one - the same as the first draw's)
+        u32 img_mask = 0, smp_mask = 0;
         for (size_t i = 0; same && i < x.images.size(); ++i) {
             const GS::ImageBinding& p = x.images[i];
             const GS::ImageBinding& q = y.images[i];
-            same = p.binding == q.binding && p.count == q.count && p.desc.raw == q.desc.raw && p.view_type == q.view_type &&
+            same = p.binding == q.binding && p.count == q.count && p.view_type == q.view_type &&
                    p.storage == q.storage && p.depth == q.depth && p.array == q.array && p.fmask == q.fmask &&
                    p.status == q.status;
+            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (gmat_ == 0) {
+                    same = false;
+                } else if (i >= Cp::RunMember::kMaxSharpIndex) {
+                    return no(18);
+                } else if (q.count > 1 || q.storage || q.fmask || q.atomic || p.atomic) {
+                    return no(17);
+                } else {
+                    img_mask |= 1u << i;
+                }
+            }
         }
         for (size_t i = 0; same && i < x.samplers.size(); ++i) {
-            same = x.samplers[i].binding == y.samplers[i].binding && x.samplers[i].desc.raw == y.samplers[i].desc.raw &&
-                   x.samplers[i].status == y.samplers[i].status;
+            const GS::SamplerBinding& p = x.samplers[i];
+            const GS::SamplerBinding& q = y.samplers[i];
+            same = p.binding == q.binding && p.status == q.status;
+            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (gmat_ == 0) {
+                    same = false;
+                } else if (i >= Cp::RunMember::kMaxSharpIndex) {
+                    return no(18);
+                } else {
+                    smp_mask |= 1u << i;
+                }
+            }
         }
         if (!same) {
             return no(13);
         }
+        m.img_mask = img_mask;
+        m.smp_mask = smp_mask;
+        own_img = img_mask;
+        own_smp = smp_mask;
+        ps_redecoded = true;
         for (size_t i = 0; i < x.buffers.size(); ++i) {
             const GS::BufferBinding& p = x.buffers[i];
             const GS::BufferBinding& q = y.buffers[i];
@@ -2117,12 +2445,76 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
             Bump(srt_by_[a.engine_run & 3].own_ps);
         }
     }
+    if (!lead.members.empty()) {
+        // thread 2 records a member on the descriptors the one before it left (Executor::DrawRunMembers pushes only a
+        // member's own over them): what that one had of its own and this one has not, this one has again - the run's
+        // (the first draw's: this one's are those), with its own registers
+        const Cp::RunMember& prev = lead.members.back();
+        u32 again = 0;
+        const auto restore = [&](const Cp::RunMember::Buffer* before, u32 n_before, Cp::RunMember::Buffer* own,
+                                 u32& n_own, const GS::ResourceBindingPlan& run) {
+            for (u32 k = 0; k < n_before; ++k) {
+                const u32 index = before[k].index;
+                if (std::any_of(own, own + n_own, [&](const Cp::RunMember::Buffer& o) { return o.index == index; })) {
+                    continue;
+                }
+                if (n_own >= Cp::RunMember::kMaxBuffers || index >= run.buffers.size()) {
+                    return false;
+                }
+                const GS::BufferBinding& q = run.buffers[index];
+                own[n_own++] = {index, q.address, q.size, q.desc.raw};
+                ++again;
+            }
+            return true;
+        };
+        if (!restore(prev.b.data(), prev.buffers, m.b.data(), m.buffers, pv.plan)) {
+            return no(19);
+        }
+        if (prev.own_user_data && !m.own_user_data) {
+            m.own_user_data = true; // (the run's past the registers: vs_flat_at stays kNoFlat)
+            ++again;
+        }
+        if (prev.own_ps && !m.own_ps) {
+            m.own_ps = true; // (its PS user data are the first draw's)
+            m.ps_user_data = b.user_data[ps];
+        }
+        if (prev.own_ps) {
+            if (!restore(prev.pb.data(), prev.ps_buffers, m.pb.data(), m.ps_buffers, lead.ps.plan)) {
+                return no(19);
+            }
+            if (prev.own_ps_user_data && !m.own_ps_user_data) {
+                m.own_ps_user_data = true; // (ps_flat_at stays kNoFlat)
+                ++again;
+            }
+            again += static_cast<u32>(std::popcount(prev.img_mask & ~m.img_mask) +
+                                      std::popcount(prev.smp_mask & ~m.smp_mask));
+            m.img_mask |= prev.img_mask;
+            m.smp_mask |= prev.smp_mask;
+        }
+        if (again != 0) {
+            Bump(run_restored_, again);
+        }
+    }
+    if ((m.img_mask | m.smp_mask) != 0) {
+        // its T#s / S#s (RunMember::sharps_at): its own from its PS plan decoded again, those it has again the run's
+        // (the same in that plan where it has none of its own)
+        const GS::ResourceBindingPlan& sp = ps_redecoded ? run_ps_plan_ : lead.ps.plan;
+        m.sharps_at = static_cast<u32>(lead.member_flat.size());
+        for (u32 mk = m.img_mask; mk != 0; mk &= mk - 1) {
+            const auto& raw = sp.images[std::countr_zero(mk)].desc.raw;
+            lead.member_flat.insert(lead.member_flat.end(), raw.begin(), raw.end());
+        }
+        for (u32 mk = m.smp_mask; mk != 0; mk &= mk - 1) {
+            const auto& raw = sp.samplers[std::countr_zero(mk)].desc.raw;
+            lead.member_flat.insert(lead.member_flat.end(), raw.begin(), raw.end());
+        }
+    }
     if (g) {
-        // (its stencil reference at its packet: thread 2 sets it for its draw - the registers are the processor's here)
+        // (its stencil reference at its packet: thread 2 sets it for its draw - `regs` are the registers at the packet)
         constexpr u32 kDbStencilRefMask = 0xA10C, kDbStencilRefMaskBf = 0xA10D;
         m.own_stencil = true;
-        m.stencil_ref = cp_->Registers().Get(kDbStencilRefMask);
-        m.stencil_ref_bf = cp_->Registers().Get(kDbStencilRefMaskBf);
+        m.stencil_ref = regs.Get(kDbStencilRefMask);
+        m.stencil_ref_bf = regs.Get(kDbStencilRefMaskBf);
     }
     m.seq = b.seq;
     m.packet_addr = b.packet_addr;
@@ -2134,9 +2526,15 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     m.vgt_index_offset = b.vgt_index_offset;
     m.changed = b.changed;
     m.vs_user_data = b.user_data[vs];
-    if (runs_ == 2 || gruns_ == 2) {
+    if (runs_ == 2 || gruns_ == 2 || (gmat_ == 2 && g)) {
         // verify: the full preparation of this draw against the first's with its geometry (it must be the same)
-        const GS::DrawPreparation& prep = frontend_->PrepareDraw(b, cp_->Registers(), reader_);
+        // (R8: the groups changed at draws the native G-buffer path prepared without the frontend - the run's first
+        // one too - count as changed, as in PrepareDraw: else the frontend kept older registers - a PS translated with
+        // another SPI_PS_IN_CONTROL, a bridge assert)
+        Cp::DrawDescriptor bv = b;
+        bv.changed |= ngb_pending_;
+        ngb_pending_ = 0;
+        const GS::DrawPreparation& prep = frontend_->PrepareDraw(bv, regs, reader_);
         GS::StageView expect = pv;
         std::copy(m.vs_user_data.begin(), m.vs_user_data.end(), expect.plan.flat.begin());
         if (m.vs_flat_at != Cp::RunMember::kNoFlat) {
@@ -2154,6 +2552,15 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
                 bb.address = m.pb[k].address;
                 bb.size = m.pb[k].size;
                 bb.desc.raw = m.pb[k].desc;
+            }
+            if (m.sharps_at != Cp::RunMember::kNoFlat) { // (SSPC_CITY_GB_RUN_MATERIAL: its T#s / S#s)
+                auto at = lead.member_flat.begin() + m.sharps_at;
+                for (u32 mk = m.img_mask; mk != 0; mk &= mk - 1, at += 8) {
+                    std::copy_n(at, 8, expect_ps.plan.images[std::countr_zero(mk)].desc.raw.begin());
+                }
+                for (u32 mk = m.smp_mask; mk != 0; mk &= mk - 1, at += 4) {
+                    std::copy_n(at, 4, expect_ps.plan.samplers[std::countr_zero(mk)].desc.raw.begin());
+                }
             }
         }
         for (u32 i = 0; i < m.streams; ++i) {
@@ -2186,7 +2593,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
             }
             return no(11); // (recorded on its own)
         }
-        if (frontend_->MemoryGeneration() != run_gen_ || !run_open_) {
+        if (frontend_->MemoryGeneration() != run_gen_ || !RunHeld()) {
             return no(10);
         }
     }
@@ -2204,10 +2611,16 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b) {
     if (g && b.engine_material) {
         Bump(run_material_joined_);
     }
+    if ((own_img | own_smp) != 0) {
+        Bump(gmat_joined_);
+        Bump(gmat_images_, static_cast<u64>(std::popcount(own_img)));
+        Bump(gmat_samplers_, static_cast<u64>(std::popcount(own_smp)));
+    }
     return true;
 }
 
 void ParallelCp::Dispatch(const Cp::DispatchDescriptor& dispatch) {
+    R8_CP_PROF(CpProfile::Sec::ParDispatch);
     Record& r = BeginRecord(Kind::Dispatch);
     r.dispatch = dispatch;
     const Cp::ComputeRegisters* cs = cp_ != nullptr ? cp_->Compute(dispatch.queue) : nullptr;
@@ -2249,14 +2662,17 @@ void ParallelCp::Dispatch(const Cp::DispatchDescriptor& dispatch) {
     } while (false)
 
 void ParallelCp::CacheAction(const Cp::CacheActionOp& op) {
+    R8_CP_PROF(CpProfile::Sec::CbCache);
     SSPC_P410_QUEUED_CALL(Kind::CacheAction, kQCache, DrainReason::CacheAction, exec_.CacheAction(op), r.cache = op);
 }
 
 void ParallelCp::Fence(const Cp::FenceOp& op) {
+    R8_CP_PROF(CpProfile::Sec::CbFence);
     SSPC_P410_QUEUED_CALL(Kind::Fence, kQFence, DrainReason::Fence, exec_.Fence(op), r.fence = op);
 }
 
 void ParallelCp::Dma(const Cp::DmaOp& op) {
+    R8_CP_PROF(CpProfile::Sec::CbDma);
     // R6-P (SSPC_R6_CP_PREFETCH=skip): Gnm's L2 prefetch writes no memory - nothing for thread 2, no memory change
     if (const R6::Options& r6 = R6::Opt(); r6.diag || r6.prefetch_skip) {
         R6::Counters& c = R6::Count();
@@ -2274,11 +2690,13 @@ void ParallelCp::Dma(const Cp::DmaOp& op) {
 }
 
 void ParallelCp::WaitMetByHeldFence(u32 queue) {
+    R8_CP_PROF(CpProfile::Sec::CbWaitMet);
     SSPC_P410_QUEUED_CALL(Kind::WaitMet, kQWaitMet, DrainReason::WaitMet, exec_.WaitMetByHeldFence(queue),
                           r.queue = queue);
 }
 
 void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
+    R8_CP_PROF(CpProfile::Sec::CbAcquire);
     if (frontend_ != nullptr) {
         if (async_acquire_ && !Idle()) {
             // P4.11 (Options::async_acquire): the CPU writes applied here, the rest in stream order on thread 2
@@ -2310,6 +2728,7 @@ void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {
 }
 
 bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes) {
+    R8_CP_PROF(CpProfile::Sec::CbCopy);
     if (!async_copies_) {
         Drain(DrainReason::TimelineCopy);
         const bool ok = exec_.CopyOnTimeline(queue, seq, src, dst, bytes);
@@ -2355,6 +2774,7 @@ bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes)
 }
 
 void ParallelCp::Flip(const Cp::FlipMarker& marker) {
+    R8_CP_PROF(CpProfile::Sec::CbFlip);
     if (async_flip_ && started_ && !exec_.EvictionDue() && !StallTrace::On() && !Inspector::On()) {
         // Native CP: executed by thread 2 behind the frame's draws; the frontend's frame begins here (thread 1's order)
         Record& r = BeginRecord(Kind::Flip);
@@ -2365,7 +2785,9 @@ void ParallelCp::Flip(const Cp::FlipMarker& marker) {
         }
         ++t1_.queued_flips;
         PushRecord();
-        frontend_->NewFrame();
+        if (!fthread_mode_) {
+            frontend_->NewFrame();
+        }
         return;
     }
     Drain(DrainReason::Flip);
@@ -2388,12 +2810,14 @@ void ParallelCp::Interrupt(u32 queue, Cp::FenceKind kind) {
 }
 
 void ParallelCp::Synchronize(u32 queue) {
+    R8_CP_PROF(CpProfile::Sec::CbSync);
     Drain(DrainReason::Synchronize);
     exec_.Synchronize(queue);
     SnapshotTimeline();
 }
 
 bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, u64 bytes) {
+    R8_CP_PROF(CpProfile::Sec::CbWrite);
     if (async_writes_ && !async_gds_only_ && started_ && !Idle()) {
         // CP-9: accepted by its shape, recorded in stream order (RunWrite: the CPU writes there after a refusal)
         if (!Vk::Executor::TimelineWriteShapeOk(dst, bytes)) {
@@ -2426,6 +2850,32 @@ bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, 
 }
 
 bool ParallelCp::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    R8_CP_PROF(CpProfile::Sec::CbZpass);
+    if (async_writes_ && !async_gds_only_ && started_ && !Idle()) {
+        // CP-9 (SSPC_CP_ASYNC_WRITES=1): after the draws queued before it (the query's own draw among them) in stream
+        // order, as a queued timeline write (RunZpass: the CPU writes the counts there after a refusal)
+        if (!Vk::Executor::ZpassShapeOk(dst, db_mask, stride)) {
+            return false; // (the processor writes its counts, draining first - as the executor's refusal)
+        }
+        const u64 bytes = u64(std::popcount(db_mask)) * 16; // (the end's counts: within the begin's DB records)
+        Record& r = BeginRecord(Kind::Zpass);
+        r.queue = queue;
+        r.seq = seq;
+        r.dst = dst;
+        r.bytes = bytes;
+        r.gds_offset = db_mask;
+        r.pattern = stride;
+        ++writes_queued_;
+        queued_tw_.emplace_back(dst, dst + bytes);
+        qtw_lo_ = std::min(qtw_lo_, dst);
+        qtw_hi_ = std::max(qtw_hi_, dst + bytes);
+        if (frontend_ != nullptr && !fthread_mode_) {
+            AddGpuWrite(dst, dst + bytes, next_, kLookup);
+        }
+        PushRecord();
+        FrontMemoChanged();
+        return true;
+    }
     // after the draws queued before it (the query's own draw among them), as the executor records it
     Drain(DrainReason::TimelineWrite);
     const bool ok = exec_.ZpassOnTimeline(queue, seq, dst, db_mask, stride);
@@ -2438,6 +2888,7 @@ bool ParallelCp::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 s
 
 bool ParallelCp::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                                u32 pattern) {
+    R8_CP_PROF(CpProfile::Sec::CbGds);
     if (async_writes_ && started_ && !Idle()) {
         if (!exec_.GdsShapeOk(kind, memory, gds_offset, bytes)) {
             return false;
@@ -2558,6 +3009,18 @@ std::string ParallelCp::Report() const {
         out += fmt::format("  frontend thread (P5.3D): preparing {:.0f} ms, waiting for records {:.0f} ms, waiting for "
                            "thread 2 {:.0f} ms ({} times)\n",
                            ms(t.tf_busy_ticks), ms(t.tf_idle_ticks), ms(t.tf_wait_ticks), t.tf_waits);
+        out += fmt::format("  front mode runs: draws joined on the frontend thread {}, runs published for thread 1's "
+                           "wait {} / after {:.0f} us without a record {}\n",
+                           f_run_joined_.load(std::memory_order_relaxed),
+                           f_run_closed_flush_.load(std::memory_order_relaxed),
+                           static_cast<double>(f_hold_ticks_) * 1e6 / static_cast<double>(Kernel::Clock::TscFrequency()),
+                           f_run_closed_idle_.load(std::memory_order_relaxed));
+        out += fmt::format("  R8 waits for a held run: thread 2 at its first draw {:.0f} ms ({} times); thread 1's full "
+                           "queue while a run was held {:.0f} ms ({} times)\n",
+                           ms(t2_idle_held_.load(std::memory_order_relaxed)),
+                           t2_idle_held_n_.load(std::memory_order_relaxed),
+                           ms(t1_full_held_.load(std::memory_order_relaxed)),
+                           t1_full_held_n_.load(std::memory_order_relaxed));
     }
     if (geofast_ != 0) {
         out += fmt::format("  CITY-OPT geometry-only draw preparations (SSPC_CITY_GEOFAST): taken {}, verified {} "
@@ -2577,16 +3040,36 @@ std::string ParallelCp::Report() const {
                            "refused (1 full, 2 memory, 3 groups, 4 draw, 5 shaders, 6 other user data, 7 VS user data, "
                            "8 table read, 9 V#, 10 published meanwhile, 11 verify, 12 VS/PS decoded again refused, 13 other "
                            "bindings, 14 a buffer not its own constants, 15 VS walk read a register that differs, 16 another "
-                           "material):{}; verified {} (mismatches {}); instanced mesh draws (0x1a1770) tagged {} of {}{}; "
-                           "materials set (0x448640) {}, G-buffer draws tagged with another material {} (as members {}, "
-                           "joined anyway {})\n",
+                           "material, 17 another kind of image/sampler, 18 an image/sampler index past 32, 19 the earlier "
+                           "member's own bindings again past 2 buffers):{}; verified {} (mismatches {}); bindings had "
+                           "again (the member before had them as its own) {}; instanced mesh draws (0x1a1770) tagged {} of "
+                           "{}{}; materials set (0x448640) {}, G-buffer draws tagged with another material {} (as members "
+                           "{}, joined anyway {})\n",
                            runs_ == 2 ? "=verify" : "", ld(es.tagged[1]), ld(es.calls[1]), ld(es.tagged[2]),
                            ld(es.calls[2]), ld(es.no_nop), ld(run_count_), ld(run_members_), ld(run_leaders_), why,
-                           ld(run_verified_), ld(run_mismatches_), ld(es.tagged[3]), ld(es.calls[3]),
+                           ld(run_verified_), ld(run_mismatches_), ld(run_restored_), ld(es.tagged[3]), ld(es.calls[3]),
                            gruns_ != 0 ? fmt::format(" - their runs (SSPC_CITY_ENGINE_GBUFFER_RUNS{})",
                                                      gruns_ == 2 ? "=verify" : "")
                                        : std::string{},
                            ld(es.materials), ld(es.material_tagged), ld(run_material_), ld(run_material_joined_));
+        if (gruns_ != 0) {
+            std::string groups;
+            for (size_t k = 0; k < gb_groups_.size(); ++k) {
+                if (ld(gb_groups_[k]) != 0) {
+                    groups += fmt::format(" {}:{}", k, ld(gb_groups_[k]));
+                }
+            }
+            out += fmt::format("  R8 G-buffer members refused for registers (3), by group (Cp::Group):{}\n",
+                               groups.empty() ? std::string(" none") : groups);
+        }
+        if (gmat_ != 0) {
+            out += fmt::format("  R8 G-buffer members with another material (SSPC_CITY_GB_RUN_MATERIAL{}): joined with "
+                               "images/samplers of their own {} (images {}, samplers {})\n",
+                               gmat_ == 2 ? "=verify" : "", ld(gmat_joined_), ld(gmat_images_), ld(gmat_samplers_));
+        }
+    }
+    if (ngb_.On()) {
+        out += "  " + ngb_.Report();
     }
     if (resources_ != 0 || gruns_ != 0) {
         std::string why;

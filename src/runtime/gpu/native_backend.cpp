@@ -25,6 +25,7 @@
 
 #include "base/lifecycle.h"
 #include "base/log.h"
+#include "engine/guest_hooks.h"
 #include "runtime/gpu/backend.h"
 #include "runtime/gpu/command_processor.h"
 #include "runtime/gpu/frame_log.h"
@@ -37,7 +38,10 @@
 #include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/page_tracker.h"
+#include "runtime/gpu/r9/gprof.h"
 #include "runtime/gpu/parallel_cp.h"
+#include "runtime/gpu/r8/cp_profile.h"
+#include "runtime/gpu/r8/r8_verify.h"
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/gcn/gcn_translator.h"
@@ -49,6 +53,7 @@
 #include "runtime/gpu/static/static_predictor.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
@@ -85,6 +90,7 @@ public:
         }
     }
     bool Read(u64 addr, void* dst, u64 bytes) override {
+        R8_CP_PROF(CpProfile::Sec::MemRead);
         if (VideoOut::LabelRead(addr, dst, bytes)) {
             return true;
         }
@@ -98,6 +104,7 @@ public:
                 parallel->Drain(DrainReason::MemoryRead);
                 const bool sync = executor->TimelineWritePending(addr, bytes);
                 if (sync) {
+                    R8_CP_PROF(CpProfile::Sec::MemSync);
                     executor->SyncFromMemoryRead();
                 }
                 if (t0 != 0) {
@@ -106,6 +113,7 @@ public:
                 }
             }
         } else if (executor != nullptr && executor->TimelineWritePending(addr, bytes)) {
+            R8_CP_PROF(CpProfile::Sec::MemSync);
             executor->SyncFromMemoryRead();
         }
         KeptBack(addr, bytes);
@@ -270,6 +278,9 @@ public:
     // ---- MemoryListener (the guest memory manager's threads)
     void OnUnmap(u64 addr, u64 size) override {
         Inspector::GuestMap(true);
+        if (Gprof::On()) {
+            Gprof::Add(Gprof::Ctr::GuestUnmaps, 1);
+        }
         memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (guest_) {
@@ -283,6 +294,9 @@ public:
     void OnRegister(u64, u64) override {}
     void OnMap(u64 addr, u64 size) override {
         Inspector::GuestMap(false);
+        if (Gprof::On()) {
+            Gprof::Add(Gprof::Ctr::GuestMaps, 1);
+        }
         memory_.map_gen.fetch_add(1, std::memory_order_acq_rel);
         tracker_.Forget(addr, size);
         if (images_) {
@@ -376,6 +390,7 @@ private:
     /// The guest's CPU wrote [addr, addr + size): the frontend's programs there are read again - on the frontend's
     /// own thread in stream order when it has one (P5.3D), else at once (it runs on this thread).
     void FrontendInvalidate(u64 addr, u64 size) {
+        R8_CP_PROF(CpProfile::Sec::FrontInvalidate);
         if (parallel_ && parallel_->FrontendThread()) {
             parallel_->FrontInvalidate(addr, size);
         } else {
@@ -947,8 +962,32 @@ bool Backend::Start(const Options& o, std::string& error) {
     executor_->SetMapGeneration(&memory_.map_gen); // P4.7: the frontend's reads keep backing runs between maps
     Gnm::SetSdkVersion(o.sdk_version);
     VideoOut::BufferLabelAddress(1, label_base_);
+    // R9 REA-3 order (SSPC_R9_REA3_ORDER=1, an experiment, off by default; docs/R9_REA3_FIX.md): a compute submission
+    // starts after the graphics submitted before it, as the game made them
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_R9_REA3_ORDER", v, sizeof(v)) == 1 && v[0] == '1') {
+        cp_->SetComputeOrder(true, label_base_, label_base_ + VideoOut::kMaxBuffers * 8);
+        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R9_REA3_ORDER=1 - a compute submission starts only after the graphics "
+                               "submitted before it is processed (unless the graphics queue waits for memory other than "
+                               "VideoOut's labels)");
+    }
     FrameLog::Start();
     ShaderTrace::SetOrigin(FrameLog::StartTsc());
+    // R9: SSPC_R9_GPROF=1|2 - the gameplay profiler (every thread's CPU time, code samples, counters, marks)
+    if (Gprof::On()) {
+        Gprof::SetPoll(
+            [](void* ctx, u64* polled) {
+                const PageTracker::Stats st = static_cast<const PageTracker*>(ctx)->GetStats();
+                const FrameLog::Progress pr = FrameLog::GetProgress();
+                polled[0] = st.faults;
+                polled[1] = st.arms;
+                polled[2] = pr.game;
+                polled[3] = pr.cp;
+                polled[4] = pr.present;
+            },
+            &tracker_);
+        Gprof::Start({.logs_dir = o.logs_dir, .guest_lo = Engine::GuestImageBase(),
+                      .guest_hi = Engine::GuestImageEnd(), .origin_tsc = FrameLog::StartTsc()});
+    }
     // P4.12: SSPC_P412_STALL_TRACE=light|deep[,...] - the stall trace (off otherwise: nothing of it runs); deep mode
     // converts the batches' GPU timestamps with the device's calibrated timestamps (GPU ticks <-> QPC)
     if (ShaderTrace::On()) {
@@ -1083,6 +1122,7 @@ void Backend::Apply(const Submission& s) {
 }
 
 bool Backend::DrainCpuWrites() {
+    R8_CP_PROF(CpProfile::Sec::CpuWrites);
     bool any = false;
     // the exact first write of each block given back: surely a write at that address (a small GPU-written image has no
     // whole block a coarse report could name; P4.5)
@@ -1170,6 +1210,8 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
     StallTrace::RegisterThread(StallTrace::Role::Cp);
+    R8_CP_PROF_THREAD(Cp);
+    Vk::Emit::SetProducerThread();
     loop_tid_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     std::deque<Submission> local;
     auto rate_t0 = std::chrono::steady_clock::now();
@@ -1196,6 +1238,7 @@ void Backend::Loop() {
             compute_rung_.store(false, std::memory_order_relaxed); // (the doorbells rung so far are taken now)
         }
         for (const auto& s : local) {
+            R8_CP_PROF(CpProfile::Sec::LoopPre);
             Apply(s);
         }
         const size_t taken = local.size();
@@ -1364,6 +1407,7 @@ void Backend::Loop() {
             if (nodrain_ && executor_->CompletionsReady()) {
                 ApplyCompletions(); // (CP-9: completions thread 2 polled - labels written before the next slice)
             }
+            R8_CP_PROF(CpProfile::Sec::Packets);
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
@@ -1420,6 +1464,7 @@ void Backend::Loop() {
         // (=2: not while the game waits for its async compute - its labels come from the drained round end's poll)
         if (parallel_ && nodrain_ && progress && fp_ahead == 0 && !(nodrain_wait_ && CriticalCompute::Waiting()) &&
             parallel_->RoundEndQueued()) {
+            R8_CP_PROF(CpProfile::Sec::RoundEnd);
             ++nodrain_rounds_;
             const u64 round_ns = ns_since(cp_t0);
             prof_cp += round_ns;
@@ -1448,6 +1493,7 @@ void Backend::Loop() {
         tot_round_ns_ += round_ns;
         const auto poll_t0 = Clock::now();
         {
+            R8_CP_PROF(CpProfile::Sec::Poll);
             const StallTrace::Scope poll_span(StallTrace::Ev::Poll, round_packets, round_capped,
                                               graphics_capped ? 1 : 0);
             executor_->Poll(); // completed batches: the processor writes its held labels now
@@ -1461,6 +1507,9 @@ void Backend::Loop() {
         if (ctx_->Failed()) {
             const VkResult result = ctx_->Failure();
             failure_result_.store(result, std::memory_order_release);
+            if (result == VK_ERROR_DEVICE_LOST && executor_) {
+                executor_->ReportDeviceLost("seen by another thread (presentation or a timeline wait)");
+            }
             SSPC_LOG(GPU, Error, "native backend: stopped after VkResult {}; the process exits with code 5",
                      static_cast<int>(result));
             std::thread([] {
@@ -1632,6 +1681,7 @@ void Backend::Loop() {
                               GpuBacklog() < fp_ahead;
         fp_flushes_ += fp_flush ? 1 : 0;
         if (executor_->WantsFlush() || (!progress && executor_->HasOpenWork()) || fp_flush) {
+            R8_CP_PROF(CpProfile::Sec::Flush);
             const auto flush_t0 = Clock::now();
             executor_->FlushFromLoop();
             const u64 flush_ns = ns_since(flush_t0);
@@ -1669,6 +1719,7 @@ void Backend::Loop() {
         const auto idle_t0 = Clock::now();
         const u64 idle_tsc = StallTrace::On() ? StallTrace::Now() : 0; // (P4.12)
         const bool busy = executor_->Busy();
+        R8_CP_PROF(blocked ? CpProfile::Sec::IdleBlocked : busy ? CpProfile::Sec::IdleGpu : CpProfile::Sec::IdleEmpty);
         // SSPC_DIAG_BLOCK_SPIN_US=<n>: a WAIT_REG_MEM blocked on memory the game's CPU writes (no notification comes)
         // is polled again after n us instead of a 1 ms sleep (P4.6 experiment)
         static const u64 spin_ns = [] {
@@ -1845,8 +1896,15 @@ void Backend::Stop() {
     if (disk_) {
         disk_->SetPeriodic(nullptr, nullptr, 0);
     }
+    const u32 saves_before = pcache_ ? pcache_->Saves() : 0;
     if (pcache_ && pcache_->Save()) { // (P4.14: the driver's compiled pipelines for the next run)
-        SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved", static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+        if (pcache_->Saves() == saves_before) {
+            SSPC_LOG(GPU, Info, "pipeline cache: not saved - nothing new since it was {} (R9-F1, {} checks)",
+                     saves_before == 0 ? "loaded" : "last saved", pcache_->SavesSkipped());
+        } else {
+            SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved",
+                     static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+        }
     }
     if (disk_) {
         if (pipelines_) {
@@ -1858,6 +1916,8 @@ void Backend::Stop() {
     std::error_code ec;
     std::filesystem::create_directories(options_.logs_dir, ec);
     std::ofstream(options_.logs_dir / "gpu_native.txt", std::ios::trunc) << Report();
+    CpProfile::WriteCsv(options_.logs_dir); // (SSPC_R8_CP_PROFILE_CSV=1)
+    Gprof::Stop(); // (R9; the backend's threads stopped - the game's may still run, the sampler stops first)
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
     StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
     ShaderTrace::Stop(); // (P4.14)
@@ -2137,8 +2197,9 @@ std::string Backend::CacheReport() {
                            p.missing_spirv, p.claimed, p.taken, pre->NeverTaken());
     }
     if (pcache_) {
-        out += fmt::format("pipeline cache (driver): at start {}; saved {} times, last {:.1f} MiB\n", pcache_->LoadNote(),
-                           pcache_->Saves(), static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
+        out += fmt::format("pipeline cache (driver): at start {}; saved {} times, last {:.1f} MiB; skipped {} (R9-F1: "
+                           "nothing new)\n", pcache_->LoadNote(), pcache_->Saves(),
+                           static_cast<double>(pcache_->SavedBytes()) / (1 << 20), pcache_->SavesSkipped());
     }
     if (!game_index_.Empty()) {
         // the packs this run's programs are in (observed, not guessed from the packs' names)
@@ -2215,6 +2276,9 @@ std::string Backend::Report() {
     if (parallel_) {
         out += parallel_->Report();
     }
+    if (std::string e = Vk::Emit::Report(); !e.empty()) {
+        out += e + "\n";
+    }
     if (executor_) {
         const auto& s = executor_->Stats();
         out += fmt::format("the processor's other callbacks (P4.10): {} calls, {:.0f} ms; recording {:.0f} ms; draws/"
@@ -2269,18 +2333,45 @@ std::string Backend::Report() {
         out += fmt::format("REA-4 backing runs merged (host-contiguous): {}\n", g.merged_runs);
         out += fmt::format("guest buffer windows {} ({} MiB; through the backing {}, the guest's pages {}), imports {}, failures {} {}\n", g.windows, g.bytes >> 20, g.backing_windows, g.guest_windows,
                            g.imports, g.import_failures, g.first_failure);
+        if (g.superseded != 0) {
+            out += fmt::format("R9-F3 heap windows replaced by longer ones: {}\n", g.superseded);
+        }
     }
     if (cp_ && executor_) {
         const auto& c = cp_->Stats();
         const auto& s = executor_->Stats();
-        out += fmt::format("target cache: hits {}, misses {}; texture memo: hits {}, misses {}\n",
-                           s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses);
+        out += fmt::format("target cache: hits {}, misses {}; texture memo: hits {}, misses {}; native G-buffer "
+                           "material bindings: stages {} (missed {}, kept {}; verified {}, differing {})\n",
+                           s.target_cache_hits, s.target_cache_misses, s.tex_memo_hits, s.tex_memo_misses,
+                           s.gb_bind_hits, s.gb_bind_misses, s.gb_bind_kept, s.gb_bind_verified,
+                           s.gb_bind_mismatches);
+        if (s.tex_seg_segments != 0) {
+            out += fmt::format("textures checked once a segment (SSPC_TEX_SEGMENT): taken from the stamp - draws {}, run "
+                               "members {}; stamps {}, segments {}; verified {}, differing {}\n",
+                               s.tex_seg_hits, s.tex_seg_member_hits, s.tex_seg_stamped, s.tex_seg_segments,
+                               s.tex_seg_verified, s.tex_seg_mismatches);
+        }
         out += cp_->WaitReport();
         out += cp_->FenceReport();
+        if (const auto& cs = cp_->Stats(); cs.order_held != 0 || cs.order_released != 0) {
+            out += fmt::format("R9 REA-3 order: compute submissions held for earlier graphics {}, let start by a graphics "
+                               "wait on other memory {}\n", cs.order_held, cs.order_released);
+        }
+        {
+            u64 set = 0, submitted = 0;
+            Gnm::GraphicsGateCounts(set, submitted);
+            if (set != 0) {
+                out += fmt::format("REA-3 graphics gates: set {}, submitted {}\n", set, submitted);
+            }
+        }
         const VideoOut::Stats vo = VideoOut::GetStats();
         out += fmt::format("videoout: flips requested {}, presented {}, vblanks {}, vblanks a flip waited for its GPU work "
                            "{}\n",
                            vo.flips_requested, vo.flips_presented, vo.vblanks, vo.waited_vblanks);
+        if (vo.paced != 0) {
+            out += fmt::format("R9-F4 free flips held back by the pacer: {} of {} (held back by the cap {})\n", vo.paced,
+                               vo.free_flips, vo.capped_waits);
+        }
         out += fmt::format("frontend reads that waited for a shader's write: {}\n", s.gpu_write_read_syncs);
         out += fmt::format("frontend reads (P4.7): from a kept backing run {}, a run found {}, through the memory "
                            "manager {}\n",
@@ -2338,9 +2429,17 @@ std::string Backend::Report() {
         if (s.run_lean != 0 || s.run_own != 0) {
             out += fmt::format("engine runs' draws (SSPC_CITY_ENGINE_OPT): by their bindings only {}, recorded on their "
                                "own {} (of them a range not in video memory {}; geometry {}, descriptors {}, own range "
-                               "{}, user data {}; own ranges none/partial/all {})\n",
+                               "{}, user data {}, own textures/samplers {}; own ranges none/partial/all {})\n",
                                s.run_lean, s.run_own, s.run_not_resident, s.run_why[0], s.run_why[1], s.run_why[2],
-                               s.run_why[3], fmt::join(s.run_range, "/"));
+                               s.run_why[3], s.run_why[4], fmt::join(s.run_range, "/"));
+            if (s.run_sharp_images != 0 || s.run_sharp_samplers != 0 || s.run_why[4] != 0 || s.run_checked != 0) {
+                out += fmt::format("  their own textures (SSPC_CITY_GB_RUN_MATERIAL): images {}, samplers {} pushed; "
+                                   "members recorded on their own for them: not in the memo/not valid {}, another "
+                                   "layout {}, a target {}, writes pending {}; verify: members compared {} (differed "
+                                   "{})\n",
+                                   s.run_sharp_images, s.run_sharp_samplers, s.run_sharp_why[0], s.run_sharp_why[1],
+                                   s.run_sharp_why[2], s.run_sharp_why[3], s.run_checked, s.run_check_mismatches);
+            }
         }
         out += fmt::format("write-backs by batch end: fence/flip/sync/idle {} MiB, full with a fence {} MiB, full "
                            "without {} MiB (full batches {})\n",
@@ -2557,14 +2656,23 @@ std::string Backend::Report() {
                                t.watch_reads, t.watch_first, t.watch_last);
         }
     }
+    out += CpProfile::Report(); // (R8: SSPC_R8_CP_PROFILE; empty when off)
     if (presenter_) {
         const auto p = presenter_->GetStats();
         out += fmt::format("presented {} (black {}), copies {}, captures {}, swapchain recreated {}{}\n", p.presented,
                            p.black, p.copies, p.captures, p.swapchain_recreated, p.device_lost ? ", DEVICE LOST" : "");
+        if (p.acquire_fence_waits != 0) { // (SSPC_PRESENT_ACQUIRE_FENCE=1)
+            out += fmt::format("  the swapchain image waited for on the present thread (acquire fence): {} times, "
+                               "{:.3f} ms each, the longest {:.3f} ms, over 5 ms {}\n",
+                               p.acquire_fence_waits,
+                               static_cast<double>(p.acquire_fence_ns) / 1e6 / static_cast<double>(p.acquire_fence_waits),
+                               static_cast<double>(p.acquire_fence_max_ns) / 1e6, p.acquire_fence_over5);
+        }
     }
     if (frontend_) { // (P5.2: the shader frontend's own counters - programs read again per frame, fetch shaders, ...)
         out += "--- shader frontend ---\n" + frontend_->Report();
     }
+    out += ::SecondSon::Gpu::R8::Verify::Report(); // (R8: the verification sites, SSPC_R8_VERIFY; empty when not set)
     return out;
 }
 

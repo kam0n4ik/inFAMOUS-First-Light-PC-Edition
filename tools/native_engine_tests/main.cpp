@@ -67,6 +67,19 @@ int R7ResourcesTests(u64 image_base, u64 image_size, void* recomp_module, const 
                      int& checks);
 int R7CoreTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
                 int& checks);
+// R8: the same, one entry per R8 branch (r8_<subsystem>_tests.cpp; docs/NATIVE_ENGINE_R8_CORE.md §3)
+int R8CoreTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                int& checks);
+int R8ProfileTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                   int& checks);
+int R8CpTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+              int& checks);
+int R8RenderTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                  int& checks);
+int R8RecompTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                  int& checks);
+int R8VerifyTests(u64 image_base, u64 image_size, void* recomp_module, const std::string& recomp_dll, u64 cases,
+                  int& checks);
 }
 
 using namespace SecondSon;
@@ -2474,6 +2487,12 @@ int main(int argc, char** argv) {
                 g_failures += Tests::R7ShadowsTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 g_failures += Tests::R7ResourcesTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 g_failures += Tests::R7CoreTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R8RecompTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R8ProfileTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R8CpTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R8RenderTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R8VerifyTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
+                g_failures += Tests::R8CoreTests(image.base, image.size, recomp_module, recomp, cases, g_checks);
                 // last: it installs the setters' jumps on the mapped image
                 TestCueSetters(image, recomp_module, std::max<u64>(cases / 10, 1000));
                 // after the setters: installs 0x448640 below an entry probe on the mapped image

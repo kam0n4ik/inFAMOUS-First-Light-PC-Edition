@@ -97,6 +97,9 @@ public:
     /// copy, with its invalid pages uploaded first (recorded into `cb`), and a write recorded for the write-back.
     /// false: not even the host import (the caller reports the resource).
     bool Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u64 seq, Range& out);
+    /// The page runs the last Prepare that uploaded copied from the host (until the next Prepare): P4.9-B brings a
+    /// block's other used, invalid pages along - past the range asked for.
+    const std::vector<std::pair<u64, u64>>& LastUploads() const { return uploads_; }
     /// [addr, addr + size) is valid in video memory (a texture upload reads it there: newer than the host's).
     bool Resident(u64 addr, u64 size, Range& out);
     /// Some page of [addr, addr + size) is valid in video memory (then the host's copy may be older).

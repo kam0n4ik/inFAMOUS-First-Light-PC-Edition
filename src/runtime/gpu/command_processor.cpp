@@ -15,6 +15,7 @@
 #include "base/log.h"
 #include "engine/render/draw_runs.h"
 #include "runtime/gpu/cp_r6_opt.h"
+#include "runtime/gpu/r8/cp_profile.h"
 #include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
@@ -95,6 +96,7 @@ struct CommandProcessor::Queue {
         const u32* data = nullptr;
         bool ring = false;
         u32 ring_offset = 0;
+        u64 seq = 0; ///< CommandProcessor::submit_seq_ when it came
     };
     struct Patch {
         u64 dst = 0;
@@ -140,6 +142,8 @@ struct CommandProcessor::Queue {
     bool blocked = false;
     u64 block_t0 = 0, block_poll = 0; ///< diagnostics: when and on what the queue blocked
     bool block_held = false;          ///< a held fence would meet the wait when it blocked
+    u64 active_seq = 0;               ///< the seq of the submission at depth 1
+    u8 order_state = 0; ///< R9 REA-3 order, the next submission: 1 counted as held, 2 as released
 };
 
 std::string_view DrawKindName(DrawKind kind) {
@@ -291,7 +295,7 @@ bool CommandProcessor::SubmitGraphics(u64 addr, u32 dwords, const u32* data) {
         Fail(q, CpErrorKind::QueueFull, addr, 0, dwords, "graphics submission refused");
         return false;
     }
-    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, false, 0};
+    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, false, 0, ++submit_seq_};
     return true;
 }
 
@@ -353,7 +357,7 @@ bool CommandProcessor::SubmitCompute(u32 vqid, u64 addr, u32 dwords, const u32* 
         return false;
     }
     const u32 offset = q.mapped ? static_cast<u32>((addr - q.ring_addr) / 4) : 0;
-    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, true, offset};
+    q.pending[(q.head + q.count++) % kMaxPending] = {addr, dwords, data, true, offset, ++submit_seq_};
     return true;
 }
 
@@ -408,9 +412,14 @@ CommandProcessor::NextResult CommandProcessor::Next(Queue& q, u64& addr, std::sp
             if (q.count == 0) {
                 return NextResult::None;
             }
+            if (q.compute && order_compute_ && HeldByOrder(q)) {
+                return NextResult::None;
+            }
             const Queue::Pending s = q.pending[q.head];
             q.head = (q.head + 1) % kMaxPending;
             --q.count;
+            q.active_seq = s.seq;
+            q.order_state = 0;
             q.faulted = false;
             q.budget = 0;
             q.patch_count = 0;
@@ -473,6 +482,39 @@ CommandProcessor::NextResult CommandProcessor::Next(Queue& q, u64& addr, std::sp
     }
 }
 
+bool CommandProcessor::HeldByOrder(Queue& q) {
+    // The executor records every queue in one stream: a compute submission the game made after a frame's graphics,
+    // started before that graphics is processed, lands inside it and delays its completion by its own GPU time - the
+    // next frame's async compute (the particles) in one frame of two, the other one without (REA-3's 17/40 ms frames).
+    const Queue& g = *queues_[kGraphicsQueue];
+    u64 first = 0; // the seq of the earliest graphics submission not processed yet (0: none)
+    for (u32 i = 0; i < g.depth; ++i) {
+        if (g.frames[i].pos < g.frames[i].size) {
+            first = g.active_seq;
+            break;
+        }
+    }
+    if (first == 0 && g.count != 0) {
+        first = g.pending[g.head].seq;
+    }
+    if (first == 0 || first > q.pending[q.head].seq) {
+        return false;
+    }
+    if (g.blocked && !(g.block_poll >= order_free_lo_ && g.block_poll < order_free_hi_)) {
+        // (the graphics queue waits for memory - or a register - the compute work may be what writes: no hold)
+        if (q.order_state != 2) {
+            q.order_state = 2;
+            ++stats_.order_released;
+        }
+        return false;
+    }
+    if (q.order_state == 0) {
+        q.order_state = 1;
+        ++stats_.order_held;
+    }
+    return true;
+}
+
 void CommandProcessor::UpdateReadPointer(Queue& q) {
     if (options_.mode != Mode::Isolated || !q.mapped || q.rptr_addr == 0 || q.depth == 0 || !q.frames[0].ring) {
         return;
@@ -521,6 +563,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     u64 addr = 0;
     std::span<const u32> p;
     Pm4::Packet pk;
+    R8_CP_PROF_PACKET();
     switch (Next(q, addr, p, pk)) {
     case NextResult::None:
         return StepStatus::Idle;
@@ -529,6 +572,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     case NextResult::Ok:
         break;
     }
+    R8_CP_PROF_DECODED(pk.opcode, p);
     Frame& f = q.frames[q.depth - 1];
     q.budget += pk.dwords;
     if (q.budget > options_.max_dwords_per_submission) {
@@ -640,6 +684,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
             ++stats_.flips;
             Engine::Render::Control().flips.fetch_add(1, std::memory_order_relaxed); // (the A/B schedule's clock)
             options_.work->Flip(FlipMarker{.queue = q.id, .packet_addr = addr, .after_seq = q.work_seq});
+            R8_CP_PROF_FRAME(); // (R8: the profiler's frame row)
         } else if (m == Pm4::NopMarker::SetVsharpInUdata || m == Pm4::NopMarker::SetTsharpInUdata ||
                    m == Pm4::NopMarker::SetSsharpInUdata) {
             inline_marker_ = body[0];
@@ -935,6 +980,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
 }
 
 StepStatus CommandProcessor::SetRegs(Queue& q, Frame& f, u64 addr, std::span<const u32> p, Space space) {
+    R8_CP_PROF_LIGHT(CpProfile::Light::SetRegs);
     const u8 op = static_cast<u8>(p[0] >> 8);
     if (p.size() < 2) {
         return Fail(q, CpErrorKind::ShortPacket, addr, op, static_cast<u32>(p.size()), "no register offset");
@@ -1066,6 +1112,11 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
         if (u64{f.pos} + 4 <= f.size) {
             d.engine_run = static_cast<u8>(Engine::Render::DrawRuns::TagOf(f.data + f.pos));
             d.engine_material = Engine::Render::DrawRuns::MaterialChangedOf(f.data + f.pos);
+            // SSPC_NATIVE_GBUFFER: the engine descriptors' ring sequence, carried in the NOP's fourth body dword
+            if (Engine::Render::DrawRuns::NativeDescOf(f.data + f.pos)) {
+                d.engine_native_present = true;
+                d.engine_native = Engine::Render::DrawRuns::NativeDescSeq(f.data + f.pos);
+            }
         }
     } else if (!packet && native_run != 0 && engine_runs_) {
         // R7: a native draw's tag came with its stream operation (the Native Render Layer keeps the Phase 5/6 runs)
@@ -1212,6 +1263,7 @@ void CommandProcessor::RunAhead(Queue& q) {
 }
 
 void CommandProcessor::BuildDraw(DrawDescriptor& d) {
+    R8_CP_PROF_LIGHT(CpProfile::Light::BuildDraw);
     const GroupMask changed = regs_.Dirty();
     regs_.ClearDirty(changed);
     d.changed = changed;

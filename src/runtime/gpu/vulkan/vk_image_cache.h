@@ -272,10 +272,21 @@ private:
     void Evict(u64 completed);
     u64 epoch_ = 0;
 
+    u64 gen_ = 0; ///< Generation's own part: barriers, uploads, applied invalidations, Find's changes of an image's flags
+
 public:
     /// Bumped whenever the set of images changes (a new image; an eviction must bump it too): what Find returned for
     /// the same layout before is still what it returns while the epoch is the same (the executor's target cache).
     u64 Epoch() const { return epoch_; }
+    /// Changes whenever any image's state may have: its layout and access (a barrier), texels (an upload), flags (an
+    /// invalidation applied, a target/storage use, an upload), the set of images (the epoch), the frame (Touch's age).
+    /// While it is the same, an image checked before is as it was (SSPC_TEX_SEGMENT: the executor's checks of a texture
+    /// once a segment). A sum of counters that only grow: it changes when any of them does.
+    u64 Generation() const { return gen_ + epoch_ + frame_; }
+    u64 Frame() const { return frame_; }
+    /// A Transition of `img` to its current layout for (`stage`, `access`) would record nothing and change nothing: it
+    /// is read there without a write since its barrier, by those stages already.
+    static bool ReadSince(const CachedImage& img, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
 
 private:
     u32 next_id_ = 1;

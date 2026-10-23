@@ -605,6 +605,34 @@ constexpr u64 kWaitBReturn = 0x29cd5b;
 bool g_defer_b = false;
 std::atomic<u64> g_defer_b_count{0}, g_defer_b_met{0};
 
+// REA-3 safe reset (with REA-3 unless SSPC_R9_REA3_SAFE_RESET=0, which keeps the unsafe deferral for A/B). The frame's
+// tail 0x196c30 - SubmitFrame 0x1f1e30, the frame allocator's frees, then 0x3ed640 -> 0x169660 - starts the compute
+// queue's command buffer anew (cur = mem, start = 0) and zeroes its position label. The buffer is not copied: each
+// submission puts an INDIRECT_BUFFER to [mem + start, cur) into the ring (0x63d8c0), 0x3f3ed0's DMAs read their data
+// from it, and the next frame's particle update 0x3ee7d0 rewrites it from offset 0 before that frame's first wait.
+// With wait B deferred, what was submitted after wait A (0x3edef0's light DMAs) can still be in flight then: its
+// commands overwritten, its late position write outliving the reset (0x169020 then reuses memory not read yet) - the
+// type-0 packet on queue 1 and the hang after ~16 min. The barrier restores what wait B guaranteed, where the reset
+// needs it: the counter label at the last submission's value and the position label at the last submission's end.
+// 0x1691e0 writes ((cur - mem) / 4 + 0x16) & ~0xf with cur past its 7-dword counter RELEASE_MEM - after the 7-dword
+// position packet and the 64-byte alignment, exactly the start it leaves. At SubmitFrame's return its wait for the
+// previous frame's label is behind, so the GPU has usually finished.
+constexpr GuestFunction kResetAssumed[] = {
+    {0x196c30, 0x15a, 0x3208b3eb8cf47d35ull}, // the frame's tail: SubmitFrame, frees, then the reset 0x3ed640
+    {0x3ed640, 0xc, 0xe56ac7198f4de952ull},   // -> 0x169660 on the compute queue
+    {0x169660, 0x44, 0x7fadb3a5dafa9a40ull},  // the reset
+    {0x1691e0, 0x2fe, 0xb1a4bc684bc8e25full}, // the submission: counter and position RELEASE_MEMs, INDIRECT_BUFFER
+    {0x169020, 0x162, 0xccb01dd6297693f6ull}, // the overflow handler: reuses the space below the position label
+};
+constexpr u32 kPositionGrace = 40; ///< delays of 50 us past the counter (the position write is the next fence)
+bool g_safe_reset = false;
+// (the main thread's: wait B deferred in this frame - the barrier only completes such a wait, so loading screens and a
+// queue being torn down, whose SubmitFrame has no deferred wait, are left as they were)
+bool g_reset_pending = false;
+u32 g_reset_target = 0;
+std::atomic<u64> g_reset_frames{0}, g_reset_waited{0}, g_reset_delays_max{0}, g_reset_position_late{0},
+    g_reset_submitted_after{0};
+
 SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
     const u64 q = reinterpret_cast<u64>(queue);
     const u32 target = Volatile<u32>(q + L::kQueueSubmitted);
@@ -616,6 +644,8 @@ SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
             return;
         }
         Gpu::Gnm::SetGraphicsGate(label, target);
+        g_reset_pending = true;
+        g_reset_target = target;
         const u64 n = g_defer_b_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n == 1 || n == 100 || n == 1000 || n == 10000) {
             SSPC_LOG(Engine, Info, "REA-3: {} second compute waits handed to the processor as a graphics gate ({} already "
@@ -644,6 +674,83 @@ SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
     Gpu::StallTrace::Span(Gpu::StallTrace::Ev::GameComputeWait, t0, Gpu::StallTrace::Now(), label, target, waited);
 }
 
+/// REA-3 safe reset (see kResetAssumed): on the game thread at SubmitFrame's return, before 0x196c30 resets the compute
+/// queue's buffer, when this frame's wait B was deferred. Its span, when it waited: GameComputeWait with c = 2. With
+/// SSPC_R9_REA3_SAFE_RESET=0 it only counts the frames whose reset comes while the queue's work is in flight.
+void ComputeResetBarrier() {
+    if (!g_reset_pending) {
+        return;
+    }
+    g_reset_pending = false;
+    const u64 q = g_base + L::kComputeQueue;
+    const u32 target = Volatile<u32>(q + L::kQueueSubmitted);
+    const u32 end = Volatile<u32>(q + L::kQueueCbStart);
+    if (target != g_reset_target) {
+        // (nothing between 0x3ee470 and the reset was seen submitting; the current value is waited for, it is the later)
+        const u64 m = g_reset_submitted_after.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (m <= 5) {
+            SSPC_LOG(Engine, Warning, "REA-3 safe reset: the compute queue's counter went from {} at wait B to {} at "
+                     "SubmitFrame's return (#{})", g_reset_target, target, m);
+        }
+    }
+    const auto label = [q](u64 index_field) {
+        const s32 index = Volatile<s32>(q + index_field);
+        return Volatile<u64>(g_base + L::kLabelArray) + static_cast<u64>(static_cast<s64>(index)) * 8;
+    };
+    const u64 n = g_reset_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!g_safe_reset) {
+        if (Volatile<u32>(label(L::kQueueLabelIndex)) < target || Volatile<u32>(label(L::kQueueReadLabel)) != end) {
+            g_reset_waited.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (n == 1 || n == 100 || n == 1000 || n % 10000 == 0) {
+            SSPC_LOG(Engine, Info, "REA-3 without its safe reset: {} frames, {} reset the compute buffer with its work "
+                     "in flight; second waits {} as gates, {} already met", n,
+                     g_reset_waited.load(std::memory_order_relaxed), g_defer_b_count.load(std::memory_order_relaxed),
+                     g_defer_b_met.load(std::memory_order_relaxed));
+        }
+        return;
+    }
+    const u64 t0 = Gpu::StallTrace::Now();
+    u64 delays = 0;
+    while (Volatile<u32>(label(L::kQueueLabelIndex)) < target) {
+        g_delay(50);
+        ++delays;
+    }
+    u32 grace = 0;
+    while (Volatile<u32>(label(L::kQueueReadLabel)) != end && grace < kPositionGrace) {
+        g_delay(50);
+        ++grace;
+    }
+    if (grace == kPositionGrace) {
+        // (the counter came, the position did not: the reset goes on as the game's own code would)
+        const u64 late = g_reset_position_late.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (late <= 5) {
+            SSPC_LOG(Engine, Error, "REA-3 safe reset: frame {}: the position label {:#x} holds {:#x}, not the end {:#x} "
+                     "of the last submission ({} us after its counter {} came): reset without it (#{})", n,
+                     label(L::kQueueReadLabel), Volatile<u32>(label(L::kQueueReadLabel)), end, kPositionGrace * 50,
+                     target, late);
+        }
+    }
+    delays += grace;
+    if (delays != 0) {
+        g_reset_waited.fetch_add(1, std::memory_order_relaxed);
+        u64 max = g_reset_delays_max.load(std::memory_order_relaxed);
+        while (delays > max && !g_reset_delays_max.compare_exchange_weak(max, delays, std::memory_order_relaxed)) {
+        }
+        Gpu::StallTrace::Span(Gpu::StallTrace::Ev::GameComputeWait, t0, Gpu::StallTrace::Now(),
+                              label(L::kQueueLabelIndex), target, 2);
+    }
+    if (n == 1 || n == 100 || n == 1000 || n % 10000 == 0) {
+        SSPC_LOG(Engine, Info, "REA-3 safe reset: {} frames, {} waited for the compute queue before its buffer reset "
+                 "(at most {} x 50 us), position late {}, submitted after wait B {}; second waits {} as gates, {} "
+                 "already met", n, g_reset_waited.load(std::memory_order_relaxed),
+                 g_reset_delays_max.load(std::memory_order_relaxed),
+                 g_reset_position_late.load(std::memory_order_relaxed),
+                 g_reset_submitted_after.load(std::memory_order_relaxed),
+                 g_defer_b_count.load(std::memory_order_relaxed), g_defer_b_met.load(std::memory_order_relaxed));
+    }
+}
+
 /// SubmitFrame with its span: a = the frame's label address, b = its fence after the call, c = the flags.
 void SubmitFrameTimed(u8* frame, u32 flags) {
     const u64 t0 = Gpu::StallTrace::Now();
@@ -653,6 +760,9 @@ void SubmitFrameTimed(u8* frame, u32 flags) {
                       static_cast<u64>(static_cast<s64>(At<s32>(f + L::kFrameLabelIndex))) * 8;
     Gpu::StallTrace::Span(Gpu::StallTrace::Ev::GameSubmitFrame, t0, Gpu::StallTrace::Now(), label,
                           At<u32>(f + L::kFrameCounter), static_cast<u16>(flags));
+    if (g_defer_b) {
+        ComputeResetBarrier();
+    }
 }
 
 SSPC_SYSV_ABI void LifecycleSubmitProbe(u8* frame, u32 flags) {
@@ -847,8 +957,21 @@ bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base) {
     if (Env("SSPC_REA_DEFER_WAIT_B") != "1") {
         return true;
     }
+    const bool safe_reset = Env("SSPC_R9_REA3_SAFE_RESET") != "0";
+    std::string error;
+    // (the safe reset - or, without it, its count - reads the queue's fields at SubmitFrame's return: its probe goes in
+    // here when no trace put it in)
+    for (const GuestFunction& f : kResetAssumed) {
+        if (!VerifyGuestFunction(eboot_base, f, error)) {
+            SSPC_LOG(Engine, Error, "REA-3 deferred compute wait not installed (its safe reset): {}", error);
+            return false;
+        }
+    }
+    if (g_submit == nullptr && !VerifyGuestFunction(eboot_base, kSubmitFrameSite.function, error)) {
+        SSPC_LOG(Engine, Error, "REA-3 deferred compute wait not installed (its safe reset): {}", error);
+        return false;
+    }
     if (!g_wait_hooked) {
-        std::string error;
         for (const GuestFunction& f : {kComputeWait, kDelay}) {
             if (!VerifyGuestFunction(eboot_base, f, error)) {
                 SSPC_LOG(Engine, Error, "REA-3 deferred compute wait not installed: {}", error);
@@ -863,10 +986,29 @@ bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base) {
         }
         g_wait_hooked = true;
     }
+    if (g_submit == nullptr) {
+        void* original =
+            InstallEntryProbe(eboot_base, kSubmitFrameSite, reinterpret_cast<const void*>(&LifecycleSubmitProbe), error);
+        if (original == nullptr) {
+            SSPC_LOG(Engine, Critical, "REA-3 deferred compute wait: {}", error); // (as the traces: never half-probed)
+            std::abort();
+        }
+        g_submit = reinterpret_cast<SubmitFrameFn>(original);
+    }
     g_defer_b = true;
+    g_safe_reset = safe_reset;
     SSPC_LOG(Engine, Warning,
              "EXPERIMENT: SSPC_REA_DEFER_WAIT_B=1 - the frame's second async compute wait (0x3ee470 -> 0x1695e0) does not "
              "block the game: the next graphics submission waits for the label on the GPU timeline instead");
+    if (safe_reset) {
+        SSPC_LOG(Engine, Warning,
+                 "EXPERIMENT: REA-3 safe reset - at SubmitFrame 0x1f1e30's return the game waits until the compute "
+                 "queue finished its last submission (counter and position labels) before 0x196c30 resets its buffer");
+    } else {
+        SSPC_LOG(Engine, Warning,
+                 "EXPERIMENT: SSPC_R9_REA3_SAFE_RESET=0 - REA-3 without its safe reset: the compute buffer may be reset "
+                 "while its work is in flight (the hang after ~16 min; for A/B only)");
+    }
     return true;
 }
 

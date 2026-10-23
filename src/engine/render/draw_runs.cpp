@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
@@ -25,6 +27,22 @@ namespace SecondSon::Engine::Render::DrawRuns {
 namespace {
 
 namespace L = Layout;
+namespace GDR = NativeEngine::Reconstructed::GBufferDraw;
+
+// SSPC_NATIVE_GBUFFER: the side ring of engine descriptions (draw_runs.h). One producer writes a slot at a time (the
+// sequence number it gets from g_desc_head); a reader (the command processor) takes it by the sequence in the draw's
+// trailing NOP, and a seqlock check tells it when the slot has since been reused. Sized well above the draws in
+// flight between a draw's capture and its recording, so reuse does not race the reader in practice.
+struct DescSlot {
+    std::atomic<u64> seq{~0ull}; ///< the sequence number whose description this holds (~0: none / being written)
+    EngineDraw draw;
+};
+constexpr u32 kDescRingBits = 13; // (8192 slots of ~5 KiB: several frames of G-buffer draws in flight)
+constexpr u32 kDescRingSize = 1u << kDescRingBits;
+constexpr u32 kDescRingMask = kDescRingSize - 1;
+std::unique_ptr<DescSlot[]> g_desc_ring;
+std::atomic<u64> g_desc_head{0};
+bool g_desc_on = false; ///< capture installed (SSPC_NATIVE_GBUFFER and the pure callees ready)
 
 // the same sites as the draw census (draw_census.cpp): prologues checked in Ghidra, bodies pinned by hash
 constexpr ProbeSite kSites[3] = {
@@ -160,6 +178,28 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
         DiagNote(I, r, I == 0 ? **reinterpret_cast<const u64* const*>(c + 0x18) : e, I == 0 ? 1 : static_cast<u32>(d));
     }
     g_stats.calls[src].fetch_add(1, std::memory_order_relaxed);
+    // SSPC_NATIVE_GBUFFER: capture the engine descriptors of this G-buffer draw into the side ring (its source
+    // structures, no SRT walk), the sequence into the trailing NOP for the command processor. (a = M/pass, r = R,
+    // c = records, d = n, e = mesh.)
+    u32 desc_seq = 0;
+    bool have_desc = false;
+    if constexpr (I == 2) {
+        if (g_desc_on && !scoped) { // (not the R7 native-render path, which replaces the draw and its tag)
+            const u64 h = g_desc_head.fetch_add(1, std::memory_order_relaxed);
+            DescSlot& s = g_desc_ring[h & kDescRingMask];
+            s.seq.store(~0ull, std::memory_order_release); // being written: readers see it as stale
+            std::atomic_thread_fence(std::memory_order_release);
+            if (GDR::Describe(a, r, c, d, e, s.draw.desc) && s.draw.desc.followed) {
+                // the stages' CUE state at the draw's commit (what their SRT walks would read: gbuffer_draw.h)
+                GDR::CaptureStage(r, 2, s.draw.vs);
+                GDR::CaptureStage(r, 1, s.draw.ps);
+                s.seq.store(h, std::memory_order_release); // published
+                desc_seq = static_cast<u32>(h);
+                have_desc = true;
+                tag |= kNativeDesc;
+            }
+        }
+    }
     u32* const p1 = *cmd;
     // the trailing NOP of the draw this call wrote: the last 4 dwords, written by this call (in this chunk after p0,
     // or in a chunk the call started), its first body dword still the driver's 0
@@ -174,6 +214,9 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     if (fresh && p1[-4] == kTrailingNopHeader && p1[-3] == 0) {
         p1[-3] = kRunMagic;
         p1[-2] = tag;
+        if (have_desc) {
+            p1[-1] = desc_seq; // nop[3]: the ring sequence (NativeDescSeq)
+        }
         g_stats.tagged[src].fetch_add(1, std::memory_order_relaxed);
     } else if (native == 0) { // (a native draw left a run token, not a NOP: its tag went with it - R7::ScopeStats)
         g_stats.no_nop.fetch_add(1, std::memory_order_relaxed);
@@ -198,6 +241,28 @@ bool On() {
 
 bool GBufferTagged() {
     return g_gbuffer;
+}
+
+bool EngineDescOn() {
+    return g_desc_on;
+}
+
+const EngineDraw* EngineDescPeek(u32 seq) {
+    if (!g_desc_on) {
+        return nullptr;
+    }
+    const DescSlot& s = g_desc_ring[seq & kDescRingMask];
+    const u64 seq1 = s.seq.load(std::memory_order_acquire);
+    if (static_cast<u32>(seq1) != seq || seq1 == ~0ull) {
+        return nullptr; // the slot holds another draw now (or is being written)
+    }
+    return &s.draw;
+}
+
+bool EngineDescStill(u32 seq) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 seq2 = g_desc_ring[seq & kDescRingMask].seq.load(std::memory_order_relaxed);
+    return static_cast<u32>(seq2) == seq && seq2 != ~0ull; // not overwritten while it was read
 }
 
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
@@ -265,6 +330,22 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         g_diag = true;
         std::thread(DiagReporter).detach();
         SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_DIAG_ENGINE_RUNS=1 - the engine's meshes per frame and context");
+    }
+    // SSPC_NATIVE_GBUFFER: capture the engine descriptors of 0x1a1770's draws into the side ring (needs the G-buffer
+    // tag, i.e. SSPC_CITY_ENGINE_GBUFFER_RUNS). The command processor reads the ring for the draws it prepares.
+    if (char ng[16] = {}; GetEnvironmentVariableA("SSPC_NATIVE_GBUFFER", ng, sizeof(ng)) > 0 && ng[0] != '0' &&
+                          std::string_view(ng) != "off") {
+        if (!g_gbuffer) {
+            SSPC_LOG(Engine, Warning, "SSPC_NATIVE_GBUFFER: 0x1a1770's draws are not tagged "
+                                      "(SSPC_CITY_ENGINE_GBUFFER_RUNS=1) - the engine descriptors are not captured");
+        } else {
+            GDR::EnsurePureCallees(eboot_base);
+            g_desc_ring = std::make_unique<DescSlot[]>(kDescRingSize);
+            g_desc_on = true;
+            SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_NATIVE_GBUFFER={} - 0x1a1770's engine descriptors (instance V#, "
+                                      "vertex streams, draw constants) and its VS/PS CUE state at the commit captured "
+                                      "for the command processor's native path", ng);
+        }
     }
     SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_CITY_ENGINE_OPT={} - the engine's mesh draws (0x1a1960) and shadow casters' "
                               "draws (0x43d480){} tagged for the command processor's runs", v,

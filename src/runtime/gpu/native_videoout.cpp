@@ -272,12 +272,38 @@ void SleepUntil(HANDLE timer, double until, const LARGE_INTEGER& freq) {
     }
 }
 
+/// R9-F4 (SSPC_R9_PACE=<percent>, 50..100; off by default; docs/R9_GAMEPLAY_PERFORMANCE.md §10): the fraction of the
+/// average interval between the frames' GPU completions that a free flip keeps after the last one (0: off).
+double PaceFraction() {
+    static const double fraction = [] {
+        char v[8] = {};
+        const u64 n = GetEnvironmentVariableA("SSPC_R9_PACE", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) : 0ull;
+        if (n == 0) {
+            return 0.0;
+        }
+        const u64 percent = std::clamp<u64>(n, 50, 100);
+        SSPC_LOG(GPU, Info, "VideoOut: R9-F4 SSPC_R9_PACE={} - a free flip at least {}% of the average interval between "
+                            "the frames' GPU completions after the last one",
+                 n, percent);
+        return static_cast<double>(percent) / 100.0;
+    }();
+    return fraction;
+}
+
 /// The free pacing (FrameBreak FB-2): the oldest request is shown as soon as its GPU work completed and the cap (and
 /// the game's own flip rate, its "lock to 30" option) allow; the vblank count still advances at 59.94 Hz. Returns when
 /// the pacing changes back to the vblank one or the thread stops.
+/// R9-F4: with REA-3 in a GPU-bound scene the frames complete in pairs (the next frame's async compute runs before
+/// this one's flip: 17 / 43 ms); the pacer shows them at an even cadence. Its average follows the completions, not
+/// the flips (its own delay does not feed it); an interval over 100 ms (a hitch, a load) restarts it.
 void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, double& next_tick) {
     LARGE_INTEGER now{};
     double last_flip = 0.0; // QPC of the last flip taken
+    const double pace = PaceFraction();
+    const double pace_restart = static_cast<double>(freq.QuadPart) / 10.0; // 100 ms
+    double ready_at = 0.0, ready_avg = 0.0; // QPC of the last completion seen, the average interval (0: none yet)
+    u64 ready_id = 0;                       // the flip whose completion it is
+    bool paced = false;                     // the front request is held back by the pacer
     for (;;) {
         if (g_stop.load(std::memory_order_acquire)) {
             return;
@@ -316,7 +342,7 @@ void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, doub
             // the cap, and the game's flip rate (1: 30 Hz, 2: 20 Hz - its own frame rate lock) as a minimum interval
             double interval = p.cap_fps != 0 ? static_cast<double>(freq.QuadPart) / p.cap_fps : 0.0;
             interval = std::max(interval, static_cast<double>(rate + 1) * period_ticks * (rate > 0 ? 1.0 : 0.0));
-            const double earliest = last_flip + interval;
+            double earliest = last_flip + interval;
             if (g_sink != nullptr && !g_sink->Ready(front.gpu_value)) {
                 // the frame's GPU work: waited for here (bounded by the next vblank tick)
                 const double left = next_tick - t;
@@ -328,6 +354,22 @@ void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, doub
                     }
                 }
                 continue;
+            }
+            if (pace > 0.0) {
+                if (front.flip_id != ready_id) {
+                    // (its completion: first seen ready here - at most a wake-up late)
+                    const double iv = t - ready_at;
+                    ready_avg = ready_at == 0.0 || iv > pace_restart ? 0.0
+                                : ready_avg == 0.0                   ? iv
+                                                                     : ready_avg + (iv - ready_avg) / 16.0;
+                    ready_at = t;
+                    ready_id = front.flip_id;
+                }
+                const double paced_at = last_flip + pace * ready_avg;
+                if (ready_avg > 0.0 && paced_at > earliest) {
+                    earliest = paced_at;
+                    paced = paced || t < earliest;
+                }
             }
             const double spin = static_cast<double>(p.spin_us) * static_cast<double>(freq.QuadPart) / 1e6;
             if (t + spin >= earliest) {
@@ -351,6 +393,8 @@ void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, doub
                 Present(front);
                 std::scoped_lock s{g_stats_mutex};
                 ++g_stats.free_flips;
+                g_stats.paced += paced ? 1 : 0;
+                paced = false;
                 continue;
             }
             {

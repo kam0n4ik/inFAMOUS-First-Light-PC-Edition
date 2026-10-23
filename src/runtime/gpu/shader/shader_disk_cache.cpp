@@ -11,6 +11,7 @@
 #include <xxhash.h>
 
 #include "base/log.h"
+#include "runtime/gpu/r9/pcache.h"
 #include "runtime/gpu/shader/shader_cache.h"
 #include "runtime/gpu/shader/shader_capture.h"
 #include "runtime/gpu/shader_trace.h"
@@ -1023,6 +1024,11 @@ void ShaderDiskCache::Flush() {
 }
 
 bool ShaderDiskCache::WithWriteOwnership(const std::function<bool()>& fn) {
+    if (R9::PipelineCacheMode() != 0) {
+        // R9-F1: a lease of its own - the driver's cache save (seconds) no longer holds module reads and appends back
+        std::scoped_lock lease{lease_mutex_};
+        return lock_ != nullptr && file_ != nullptr && writable_ && fn();
+    }
     std::scoped_lock io{io_mutex_};
     return lock_ != nullptr && file_ != nullptr && writable_ && fn();
 }
@@ -1036,7 +1042,7 @@ void ShaderDiskCache::Close() {
     if (writer_.joinable()) {
         writer_.join();
     }
-    std::scoped_lock io{io_mutex_};
+    std::scoped_lock io{lease_mutex_, io_mutex_}; // (R9-F1: a save holding the lease finishes first)
     if (file_ != nullptr) {
         CloseHandle(static_cast<HANDLE>(file_));
         file_ = nullptr;

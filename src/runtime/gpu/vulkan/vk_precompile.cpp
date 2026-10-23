@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <memory>
 
 #include <fmt/format.h>
 #include <xxhash.h>
 
 #include "base/log.h"
+#include "runtime/gpu/r9/pcache.h"
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
@@ -120,6 +122,7 @@ bool PipelineCacheFile::Load() {
     }
     if (!data.empty()) {
         loaded_bytes_ = data.size();
+        last_bytes_ = data.size();
         note_ = fmt::format("{:.1f} MiB loaded", static_cast<double>(data.size()) / (1 << 20));
     }
     ShaderTrace::Event(ShaderTrace::Kind::CacheLoad, t0, __rdtsc(), 1, data.size());
@@ -131,7 +134,71 @@ bool PipelineCacheFile::Save() {
         return false;
     }
     std::scoped_lock lock{save_mutex_};
+    if (R9::PipelineCacheMode() != 0) {
+        return owner_.WithWriteOwnership([this] { return SaveR9(); });
+    }
     return owner_.WithWriteOwnership([this] { return SaveOwned(); });
+}
+
+bool PipelineCacheFile::SaveR9() {
+    const u64 t0 = __rdtsc();
+    size_t size = 0;
+    if (Fn().vkGetPipelineCacheData(ctx_.Device(), cache_, &size, nullptr) != VK_SUCCESS || size == 0) {
+        return false;
+    }
+    if (size == last_bytes_) {
+        skipped_.fetch_add(1);
+        return true; // (nothing new in the driver's cache: the file holds it)
+    }
+    // the driver's data written as it comes: no zero-filled buffer, no second copy with the header
+    auto data = std::make_unique_for_overwrite<u8[]>(size);
+    if (Fn().vkGetPipelineCacheData(ctx_.Device(), cache_, &size, data.get()) != VK_SUCCESS) {
+        return false;
+    }
+    CacheHeader h{};
+    std::memcpy(h.magic, kMagic, sizeof(kMagic));
+    h.version = kVersion;
+    h.vendor_id = ctx_.VendorId();
+    h.device_id = ctx_.DeviceId();
+    h.driver_version = ctx_.DriverVersion();
+    std::memcpy(h.uuid, ctx_.PipelineCacheUuid().data(), VK_UUID_SIZE);
+    h.data_bytes = size;
+    h.data_hash = XXH3_64bits(data.get(), size);
+    h.header_hash = XXH3_64bits(&h, offsetof(CacheHeader, header_hash));
+    auto tmp = file_;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        const u64 total = sizeof(h) + size;
+        const u64 bytes = tear_ != 0 ? std::min<u64>(std::exchange(tear_, 0), total) : total;
+        out.write(reinterpret_cast<const char*>(&h), static_cast<std::streamsize>(std::min<u64>(bytes, sizeof(h))));
+        if (bytes > sizeof(h)) {
+            out.write(reinterpret_cast<const char*>(data.get()), static_cast<std::streamsize>(bytes - sizeof(h)));
+        }
+        if (!out || bytes != total) {
+            if (crash_after_tear_) {
+                out.flush();
+                TerminateProcess(GetCurrentProcess(), 0xDEAD); // (the diagnostic crash while saving)
+            }
+            return false;
+        }
+    }
+    if (!MoveFileExW(tmp.wstring().c_str(), file_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        SSPC_LOG(GPU, Warning, "pipeline cache: {} not replaced ({})", file_.string(), GetLastError());
+        return false;
+    }
+    last_bytes_ = size;
+    saved_bytes_.store(size);
+    saves_.fetch_add(1);
+    const u64 t1 = __rdtsc();
+    ShaderTrace::Event(ShaderTrace::Kind::CacheSave, t0, t1, 0, size);
+    SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved in {:.0f} ms (R9-F1: module reads not held back)",
+             static_cast<double>(size) / (1 << 20),
+             static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(std::max<u64>(Kernel::Clock::TscFrequency(), 1)));
+    return true;
 }
 
 bool PipelineCacheFile::SaveOwned() {
@@ -183,6 +250,7 @@ bool PipelineCacheFile::SaveOwned() {
     }
     saved_bytes_.store(data.size());
     saves_.fetch_add(1);
+    last_bytes_ = data.size();
     ShaderTrace::Event(ShaderTrace::Kind::CacheSave, t0, __rdtsc(), 0, data.size());
     return true;
 }

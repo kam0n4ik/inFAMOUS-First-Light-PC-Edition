@@ -103,7 +103,13 @@ struct ExecutorStats {
     u64 inst_no_pipeline = 0, inst_not_current = 0; ///< fallbacks: the patched pipeline not built yet / a block not current
     u64 zc_batches = 0, zc_draws = 0; ///< batches (draws) drawn from their ranges in video memory, nothing copied
     u64 run_lean = 0, run_own = 0, run_not_resident = 0; ///< SSPC_CITY_ENGINE_OPT: run members by bindings only / own
-    std::array<u64, 4> run_why{};   ///< ... not by bindings: geometry not resident, descriptors not pushed, own range, user data
+    /// ... not by bindings: geometry not resident, descriptors not pushed, own range, user data, own textures/samplers
+    std::array<u64, 5> run_why{};
+    /// SSPC_CITY_GB_RUN_MATERIAL: members' own textures / samplers pushed; members with them not by bindings: an image
+    /// not kept by the memo (or not valid), in another layout, a target (or the run's draw samples one), writes pending
+    u64 run_sharp_images = 0, run_sharp_samplers = 0;
+    std::array<u64, 4> run_sharp_why{};
+    u64 run_checked = 0, run_check_mismatches = 0; ///< ... =verify: members by bindings compared / that differed
     std::array<u64, 3> run_range{}; ///< ... own ranges by residency: none, partial, all
     /// SSPC_CITY_GEOMETRY_CACHE: batches drawn from their kept geometry, kept ones whose sources changed, geometry built
     /// (and its bytes), built into an arena (kept), arenas recycled
@@ -124,6 +130,12 @@ struct ExecutorStats {
     u64 shadow_vram = 0; ///< written bindings in the buffer cache's video memory (GPU-6: not shadowed with =skip)
     u64 target_cache_hits = 0, target_cache_misses = 0;
     u64 tex_memo_hits = 0, tex_memo_misses = 0;
+    u64 gb_bind_hits = 0, gb_bind_misses = 0, gb_bind_kept = 0; ///< SSPC_NATIVE_GBUFFER (GbBind)
+    u64 gb_bind_verified = 0, gb_bind_mismatches = 0;          ///< ... SSPC_NATIVE_GBUFFER_BIND=verify
+    /// SSPC_TEX_SEGMENT: textures bound from a segment's stamp (draws, run members' own), stamps made, segments; verify:
+    /// hits checked in full, those that differed
+    u64 tex_seg_hits = 0, tex_seg_member_hits = 0, tex_seg_stamped = 0, tex_seg_segments = 0;
+    u64 tex_seg_verified = 0, tex_seg_mismatches = 0;
     u64 gpu_write_read_syncs = 0; ///< frontend reads of memory a shader writes in a batch not completed
     /// P4.7 frontend reads: from a backing run kept / a run found for it / through the guest memory manager
     u64 read_run_hits = 0, read_run_misses = 0, read_run_none = 0;
@@ -190,6 +202,9 @@ struct PreparedCommand {
     const GS::StageView* stage = nullptr; ///< VS of a draw, CS of a dispatch
     const GS::StageView* ps = nullptr;    ///< a draw's PS
     const GS::GraphicsPipelineState* state = nullptr; ///< a ready draw's pipeline state
+    /// SSPC_NATIVE_GBUFFER: a native 0x1a1770 draw's VS / PS material ids - its module, T#s and S#s (Executor::GbBind;
+    /// 0: none)
+    std::array<u64, 2> material{};
 };
 
 /// SSPC_CITY_BATCH: one draw of a batch (Executor::DrawPreparedBatch).
@@ -321,6 +336,8 @@ public:
     u64 LastUnblockTsc() const { return last_unblock_tsc_; }
     /// FrameBreak AQ: the async compute lane is on (SSPC_FB_ASYNC_COMPUTE=1 and a queue for it).
     bool AsyncLane() const { return aq_; }
+    /// The device-lost report when another thread (the presentation's) saw the loss first (once per run)
+    void ReportDeviceLost(const char* where) { OnDeviceLost(where, timeline_.LastSubmitted()); }
     /// P4.11 soak telemetry: command buffer batches the executor owns (free and in flight).
     u64 BatchObjects() const { return free_.size() + in_flight_.size() + (open_ ? 1 : 0); }
     /// Called at each flip marker queued for presentation (after its batch was submitted), with its timeline value.
@@ -363,6 +380,8 @@ public:
     static bool TimelineWriteShapeOk(u64 dst, u64 bytes) {
         return bytes != 0 && bytes <= 65536 && (dst & 3) == 0 && (bytes & 3) == 0 && dst < (1ull << 40);
     }
+    /// ... and what ZpassOnTimeline refuses so (SSPC_OCCLUSION=off, the DB records' layout)
+    static bool ZpassShapeOk(u64 dst, u32 db_mask, u32 stride);
     bool GdsShapeOk(Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes) const {
         return bytes != 0 && (gds_offset & 3) == 0 && (bytes & 3) == 0 && gds_.buffer != VK_NULL_HANDLE &&
                u64{gds_offset} + bytes <= gds_.size && (kind == Cp::DmaKind::DataToGds || memory < (1ull << 40)) &&
@@ -534,11 +553,70 @@ private:
         u64 epoch = ~0ull;
         CachedImage* img = nullptr;
         VkImageView view = VK_NULL_HANDLE;
+        /// SSPC_TEX_SEGMENT: the segment (tex_seg_) its image was checked in - valid, touched, read in `seg_layout`
+        /// without a barrier, after the draw's barriers (0: none)
+        u64 seg = 0;
+        VkImageLayout seg_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
     std::unordered_map<u64, TexMemo, U64Hash> tex_memo_;
     /// P4.9: tex_memo_'s entries looked up last, direct-mapped by key (never erased: the pointers stay valid) - the map's
-    /// hashing on every texture of every draw was ~1.1% of the GPU thread (village); SSPC_P49_LOOKUP_MEMO=0: off
-    std::array<std::pair<u64, TexMemo*>, 256> tex_slot_{};
+    /// hashing on every texture of every draw was ~1.1% of the GPU thread (village); SSPC_P49_LOOKUP_MEMO=0: off.
+    /// 2048 slots: the city binds thousands of textures a frame - with 256 most lookups missed into the map (deep-perf
+    /// ETW: its hashing 2.6% of the recording thread)
+    static constexpr u32 kTexSlots = 2048;
+    static size_t TexSlot(u64 key) { return static_cast<size_t>((key * 0x9E3779B97F4A7C15ull) >> 53); }
+    std::array<std::pair<u64, TexMemo*>, kTexSlots> tex_slot_{};
+    /// SSPC_NATIVE_GBUFFER (native_gbuffer_prep.h): a native 0x1a1770 stage's images and samplers kept by its material -
+    /// the frontend's id (PreparedCommand::material) of its module, T#s and S#s, each compared again - while the image
+    /// cache's epoch is the same and each image needs no upload (TexMemo's rule): one lookup for the stage instead of
+    /// one per texture and sampler, the id's hashing on the frontend thread.
+    static constexpr u32 kGbMaxImages = 16, kGbMaxSamplers = 16;
+    static constexpr u32 kGbBinds = 2048;
+    struct GbBind {
+        u64 id = 0;
+        const void* module = nullptr;
+        u64 epoch = ~0ull;
+        u32 lod = 0; ///< the samplers' extra LOD bias (its bits)
+        u8 images = 0, samplers = 0;
+        std::array<std::array<u32, 8>, kGbMaxImages> raw{};
+        std::array<u32, kGbMaxImages> flags{}; ///< TexMemo's flags; kGbNull: a null image
+        std::array<CachedImage*, kGbMaxImages> img{};
+        std::array<VkImageView, kGbMaxImages> view{};
+        std::array<std::array<u32, 4>, kGbMaxSamplers> sraw{}; ///< the S# looked up (the default one for a null S#)
+        std::array<VkSampler, kGbMaxSamplers> smp{};           ///< VK_NULL_HANDLE: a custom border colour (each time)
+    };
+    static constexpr u32 kGbNull = ~0u;
+    std::vector<GbBind> gb_bind_;
+    GbBind gb_new_; ///< the stage being bound (kept when complete)
+    /// SSPC_NATIVE_GBUFFER_BIND: off (default: no gain measured), on, verify - a hit's bindings made again by the full
+    /// lookups and compared (the full ones are used)
+    enum class GbMode : u8 { Unread, On, Off, Verify };
+    GbMode gb_mode_ = GbMode::Unread;
+    std::vector<VkDescriptorImageInfo> gb_check_infos_;
+    std::vector<VkWriteDescriptorSet> gb_check_writes_;
+    std::vector<CachedImage*> gb_check_bound_, gb_check_info_images_;
+    /// SSPC_TEX_SEGMENT (off by default; on, verify): a draw's texture checked once a segment. A segment: the image
+    /// cache's state (ImageCache::Generation - no barrier, upload, applied invalidation, image or frame since) and the
+    /// command buffer the same (SegSync). A memo hit stamped in it (after the draw's barriers: valid, touched, in its
+    /// texture layout and read there by the graphics shaders since its barrier) and not a target of the draw is bound
+    /// from the memo alone - its image not looked at again, not among the draw's bound images (no barrier, no layout
+    /// fix-up: none would be recorded or change anything). verify: such a hit's image checked as the full path does and
+    /// the full path taken (compared).
+    enum class SegMode : u8 { Unread, On, Off, Verify };
+    SegMode seg_mode_ = SegMode::Unread;
+    bool seg_draw_ = false; ///< the draw being bound may take segment hits (RecordDraw: no diagnostic looks at its images)
+    u64 tex_seg_ = 1, seg_gen_ = ~0ull, seg_value_ = ~0ull;
+    struct SegStamp {
+        TexMemo* memo;
+        CachedImage* img;
+    };
+    std::vector<SegStamp> seg_pending_; ///< the draw's memo hits and lookups, stamped once its barriers are recorded
+    struct SegCheck {
+        u32 info;
+        VkImageLayout layout;
+    };
+    std::vector<SegCheck> seg_check_; ///< verify: the draw's segment hits (their image infos, the stamped layout)
+    void SegSync(); ///< a new segment when the image cache's state or the command buffer changed
     struct StreamSeen {
         u64 hash = 0, flip = 0;
     };
@@ -612,6 +690,13 @@ private:
     bool RunRange(u64 addr, u64 size, u64 align, VkBuffer& buffer, u64& offset, u64& avail);
     VkPipelineLayout run_layout_ = VK_NULL_HANDLE; ///< ... its pipeline's layout
     bool run_push_desc_ = false;                    ///< ... its descriptors pushed with the shadow (P4.7)
+    bool run_feedback_ = false; ///< ... it samples one of its targets (its attachments in the general layout)
+    /// SSPC_CITY_GB_RUN_MATERIAL=verify: what each graphics binding refers to (a hash of its guest description; 0: none)
+    /// as the run's draws left it - the first draw's, each member's own over it - and as a member recorded on its own
+    /// would have it (its views); -1 not read yet
+    int run_check_ = -1;
+    std::vector<u64> run_desc_, run_expect_;
+    std::vector<std::pair<u32, u64>> run_check_own_; ///< ... a member's own pushed (binding, hash)
     /// SSPC_CITY_GEOMETRY_CACHE=1: a batch's geometry kept in video memory (two arenas mapped through the BAR, recycled
     /// in turn once the GPU is done with the older one) by its exact composition, valid while its source ranges'
     /// buffer cache versions are those it was built from
@@ -719,7 +804,7 @@ private:
     bool BindStage(const void* stage_view, bool compute, PushData& push, std::vector<VkWriteDescriptorSet>& writes,
                    std::vector<VkDescriptorBufferInfo>& buffers, std::vector<VkDescriptorImageInfo>& images,
                    std::vector<CachedImage*>& bound, bool& writes_memory, const std::vector<CachedImage*>& targets,
-                   const u32* user_data = nullptr);
+                   const u32* user_data = nullptr, u64 material = 0);
     bool PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bind, std::vector<VkWriteDescriptorSet>& writes);
     void SetDynamicState(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
     void SetDynamicStateWhole(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
@@ -1094,6 +1179,63 @@ private:
                                    ///< 1 while the game waits for its async compute (CriticalCompute), 2 always
     bool aq_cmd_compute_ = false;  ///< the command being recorded is a compute queue's
     bool aq_family_ = false;       ///< the lane is a queue of the compute family: the lane is decided at Begin
+    /// R9 AQ (SSPC_FB_ASYNC_NOTE_READS=1, experiment): the main queue's graphics reads of video memory are noted too - a
+    /// lane batch writing what a main batch in flight still reads waits for it (otherwise only the main batch's writes,
+    /// uploads and compute accesses are, so a lane write over a graphics read of the frame before goes unseen)
+    bool aq_note_reads_ = false;
+    /// AQ: the pages an upload copied noted for the lane's conflicts, the block's other pages too (SSPC_FB_ASYNC_NOTE_UPLOADS=0:
+    /// only the binding's range - A/B only)
+    bool aq_note_uploads_ = true;
+    /// R9 AQ (SSPC_DIAG_AQ_MARKERS=1, diagnostic): a buffer marker before and after every dispatch, per queue (host-visible
+    /// words: [0] main started, [1] main completed, [2] lane started, [3] lane completed), and what each dispatch was - the
+    /// device-lost report lists the dispatches started and not completed on each queue
+    struct AqMarker {
+        u64 batch = 0, cs = 0;
+        u32 queue = 0, groups[3] = {};
+        u8 lane = 0;
+        bool indirect = false;
+        u64 ps = 0; ///< a draw group's (queue 0xFFFF: draws from a pipeline change on; cs its vertex shader)
+        // SSPC_DIAG_AQ_WATCH: the watched shader's first buffer - its guest range, how it was bound, its bytes 0..15 as
+        // the CPU had them when recorded (the GPU's: aq_probe_buf_ at the marker's slot)
+        u64 waddr = 0;
+        u32 wsize = 0, wcpu[4] = {};
+        u8 wpath = 0, wflags = 0;
+    };
+    bool aq_markers_ = false;
+    u64 aq_mark_draw_key_ = ~0ull; ///< the draw group's pipeline and shaders (a new group: a new marker)
+    /// R9 AQ (SSPC_DIAG_AQ_WATCH=<hex cs>, with the markers; diagnostic): that shader's dispatches - the bytes 0..15 of its
+    /// first buffer as the CPU had them and as the GPU had them right before the dispatch, and the commands writing those
+    /// ranges (the device-lost report and the log list them)
+    u64 aq_watch_cs_ = 0;
+    bool aq_watch_capture_ = false; ///< BindStage: the watched dispatch's first buffer wanted
+    struct AqWatchB0 {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        u64 offset = 0, addr = 0, size = 0, avail = 0;
+        u8 path = 0;
+    } aq_watch_b0_;
+    u8 aq_range_path_ = 0; ///< GuestRangeImpl's last path: 1 resident, 2 stream reuse, 3 streamed, 4 prepared, 5 uploaded, 6 written
+    OwnedBuffer aq_probe_buf_{}; ///< 16 bytes per marker slot
+    std::vector<std::pair<u64, u64>> aq_watch_ranges_;
+    u64 aq_watch_lo_ = 0, aq_watch_hi_ = 0;
+    struct AqWriter {
+        u64 batch = 0, addr = 0, size = 0, what = 0;
+        u8 lane = 0, kind = 0; ///< kind: 1 a write, 2 an upload, 3 WRITE_DATA
+    };
+    std::vector<AqWriter> aq_writers_;
+    u32 aq_writer_next_ = 0;
+    u64 aq_what_ = 0; ///< the command recorded: a dispatch's cs, a draw's vs | 1 << 63, 1 WRITE_DATA, 2 DMA, 3 GDS DMA
+    std::deque<u32> aq_watch_pending_; ///< watched markers whose batch has not completed
+    u64 aq_watch_stats_[4] = {};       ///< checked, differ from the CPU's, count past the threads, huge
+    u32 aq_watch_logged_ = 0;
+    bool aq_watch_probe_ = true; ///< SSPC_DIAG_AQ_WATCH_PROBE=0: no GPU copy (no barrier before the watched dispatch)
+    std::unordered_set<u64> aq_writer_kinds_; ///< writers logged (what, kind, lane)
+    void AqWatchWrite(u64 addr, u64 size, u8 kind);
+    void AqWatchDispatch(u32 id);
+    void AqWatchCheck(u64 completed);
+    OwnedBuffer aq_marker_buf_{};
+    std::vector<AqMarker> aq_marker_ring_;
+    u32 aq_marker_next_ = 1;
+    void AqMarkersReport(std::string& out);
     u64 aq_next_wait_main_ = 0;    ///< a held fence's main batch for the next batch (none open at the wait)
     struct AqLast {
         u64 value = 0;

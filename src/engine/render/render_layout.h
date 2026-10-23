@@ -32,6 +32,11 @@ inline constexpr u64 kLabelArray = 0xe17e80;   ///< u64*: the engine's labels, 8
 inline constexpr u64 kComputeQueue = 0x7d3cf10; ///< the particles' async compute queue object (main loop 0x29c8d0)
 inline constexpr u64 kQueueSubmitted = 0x1b88;  ///< u32: the value its last submission's RELEASE_MEM writes
 inline constexpr u64 kQueueLabelIndex = 0x1b8c; ///< s32: its label in kLabelArray
+// its command buffer (0x1691e0 / 0x169020 / 0x169660; the per-frame reset 0x169660 starts it anew)
+inline constexpr u64 kQueueCbStart = 0x1b7c;    ///< u32: offset (dwords) of the part not submitted yet
+inline constexpr u64 kQueueReadLabel = 0x1b80;  ///< s32: label in kLabelArray - the offset each submission's end has
+                                                ///< reached on the GPU (its second RELEASE_MEM); the overflow handler
+                                                ///< 0x169020 reuses the space below it, the reset writes 0
 inline constexpr u64 kSubmitMode = 0x1d20388;    ///< s32: where SubmitFrame calls sceGnmSubmitDone (0: before its wait)
 inline constexpr u64 kSubmitFlipArg = 0x1d20384; ///< s32: the flip argument SubmitFrame passes
 

@@ -43,6 +43,7 @@
 #include "base/abi.h"
 #include "runtime/gpu/command_processor.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/native_gbuffer_prep.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 
 namespace SecondSon::Gpu::Vk {
@@ -273,7 +274,7 @@ public:
 
 private:
     enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy, Flip,
-                           RoundEnd, Write, Gds };
+                           RoundEnd, Write, Gds, Zpass };
     struct Record {
         Kind kind = Kind::Journal;
         bool memory_changed = false; ///< a guest memory change reported before it
@@ -282,6 +283,12 @@ private:
         bool hook_done = false, applied = false; ///< MemoryAcquired with P4.11's async_acquire (applied: writes found)
         bool prepared = false; ///< stage 2: the frontend's preparation below (a filtered draw has none)
         bool front_memo = false; ///< frontend thread: a guest memory change (memo) before this record
+        /// frontend thread: a processor write's deferred invalidation is due before this record (it never joins a run
+        /// held before it: the run's draws are recorded at its first draw, before the invalidation)
+        bool run_barrier = false;
+        /// front mode: a draw the frontend thread joined to the run before it (a journal record now) - thread 2 takes
+        /// it with the run's first draw (its registers after the run's draws)
+        bool joined = false;
         /// FrameBreak FB-6: the draw's VS / PS view was not copied - the same as the last copied one (thread 2 keeps it)
         bool vs_same = false, ps_same = false;
         u64 journal_end = 0;   ///< the journal applied up to here before it executes
@@ -297,7 +304,7 @@ private:
         u32 queue = 0;                       ///< WaitMet, MemoryAcquired, Copy
         std::vector<u8> payload;             ///< CP-9 Write: the data (capacity reused)
         Cp::DmaKind gds_kind{};              ///< CP-9 Gds (memory in src)
-        u32 gds_offset = 0, pattern = 0;
+        u32 gds_offset = 0, pattern = 0;     ///< Gds; Zpass: the DB mask, the stride
         u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
@@ -305,6 +312,7 @@ private:
         /// P5.3: the Native Render Frontend's shared preparations of the draw's VS/PS (instead of the copies above)
         std::shared_ptr<const GS::StageView> stage_shared, ps_shared;
         const GS::GraphicsPipelineState* state = nullptr;
+        std::array<u64, 2> material{}; ///< SSPC_NATIVE_GBUFFER: a native draw's VS / PS material ids (0: none)
         u64 census_key = 0; ///< SSPC_DIAG_PREP_CENSUS: the draw's row (0: not counted)
         /// SSPC_CITY_ENGINE_OPT: the draws that joined this one's run (recorded right after it, each with only its own
         /// geometry; their registers are in the journal after this record's journal_end)
@@ -314,7 +322,8 @@ private:
         const GS::StageView& Vs() const { return stage_shared != nullptr ? *stage_shared : stage; }
         const GS::StageView& Ps() const { return ps_shared != nullptr ? *ps_shared : ps; }
     };
-    static constexpr u32 kSlots = 1024; ///< records (power of two)
+    /// records (power of two; front mode: a run's every draw is a record too)
+    static constexpr u32 kSlots = 8192;
     static constexpr u32 kJournalWords = 1u << 22; ///< 16 MiB of register writes (power of two)
     enum JournalOp : u32 { kOpWrite = 1, kOpReset = 2, kOpLoad = 3, kOpPad = 15 };
 
@@ -407,6 +416,13 @@ private:
     Cp::CommandProcessor* cp_ = nullptr;
     Cp::RegisterFile replica_;
     const u64 spin_ticks_;
+    /// Records thread 1 may have queued ahead of thread 2 (SSPC_CP_QUEUE_DEPTH, at most the ring): a deep queue's
+    /// prepared records are cold in the caches by the time thread 2 takes them, and a drain waits for all of them
+    u64 depth_limit_ = kSlots;
+    /// The slots in use, less one (SSPC_CP_RING; 1024 - front mode 8192): every record takes the next slot, so a ring
+    /// larger than the queue ever gets cycles through cold memory (the 8192 of front mode cost the default 2 ms of
+    /// thread 1 - deep perf)
+    u64 slot_mask_ = kSlots - 1;
     const bool async_, async_copies_, verify_;
     const bool async_writes_, async_gds_only_;
     bool async_acquire_ = false;
@@ -480,6 +496,7 @@ private:
     u32 gruns_ab_ = 0; ///< =ab:<n>: in odd blocks of n flips only (image A/B)
     bool GRunsNow() const; ///< on, and (=ab:<n>) in an odd block
     GS::ResourceBindingPlan run_ps_plan_;
+    GS::ResourceBindingPlan run_ps_check_; ///< SSPC_CITY_GB_RUN_MATERIAL=verify: the walk's plan, MemberPlan's checked
     // SSPC_DIAG_PREP_CENSUS=<first flip>:<flips> (CITY-OPT Phase 4): the draws of those flips by their VS/PS programs -
     // both threads' time, GEOFAST's answers, what changed since the draw before (Report)
     struct CensusRow {
@@ -511,13 +528,49 @@ private:
     /// The record can lead a run (prepared, VS+PS, a VS without an SRT walk taking its vertices from fetch tables, no
     /// memory writes); the draw `d` can join the held run (the reason it cannot, counted, otherwise).
     bool RunLeaderOk(const Record& r) const;
-    bool JoinRun(const Cp::DrawDescriptor& d);
+    /// The draw is tagged by an engine draw function whose runs are on (Phase 6: 0x1a1770 with GBUFFER_RUNS only)
+    bool RunTagged(const Cp::DrawDescriptor& d) const;
+    /// `regs`: the registers at the joining draw's packet (the processor's, or the frontend thread's replica)
+    bool JoinRun(const Cp::DrawDescriptor& d, const Cp::RegisterFile& regs);
+    /// The held run's first draw and whether one is held - thread 1's, or with the frontend thread that thread's
+    Record& RunLead() { return slots_[(fthread_mode_ ? f_run_lead_ : next_) & slot_mask_]; }
+    bool RunHeld() const { return fthread_mode_ ? f_run_open_ : run_open_; }
+    // Fork port (front mode: SSPC_P53_FRONTEND_THREAD=1 with SSPC_CITY_ENGINE_OPT): thread 1 only parses the packets and
+    // publishes every draw; the frontend thread prepares them (GEOFAST included) and builds the runs - a held run's
+    // first draw is not published (fhead_ stays at it) while the draws after it join; a joined draw's record becomes a
+    // journal record (thread 2 replays its registers, its draw is recorded with the run's first).
+    bool f_run_open_ = false; ///< the frontend thread holds a run
+    u64 f_run_lead_ = 0;      ///< ... its first draw's record
+    bool pending_run_barrier_ = false; ///< thread 1: Record::run_barrier of the next record
+    /// 1 while thread 1 waits for thread 2 (a drain, backpressure: written by thread 1 only) - a held run is published
+    alignas(64) std::atomic<u32> f_flush_{0};
+    u64 f_hold_ticks_ = 0; ///< how long the frontend thread keeps a run held with no record to join (then publishes)
+    std::atomic<u64> f_run_joined_{0}, f_run_closed_idle_{0}, f_run_closed_flush_{0};
+    /// R8: the held run's first draw's record + 1 (0: none held) - the frontend thread writes it; thread 2 and thread 1
+    /// read it only to file their waits (a wait at the held run's first draw, a full queue while a run is held)
+    alignas(64) std::atomic<u64> f_hold_lead_{0};
+    std::atomic<u64> t2_idle_held_{0}, t2_idle_held_n_{0}, t1_full_held_{0}, t1_full_held_n_{0}; ///< TSC ticks, waits
+    /// The frontend thread: record `index` (its registers applied) joins the held run - true: it is a journal record now
+    bool FrontTryJoin(Record& r, u64 index);
+    /// The frontend thread: the held run is complete - every record before `upto` published to thread 2
+    void FrontCloseRun(u64 upto);
     GS::ResourceBindingPlan run_plan_; ///< a joining draw's VS plan decoded again (its own constant buffers)
     std::atomic<u64> run_count_{0}, run_members_{0}, run_leaders_{0}, run_verified_{0}, run_mismatches_{0};
-    std::array<std::atomic<u64>, 17> run_refused_{};
+    std::array<std::atomic<u64>, 20> run_refused_{};
     /// Phase 6: G-buffer members tagged with another material (DrawRuns::kMaterialChanged) - refused before their PS is
     /// walked again (16); verify: not refused, those that still joined counted (the hint's misses)
     std::atomic<u64> run_material_{0}, run_material_joined_{0};
+    /// SSPC_CITY_GB_RUN_MATERIAL=1|verify (with GBUFFER_RUNS; default off): a G-buffer member whose material differs
+    /// joins too - the PS images / samplers whose T# / S# differ from the first draw's are its own (RunMember::img_mask,
+    /// smp_mask; 17: another kind of image or sampler, 18: one past kMaxSharpIndex), thread 2 pushes only those
+    /// (Executor::DrawRunMembers); verify: each member prepared in full too and compared (as GBUFFER_RUNS=verify)
+    u8 gmat_ = 0; ///< 0 off, 1 on, 2 verify
+    /// members joined with images or samplers of their own; those images / samplers
+    std::atomic<u64> gmat_joined_{0}, gmat_images_{0}, gmat_samplers_{0};
+    /// R8: bindings a member has again because the member before it had them as its own (thread 2 records a member on
+    /// the descriptors the one before left: the run's again over those - 19: more than RunMember::kMaxBuffers then)
+    std::atomic<u64> run_restored_{0};
+    std::array<std::atomic<u64>, 64> gb_groups_{}; ///< G-buffer members refused for groups (3): the groups that changed
     bool batch_on_ = false;
     u32 batch_ab_ = 0;
     std::vector<Vk::BatchDraw> batch_items_;
@@ -529,6 +582,8 @@ private:
     GS::StageView last_vs_, last_ps_;                     ///< thread 2
     std::atomic<u64> reuse_same_{0}, reuse_copied_{0}, reuse_mismatches_{0};
     GS::ShaderFrontend* frontend_ = nullptr;
+    NativeGBuffer ngb_; ///< SSPC_NATIVE_GBUFFER: the engine-descriptor G-buffer path (reads the environment itself)
+    Cp::GroupMask ngb_pending_ = 0; ///< the groups changed at draws ngb_ prepared without the frontend
     const std::atomic<u64>* map_gen_ = nullptr;
     const Vk::Timeline* timeline_ = nullptr;
     FrontReader reader_{*this};
@@ -539,6 +594,8 @@ private:
     void* write_ctx_ = nullptr;
     void RunWrite(const Record& r);
     void RunGds(const Record& r);
+    void RunZpass(const Record& r);
+    u64 zpass_fallback_count_ = 0; ///< thread 2: the counts a refused queued query's DB records get (only growing)
     u64 writes_queued_ = 0;
     bool flush_at_fence_ = false;
     std::atomic<u64> write_fallbacks_{0};

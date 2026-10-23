@@ -195,6 +195,7 @@ private:
     void* lock_ = nullptr;  ///< HANDLE of the lock file (exclusive, deleted on close)
     std::atomic<u64> end_{0}; ///< the file's size (the next record's offset; written under io_mutex_)
     std::mutex io_mutex_;
+    std::mutex lease_mutex_; ///< R9-F1 (SSPC_R9_PCACHE=1): WithWriteOwnership's own lock, taken by Close too
 
     mutable std::mutex mutex_; ///< the index and the queue
     std::vector<RecordRef> records_;

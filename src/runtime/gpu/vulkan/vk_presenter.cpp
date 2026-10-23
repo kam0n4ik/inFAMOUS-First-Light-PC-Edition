@@ -1103,6 +1103,35 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         return;
     }
     s.acquire_pending = !m.fg;
+    // SSPC_PRESENT_ACQUIRE_FENCE=1 (default off): the image waited for here, on the present thread. The present's
+    // submission below shares the one queue with the game's batches: its wait on `acquired` holds that queue until the
+    // presentation engine gives the image back (FIFO: up to a refresh) - the batches submitted after it wait too. With
+    // the acquire fence met the semaphore is signalled when the submission reaches the queue. A timeout keeps the
+    // fence pending (WaitSlot waits for it later) and the semaphore wait still orders the copy: only advisory.
+    // (Castlesea's port, vk_swapchain.cpp: city at 75 Hz, frames over 25 ms 17.9 -> 2.7 a minute, p99 21.9 -> 16.8 ms)
+    static const bool acquire_fence_wait = [] {
+        char v[8] = {};
+        const bool on = GetEnvironmentVariableA("SSPC_PRESENT_ACQUIRE_FENCE", v, sizeof(v)) == 1 && v[0] == '1';
+        if (on) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_PRESENT_ACQUIRE_FENCE=1 - the swapchain image waited for on the "
+                                   "present thread before the present's submission");
+        }
+        return on;
+    }();
+    if (acquire_fence_wait && s.acquire_pending) {
+        const StallTrace::Scope trace_wait(StallTrace::Ev::PresentAcquire, flip_id);
+        const auto w0 = std::chrono::steady_clock::now();
+        const bool met = m.WaitFence(s.acquire_fence, s.acquire_pending, 1'000'000'000ull);
+        const u64 ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count());
+        std::scoped_lock lock{m.stats_mutex};
+        if (met) {
+            ++m.stats.acquire_fence_waits;
+            m.stats.acquire_fence_ns += ns;
+            m.stats.acquire_fence_max_ns = std::max(m.stats.acquire_fence_max_ns, ns);
+            m.stats.acquire_fence_over5 += ns > 5'000'000 ? 1 : 0;
+        }
+    }
     r = f.vkResetFences(m.ctx.Device(), 1, &s.fence);
     if (r == VK_SUCCESS) {
         r = f.vkResetFences(m.ctx.Device(), 1, &s.present_fence);
