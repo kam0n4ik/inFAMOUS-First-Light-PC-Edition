@@ -131,7 +131,8 @@ std::wstring QuoteArg(const std::wstring& s) {
 /// second when the cache was prepared already). A failure only costs the preparation: the game starts as before.
 void PrepareShaders(const SecondSon::App::Config& config) {
     using namespace SecondSon;
-    const auto templates = App::RootDir() / "tools" / "static_shaders" / "static_templates.txt";
+    // data\static_templates.txt beside SecondSonPC.toml (game\data in the sources)
+    const auto templates = App::RootDir() / "data" / "static_templates.txt";
     std::error_code ec;
     if (!std::filesystem::is_regular_file(templates, ec)) {
         SSPC_LOG(App, Warning, "shader preparation: no {} - skipped", templates.string());

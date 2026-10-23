@@ -164,11 +164,22 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     }
     const Reader r{data, errors};
 
-    std::string game = "E:\\shdps4\\CUSA00004";
+    const auto resolve = [&](const std::string& p) {
+        const auto path = Utf8Path(p);
+        return path.is_absolute() ? path : root / path;
+    };
+    // "." (the default): the folder of this file - SecondSonPC put into the game's folder
+    std::string game = ".";
     r.String("Game", "path", game);
-    c.game_dir = Utf8Path(game);
+    c.game_dir = resolve(game);
+    std::error_code canon_ec;
+    if (auto canon = std::filesystem::weakly_canonical(c.game_dir, canon_ec); !canon_ec) {
+        c.game_dir = std::move(canon); // ("." -> the folder's own name: the shader cache is kept per game folder name)
+    }
     if (!std::filesystem::is_regular_file(c.game_dir / "eboot.bin")) {
-        r.Error(fmt::format("[Game] path: {} does not contain eboot.bin", game));
+        r.Error(fmt::format("[Game] path: {} does not contain eboot.bin (put SecondSonPC into the game's folder, the "
+                            "one with eboot.bin, or give that folder here)",
+                            c.game_dir.string()));
     }
 
     c.language_locale = "en-US";
@@ -203,10 +214,6 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     std::string logs = "logs";
     r.String("Paths", "userData", user_data);
     r.String("Paths", "logs", logs);
-    const auto resolve = [&](const std::string& p) {
-        const auto path = Utf8Path(p);
-        return path.is_absolute() ? path : root / path;
-    };
     c.user_data_dir = resolve(user_data);
     c.logs_dir = resolve(logs);
 

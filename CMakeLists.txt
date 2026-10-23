@@ -254,9 +254,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_sspc_gen_input
 set_source_files_properties(src/runtime/gpu/shader/shader_disk_cache.cpp PROPERTIES
     COMPILE_DEFINITIONS "SSPC_NATIVE_SHADER_GENERATION=\"${SSPC_NATIVE_SHADER_GENERATION}\"")
 message(STATUS "SecondSonPC: native shader cache generation ${SSPC_NATIVE_SHADER_GENERATION}")
-# The own GCN translator's generation (src/runtime/gpu/gcn/*: not part of the one above): play_rea_own.cmd's cache
-# (native_own) is seeded again from the main one when it changes (tools/seed_own_shader_cache.py reads this file), so
-# no module of an earlier own translator is used.
+# The own GCN translator's generation (src/runtime/gpu/gcn/*: not part of the one above), written beside the
+# executable: a cache made by an earlier own translator is told apart by it.
 file(GLOB _sspc_own_inputs CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/gpu/gcn/*.cpp
      ${CMAKE_SOURCE_DIR}/src/runtime/gpu/gcn/*.h ${CMAKE_SOURCE_DIR}/src/runtime/gpu/gcn/*.inc)
 list(SORT _sspc_own_inputs)
@@ -308,16 +307,16 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/ui/settings_menu.cpp
 )
 # Settings and draw commands are written with designated initializers that leave the other fields at their defaults.
-set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp tools/settings_tests/main.cpp
+set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp tests/settings_tests/main.cpp
                             PROPERTIES COMPILE_OPTIONS "-Wno-missing-designated-field-initializers")
 target_sources(sspc_runtime PRIVATE ${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp src/ui/prompt_service.cpp)
 target_link_libraries(sspc_runtime PUBLIC d2d1 dwrite windowscodecs ole32)
 target_sources(shadps4 PRIVATE ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/settings_host.cpp) # the bridge's live settings
 
 # Standalone tests of the PC settings and screenshots of the menu: SecondSonPC's sources only, no bridge, no game
-# (cmake --build <dir> --target sspc_settings_tests; tools/settings_tests/main.cpp).
+# (cmake --build <dir> --target sspc_settings_tests; tests/settings_tests/main.cpp).
 add_executable(sspc_settings_tests EXCLUDE_FROM_ALL
-    tools/settings_tests/main.cpp
+    tests/settings_tests/main.cpp
     ${SSPC_PC_SETTINGS_SOURCES}
     src/app/config.cpp
     src/base/log.cpp
@@ -333,9 +332,9 @@ target_link_libraries(sspc_settings_tests PRIVATE fmt::fmt toml11::toml11 SDL3::
 set_target_properties(sspc_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Standalone tests of the reconstructed engine code (src/engine; docs/native-reconstruction): no bridge, no game
-# (cmake --build <dir> --target sspc_engine_tests; tools/engine_tests/main.cpp [--bench]).
+# (cmake --build <dir> --target sspc_engine_tests; tests/engine_tests/main.cpp [--bench]).
 add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
-    tools/engine_tests/main.cpp
+    tests/engine_tests/main.cpp
     src/runtime/psf/param_sfo.cpp
     src/runtime/gpu/gcn/spirv_builder.cpp
     src/engine/guest_hooks.cpp
@@ -361,12 +360,12 @@ set_target_properties(sspc_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CM
 
 # Standalone tests of Native Engine Reconstruction (src/native_engine; docs/NATIVE_ENGINE_RECONSTRUCTION.md): the ABI
 # boundary, clones, the registry's modes, and - given the game's eboot.bin - each reconstruction against the eboot's own
-# code (cmake --build <dir> --target sspc_native_engine_tests; tools/native_engine_tests/main.cpp).
+# code (cmake --build <dir> --target sspc_native_engine_tests; tests/native_engine_tests/main.cpp).
 add_executable(sspc_native_engine_tests EXCLUDE_FROM_ALL
-    tools/native_engine_tests/main.cpp
-    tools/native_engine_tests/lift_check.cpp
-    tools/native_engine_tests/gbuffer_tests.cpp
-    tools/native_engine_tests/shadow_tests.cpp
+    tests/native_engine_tests/main.cpp
+    tests/native_engine_tests/lift_check.cpp
+    tests/native_engine_tests/gbuffer_tests.cpp
+    tests/native_engine_tests/shadow_tests.cpp
     src/native_engine/guest_code_clone.cpp
     src/native_engine/native_engine_verify.cpp
     src/native_engine/native_function_registry.cpp
@@ -395,8 +394,9 @@ target_link_libraries(sspc_native_engine_tests PRIVATE fmt::fmt Zydis::Zydis xby
 set_target_properties(sspc_native_engine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Upscaling and frame generation (docs/UPSCALING_FRAME_GENERATION.md). The vendors' SDKs are not part of the sources:
-# tools/upscalers/stage_sdks.ps1 puts them into third_party/upscalers (NVIDIA DLSS SDK headers + nvsdk_ngx_s.lib,
-# AMD FidelityFX API headers, NVIDIA Streamline headers, and the runtime DLLs copied next to SecondSonPC.exe).
+# they are put into third_party/upscalers by hand (README.md, Building from source: NVIDIA DLSS SDK headers +
+# nvsdk_ngx_s.lib, AMD FidelityFX API headers, NVIDIA Streamline headers, and the runtime DLLs copied next to
+# SecondSonPC.exe).
 set(SSPC_UPSCALERS_DIR "${CMAKE_SOURCE_DIR}/third_party/upscalers" CACHE PATH "Staged upscaler SDKs")
 if(EXISTS "${SSPC_UPSCALERS_DIR}/ngx/include/nvsdk_ngx_vk.h" AND EXISTS "${SSPC_UPSCALERS_DIR}/ngx/lib/nvsdk_ngx_s.lib")
     # sspc_dlss.dll: the only binary that links NVIDIA's NGX SDK (static CRT, as nvsdk_ngx_s.lib). SecondSonPC.exe

@@ -6,5 +6,5 @@ set(SSPC_R6_CORE_SOURCES
 )
 set(SSPC_R6_CORE_TEST_SOURCES
     src/native_engine/r6/cue_dedup.cpp
-    tools/native_engine_tests/r6_core_tests.cpp
+    tests/native_engine_tests/r6_core_tests.cpp
 )

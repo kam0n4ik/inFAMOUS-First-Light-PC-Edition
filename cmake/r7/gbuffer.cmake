@@ -8,7 +8,7 @@ set(SSPC_R7_GBUFFER_SOURCES
     src/native_engine/reconstructed/gbuffer_mesh_pass.cpp
 )
 set(SSPC_R7_GBUFFER_TEST_SOURCES
-    tools/native_engine_tests/r7_gbuffer_tests.cpp
+    tests/native_engine_tests/r7_gbuffer_tests.cpp
     src/native_engine/r7/gbuffer/geometry_pass.cpp
     src/native_engine/r7/gbuffer/arg_liveness.cpp
     src/native_engine/reconstructed/gbuffer_mesh_pass.cpp

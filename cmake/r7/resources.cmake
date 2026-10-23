@@ -5,6 +5,6 @@ set(SSPC_R7_RESOURCES_SOURCES
     src/native_engine/r7/resources/resource_state.cpp
 )
 set(SSPC_R7_RESOURCES_TEST_SOURCES
-    tools/native_engine_tests/r7_resources_tests.cpp
+    tests/native_engine_tests/r7_resources_tests.cpp
     src/native_engine/r7/resources/resource_state.cpp
 )

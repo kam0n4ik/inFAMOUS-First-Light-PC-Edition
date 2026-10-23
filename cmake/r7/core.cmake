@@ -5,5 +5,5 @@ set(SSPC_R7_CORE_SOURCES
     src/engine/render/native_render_layer.cpp
 )
 set(SSPC_R7_CORE_TEST_SOURCES
-    tools/native_engine_tests/r7_core_tests.cpp
+    tests/native_engine_tests/r7_core_tests.cpp
 )

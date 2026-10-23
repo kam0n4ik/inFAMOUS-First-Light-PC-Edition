@@ -7,8 +7,8 @@ set(SSPC_R6_GBUFFER_SOURCES
     src/native_engine/reconstructed/gbuffer_frames_game.cpp
 )
 set(SSPC_R6_GBUFFER_TEST_SOURCES
-    tools/native_engine_tests/r6_gbuffer_tests.cpp
-    tools/native_engine_tests/r6_gbuffer_frames.cpp
+    tests/native_engine_tests/r6_gbuffer_tests.cpp
+    tests/native_engine_tests/r6_gbuffer_frames.cpp
     src/native_engine/reconstructed/gbuffer_trace.cpp
     src/native_engine/reconstructed/gbuffer_draw.cpp
 )

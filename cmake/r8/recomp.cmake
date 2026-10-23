@@ -4,5 +4,5 @@
 set(SSPC_R8_RECOMP_SOURCES
 )
 set(SSPC_R8_RECOMP_TEST_SOURCES
-    tools/native_engine_tests/r8_recomp_tests.cpp
+    tests/native_engine_tests/r8_recomp_tests.cpp
 )

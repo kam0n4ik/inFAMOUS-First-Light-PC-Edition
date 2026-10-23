@@ -1,0 +1,42 @@
+@echo off
+rem inFAMOUS: Second Son - PC Edition. Lives in the game's folder (the one with eboot.bin) next to SecondSonPC.exe.
+rem Starts the game with every measured improvement that is on for players (README.md, Performance):
+rem the native command processor preset, the city preset, the second Vulkan recording thread and its batching,
+rem F1 (no pipeline cache freezes) and F3 (no vertex heap re-imports).
+rem Saves: userdata\ here, copied to userdata\savedata_backups\<date_time> before every start.
+rem Arguments are passed on to SecondSonPC.exe.
+cd /d "%~dp0"
+if not exist "%~dp0eboot.bin" (
+    echo eboot.bin is not in this folder - put SecondSonPC into the game's folder ^(README.md, Installation^).
+    pause
+    exit /b 1
+)
+tasklist /fi "imagename eq SecondSonPC.exe" 2>nul | find /i "SecondSonPC.exe" >nul
+if not errorlevel 1 (
+    echo SecondSonPC.exe is already running.
+    pause
+    exit /b 1
+)
+set SSPC_CP_MODE=native
+set SSPC_CITY_PERFORMANCE=1
+set SSPC_REA_MERGE_RUNS=1
+set SSPC_CP_ROUND_NODRAIN=1
+set SSPC_P411_ASYNC_ACQUIRE=1
+set SSPC_ASYNC_PIPELINES=1
+set SSPC_P53_FRONTEND_THREAD=1
+set SSPC_CP_ASYNC_WRITES=1
+set SSPC_CP_ASYNC_FLIP=1
+set SSPC_VK_EMIT_THREAD=1
+set SSPC_VK_EMIT_BATCH=1
+set SSPC_CP_RING=128
+set SSPC_NATIVE_GBUFFER=native
+set SSPC_R9_PCACHE=1
+set SSPC_R9_HEAP_WINDOW=1
+if defined SSPC_PLAY_EXPERIMENTAL (
+    rem play_experimental.cmd: REA-3 and AQ (docs/R9_REA3_FIX.md) - faster, frame pacing not even yet
+    set SSPC_REA_DEFER_WAIT_B=1
+    set SSPC_FB_ASYNC_COMPUTE=1
+)
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set STAMP=%%i
+if exist "%~dp0userdata\home" if defined STAMP xcopy /e /i /q /y "%~dp0userdata\home" "%~dp0userdata\savedata_backups\%STAMP%" >nul
+start "" /wait /d "%~dp0" "%~dp0SecondSonPC.exe" %*

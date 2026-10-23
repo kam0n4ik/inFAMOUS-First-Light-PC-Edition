@@ -8,7 +8,7 @@ set(SSPC_R7_SHADOWS_SOURCES
     src/native_engine/r7/shadows/shadow_params.cpp
 )
 set(SSPC_R7_SHADOWS_TEST_SOURCES
-    tools/native_engine_tests/r7_shadows_tests.cpp
+    tests/native_engine_tests/r7_shadows_tests.cpp
     src/native_engine/reconstructed/shadow_casters.cpp
     src/native_engine/r7/shadows/shadow_stats.cpp
     src/native_engine/r7/shadows/shadow_draw_command.cpp

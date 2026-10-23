@@ -4,5 +4,5 @@
 set(SSPC_R8_CP_SOURCES
 )
 set(SSPC_R8_CP_TEST_SOURCES
-    tools/native_engine_tests/r8_cp_tests.cpp
+    tests/native_engine_tests/r8_cp_tests.cpp
 )

@@ -17,3 +17,4 @@ __pycache__/
 /logs/crash/
 /cache/
 /third_party/upscalers/
+/dist/

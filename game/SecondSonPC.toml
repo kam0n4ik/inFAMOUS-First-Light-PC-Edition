@@ -1,0 +1,123 @@
+# SecondSonPC configuration. Paths may be absolute or relative to this file's folder.
+# This file goes into the game's folder together with SecondSonPC.exe (README.md, Installation).
+# Every setting SecondSonPC and its temporary shadPS4 bridge use comes from this file; with the
+# default loader (sspc) shadPS4's runtime\sspc\user\config.json is not read (docs\MIGRATION.md).
+# A misspelt table or key is an error at start-up.
+
+[Game]
+path = "."                         # the game's folder (eboot.bin, sce_module, sce_sys); "." = the folder
+                                   # of this file. Read only: the game's files are never modified
+
+[Language]
+system = "en-US"                   # "en-US" (PS4 id 1) | "ru-RU" (PS4 id 8)
+
+[System]
+name = ""                          # sceSystemServiceParamGetString(SystemName)
+enterButton = "cross"              # "cross" | "circle"
+
+[Console]                          # the emulated PS4 (the game sees these)
+neoMode = false                    # PS4 Pro (sceKernelIsNeoMode, memory budget)
+devKit = false                     # development kit memory budget
+extraDirectMemoryMiB = 0           # added to the retail direct memory budget
+extraFlexibleMemoryMiB = 0         # added to the retail flexible memory budget
+
+[Paths]
+userData = "userdata"              # /savedata0 -> userdata\home\<user>\savedata\CUSA00004\<dir>
+logs = "logs"                      # SecondSonPC.log, calls.json, bridge_shadps4.log
+
+[ShaderCache]                      # translated shaders and pipelines kept between runs: a level seen
+                                   # before does not compile them again (docs\SHADER_CACHE.md)
+enabled = true
+dir = 'cache\shaders'              # <dir>\CUSA00004\<translator>-<GPU and driver>; SecondSonPC.exe
+                                   # --clear-shader-cache empties it (rebuilt while playing)
+
+[Display]
+width = 1280
+height = 720
+fullscreen = false                 # F11 toggles while playing
+fullscreenMode = "borderless"      # "borderless" | "exclusive"
+vblankFrequency = 60               # FPS unlock is a later stage (game timing must be checked first)
+presentMode = "mailbox"            # "mailbox" | "fifo" (vsync) | "immediate"
+showFps = true                   # FPS counter overlay at start-up (F10 toggles)
+monitor = ""                       # display name the window opens on; "" = the primary display
+
+[Audio]
+volume = 100                       # 0..100, on top of the game's own volume settings
+device = ""                        # output device name; "" = system default
+
+[Input]                            # keyboard/mouse controller (docs\INPUT_MAPPING.md)
+mouseSensitivity = 1.0             # camera speed for a given mouse speed
+invertY = false
+mouseDeadzone = 0.10               # right-stick deflection a moving mouse starts from (0..0.9)
+captureMouse = true                # captured while the window has focus; Esc releases / takes it again
+motionSensitivity = 1.0            # motion mode (G): controller rotation per mouse movement
+sideways = "right-up"              # motion mode: "right-up" | "left-up" (which side points up)
+
+[Keyboard]                         # action = "Key" or ["Key", "Mouse Left", ...]; [] = unbound.
+                                   # Key names are SDL scancode names (layout independent).
+cross = "Space"
+circle = "E"
+square = "V"
+triangle = "F"
+l1 = "Q"
+r1 = "R"
+l2 = "Mouse Right"
+r2 = "Mouse Left"
+l3 = "Left Shift"
+r3 = ["Mouse Middle", "Z"]
+options = ["Return", "Escape"]
+touchPad = "Tab"                   # touch pad click (a finger at the centre while held)
+dpadUp = "Up"
+dpadDown = "Down"
+dpadLeft = "Left"
+dpadRight = "Right"
+moveForward = "W"
+moveBack = "S"
+moveLeft = "A"
+moveRight = "D"
+walk = "Left Ctrl"                 # left stick at half deflection
+releaseMouse = "Escape"            # gives the cursor back
+motionMode = "G"                   # controller held sideways, the mouse moves it (graffiti);
+                                   # a movement key also ends it (the mouse turns the camera again)
+shake = "X"                        # shakes the controller while held (spray can)
+touchDrag = "T"                    # while held the mouse drags a finger on the touch pad
+touchTwoFingers = "C"              # while held: two fingers on the touch pad + its click (two-finger actions)
+                                   # Mouse X1/X2 and "Wheel Up"/"Wheel Down" (a notch = one press) can be bound too;
+                                   # F10 (FPS counter) and F11 (full screen) are SecondSonPC's and cannot be.
+
+[Graphics]                         # the bridge's presenter (with --gpu-backend sspc: P4.6)
+fsr = false                        # FSR 1.0 scaling of the game's 1920x1080 frame to a larger window
+sharpening = true                  # RCAS after FSR
+sharpness = 88                     # 0..100 %
+
+[Gamepad]                          # real controllers (DualShock 4 and others)
+vibration = 100                    # % of the rumble the game asks for; 0 = off
+cameraSensitivity = 1.0            # right stick multiplier (0.25..2.0), on top of the game's own option
+invertCameraX = false
+invertCameraY = false
+menuButton = "off"                 # PC settings are in the game's Settings screen (Esc / Options); a shortcut besides: "guide" (PS button) | "l3r3" (held 1 s) | "off"
+
+[Interface]                        # SecondSonPC's settings window (the game's Settings -> "Additional Settings")
+language = "auto"                  # "auto" (as [Language] system) | "ru" | "en"
+scale = 100                        # 75..200 %: 100 = 900x700 at a 1080-pixel tall window (or the display scale)
+prompts = "auto"                   # button hints: "auto" | "playstation" | "xbox" | "keyboard"
+
+# The settings window (the game's Settings -> "Additional Settings") saves the user's changes to
+# %LOCALAPPDATA%\SecondSonPC\settings.toml, which overrides this file; delete a line there (or the file) to come back
+# to the values here (docs\PC_SETTINGS_UI.md).
+
+[Log]
+level = "info"                    # trace | debug | info | warning | error | critical
+bridgeFilter = "*:info"            # temporary shadPS4 core log (logs\bridge_shadps4.log)
+
+[Debug]                            # diagnostics of the temporary Vulkan bridge and of the input
+vulkanValidation = false           # Khronos validation layer (slow; needs the Vulkan SDK)
+vulkanCrashDiagnostic = false      # crash diagnostic layer
+inputLog = true                    # once a second while the mouse/sticks move: what the game is
+                                   # sent and what its stick filter reads (SecondSonPC.log, [Input])
+crashDump = true                   # a jump to a bad address (SSPC-002): minidump -> logs\crash
+                                   # (the report in SecondSonPC.log is always written)
+
+[Trace]
+importCounter = true               # count calls of every bound import -> logs\calls.json
+dumpIntervalSeconds = 10
