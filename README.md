@@ -49,6 +49,8 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
 - **PC-native around the game.**
   - Settings live inside the game's own menu.
   - Keyboard and mouse are supported, and every button prompt is redrawn for keyboard, Xbox or PlayStation.
+  - The mouse turns the camera directly, as in a PC game: no stick emulation, dead zone, acceleration or speed cap ([Native mouse camera](#native-mouse-camera)).
+  - Any resolution and aspect ratio from 4:3 to 32:9, with Hor+, an unstretched HUD, an FOV setting and movies kept 16:9 ([Resolutions and aspect ratios](#resolutions-and-aspect-ratios)).
   - Audio goes out through WASAPI; cutscene video is decoded natively.
   - `play.cmd` backs up your saves before every start.
 - **No PS4 firmware.** The system libraries the game imports are implemented by the project (336 of 417 natively, the rest from the shadPS4 core linked in). Only your own copy of the game is needed.
@@ -402,6 +404,38 @@ Keyboard and mouse are handled natively, with PC key bindings. The game draws ev
   <img src=".github/readme/prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
 </p>
 
+### Native mouse camera
+
+On the PS4 the camera is turned by the right stick, and an emulator usually turns mouse movement into a stick deflection. That brings the stick's dead zone, response curve, acceleration and top speed with it: slow movements are lost, fast ones are capped. SecondSonPC hands the mouse to the game's camera directly instead.
+
+- The game's camera integrator (eboot `0x14d6f0`) gets the mouse counts as yaw and pitch angles: 0.001 rad per count at `mouseSensitivity = 1.0` (1 000 counts ≈ 57°). Nothing is smoothed or accelerated, so the same hand movement always turns the camera by the same angle, at any frame rate.
+- What the game decides stays the game's:
+  - its vertical limits for the current camera, the same as the stick's (on foot about 85° up and down);
+  - camera locks in cut-scenes and moves;
+  - the game's own X / Y inversion options, plus `invertY` in `[Input]`.
+- The mouse moves the camera through the same limits as the stick. The automatic camera's narrower range (about ±10°, the one it returns to when you run) does not hold the mouse back.
+- Motion mode (G, for graffiti) and the touch pad keys still move the controller and the touch pad, not the camera.
+- `SSPC_MOUSE_CAMERA=0` returns to the stick emulation (`mouseDeadzone` applies only there).
+
+## Resolutions and aspect ratios
+
+The game renders at the window's size, or the display's in full screen, not at a fixed 1920 × 1080. Set it in **Settings → Display** or in `SecondSonPC.toml`:
+
+| Key | Values | What it does |
+|---|---|---|
+| `[Display] resolution` | `"auto"` \| `"WxH"` | The game's output size. `auto` = the window / the display. |
+| `[Display] aspectRatio` | `"auto"`, `"4:3"`, `"16:10"`, `"16:9"`, `"21:9"`, `"32:9"` | `auto` follows the window. A window taller than 16:9 (e.g. portrait) gets 16:9 with bars. |
+| `[Graphics] renderScale` | `"auto"` \| `"50"`…`"100"` | The 3D scene against the output. `auto` = at most 1080 lines, so 4K output keeps a 1080p scene unless raised. The scene is capped at 2880 × 2160 pixels. |
+| `[Display] hudSafeArea` | 85…100 % | The HUD's distance from the edges, like the PS4's Display Area. |
+| `[Display] hudArea` | `"full"`, `"21:9"`, `"16:9"` | On very wide pictures, keeps the HUD in the centre. |
+| `[Graphics] fov` | 80…130 % | The player camera's field of view; cut-scenes keep theirs. |
+
+- **Hor+.** Wider shapes show more of the world at the sides with the same vertical view. Nothing is stretched.
+- **HUD and menus.** The HUD is never stretched. The game's pause and settings screens stay centred on wide pictures, and mouse pointing in them follows that layout.
+- **Movies.** On a picture that is not 16:9 the game cut pre-rendered movies above and below (21:9, 32:9) or smeared their edges into the bars (4:3). They are now shown whole, 16:9, with black bars. Subtitles are unchanged.
+- **Cost.** At 1920 × 1080 nothing changes (55.7 vs 56.0 FPS in an A/B). A wider picture draws more of the world: about −18 % FPS at 2560 × 1080 and −31 % at 32:9 on an RTX 2060. Render scale and DLSS / FSR help.
+- Needs the default GPU backend (`--gpu-backend sspc`).
+
 ## Archive
 
 `main` is the playable build and the only branch. Earlier work that is not in it is kept in tags:
@@ -492,6 +526,9 @@ Vulkan 1.3 driver
 - [x] PC settings window in the game's menu
 - [x] Experiments page: every runtime switch on and off from the menu (R10)
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
+- [x] Native mouse camera (no stick emulation)
+- [x] Any resolution and aspect ratio (4:3 to 32:9, Hor+, HUD, FOV, movies 16:9)
+- [ ] Tested on real 21:9, 32:9 and 4K monitors
 - [x] A release package for the game's folder (`build.ps1`, `play.cmd`)
 - [ ] Tested on more hardware (AMD / Intel GPUs, Intel CPUs)
 
