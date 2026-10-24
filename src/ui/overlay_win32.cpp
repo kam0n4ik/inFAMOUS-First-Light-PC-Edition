@@ -64,6 +64,8 @@ struct Win32Overlay::Impl final : TextMeasure {
     bool visible = false;
     u8 fade = 255;      // the window's opacity while it fades in after being shown (0..255)
     u8 dim_alpha = 0;   // the backdrop's opacity the list asked for
+    int dim_set = -1;   // the backdrop's opacity set on its window (-1: none since it was shown)
+    RECT dim_rect{};    // the backdrop's place on the screen while it is shown
     HDC mem_dc = nullptr;
     HBITMAP dib = nullptr;
     void* bits = nullptr;
@@ -116,11 +118,17 @@ struct Win32Overlay::Impl final : TextMeasure {
             BLENDFUNCTION blend{AC_SRC_OVER, 0, fade, AC_SRC_ALPHA};
             UpdateLayeredWindow(panel, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &blend, ULW_ALPHA);
         }
-        if (dim != nullptr) {
-            SetLayeredWindowAttributes(dim, 0, static_cast<BYTE>(dim_alpha * fade / 255), LWA_ALPHA);
-        }
+        SetDimAlpha(dim_alpha * fade / 255);
         if (fade == 255 && panel != nullptr) {
             KillTimer(panel, kFadeTimer);
+        }
+    }
+
+    /// The backdrop's opacity, set only when it changes (each set recomposes the whole window).
+    void SetDimAlpha(int alpha) {
+        if (dim != nullptr && alpha != dim_set) {
+            SetLayeredWindowAttributes(dim, 0, static_cast<BYTE>(alpha), LWA_ALPHA);
+            dim_set = alpha;
         }
     }
 
@@ -420,6 +428,7 @@ struct Win32Overlay::Impl final : TextMeasure {
             DestroyWindow(dim);
             dim = nullptr;
         }
+        dim_set = -1;
         owner = nullptr;
         visible = false;
     }
@@ -523,13 +532,22 @@ bool Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
     const int cw = client.right - client.left, ch = client.bottom - client.top;
 
     // shown again: it fades in over a few timer steps (the opacity of the same pixels, nothing drawn again)
+    const bool showing = !m.visible || !IsWindowVisible(m.panel) || !IsWindowVisible(m.dim);
     if (!m.visible) {
         m.fade = 0;
     }
     m.dim_alpha = list.Dim();
-    // backdrop: one colour with a constant alpha (no pixels to upload)
-    SetLayeredWindowAttributes(m.dim, 0, static_cast<BYTE>(m.dim_alpha * m.fade / 255), LWA_ALPHA);
-    SetWindowPos(m.dim, HWND_TOP, origin.x, origin.y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // backdrop: one colour with a constant alpha (no pixels to upload). Placed and raised only when shown or moved,
+    // and then right under the panel: raised over it on every redraw (each mouse move), the panel flickered - the
+    // compositor could show a frame with the backdrop over the panel before the panel was raised again.
+    m.SetDimAlpha(m.dim_alpha * m.fade / 255);
+    const RECT dim_rect{origin.x, origin.y, origin.x + cw, origin.y + ch};
+    if (showing) {
+        SetWindowPos(m.dim, HWND_TOP, origin.x, origin.y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else if (!EqualRect(&dim_rect, &m.dim_rect)) {
+        SetWindowPos(m.dim, m.panel, origin.x, origin.y, cw, ch, SWP_NOACTIVATE);
+    }
+    m.dim_rect = dim_rect;
 
     const Rect s = list.Surface();
     const int sx = static_cast<int>(std::floor(s.x)), sy = static_cast<int>(std::floor(s.y));
@@ -546,7 +564,9 @@ bool Win32Overlay::Present(void* owner_hwnd, const DrawList& list) {
         HDC screen = GetDC(nullptr);
         drawn = UpdateLayeredWindow(m.panel, screen, &dst, &size, m.mem_dc, &src, 0, &blend, ULW_ALPHA) != FALSE;
         ReleaseDC(nullptr, screen);
-        SetWindowPos(m.panel, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (showing) { // (redrawn: UpdateLayeredWindow alone replaces its pixels, place and size at once)
+            SetWindowPos(m.panel, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
     }
     if (!drawn) {
         Hide(); // never a dimmed screen without the menu on it
@@ -579,6 +599,7 @@ void Win32Overlay::Hide() {
     }
     m.visible = false;
     m.fade = 255;
+    m.dim_set = -1;
 }
 
 bool Win32Overlay::RenderToPixels(const DrawList& list, std::vector<std::uint32_t>& pixels, unsigned& width,
