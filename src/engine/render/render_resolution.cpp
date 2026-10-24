@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -23,9 +24,19 @@ namespace {
 constexpr u64 kRenderSizeSite = 0x1eff47;
 constexpr u8 kRenderSizeBytes[14] = {0xC7, 0x43, 0x0C, 0x80, 0x07, 0x00, 0x00,
                                      0xC7, 0x43, 0x10, 0x38, 0x04, 0x00, 0x00};
+// 0x1eff55: mov dword [rbx], 0x780 ; mov dword [rbx+4], 0x438 (display width / height)
+constexpr u64 kDisplaySite = 0x1eff55;
+constexpr u8 kDisplayBytes[13] = {0xC7, 0x03, 0x80, 0x07, 0x00, 0x00, 0xC7, 0x43, 0x04, 0x38, 0x04, 0x00, 0x00};
+// 0x1f03f8: mov dword [r15], 0x438 ; mov dword [r12], 0x780 (the screen size 0x1d0ccc4 / 0x1d0ccc0)
+constexpr u64 kScreenSite = 0x1f03f8;
+constexpr u8 kScreenBytes[15] = {0x41, 0xC7, 0x07, 0x38, 0x04, 0x00, 0x00, 0x41,
+                                 0xC7, 0x04, 0x24, 0x80, 0x07, 0x00, 0x00};
 
 std::atomic<u32> g_width{1920};
 std::atomic<u32> g_height{1080};
+std::atomic<u64> g_display{u64{1920} << 32 | 1080};
+std::atomic<u32> g_render_scale{kRenderScaleAuto};
+DisplayPlan g_plan{.output = {1920, 1080}, .display = {1920, 1080}, .screen = {1920, 1080}, .scene = {1920, 1080}};
 
 std::string Env(const char* name) {
     char v[64] = {};
@@ -33,53 +44,124 @@ std::string Env(const char* name) {
     return n > 0 && n < sizeof(v) ? std::string(v, n) : std::string();
 }
 
-} // namespace
-
-RenderSize RenderSizeForScale(float scale) {
-    scale = std::clamp(scale, 1.0f, 3.0f);
-    auto round = [](float v, u32 step) { return std::max<u32>(step, static_cast<u32>(std::lround(v / step)) * step); };
-    RenderSize s{round(kDisplaySize.width / scale, 16), round(kDisplaySize.height / scale, 8)};
-    s.width = std::clamp<u32>(s.width, 640, kDisplaySize.width);
-    s.height = std::clamp<u32>(s.height, 360, kDisplaySize.height);
-    return s;
-}
-
-bool InstallRenderResolution(u64 eboot_base, RenderSize size) {
-    if (const std::string env = Env("SSPC_RENDER_RES"); !env.empty()) {
-        unsigned w = 0, h = 0;
-        if (std::sscanf(env.c_str(), "%ux%u", &w, &h) == 2 && w >= 320 && h >= 180 && w <= 1920 && h <= 1080) {
-            size = {w, h};
-        } else {
-            SSPC_LOG(Engine, Warning, "SSPC_RENDER_RES='{}' is not WxH within 320x180..1920x1080 - ignored", env);
-        }
-    }
-    size.width &= ~1u;
-    size.height &= ~1u;
-    if (size.width == 1920 && size.height == 1080) {
-        return true;
-    }
-    auto* at = reinterpret_cast<u8*>(eboot_base + kRenderSizeSite);
-    if (std::memcmp(at, kRenderSizeBytes, sizeof(kRenderSizeBytes)) != 0) {
-        SSPC_LOG(Engine, Error, "Render resolution {}x{} not applied: eboot+{:#x} is not the analysed code (another "
-                                "game version?) - the game renders at 1920x1080",
-                 size.width, size.height, kRenderSizeSite);
+/// Writes the two 32-bit immediates of `bytes` (at `first` and `second`) at eboot+`site` when the code there is
+/// `bytes`.
+bool PatchImmediates(u64 eboot_base, u64 site, std::span<const u8> bytes, u32 first_at, u32 first, u32 second_at,
+                     u32 second, std::string_view what) {
+    auto* at = reinterpret_cast<u8*>(eboot_base + site);
+    if (std::memcmp(at, bytes.data(), bytes.size()) != 0) {
+        SSPC_LOG(Engine, Error, "{} not applied: eboot+{:#x} is not the analysed code (another game version?)", what,
+                 site);
         return false;
     }
     DWORD old = 0;
-    if (!VirtualProtect(at, sizeof(kRenderSizeBytes), PAGE_EXECUTE_READWRITE, &old)) {
-        SSPC_LOG(Engine, Error, "Render resolution not applied: VirtualProtect failed ({})", GetLastError());
+    if (!VirtualProtect(at, bytes.size(), PAGE_EXECUTE_READWRITE, &old)) {
+        SSPC_LOG(Engine, Error, "{} not applied: VirtualProtect failed ({})", what, GetLastError());
         return false;
     }
-    std::memcpy(at + 3, &size.width, 4);
-    std::memcpy(at + 10, &size.height, 4);
+    std::memcpy(at + first_at, &first, 4);
+    std::memcpy(at + second_at, &second, 4);
     DWORD unused = 0;
-    VirtualProtect(at, sizeof(kRenderSizeBytes), old, &unused);
-    FlushInstructionCache(GetCurrentProcess(), at, sizeof(kRenderSizeBytes));
-    g_width.store(size.width, std::memory_order_release);
-    g_height.store(size.height, std::memory_order_release);
-    SSPC_LOG(Engine, Warning, "Render resolution: the game's scene renders at {}x{} (display {}x{}; eboot+{:#x})",
-             size.width, size.height, kDisplaySize.width, kDisplaySize.height, kRenderSizeSite);
+    VirtualProtect(at, bytes.size(), old, &unused);
+    FlushInstructionCache(GetCurrentProcess(), at, bytes.size());
     return true;
+}
+
+/// A diagnostic WxH override of `size` from `name`; false when absent or malformed (logged).
+bool EnvSize(const char* name, Size& size) {
+    const std::string env = Env(name);
+    if (env.empty()) {
+        return false;
+    }
+    Size s;
+    if (!ParseSize(env, s)) {
+        SSPC_LOG(Engine, Warning, "{}='{}' is not WxH within 320x240..7680x4320 - ignored", name, env);
+        return false;
+    }
+    size = {s.width & ~1u, s.height & ~1u};
+    SSPC_LOG(Engine, Warning, "DIAGNOSTIC: {}: {}x{}", name, size.width, size.height);
+    return true;
+}
+
+} // namespace
+
+void SetDisplayPlan(const DisplayPlan& plan) {
+    g_plan = plan;
+    g_display.store(u64{plan.display.width} << 32 | plan.display.height, std::memory_order_release);
+}
+
+const DisplayPlan& GetDisplayPlan() {
+    return g_plan;
+}
+
+void SetRenderScale(u32 render_scale) {
+    g_render_scale.store(render_scale, std::memory_order_relaxed);
+}
+
+RenderSize SceneSizeForRenderScale() {
+    const RenderSize d = DisplaySize();
+    const Size s = SceneSizeFor({d.width, d.height}, g_render_scale.load(std::memory_order_relaxed));
+    return {s.width, s.height};
+}
+
+RenderSize RenderSizeForScale(float scale) {
+    scale = std::clamp(scale, 1.0f, 3.0f);
+    const RenderSize d = DisplaySize();
+    auto round = [](float v, u32 step) { return std::max<u32>(step, static_cast<u32>(std::lround(v / step)) * step); };
+    RenderSize s{round(d.width / scale, 16), round(d.height / scale, 8)};
+    s.width = std::clamp<u32>(s.width, std::min<u32>(640, d.width), d.width);
+    s.height = std::clamp<u32>(s.height, std::min<u32>(360, d.height), d.height);
+    return s;
+}
+
+bool InstallRenderResolution(u64 eboot_base) {
+    Size display = g_plan.display, screen = g_plan.screen;
+    // the scene starts at the largest size the render scale and the upscalers may ask for (its targets' memory is
+    // allocated for it at start); the size asked for is switched to at the game's first frame (InstallRenderSwitch)
+    Size scene = SceneSizeFor(display, kRenderScaleMax);
+    EnvSize("SSPC_DISPLAY_RES", display);
+    EnvSize("SSPC_SCREEN_RES", screen);
+    if (EnvSize("SSPC_RENDER_RES", scene)) {
+        scene = {std::min(scene.width, display.width), std::min(scene.height, display.height)};
+    }
+    // all three sites or none (a wide display with the 16:9 screen would be a stretched picture)
+    const auto pristine = [eboot_base](u64 site, std::span<const u8> bytes) {
+        return std::memcmp(reinterpret_cast<const void*>(eboot_base + site), bytes.data(), bytes.size()) == 0;
+    };
+    const bool sizes_kept = display == Size{1920, 1080} && screen == Size{1920, 1080} && scene == Size{1920, 1080};
+    if (!sizes_kept && !(pristine(kDisplaySite, kDisplayBytes) && pristine(kScreenSite, kScreenBytes) &&
+                         pristine(kRenderSizeSite, kRenderSizeBytes))) {
+        SSPC_LOG(Engine, Error, "Resolution {}x{} (screen {}x{}, scene {}x{}) not applied: eboot+{:#x} / +{:#x} / "
+                 "+{:#x} are not the analysed code (another game version?) - the game stays 1920x1080",
+                 display.width, display.height, screen.width, screen.height, scene.width, scene.height, kDisplaySite,
+                 kScreenSite, kRenderSizeSite);
+        g_display.store(u64{1920} << 32 | 1080, std::memory_order_release);
+        return false;
+    }
+    bool ok = true;
+    if (display != Size{1920, 1080}) {
+        ok = PatchImmediates(eboot_base, kDisplaySite, kDisplayBytes, 2, display.width, 9, display.height,
+                             "Display size");
+        g_display.store(u64{display.width} << 32 | display.height, std::memory_order_release);
+    }
+    if (screen != Size{1920, 1080}) {
+        // (h first: mov [r15], h ; mov [r12], w)
+        ok = PatchImmediates(eboot_base, kScreenSite, kScreenBytes, 3, screen.height, 11, screen.width,
+                             "Screen size") && ok;
+    }
+    if (scene != Size{1920, 1080} &&
+        PatchImmediates(eboot_base, kRenderSizeSite, kRenderSizeBytes, 3, scene.width, 10, scene.height,
+                        "Render resolution")) {
+        g_width.store(scene.width, std::memory_order_release);
+        g_height.store(scene.height, std::memory_order_release);
+    }
+    const RenderSize d = DisplaySize(), r = CurrentRenderSize();
+    if (d.width != 1920 || d.height != 1080 || r.width != 1920 || r.height != 1080 || screen != Size{1920, 1080}) {
+        SSPC_LOG(Engine, Warning, "Resolution: display {}x{}, screen {}x{}, scene up to {}x{} (eboot+{:#x}, +{:#x}, "
+                 "+{:#x})", d.width, d.height, screen.width, screen.height, r.width, r.height, kDisplaySite,
+                 kScreenSite, kRenderSizeSite);
+    }
+    return ok;
 }
 
 namespace {
@@ -147,6 +229,11 @@ RenderSize CurrentRenderSize() {
     return {g_width.load(std::memory_order_acquire), g_height.load(std::memory_order_acquire)};
 }
 
+RenderSize DisplaySize() {
+    const u64 d = g_display.load(std::memory_order_acquire);
+    return {static_cast<u32>(d >> 32), static_cast<u32>(d)};
+}
+
 namespace {
 
 // The render size changed while the game runs - the PS4 Pro's own path. FrameBegin 0x1f0be0 (every frame, the game's
@@ -177,6 +264,40 @@ struct DiagSwitch {
 };
 std::vector<DiagSwitch> g_diag;
 
+// The HUD's margins in screen units (0x1d0ccc8 x, 0x1d0cccc y), as the game computes them from the Display Area ratio
+// at start (0x1f0407) and on a system change (0x1f2a60, 0x1f2b60): (size - size * ratio) / 2, at least 16.
+constexpr u64 kScreenWidth = 0x1d0ccc0;
+constexpr u64 kScreenHeight = 0x1d0ccc4;
+constexpr u64 kMarginX = 0x1d0ccc8;
+constexpr u64 kMarginY = 0x1d0cccc;
+std::atomic<u32> g_safe_area{100};  // %
+std::atomic<u32> g_hud_aspect{0};   // the HUD area's width / height * 1000, 0: the whole screen
+
+s32 SafeMargin(s32 size, float ratio) {
+    const s32 m = (size - static_cast<s32>(static_cast<float>(size) * ratio)) / 2;
+    return m <= 15 ? 16 : m;
+}
+
+void WriteHudMargins() {
+    const s32 w = *reinterpret_cast<volatile s32*>(g_switch_base + kScreenWidth);
+    const s32 h = *reinterpret_cast<volatile s32*>(g_switch_base + kScreenHeight);
+    if (w <= 0 || h <= 0) {
+        return; // (before the game's VideoOut init)
+    }
+    const float ratio = static_cast<float>(g_safe_area.load(std::memory_order_relaxed)) / 100.0f;
+    s32 area = w;
+    if (const u32 a = g_hud_aspect.load(std::memory_order_relaxed); a != 0) {
+        area = std::min<s32>(w, static_cast<s32>(std::lround(h * (a / 1000.0))) & ~1);
+    }
+    const s32 mx = (w - area) / 2 + SafeMargin(area, ratio), my = SafeMargin(h, ratio);
+    auto* x = reinterpret_cast<volatile s32*>(g_switch_base + kMarginX);
+    auto* y = reinterpret_cast<volatile s32*>(g_switch_base + kMarginY);
+    if (*x != mx || *y != my) {
+        *x = mx;
+        *y = my;
+    }
+}
+
 void WriteSizes(u64 device, u32 w, u32 h) {
     auto* d = reinterpret_cast<u8*>(device);
     const auto put = [&](u64 off, u32 a, u32 b) {
@@ -206,6 +327,7 @@ void WriteSizes(u64 device, u32 w, u32 h) {
 
 SSPC_SYSV_ABI void FrameBeginProbe(u64 device, u32 arg) {
     const u64 frame = g_frames.fetch_add(1, std::memory_order_relaxed);
+    WriteHudMargins();
     for (const DiagSwitch& s : g_diag) {
         if (s.frame == frame) {
             g_requested.store(u64{s.size.width} << 32 | s.size.height, std::memory_order_release);
@@ -276,6 +398,57 @@ bool RequestRenderSize(RenderSize size) {
     }
     g_requested.store(u64{size.width} << 32 | size.height, std::memory_order_release);
     return true;
+}
+
+void SetHudLayout(u32 safe_area_percent, std::string_view area) {
+    g_safe_area.store(std::clamp<u32>(safe_area_percent, 85, 100), std::memory_order_relaxed);
+    g_hud_aspect.store(area == "16:9" ? 1778 : area == "21:9" ? 2370 : 0, std::memory_order_relaxed);
+}
+
+float HudSafeAreaRatio() {
+    return static_cast<float>(g_safe_area.load(std::memory_order_relaxed)) / 100.0f;
+}
+
+namespace {
+
+// Camera::SetFov(camera, vertical FOV in radians) 0x580580: stores the angle (+0x590), tan(angle / 2) (+0x5a4) and
+// aspect * tan (+0x5a0) and rebuilds the projection. The player camera's update 0x14ddd0 calls it every frame with its
+// controller's angle (+0x468 + +0x358: the base FOV and its aim / sprint offset) - the call returning to 0x14f517.
+constexpr ProbeSite kSetFovSite{{0x580580, 0xc1, 0xef658398f5aad2a4ull}, 17};
+constexpr u64 kPlayerSetFovReturn = 0x14f517;
+constexpr float kMaxFov = 2.6f; // rad (149 degrees)
+
+using SetFovFn = SSPC_SYSV_ABI void (*)(u64 camera, float vfov);
+SetFovFn g_set_fov = nullptr;
+u64 g_fov_base = 0;
+std::atomic<u32> g_fov_percent{100};
+
+SSPC_SYSV_ABI void SetFovProbe(u64 camera, float vfov) {
+    const u32 p = g_fov_percent.load(std::memory_order_relaxed);
+    if (p != 100 && reinterpret_cast<u64>(__builtin_return_address(0)) == g_fov_base + kPlayerSetFovReturn) {
+        vfov = std::min(vfov * static_cast<float>(p) / 100.0f, kMaxFov);
+    }
+    g_set_fov(camera, vfov);
+}
+
+} // namespace
+
+bool InstallFovControl(u64 eboot_base) {
+    std::string error;
+    void* original = InstallEntryProbe(eboot_base, kSetFovSite, reinterpret_cast<const void*>(&SetFovProbe), error);
+    if (original == nullptr) {
+        SSPC_LOG(Engine, Error, "Field of view control not installed (the game's own FOV): {}", error);
+        return false;
+    }
+    g_fov_base = eboot_base;
+    g_set_fov = reinterpret_cast<SetFovFn>(original);
+    SSPC_LOG(Engine, Info, "Field of view: entry probe on Camera::SetFov 0x580580 (player camera {} %)",
+             g_fov_percent.load());
+    return true;
+}
+
+void SetFovPercent(u32 percent) {
+    g_fov_percent.store(std::clamp<u32>(percent, 80, 130), std::memory_order_relaxed);
 }
 
 } // namespace SecondSon::Engine::Render

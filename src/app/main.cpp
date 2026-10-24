@@ -7,6 +7,7 @@
 //     --user-data <dir>        overrides [Paths] userData (test runs on a copy of the saves)
 //   diagnostics:
 //     --no-counter             disables the import call counter
+//     --window WxH             the window's size for this run (overrides [Display] width/height)
 //     --call-order <N>         records the first N import calls -> logs\call_order.txt
 //     --reloc-snapshot <file>  writes every relocation slot at the first ParamGetInt call
 //     --selftest               NATIVE vs BRIDGE subsystem self-test -> logs\selftest.txt, no game
@@ -105,6 +106,8 @@
 #include "bridge/shadps4/gcn_decoder_check.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
+#include "engine/render/display_plan.h"
+#include "engine/render/render_resolution.h"
 #include "runtime/gpu/cp_replay.h"
 #include "runtime/gpu/shader/game_shader_index.h"
 #include "runtime/gpu/vulkan/vk_foundation.h"
@@ -161,6 +164,90 @@ void PrepareShaders(const SecondSon::App::Config& config) {
     CloseHandle(pi.hProcess);
     SSPC_LOG(App, Info, "shader preparation: exit code {} after {:.1f} s", code,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
+/// The desktop mode (pixels) of the display named `name` as SDL names it on Windows (the monitor's friendly name from
+/// the display configuration), or of the primary display; {0, 0} when Windows does not say.
+SecondSon::Engine::Render::Size DesktopSize(const std::string& name) {
+    std::wstring device;
+    UINT32 paths = 0, modes = 0;
+    if (!name.empty() && GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) == ERROR_SUCCESS) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> path(paths);
+        std::vector<DISPLAYCONFIG_MODE_INFO> mode(modes);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, path.data(), &modes, mode.data(), nullptr) ==
+            ERROR_SUCCESS) {
+            for (UINT32 i = 0; i < paths && device.empty(); ++i) {
+                DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
+                target.header = {DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, sizeof(target), path[i].targetInfo.adapterId,
+                                 path[i].targetInfo.id};
+                if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) {
+                    continue;
+                }
+                char utf8[256] = {};
+                WideCharToMultiByte(CP_UTF8, 0, target.monitorFriendlyDeviceName, -1, utf8, sizeof(utf8), nullptr,
+                                    nullptr);
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+                source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), path[i].sourceInfo.adapterId,
+                                 path[i].sourceInfo.id};
+                if (name == utf8 && DisplayConfigGetDeviceInfo(&source.header) == ERROR_SUCCESS) {
+                    device = source.viewGdiDeviceName;
+                }
+            }
+        }
+    }
+    if (device.empty()) {
+        MONITORINFOEXW info{};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &info)) {
+            device = info.szDevice;
+        }
+    }
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (device.empty() || !EnumDisplaySettingsW(device.c_str(), ENUM_CURRENT_SETTINGS, &dm)) {
+        return {};
+    }
+    return {dm.dmPelsWidth, dm.dmPelsHeight};
+}
+
+/// The game's display, screen and scene sizes (docs/RESOLUTION_IMPLEMENTATION.md) from [Display] resolution /
+/// aspectRatio and [Graphics] renderScale, for the window's size or, in full screen, the display's desktop mode; the
+/// game's render targets get the direct memory they need for them.
+void PlanGameDisplay(SecondSon::App::Config& config) {
+    using namespace SecondSon;
+    namespace R = Engine::Render;
+    R::Size output{config.window_width, config.window_height};
+    if (config.fullscreen) {
+        if (const R::Size desktop = DesktopSize(config.pc.monitor); desktop.width != 0) {
+            output = desktop;
+        }
+    }
+    R::AspectMode aspect = R::AspectMode::Auto;
+    if (!R::ParseAspectMode(config.pc.aspect_ratio, aspect)) {
+        SSPC_LOG(App, Warning, "[Display] aspectRatio '{}' is not auto / 16:9 / 16:10 / 21:9 / 32:9 / 4:3: auto",
+                 config.pc.aspect_ratio);
+    }
+    R::Size fixed{};
+    if (config.pc.resolution != "auto" && !R::ParseSize(config.pc.resolution, fixed)) {
+        SSPC_LOG(App, Warning, "[Display] resolution '{}' is not auto or WxH (320x240..7680x4320): auto",
+                 config.pc.resolution);
+        fixed = {};
+    }
+    const R::DisplayPlan plan = R::PlanDisplay(output, aspect, fixed, R::ParseRenderScale(config.pc.render_scale));
+    if (plan.Native() && plan.extra_direct_mib == 0) {
+        SSPC_LOG(App, Info, "Resolution: {} (the PS4's sizes)", R::Describe(plan));
+        return;
+    }
+    if (config.gpu_backend != App::Config::GpuBackend::Sspc || config.neo_mode) {
+        SSPC_LOG(App, Warning, "Resolution: {} needs SecondSonPC's GPU backend (--gpu-backend sspc) on a PS4 (not "
+                 "Pro): the game keeps 1920x1080", R::Describe(plan));
+        return;
+    }
+    R::SetDisplayPlan(plan);
+    config.extra_dmem_mib = std::min<u32>(config.extra_dmem_mib + plan.extra_direct_mib, 4096);
+    SSPC_LOG(App, Info, "Resolution: {} (resolution {}, aspect {}, render scale {}{})", R::Describe(plan),
+             config.pc.resolution, config.pc.aspect_ratio, config.pc.render_scale,
+             config.fullscreen ? ", full screen" : ", window");
 }
 
 } // namespace
@@ -223,6 +310,13 @@ int main(int argc, char* argv[]) {
             // read above
         } else if (arg == "--no-counter") {
             config->import_counter = false;
+        } else if (arg == "--window" && has_value) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w < 320 || h < 240 || w > 7680 || h > 4320) {
+                return Fail("--window must be WxH (320x240..7680x4320)");
+            }
+            config->window_width = w;
+            config->window_height = h;
         } else if (arg == "--stock-bootstrap") {
             stock_bootstrap = true; // diagnostics only
         } else if (arg == "--no-bind" && has_value) {
@@ -724,6 +818,8 @@ int main(int argc, char* argv[]) {
     if (!Runtime::ReportLanguageFiles(*language, config->game_dir)) {
         SSPC_LOG(Language, Error, "language files for {} are missing in the game folder", language->locale);
     }
+
+    PlanGameDisplay(*config); // (before the bridge reads the memory budget)
 
     SystemService::Configure(SystemService::Settings{
         .language_id = config->language_id,

@@ -59,7 +59,7 @@ void ApplyUpscaling(bool at_start) {
     const bool upscaling = us.backend != Up::Backend::Off;
     const Engine::Render::RenderSize rs = upscaling
                                               ? Engine::Render::RenderSizeForScale(Up::ScaleOf(us.quality))
-                                              : Engine::Render::kDisplaySize;
+                                              : Engine::Render::SceneSizeForRenderScale();
     // the game's SMAA T2x (its own camera jitter, a two-frame blend) off while an upscaler jitters the scene;
     // SSPC_UPSCALE_GAME_TAA=1 keeps it (diagnostics)
     static const bool keep_taa = [] {
@@ -76,7 +76,7 @@ void ApplyUpscaling(bool at_start) {
     }
     SSPC_LOG(Loader, Info, "Upscaling: {} {}, scene {}x{} -> display {}x{}, frame generation {}{}",
              Up::BackendName(us.backend), Up::QualityName(us.quality), rs.width, rs.height,
-             Engine::Render::kDisplaySize.width, Engine::Render::kDisplaySize.height,
+             Engine::Render::DisplaySize().width, Engine::Render::DisplaySize().height,
              us.frame_gen == Up::FrameGen::Fsr ? "FSR" : "off", at_start ? "" : " (applied while running)");
     // SSPC_DIAG_UPSCALE_SWITCH=seconds:upscaler:quality:framegen[;...]: what the menu does, at those seconds after
     // start (automated runs of the live switch)
@@ -145,6 +145,13 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
             } else if (d->id == "graphics.particleResolution") {
                 Engine::Particles::SetParticleResolution(c.pc.particle_resolution);
+            } else if (d->id == "graphics.renderScale" && !bridge_presenter) {
+                Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(c.pc.render_scale));
+                upscaling = true; // (the scene size switches at the game's next frame, as the upscalers')
+            } else if ((d->id == "display.hudSafeArea" || d->id == "display.hudArea") && !bridge_presenter) {
+                Engine::Render::SetHudLayout(c.pc.hud_safe_area, c.pc.hud_area); // written at every frame start
+            } else if (d->id == "graphics.fov" && !bridge_presenter) {
+                Engine::Render::SetFovPercent(c.pc.fov); // at the player camera's next update
             } else if (d->id == "upscaling.sharpness" || d->id == "upscaling.frameGenMultiplier" ||
                        d->id == "upscaling.reflex") {
                 // read by the GPU's recording / present threads every frame

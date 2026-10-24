@@ -762,6 +762,11 @@ private:
     struct UpscaleState;
     std::unique_ptr<UpscaleState> up_;
     bool up_display_draw_ = false; ///< the draw being bound writes a display buffer (BindStage notes its textures)
+    bool movie_check_ = false;     ///< a full-screen movie is shown: BindStage looks for its picture's planes
+    bool movie_hit_ = false;       ///< the draw being bound samples a full-screen movie's picture
+    float movie_v_end_ = 1.0f;     ///< its picture's last line in the texture (v: 1080 of the planes' 1088 rows)
+    bool movie_fit_ = false;       ///< the movie draw shown 16:9 (FitMovieCoords; SetDynamicState, its bars cleared)
+    u32 movie_fitted_ = 0;
     struct UpscaleSampled {
         CachedImage* img = nullptr;
         VkImageView view = VK_NULL_HANDLE;

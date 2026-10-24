@@ -41,6 +41,49 @@ constexpr Choice kFrameRateLimits[] = {
     {"240", "240", "240"},
     {"unlimited", "Unlimited", "Без ограничения"},
 };
+constexpr Choice kResolutions[] = {
+    {"auto", "Automatic (the window / the display)", "Автоматически (окно / монитор)"},
+    {"1280x720", "1280 × 720 (16:9)", "1280 × 720 (16:9)"},
+    {"1600x900", "1600 × 900 (16:9)", "1600 × 900 (16:9)"},
+    {"1920x1080", "1920 × 1080 (16:9)", "1920 × 1080 (16:9)"},
+    {"2560x1440", "2560 × 1440 (16:9)", "2560 × 1440 (16:9)"},
+    {"3840x2160", "3840 × 2160 (16:9)", "3840 × 2160 (16:9)"},
+    {"1280x800", "1280 × 800 (16:10)", "1280 × 800 (16:10)"},
+    {"1680x1050", "1680 × 1050 (16:10)", "1680 × 1050 (16:10)"},
+    {"1920x1200", "1920 × 1200 (16:10)", "1920 × 1200 (16:10)"},
+    {"2560x1600", "2560 × 1600 (16:10)", "2560 × 1600 (16:10)"},
+    {"2560x1080", "2560 × 1080 (21:9)", "2560 × 1080 (21:9)"},
+    {"3440x1440", "3440 × 1440 (21:9)", "3440 × 1440 (21:9)"},
+    {"3840x1600", "3840 × 1600 (21:9)", "3840 × 1600 (21:9)"},
+    {"3840x1080", "3840 × 1080 (32:9)", "3840 × 1080 (32:9)"},
+    {"5120x1440", "5120 × 1440 (32:9)", "5120 × 1440 (32:9)"},
+    {"800x600", "800 × 600 (4:3)", "800 × 600 (4:3)"},
+    {"1024x768", "1024 × 768 (4:3)", "1024 × 768 (4:3)"},
+    {"1440x1080", "1440 × 1080 (4:3)", "1440 × 1080 (4:3)"},
+    {"1600x1200", "1600 × 1200 (4:3)", "1600 × 1200 (4:3)"},
+};
+constexpr Choice kAspectRatios[] = {
+    {"auto", "Automatic (as the resolution)", "Автоматически (по разрешению)"},
+    {"16:9", "16:9", "16:9"},
+    {"16:10", "16:10", "16:10"},
+    {"21:9", "21:9", "21:9"},
+    {"32:9", "32:9", "32:9"},
+    {"4:3", "4:3", "4:3"},
+};
+constexpr Choice kHudAreas[] = {
+    {"full", "Whole picture", "Вся картинка"},
+    {"21:9", "Centre 21:9", "Центр 21:9"},
+    {"16:9", "Centre 16:9", "Центр 16:9"},
+};
+constexpr Choice kRenderScales[] = {
+    {"auto", "Automatic (up to 1080 lines)", "Автоматически (до 1080 строк)"},
+    {"50", "50 %", "50 %"},
+    {"60", "60 %", "60 %"},
+    {"67", "67 %", "67 %"},
+    {"75", "75 %", "75 %"},
+    {"85", "85 %", "85 %"},
+    {"100", "100 % (native)", "100 % (родное)"},
+};
 constexpr Choice kSideways[] = {
     {"right-up", "Right side up", "Правой стороной вверх"},
     {"left-up", "Left side up", "Левой стороной вверх"},
@@ -82,16 +125,16 @@ constexpr Choice kParticleResolutions[] = {
     {"quarter", "Quarter", "Четверть"},
 };
 constexpr Choice kUpscalers[] = {
-    {"off", "Off (native 1920x1080)", "Выключено (нативные 1920×1080)"},
+    {"off", "Off (Render scale)", "Выключено (масштаб рендеринга)"},
     {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
     {"fsr", "AMD FSR 3.1", "AMD FSR 3.1"},
 };
 constexpr Choice kUpscaleQualities[] = {
     {"native", "Native AA (DLAA / FSR native)", "Нативное сглаживание (DLAA / FSR native)"},
-    {"quality", "Quality (1280x720)", "Качество (1280×720)"},
-    {"balanced", "Balanced (1120x632)", "Баланс (1120×632)"},
-    {"performance", "Performance (960x540)", "Производительность (960×540)"},
-    {"ultra", "Ultra Performance (640x360)", "Ультрапроизводительность (640×360)"},
+    {"quality", "Quality (67 %)", "Качество (67 %)"},
+    {"balanced", "Balanced (59 %)", "Баланс (59 %)"},
+    {"performance", "Performance (50 %)", "Производительность (50 %)"},
+    {"ultra", "Ultra Performance (33 %)", "Ультрапроизводительность (33 %)"},
 };
 constexpr Choice kFrameGenerations[] = {
     {"off", "Off", "Выключено"},
@@ -287,6 +330,71 @@ void Build(Registry& r) {
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.frame_rate_limit = std::get<std::string>(x); },
     });
 
+    v.push_back(Desc{
+        .id = "display.resolution", .table = "Display", .key = "resolution", .category = Category::Display,
+        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::RenderScale, .choices = kResolutions,
+        .en = "Resolution", .ru = "Разрешение",
+        .help_en = "The game's own resolution: its picture and HUD are drawn at this size and the window shows it "
+                   "(with bars when the shapes differ). Automatic: the window's size, or the display's in full screen. "
+                   "Below 1080 lines the game still draws 1080 lines (as the PS4) and the picture is shown smaller. "
+                   "The 3D scene's own resolution is Render scale. Takes effect after a restart: the game sizes its "
+                   "buffers when it starts.",
+        .help_ru = "Собственное разрешение игры: картинка и интерфейс рисуются в этом размере, окно показывает его "
+                   "(с полосами, если форма другая). «Автоматически» — размер окна, а в полноэкранном режиме — "
+                   "монитора. Меньше 1080 строк игра всё равно рисует 1080 (как PS4), а картинка показывается "
+                   "уменьшенной. Разрешение самой 3D-сцены — «Масштаб рендеринга». Вступает в силу после "
+                   "перезапуска: игра создаёт буферы при старте.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc); the bridge's renders 1920x1080.",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc); мост рендерит 1920×1080.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.resolution; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.resolution = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "display.aspectRatio", .table = "Display", .key = "aspectRatio", .category = Category::Display,
+        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::RenderScale, .choices = kAspectRatios,
+        .en = "Aspect ratio", .ru = "Соотношение сторон",
+        .help_en = "The shape of the game's picture. A wider one shows more at the sides with the same height of view "
+                   "(Hor+), a narrower one less; nothing is stretched, the rest of the window gets bars. Automatic: "
+                   "the resolution's shape (4:3 .. 32:9; a taller window shows 16:9 with bars above and below). Takes "
+                   "effect after a restart.",
+        .help_ru = "Форма картинки игры. Шире — по бокам видно больше при той же высоте обзора (Hor+), уже — меньше; "
+                   "ничего не растягивается, остальное окно занимают полосы. «Автоматически» — форма разрешения "
+                   "(от 4:3 до 32:9; в высоком окне — 16:9 с полосами сверху и снизу). Вступает в силу после "
+                   "перезапуска.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc); the bridge's renders 16:9.",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc); мост рендерит 16:9.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.aspect_ratio; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.aspect_ratio = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "display.hudSafeArea", .table = "Display", .key = "hudSafeArea", .category = Category::Display,
+        .type = Type::Int, .apply = Apply::Live, .needs = Capability::RenderScale, .min = 85, .max = 100,
+        .ui_min = 85, .ui_max = 100, .step = 1, .unit = "%", .en = "HUD safe area", .ru = "Безопасная зона HUD",
+        .help_en = "How far the HUD (health, the map, prompts) keeps from the picture's edges, as the PS4's Display "
+                   "Area: 100 % at the edges, 85 % furthest in. Applies at once.",
+        .help_ru = "Насколько интерфейс (здоровье, карта, подсказки) отступает от краёв картинки, как «Область "
+                   "отображения» PS4: 100 % — у самых краёв, 85 % — дальше всего. Применяется сразу.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.hud_safe_area); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.hud_safe_area = static_cast<u32>(std::get<s64>(x));
+        },
+    });
+    v.push_back(Desc{
+        .id = "display.hudArea", .table = "Display", .key = "hudArea", .category = Category::Display,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kHudAreas,
+        .en = "HUD area", .ru = "Область HUD",
+        .help_en = "On a wide picture (21:9, 32:9): the HUD at the picture's edges, or in its centre 21:9 / 16:9 part, "
+                   "closer to where you look. Applies at once.",
+        .help_ru = "На широкой картинке (21:9, 32:9): интерфейс у краёв картинки или в её центральной части 21:9 / "
+                   "16:9, ближе к центру взгляда. Применяется сразу.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.hud_area; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.hud_area = std::get<std::string>(x); },
+    });
+
     // ------------------------------------------------------------------ Graphics
     v.push_back(Desc{
         .id = "graphics.fsr", .table = "Graphics", .key = "fsr", .category = Category::Graphics, .type = Type::Bool,
@@ -350,19 +458,51 @@ void Build(Registry& r) {
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.particle_resolution; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.particle_resolution = std::get<std::string>(x); },
     });
+    v.push_back(Desc{
+        .id = "graphics.renderScale", .table = "Graphics", .key = "renderScale", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kRenderScales,
+        .en = "Render scale", .ru = "Масштаб рендеринга",
+        .help_en = "The 3D scene's resolution against the game's resolution, per side; the game scales the scene up "
+                   "and draws the HUD sharp on top. Automatic: at most 1080 lines, as the PS4 (a larger display costs "
+                   "no frame rate). 100 %: the scene at the full resolution (up to about 6 million pixels). With an "
+                   "upscaler (DLSS / FSR) its quality sets the scene instead. Applies at once.",
+        .help_ru = "Разрешение 3D-сцены относительно разрешения игры, по стороне; игра растягивает сцену, а интерфейс "
+                   "рисует поверх чётким. «Автоматически» — не больше 1080 строк, как на PS4 (большой монитор не "
+                   "отнимает FPS). 100 % — сцена в полном разрешении (до ~6 млн пикселей). С апскейлером (DLSS / FSR) "
+                   "сцену задаёт его качество. Применяется сразу.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.render_scale; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.render_scale = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.fov", .table = "Graphics", .key = "fov", .category = Category::Graphics, .type = Type::Int,
+        .apply = Apply::Live, .needs = Capability::RenderScale, .min = 80, .max = 130, .ui_min = 80, .ui_max = 130,
+        .step = 5, .unit = "%", .en = "Field of view", .ru = "Поле зрения",
+        .help_en = "The player camera's field of view against the game's own (its aiming and sprint changes stay). "
+                   "Cut-scenes keep theirs. The picture's shape already widens the view on wide displays (Hor+). "
+                   "Applies at once.",
+        .help_ru = "Поле зрения камеры игрока относительно собственного (её изменения при прицеливании и беге "
+                   "сохраняются). В кат-сценах — своё. Широкий монитор и так расширяет обзор по бокам (Hor+). "
+                   "Применяется сразу.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.fov); },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.fov = static_cast<u32>(std::get<s64>(x)); },
+    });
     // ------------------------------------------------------------------ Upscaling & frame generation
     v.push_back(Desc{
         .id = "upscaling.upscaler", .table = "Graphics", .key = "upscaler", .category = Category::Upscaling,
         .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kUpscalers,
         .en = "Upscaling technology", .ru = "Технология масштабирования",
         .help_en = "The game renders its 3D scene at the quality's lower resolution and the upscaler rebuilds the "
-                   "1920x1080 picture from it (motion vectors, depth and a sub-pixel jitter of the scene); the HUD is "
+                   "picture at the game's resolution from it (motion vectors, depth and a sub-pixel jitter of the scene); the HUD is "
                    "drawn by the game at full resolution on top. DLSS needs a GeForce RTX card; FSR 3.1 runs on any "
-                   "GPU. Off: the game renders at 1920x1080 with its own anti-aliasing.",
+                   "GPU. Off: the scene renders at Render scale with the game's own anti-aliasing.",
         .help_ru = "Игра рендерит 3D-сцену в пониженном разрешении выбранного качества, а апскейлер восстанавливает "
-                   "из неё картинку 1920×1080 (векторы движения, глубина и субпиксельный сдвиг сцены); интерфейс игра "
+                   "из неё картинку в разрешении игры (векторы движения, глубина и субпиксельный сдвиг сцены); интерфейс игра "
                    "рисует поверх в полном разрешении. DLSS нужна видеокарта GeForce RTX; FSR 3.1 работает на любой. "
-                   "«Выключено» — игра рендерит 1920×1080 со своим сглаживанием.",
+                   "«Выключено» — сцена рендерится по «Масштабу рендеринга» со сглаживанием самой игры.",
         .why_en = "Only SecondSonPC's own GPU backend (--gpu-backend sspc) has the upscalers.",
         .why_ru = "Апскейлеры есть только в собственном графическом бэкенде SecondSonPC (--gpu-backend sspc).",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.upscaler; },
@@ -372,10 +512,10 @@ void Build(Registry& r) {
         .id = "upscaling.quality", .table = "Graphics", .key = "upscaleQuality", .category = Category::Upscaling,
         .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kUpscaleQualities,
         .en = "Quality", .ru = "Качество",
-        .help_en = "The render resolution of the scene (output 1920x1080): Quality 1.5x, Balanced 1.7x, Performance 2x, "
+        .help_en = "The render resolution of the scene (output: the game's resolution): Quality 1.5x, Balanced 1.7x, Performance 2x, "
                    "Ultra Performance 3x fewer pixels per side. Lower: faster where the GPU limits the frame rate, "
                    "softer picture. Native: anti-aliasing only, at full resolution.",
-        .help_ru = "Разрешение рендеринга сцены (вывод 1920×1080): «Качество» в 1,5 раза, «Баланс» в 1,7, "
+        .help_ru = "Разрешение рендеринга сцены (вывод — разрешение игры): «Качество» в 1,5 раза, «Баланс» в 1,7, "
                    "«Производительность» в 2, «Ультрапроизводительность» в 3 раза меньше пикселей по стороне. Ниже — "
                    "быстрее там, где кадр упирается в GPU, и мягче картинка. «Нативное» — только сглаживание в полном "
                    "разрешении.",
@@ -453,25 +593,17 @@ void Build(Registry& r) {
     });
     v.push_back(Desc{
         .id = "upscaling.output", .category = Category::Upscaling, .type = Type::Bool, .apply = Apply::Unavailable,
-        .en = "Output resolution: 1920x1080", .ru = "Выходное разрешение: 1920×1080",
-        .why_en = "The upscaler writes the game's own 1920x1080 display buffer, under the game's UI; the window then "
-                  "scales that picture. A larger output needs the game's display size and UI layout changed (not "
-                  "researched).",
-        .why_ru = "Апскейлер пишет в собственный буфер дисплея игры 1920×1080, под её интерфейс; окно затем "
-                  "масштабирует эту картинку. Больший вывод требует изменить размер дисплея и раскладку интерфейса "
-                  "игры (не исследовано).",
+        .en = "Output resolution: the game's resolution", .ru = "Выходное разрешение: разрешение игры",
+        .why_en = "The upscaler writes the game's own display buffer, under its HUD: its size is Display - Resolution "
+                  "(the window then shows that picture).",
+        .why_ru = "Апскейлер пишет в собственный буфер дисплея игры, под её интерфейс: его размер — «Экран» → "
+                  "«Разрешение» (окно затем показывает эту картинку).",
     });
     struct Missing {
         std::string_view id, en, ru, why_en, why_ru;
         u32 cap;
     };
     constexpr Missing kMissing[] = {
-        {"graphics.renderScale", "Render resolution", "Разрешение рендеринга",
-         "Set by the upscaler's quality (Upscaling & frame generation): the scene is rendered smaller only when an "
-         "upscaler rebuilds the picture.",
-         "Задаётся качеством апскейлера (раздел «Масштабирование и генерация кадров»): сцена рендерится меньше "
-         "только тогда, когда апскейлер восстанавливает картинку.",
-         0},
         {"graphics.textures", "Texture quality", "Качество текстур",
          "The game loads one set of textures; another quality needs replaced resources or filtering in the backend "
          "(not researched).",

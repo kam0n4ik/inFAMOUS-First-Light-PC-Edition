@@ -18,6 +18,7 @@
 #include <windows.h>
 
 #include "base/log.h"
+#include "engine/render/render_resolution.h"
 #include "engine/ui/game_menu.h"
 #include "input/device_tracker.h"
 #include "input/keyboard_mouse.h"
@@ -332,10 +333,12 @@ MenuEnv BuildEnv() {
         const auto us = Up::GetStatus();
         u32 rw = 0, rh = 0;
         Up::GetRenderSize(rw, rh);
-        if (rw != 0 && rh != 0 && (rw != 1920 || rh != 1080)) {
-            env.render_label = fmt::format("{} × {} → 1920 × 1080", rw, rh);
+        const Engine::Render::RenderSize ds = Engine::Render::DisplaySize();
+        if (rw != 0 && rh != 0 && (rw != ds.width || rh != ds.height)) {
+            env.render_label = fmt::format("{} × {} → {} × {}", rw, rh, ds.width, ds.height);
         } else {
-            env.render_label = env.ru ? "1920 × 1080 (без масштабирования)" : "1920 × 1080 (native)";
+            env.render_label = fmt::format("{} × {} ({})", ds.width, ds.height,
+                                           env.ru ? "без масштабирования" : "native");
         }
         env.dlss_why = us.dlss_why;
         env.fsr_fg_why = us.fsr_fg_why;
@@ -602,14 +605,17 @@ u32 GamePollTimer(void*, SDL_TimerID, u32 interval) {
     return interval;
 }
 
-/// The game's 1920x1080 frame inside the window's client area (the presenter keeps its proportions, centred).
+/// The game's picture inside the window's client area (the presenter keeps its proportions, centred).
 Rect GameFrame() {
     RECT cr{};
-    if (S().hwnd == nullptr || !GetClientRect(S().hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) {
+    const Engine::Render::RenderSize ds = Engine::Render::DisplaySize();
+    if (S().hwnd == nullptr || !GetClientRect(S().hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0 || ds.width == 0 ||
+        ds.height == 0) {
         return {};
     }
+    const float aspect = static_cast<float>(ds.width) / static_cast<float>(ds.height);
     const float pw = static_cast<float>(cr.right), ph = static_cast<float>(cr.bottom);
-    const float fw = std::min(pw, ph * 16.0f / 9.0f), fh = fw * 9.0f / 16.0f;
+    const float fw = std::min(pw, ph * aspect), fh = fw / aspect;
     return {std::floor((pw - fw) / 2), std::floor((ph - fh) / 2), fw, fh};
 }
 
@@ -624,13 +630,15 @@ bool AdditionalItemChosen(const Gpu::MenuFocus::Row& r) {
     return std::abs(center - kLastRowY) <= kRowPitch / 2;
 }
 
-/// Client pixels -> the game's 1920x1080 frame.
+/// Client pixels -> the game's 1920x1080 menu layout: scaled by the height and centred across a picture that is not
+/// 16:9 (docs/RESOLUTION_RESEARCH.md).
 std::pair<float, float> ToFrame(float x, float y) {
     const Rect f = GameFrame();
-    if (f.w <= 0) {
+    if (f.w <= 0 || f.h <= 0) {
         return {-1, -1};
     }
-    return {(x - f.x) * 1920.0f / f.w, (y - f.y) * 1080.0f / f.h};
+    const float s = 1080.0f / f.h;
+    return {(x - f.x) * s - (f.w * s - 1920.0f) / 2, (y - f.y) * s};
 }
 
 bool InList(float fx, float fy) {

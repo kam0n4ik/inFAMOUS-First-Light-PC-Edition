@@ -40,6 +40,10 @@ vblankFrequency = 60               # FPS unlock is a later stage (game timing mu
 presentMode = "mailbox"            # "mailbox" | "fifo" (vsync) | "immediate"
 showFps = true                   # FPS counter overlay at start-up (F10 toggles)
 monitor = ""                       # display name the window opens on; "" = the primary display
+resolution = "auto"                # the game's own resolution: "auto" (the window; the display in full screen) | "WxH"
+aspectRatio = "auto"               # "auto" (4:3..32:9, Hor+) | "16:9" | "16:10" | "21:9" | "32:9" | "4:3"
+hudSafeArea = 100                  # 85..100 %: the HUD's distance from the picture's edges (the PS4's Display Area)
+hudArea = "full"                   # wide pictures: the HUD at the edges ("full") or in the centre "21:9" / "16:9"
 
 [Audio]
 volume = 100                       # 0..100, on top of the game's own volume settings
@@ -89,6 +93,8 @@ touchTwoFingers = "C"              # while held: two fingers on the touch pad + 
 fsr = false                        # FSR 1.0 scaling of the game's 1920x1080 frame to a larger window
 sharpening = true                  # RCAS after FSR
 sharpness = 88                     # 0..100 %
+renderScale = "auto"               # the 3D scene against the resolution: "auto" (at most 1080 lines) | "50".."100"
+fov = 100                          # 80..130 %: the player camera's field of view (cut-scenes keep theirs)
 
 [Gamepad]                          # real controllers (DualShock 4 and others)
 vibration = 100                    # % of the rumble the game asks for; 0 = off

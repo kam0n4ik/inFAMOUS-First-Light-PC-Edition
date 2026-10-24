@@ -452,6 +452,9 @@ void SettingsMenu::RebuildRows() {
         setting("upscaling.quality");
         setting("upscaling.sharpness");
         AddInfo("Render resolution", "Разрешение рендеринга", "info.render");
+        AddHeader("Picture", "Картинка");
+        setting("graphics.renderScale");
+        setting("graphics.fov");
         AddHeader("Frame generation", "Генерация кадров");
         setting("upscaling.frameGeneration");
         setting("upscaling.frameGenMultiplier");
@@ -1557,9 +1560,10 @@ std::string SettingsMenu::HelpText(size_t row, Color& color) const {
                             why));
         }
     } else if (r.kind == Row::Kind::WindowSize) {
-        add(T("The window's size when not in full screen. The game draws 1920×1080; the window scales the finished "
-              "frame.",
-              "Размер окна вне полноэкранного режима. Игра рисует кадр 1920×1080, окно его масштабирует."));
+        add(T("The window's size when not in full screen. The game draws at its Resolution (automatic: this size, at "
+              "least 1080 lines); the window scales the finished frame.",
+              "Размер окна вне полноэкранного режима. Игра рисует в своём «Разрешении» (автоматически — в этом "
+              "размере, не меньше 1080 строк); окно масштабирует готовый кадр."));
     } else if (r.kind == Row::Kind::ResetPage) {
         add(fmt::format("{} «{}» {}", T("Every setting of", "Все настройки раздела"), PageLabel(page_, env_.ru),
                         T("goes back to its default (SecondSonPC.toml). Asks first.",
@@ -1581,10 +1585,10 @@ std::string SettingsMenu::HelpText(size_t row, Color& color) const {
         add(T("Chosen at start (--gpu-backend). Settings of the other backend are not listed.",
               "Выбирается при запуске (--gpu-backend). Настройки другого бэкенда не показываются."));
     } else if (r.tag == "info.render") {
-        add(T("The 3D scene's resolution now. The game's interface and the output are always 1920×1080; an upscaler "
-              "renders the scene smaller and rebuilds the full picture.",
-              "Разрешение 3D-сцены сейчас. Интерфейс игры и выходной кадр всегда 1920×1080; апскейлер рендерит сцену "
-              "меньше и восстанавливает полную картинку."));
+        add(T("The 3D scene's resolution now -> the game's resolution (its interface and the output). Render scale or "
+              "an upscaler renders the scene smaller; the upscaler rebuilds the full picture.",
+              "Разрешение 3D-сцены сейчас → разрешение игры (её интерфейс и выходной кадр). Масштаб рендеринга или "
+              "апскейлер рендерят сцену меньше; апскейлер восстанавливает полную картинку."));
     } else if (r.tag == "info.settings") {
         add(T("Every change is saved at once to this file, over SecondSonPC.toml's defaults. Delete a line there to use "
               "the default again; keys this version does not know are kept.",

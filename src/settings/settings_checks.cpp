@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 
 #include "app/config.h"
+#include "engine/render/display_plan.h"
 #include "input/binding_rules.h"
 #include "input/device_tracker.h"
 #include "input/gamepad_tuning.h"
@@ -251,7 +252,7 @@ void ServiceChecks(const CheckFn& check, const fs::path& dir) {
     const Desc& vol = *Find("audio.volume");
     const Desc& inv = *Find("input.invertY");
     const Desc& pm = *Find("display.presentMode");
-    const Desc& rs = *Find("graphics.renderScale");
+    const Desc& rs = *Find("graphics.textures");
     const Desc& sens = *Find("input.mouseSensitivity");
 
     check(g, "live change applied and recorded",
@@ -515,6 +516,56 @@ void DeviceChecks(const CheckFn& check) {
 /// The game's button icons (ui/prompt_icons.h): the atlas codec on any bytes; with the game's language table at hand
 /// (SSPC_GAME_DIR, else E:\shdps4\CUSA00004) the real atlas: found, decoded and encoded back to the same bytes, the
 /// three styles built, PNGs of them in `dir` (prompt_*.png) to look at.
+void DisplayPlanChecks(const CheckFn& check) {
+    namespace R = Engine::Render;
+    const auto g = "Display.plan";
+    const auto plan = [](u32 w, u32 h, R::AspectMode a = R::AspectMode::Auto, R::Size fixed = {},
+                         u32 scale = R::kRenderScaleAuto) { return R::PlanDisplay({w, h}, a, fixed, scale); };
+    const auto is = [](R::Size s, u32 w, u32 h) { return s.width == w && s.height == h; };
+    const R::DisplayPlan p720 = plan(1280, 720), p1080 = plan(1920, 1080);
+    check(g, "16:9 up to 1080p: the PS4's sizes, no extra memory",
+          p720.Native() && p1080.Native() && p720.extra_direct_mib == 0 && !p720.boxed && plan(1366, 768).Native(),
+          R::Describe(p720));
+    const R::DisplayPlan uw = plan(2560, 1080);
+    check(g, "2560x1080: display = screen = scene 2560x1080 (Hor+), not boxed",
+          is(uw.display, 2560, 1080) && is(uw.screen, 2560, 1080) && is(uw.scene, 2560, 1080) && !uw.boxed,
+          R::Describe(uw));
+    const R::DisplayPlan uw2 = plan(3440, 1440);
+    check(g, "3440x1440: screen 1080 tall in its shape, auto scene at most 1080 lines",
+          is(uw2.display, 3440, 1440) && is(uw2.screen, 2580, 1080) && uw2.scene.height == 1080 &&
+              uw2.extra_direct_mib > 0,
+          R::Describe(uw2));
+    const R::DisplayPlan uhd = plan(3840, 2160), uhd100 = plan(3840, 2160, R::AspectMode::Auto, {}, 100);
+    check(g, "3840x2160: screen 1920x1080, auto scene 1920x1080; 100 % capped to the verified pixels",
+          is(uhd.display, 3840, 2160) && is(uhd.screen, 1920, 1080) && is(uhd.scene, 1920, 1080) &&
+              uhd100.scene_capped && u64{uhd100.scene.width} * uhd100.scene.height <= R::kMaxScenePixels &&
+              uhd.extra_direct_mib >= 1024,
+          R::Describe(uhd100));
+    const R::DisplayPlan sw = plan(5120, 1440);
+    check(g, "5120x1440 (32:9): screen 3840x1080", is(sw.display, 5120, 1440) && is(sw.screen, 3840, 1080),
+          R::Describe(sw));
+    const R::DisplayPlan p43 = plan(800, 600), p1610 = plan(1280, 800), portrait = plan(600, 800);
+    check(g, "small windows draw 1080 lines: 4:3 1440x1080, 16:10 1728x1080, portrait 16:9 with bars",
+          is(p43.display, 1440, 1080) && is(p43.screen, 1440, 1080) && p43.display_raised && !p43.boxed &&
+              is(p1610.display, 1728, 1080) && is(portrait.display, 1920, 1080) && portrait.boxed,
+          R::Describe(portrait));
+    const R::DisplayPlan fixed = plan(1920, 1080, R::AspectMode::Auto, {2560, 1080});
+    const R::DisplayPlan forced = plan(2560, 1080, R::AspectMode::R16x9);
+    check(g, "a fixed resolution / aspect ratio is boxed into the output",
+          is(fixed.display, 2560, 1080) && fixed.boxed && is(forced.display, 1920, 1080) && forced.boxed &&
+              plan(7680, 1080).aspect <= 32.0 / 9.0 + 1e-3,
+          R::Describe(fixed));
+    R::Size parsed;
+    R::AspectMode aspect = R::AspectMode::Auto;
+    check(g, "parsing: WxH, aspect names, render scale",
+          R::ParseSize("3440x1440", parsed) && is(parsed, 3440, 1440) && !R::ParseSize("3440", parsed) &&
+              !R::ParseSize("100x100", parsed) && R::ParseAspectMode("21:9", aspect) &&
+              aspect == R::AspectMode::R21x9 && !R::ParseAspectMode("5:4", aspect) &&
+              R::ParseRenderScale("75") == 75 && R::ParseRenderScale("auto") == R::kRenderScaleAuto &&
+              R::ParseRenderScale("40") == R::kRenderScaleAuto,
+          "");
+}
+
 void PromptIconChecks(const CheckFn& check, const fs::path& dir) {
     namespace P = Ui::PromptIcons;
     const auto g = "Ui.prompts";
@@ -771,7 +822,7 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
           menu.CurrentPage() == Ui::Page::Graphics && menu.FocusedId() == "upscaling.upscaler", menu.FocusedId());
     const auto graphics = menu.ListedIds();
     check(g, "Graphics: not implemented settings and the bridge's presenter rows are not listed",
-          !contains(graphics, "graphics.renderScale") && !contains(graphics, "graphics.textures") &&
+          contains(graphics, "graphics.renderScale") && !contains(graphics, "graphics.textures") &&
               !contains(graphics, "graphics.fsr") && !contains(graphics, "upscaling.output") &&
               !contains(graphics, "upscaling.frameGenMultiplier") && contains(graphics, "graphics.smokeQuality") &&
               contains(graphics, "info.render"),
@@ -923,6 +974,7 @@ void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     KeyboardMouseChecks(check);
     GamepadChecks(check);
     DeviceChecks(check);
+    DisplayPlanChecks(check);
     PromptIconChecks(check, scratch);
     PromptPictureChecks(check, scratch);
     MenuChecks(check, scratch);

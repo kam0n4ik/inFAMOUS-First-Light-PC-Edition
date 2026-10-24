@@ -887,14 +887,20 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
                                cfg.pc.particle_resolution);
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
-    // size (the engine's own render size, written before it starts); the display and the UI stay 1920x1080.
+    // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {
         Gpu::Upscale::ApplyEnvironmentOverrides();
         // the game starts at the native size (its targets' memory is allocated for it at start; a smaller size is
         // switched to at its first frame and back whenever the menu changes - SSPC_RENDER_RES=WxH: a fixed start size,
         // diagnostics)
-        Engine::Render::InstallRenderResolution(linker.GetModule(eboot_index)->Base(), Engine::Render::kDisplaySize);
+        // the display, screen and scene sizes from main.cpp's plan (docs/RESOLUTION_IMPLEMENTATION.md; the PS4's
+        // 1920x1080 on the bridge's GPU backend)
+        Engine::Render::InstallRenderResolution(linker.GetModule(eboot_index)->Base());
         if (native_gpu) {
+            Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(cfg.pc.render_scale));
+            Engine::Render::SetHudLayout(cfg.pc.hud_safe_area, cfg.pc.hud_area);
+            Engine::Render::SetFovPercent(cfg.pc.fov);
+            Engine::Render::InstallFovControl(linker.GetModule(eboot_index)->Base());
             Engine::Render::InstallTemporalAaControl(linker.GetModule(eboot_index)->Base());
             Engine::Render::InstallRenderSwitch(linker.GetModule(eboot_index)->Base());
             Bridge::ApplyUpscaling(true);

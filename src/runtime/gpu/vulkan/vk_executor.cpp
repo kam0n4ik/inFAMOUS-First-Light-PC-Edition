@@ -39,6 +39,8 @@
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_presenter.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
+#include "runtime/filesystem/fs_host.h"
+#include "runtime/media/videodec.h"
 
 #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
 
@@ -3349,6 +3351,15 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         const size_t first = image_infos.size();
         bool null_image = im.status != GS::ResourceStatus::Ok;
         CachedImage* img = nullptr;
+        if (movie_check_ && !null_image) {
+            // a 1920x1080 movie's picture: the game's copies of the decoder's NV12 planes (8-bit luma, 8_8 chroma at
+            // half size, 16-aligned heights)
+            const u32 tw = im.desc.Width(), th = im.desc.Height(), tf = im.desc.DataFormat();
+            if ((tf == 1 && tw == 1920 && th >= 1080 && th <= 1088) || (tf == 3 && tw == 960 && th >= 540 && th <= 544)) {
+                movie_hit_ = true;
+                movie_v_end_ = static_cast<float>(tw * 9 / 16) / static_cast<float>(th);
+            }
+        }
         // the memo: one view (a dynamic mip index binds every level: not memoized), the same T# and binding flags
         const bool memo_able = !null_image && count == 1 && !im.fmask;
         const u32 flags = image_flags(im);
@@ -3646,7 +3657,7 @@ void Executor::SetDynamicState(const Cp::RegisterFile& r, const GS::GraphicsPipe
         }
     }
     DynMemo memo;
-    if (dyn_memo_on_ == 1 && !stencil_override_ &&
+    if (dyn_memo_on_ == 1 && !stencil_override_ && !movie_fit_ &&
         (dyn_memo_ab_ == 0 || (VideoOut::NextFlipId() / dyn_memo_ab_) % 2 == 1)) {
         memo.valid = true;
         memo.regs = &r;
@@ -3799,6 +3810,17 @@ void Executor::SetDynamicStateWhole(const Cp::RegisterFile& r, const GS::Graphic
         vps[0] = {-1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 1.0f};
         scs[0] = {{0, 0}, {1, 1}};
         n = 1;
+    }
+    if (movie_fit_) { // (the movie draw, see movie_fit_) the viewport: the 16:9 box centred in the target
+        VkViewport& v = vps[0];
+        const float cx = v.x + v.width / 2, cy = v.y + v.height / 2;
+        if (std::abs(v.width) / std::abs(v.height) > 16.0f / 9.0f) {
+            v.width = std::copysign(std::abs(v.height) * 16.0f / 9.0f, v.width);
+        } else {
+            v.height = std::copysign(std::abs(v.width) * 9.0f / 16.0f, v.height);
+        }
+        v.x = cx - v.width / 2;
+        v.y = cy - v.height / 2;
     }
     DynShadow& sh = dyn_;
     const bool all = !sh.valid;
@@ -4920,6 +4942,28 @@ bool Executor::DrawPreparedBatch(std::span<const BatchDraw> draws) {
 }
 
 namespace {
+/// A full-screen movie's vertex constants (0x90 bytes the game writes each frame, docs/RESOLUTION_RESEARCH.md): the
+/// quad's corners (x, y, 0, 1) at +-1, their texture coordinates (u, v, 0, 0), a colour. The game fits the picture to
+/// the target's width: on a target that is not 16:9 v runs past the picture's lines (narrower) or over a part of them
+/// (wider). They are set to the whole picture, as on 16:9 (0 .. v_end); false: not that layout, nothing written.
+bool FitMovieCoords(u64 address, u64 size, float v_end) {
+    static constexpr float kCorners[16] = {1, 1, 0, 1, -1, 1, 0, 1, 1, -1, 0, 1, -1, -1, 0, 1};
+    if (size < 0x90) {
+        return false;
+    }
+    float* c = reinterpret_cast<float*>(address);
+    if (std::memcmp(c, kCorners, sizeof(kCorners)) != 0 || c[16] != 1 || c[20] != 0 || c[24] != 1 || c[28] != 0 ||
+        c[17] != c[21] || c[25] != c[29] || c[17] >= c[25]) {
+        return false;
+    }
+    if (c[17] != 0 || c[25] != v_end) {
+        c[17] = c[21] = 0;
+        c[25] = c[29] = v_end;
+        Filesystem::NotifyHostWrite(address, 0x90);
+    }
+    return true;
+}
+
 /// R8 profile (SSPC_R8_CP_PROFILE): a 0x1a1770 draw's record by its stage (CpProfile::Sec::T2Gb*) - one section open at
 /// a time, the last one left at the record's end (any return)
 class GBufferRecordStages {
@@ -5287,6 +5331,8 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     seg_check_.clear();
     const u64 tb0 = GS::FineTicks();
     aq_what_ = (1ull << 63) | vs.address;
+    movie_check_ = Media::FullScreenMovieShowing();
+    movie_hit_ = false;
     if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
                              d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data(), pc.material[1])) {
         seg_draw_ = false;
@@ -5296,6 +5342,33 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         ++stats_.inst_not_current;
         instanced = false; // (the first draw's own block below; the batch is recorded draw by draw)
         inst_bind_.clear();
+    }
+    // A full-screen movie on a target that is not 16:9: the game's quad covers the whole target and its picture is
+    // fitted to the width - cut above and below on a wider target, its edge lines smeared above and below on a
+    // narrower one. Shown whole and 16:9 instead: the coordinates as on 16:9 (before the vertex stage reads them), the
+    // viewport the centred 16:9 box (SetDynamicState), the rest of the target cleared to black. The subtitles and
+    // menus over it are other draws (docs/RESOLUTION_IMPLEMENTATION.md).
+    movie_fit_ = false;
+    if (movie_hit_ && color_img[0] != nullptr) {
+        const float vw = 2.0f * std::abs(F(regs, kViewport0)), vh = 2.0f * std::abs(F(regs, kViewport0 + 2));
+        const auto& ts = color_img[0]->layout.size;
+        if ((regs.Get(kPaClVteCntl) & 0xF) == 0xF && ((regs.Get(kPaClClipCntl) >> 16) & 1) == 0 && vh > 0 &&
+            std::abs(vw - static_cast<float>(ts.width)) < 1.0f && std::abs(vh - static_cast<float>(ts.height)) < 1.0f &&
+            std::abs(vw / vh - 16.0f / 9.0f) > 0.01f) {
+            for (const auto& b : vs.plan.buffers) {
+                if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.address != 0 &&
+                    FitMovieCoords(b.address, b.size, movie_v_end_)) {
+                    movie_fit_ = true;
+                    break;
+                }
+            }
+            if (movie_fitted_ < 2 || (movie_fitted_ + 1) % 1800 == 0 || (!movie_fit_ && movie_fitted_ < 4)) {
+                SSPC_LOG(GPU, Info, "movie draw {}: {} on its {}x{} target", movie_fitted_ + 1,
+                         movie_fit_ ? "shown whole, 16:9" : "left as the game draws it (not its constants' layout)",
+                         ts.width, ts.height);
+            }
+            ++movie_fitted_;
+        }
     }
     const bool vs_bound = BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
                                     d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data(), pc.material[0]);
@@ -5710,6 +5783,33 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
         ++stats_.push_constants_skipped;
     }
     SetDynamicState(regs, *st, d.indexed);
+    if (movie_fit_) { // (the movie draw kept 16:9: the target outside its box black)
+        const VkViewport& vp = dyn_.vps[0];
+        const s32 bx0 = static_cast<s32>(std::lround(std::min(vp.x, vp.x + vp.width)));
+        const s32 bx1 = static_cast<s32>(std::lround(std::max(vp.x, vp.x + vp.width)));
+        const s32 by0 = static_cast<s32>(std::lround(std::min(vp.y, vp.y + vp.height)));
+        const s32 by1 = static_cast<s32>(std::lround(std::max(vp.y, vp.y + vp.height)));
+        const s32 tw = static_cast<s32>(key.width), th = static_cast<s32>(key.height);
+        std::array<VkClearRect, 2> bars{};
+        u32 nb = 0;
+        const auto bar = [&](s32 x0, s32 y0, s32 x1, s32 y1) {
+            if (x1 > x0 && y1 > y0) {
+                bars[nb++] = {{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}}, 0, key.layers};
+            }
+        };
+        if (bx0 > 0 || bx1 < tw) {
+            bar(0, 0, std::clamp(bx0, 0, tw), th);
+            bar(std::clamp(bx1, 0, tw), 0, tw, th);
+        } else {
+            bar(0, 0, tw, std::clamp(by0, 0, th));
+            bar(0, std::clamp(by1, 0, th), tw, th);
+        }
+        if (nb != 0) {
+            VkClearAttachment black{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0};
+            black.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+            f.vkCmdClearAttachments(cur_.cb, 1, &black, nb, bars.data());
+        }
+    }
     // the hardware's depth/stencil clear (DB_RENDER_CONTROL clear bits): the pixels the draw covers take the clear
     // value - the draw is the game's clear rectangle, so its viewport within its scissor. Not the whole target: a
     // shadow atlas clears each cascade's part before drawing it, and a clear of everything wiped the cascades drawn
@@ -7241,12 +7341,18 @@ void Executor::MenuFocusProbe(const CachedImage& img, VkFormat shown, u32 w, u32
     if (slot == nullptr) {
         return; // the GPU is behind: this flip is not read (the next one is)
     }
-    // the strip in this image's pixels (the game draws its menus for 1920x1080; other sizes scale)
-    const float sx = static_cast<float>(w) / 1920.0f, sy = static_cast<float>(h) / 1080.0f;
-    const u32 x0 = static_cast<u32>(MenuFocus::kStripX * sx), y0 = static_cast<u32>(MenuFocus::kStripY * sy);
+    // the strip in this image's pixels: the game lays its menus out for 1920x1080, scaled by the height and centred
+    // across a picture that is not 16:9 (docs/RESOLUTION_RESEARCH.md)
+    const float sx = static_cast<float>(h) / 1080.0f, sy = sx;
+    const float ox = (static_cast<float>(w) / sx - 1920.0f) / 2;
+    const u32 x0 = static_cast<u32>(std::max(0.0f, (MenuFocus::kStripX + ox) * sx));
+    const u32 y0 = static_cast<u32>(MenuFocus::kStripY * sy);
+    if (x0 >= w) {
+        return;
+    }
     const u32 sw = std::max<u32>(1, std::min<u32>(static_cast<u32>(MenuFocus::kStripW * sx), w - x0));
     const u32 sh = std::max<u32>(1, std::min<u32>(static_cast<u32>(MenuFocus::kStripH * sy), h - y0));
-    const u32 bx = static_cast<u32>(MenuFocus::kBarX * sx);
+    const u32 bx = static_cast<u32>(std::max(0.0f, (MenuFocus::kBarX + ox) * sx));
     const u32 bw = std::max<u32>(1, std::min<u32>(static_cast<u32>(MenuFocus::kBarW * sx), w > bx ? w - bx : 1));
     if (bx >= w) {
         return;

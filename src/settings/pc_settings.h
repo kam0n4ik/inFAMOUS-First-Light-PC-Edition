@@ -16,6 +16,13 @@ struct PcSettings {
     // "144" | "165" | "240" | "unlimited" (a flip as soon as its frame is done). Default 60: no vblank wait, and the
     // frame rate the game was made for (FB-3: its clock measured at 30 / 56 FPS / unlimited runs at wall time)
     std::string frame_rate_limit = "60";
+    // the game's own resolution and picture shape (docs/RESOLUTION_IMPLEMENTATION.md); used from the next start
+    std::string resolution = "auto";   // "auto" (the window, or the display in full screen) | "WxH": the game's display
+    std::string aspect_ratio = "auto"; // "auto" (the output's, 4:3..32:9) | "16:9" | "16:10" | "21:9" | "32:9" | "4:3"
+    // the HUD (while playing): its distance from the picture's edges, as the PS4's Display Area (the game takes
+    // 85..100 %), and on a wide picture the part of it the HUD uses
+    u32 hud_safe_area = 100;       // 85..100 %
+    std::string hud_area = "full"; // "full" (to the picture's edges) | "21:9" | "16:9" (the centre of that shape)
 
     // [Graphics]: the bridge's presenter (FSR 1.0 + RCAS of the final frame); the native backend: P4.6
     bool fsr = false;       // upscales the game's 1920x1080 frame to a larger window
@@ -27,6 +34,10 @@ struct PcSettings {
     // [Graphics] the engine's own reduced-resolution path for its translucent particles (fire, smoke, dust): "auto"
     // (the game's own adaptation) | "full" | "half" | "quarter"
     std::string particle_resolution = "auto";
+    // [Graphics] the 3D scene against the game's display, per side (native backend; while playing up to the size the
+    // game started with): "auto" (at most 1080 lines, as the PS4) | "50" | "60" | "67" | "75" | "85" | "100"
+    std::string render_scale = "auto";
+    u32 fov = 100; // 80..130 %: the player camera's vertical field of view (cut-scenes keep theirs)
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"
     std::string upscale_quality = "quality"; // "native" | "quality" | "balanced" | "performance" | "ultra"

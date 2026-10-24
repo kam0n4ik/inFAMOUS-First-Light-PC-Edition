@@ -6,6 +6,9 @@
 // resource sizes. One deliberate difference: a decoder handle the game no longer owns (deleted, or garbage) is
 // refused with ERROR_HANDLE instead of being used.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -21,6 +24,7 @@ extern "C" {
 #include "base/log.h"
 #include "runtime/exports.h"
 #include "runtime/filesystem/fs_host.h"
+#include "runtime/media/videodec.h"
 
 namespace SecondSon::Media {
 
@@ -112,6 +116,15 @@ u64 AlignUp64(u64 v, u64 a) {
     return (v + a - 1) / a * a;
 }
 
+// Full-screen movies (FullScreenMovieShowing): the decoders alive that gave such pictures, and when the last one came.
+std::atomic<int> g_full_screen{0};
+std::atomic<s64> g_full_screen_ms{0};
+
+s64 NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 class Decoder {
 public:
     explicit Decoder(const ConfigInfo& cfg) {
@@ -135,6 +148,9 @@ public:
                  "videodec: decoder {:#x} done: {} access units in, {} pictures out, {} flushes, {} resets, {} pictures "
                  "with a pts at or before the previous one, {} without a pts, {} errors",
                  reinterpret_cast<u64>(this), units_, pictures_, flushes_, resets_, pts_back_, no_pts_, errors_);
+        if (full_screen_) {
+            g_full_screen.fetch_sub(1);
+        }
         avcodec_free_context(&ctx_);
         sws_freeContext(sws_);
     }
@@ -256,6 +272,14 @@ private:
         pic.is_error_pic = 0;
         pic.pts = static_cast<u64>(frame->pts);
         ++pictures_;
+        if (frame->width >= 1280 && frame->height > 0 &&
+            std::abs(static_cast<double>(frame->width) / frame->height - 16.0 / 9.0) < 0.05) {
+            if (!full_screen_) {
+                full_screen_ = true;
+                g_full_screen.fetch_add(1);
+            }
+            g_full_screen_ms.store(NowMs(), std::memory_order_relaxed);
+        }
         if (pictures_ <= 3) {
             SSPC_LOG(Audio, Info, "videodec: decoder {:#x}: picture {}: pts {:#x}, attached {:#x}",
                      reinterpret_cast<u64>(this), pictures_, pic.pts, reinterpret_cast<u64>(frame->opaque));
@@ -326,6 +350,7 @@ private:
     u64 units_ = 0, pictures_ = 0, flushes_ = 0, resets_ = 0, pts_back_ = 0, errors_ = 0, back_logged_ = 0, no_pts_ = 0;
     u64 last_in_pts_ = 0, last_out_pts_ = 0;
     bool has_out_pts_ = false;
+    bool full_screen_ = false; // counted in g_full_screen
 };
 
 std::mutex g_mutex; // (the set of live decoders; a decoder itself is used by one thread at a time, as on the console)
@@ -466,6 +491,11 @@ const Runtime::Export kExports[] = {
 #undef VD
 
 } // namespace
+
+bool FullScreenMovieShowing() {
+    return g_full_screen.load(std::memory_order_relaxed) > 0 &&
+           NowMs() - g_full_screen_ms.load(std::memory_order_relaxed) < 1500;
+}
 
 std::span<const Runtime::Export> VideodecExports() {
     return kExports;

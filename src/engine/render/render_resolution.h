@@ -8,9 +8,17 @@
 // a lower render size is written into those two instructions before the game runs, so the scene is really rendered
 // at fewer pixels and the game's own scene-to-display scaling (the PS4 Pro path) brings it to the display size,
 // where the HUD is drawn. A temporal upscaler replaces that scaling (native backend).
+//
+// Any display size and shape (docs/RESOLUTION_IMPLEMENTATION.md): the loader also writes the display size (0x1eff55,
+// the same instructions' neighbours) and the screen size (0x1f03f8: the HUD's layout space and every camera's aspect)
+// from the plan main.cpp made (display_plan.h); the game's PS4 Pro path then does the rest (its HUD scaled from the
+// screen to the display, the scene scaled to the display).
 #pragma once
 
+#include <string_view>
+
 #include "base/abi.h"
+#include "engine/render/display_plan.h"
 
 namespace SecondSon::Engine::Render {
 
@@ -22,16 +30,41 @@ struct RenderSize {
 /// The display size of the PS4 build (VideoOut buffers, UI).
 constexpr RenderSize kDisplaySize{1920, 1080};
 
+/// The plan the game starts with (main.cpp, before the bridge starts; the PS4's 1920x1080 unless set) and the render
+/// scale ([Graphics] renderScale: kRenderScaleAuto or 50..100; it changes while playing).
+void SetDisplayPlan(const DisplayPlan& plan);
+const DisplayPlan& GetDisplayPlan();
+void SetRenderScale(u32 render_scale);
+/// The scene size the render scale asks for now (without an upscaler), within the size the game started with.
+RenderSize SceneSizeForRenderScale();
+
 /// A render size for `scale` (display / render per side, >= 1): rounded to 16 pixels in width and 8 in height, at
 /// least 640x360 (the engine's quarter-size targets have a floor of 480x270).
 RenderSize RenderSizeForScale(float scale);
 
-/// The loader's window before the guest runs: writes `size` into the game's render size (SSPC_RENDER_RES=WxH wins).
-/// 1920x1080 leaves the code untouched. Returns false and logs why when the code is not the analysed one.
-bool InstallRenderResolution(u64 eboot_base, RenderSize size);
+/// The loader's window before the guest runs: writes the plan's display, screen and (largest) scene size into the
+/// game's code (SSPC_RENDER_RES=WxH: the scene's start size, SSPC_DISPLAY_RES / SSPC_SCREEN_RES: diagnostics). The
+/// PS4's sizes leave the code untouched. Returns false and logs why when the code is not the analysed one.
+bool InstallRenderResolution(u64 eboot_base);
 
 /// The scene's render size now (the size the game started with, then the last switch).
 RenderSize CurrentRenderSize();
+/// The game's display size (its VideoOut buffers and UI): kDisplaySize unless the loader changed it.
+RenderSize DisplaySize();
+
+/// The HUD's distance from the picture's edges ([Display] hudSafeArea 85..100 %, as the PS4's Display Area the game
+/// reads with sceSystemServiceGetDisplaySafeAreaInfo) and the part of a wide picture it uses ([Display] hudArea "full" |
+/// "21:9" | "16:9"). The game's margins (0x1d0ccc8 / 0x1d0cccc, screen units) are written at every frame start (needs
+/// InstallRenderSwitch); 100 % and "full" are the game's own 16 / 16.
+void SetHudLayout(u32 safe_area_percent, std::string_view area);
+/// The safe area ratio sceSystemServiceGetDisplaySafeAreaInfo reports (0.85..1).
+float HudSafeAreaRatio();
+
+/// [Graphics] fov 80..130 %: the player camera's vertical field of view. An entry probe on Camera::SetFov 0x580580
+/// scales the angle when the call comes from the player camera's update (0x14ddd0, return address 0x14f517); the
+/// cut-scene and the other cameras keep theirs. Install in the loader's window.
+bool InstallFovControl(u64 eboot_base);
+void SetFovPercent(u32 percent);
 
 /// The render size changed while the game runs (the PS4 Pro's mode switch path): an entry probe on FrameBegin
 /// 0x1f0be0 writes a requested size into the device and its size-class table and re-describes the display and scene
