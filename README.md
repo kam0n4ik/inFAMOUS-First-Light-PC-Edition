@@ -476,7 +476,8 @@ Vulkan 1.3 driver
 - [x] Free frame pacing
 - [x] City: draw runs (CITY-OPT 1–6), trivial waits (R6-P), emitter batching (R8)
 - [x] Gameplay: no pipeline-cache freezes (F1), no vertex heap re-imports (F3)
-- [ ] REA-3 / AQ with even frame pacing (then into `play.cmd`): R10 MAIN_FREE fixed the 17 / 43 ms pairs; Neon Dash and a 20-minute run remain
+- [x] REA-3 / AQ with even frame pacing in fights and on the owner's save (R10 MAIN_FREE, `play_experimental.cmd`)
+- [ ] REA-3 / AQ / MAIN_FREE into `play.cmd`, after Neon Dash (1 % low and P99 below `play.cmd` now) and a 20-minute run
 - [ ] Less command processor work for the remaining draws
 - [ ] Potato mode for weak PCs in `main`
 
