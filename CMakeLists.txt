@@ -217,8 +217,24 @@ foreach(_r9 profile)
     include(${CMAKE_SOURCE_DIR}/cmake/r9/${_r9}.cmake)
 endforeach()
 target_sources(sspc_runtime PRIVATE ${SSPC_R9_PROFILE_SOURCES})
+# R10 sysrt (docs/R10_SYSRT.md): its own list (cmake/r10/sysrt.cmake), the bridge's part in sspc_attach_bootstrap
+include(${CMAKE_SOURCE_DIR}/cmake/r10/sysrt.cmake)
+target_sources(sspc_runtime PRIVATE ${SSPC_R10_SYSRT_SOURCES})
+# R10 sched (docs/R10_CPU_GPU_SCHEDULER.md): the latency probe and the pipeline workers' pool (cmake/r10/sched.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/r10/sched.cmake)
+target_sources(sspc_runtime PRIVATE ${SSPC_R10_SCHED_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
+# R10 (docs/R10_AJM.md): libSceAjm, SecondSonPC's own (runtime/audio/ajm.cpp, SSPC_R10_AJM=native|verify), on its
+# own copy of LibAtrac9 (third_party/LibAtrac9, MIT). Every external symbol of the copy is renamed (SspcAt9_*) by a
+# force-included header, so it never meets the bridge's LibAtrac9 at link time and keeps its own global tables.
+file(GLOB SSPC_ATRAC9_SOURCES ${CMAKE_SOURCE_DIR}/third_party/LibAtrac9/src/*.c)
+add_library(sspc_atrac9 STATIC ${SSPC_ATRAC9_SOURCES})
+target_compile_definitions(sspc_atrac9 PRIVATE SSPC_ATRAC9_BUILD _CRT_SECURE_NO_WARNINGS)
+target_compile_options(sspc_atrac9 PRIVATE "/FI${CMAKE_SOURCE_DIR}/third_party/LibAtrac9/sspc_atrac9_prefix.h" -w)
+target_include_directories(sspc_atrac9 INTERFACE ${CMAKE_SOURCE_DIR}/third_party/LibAtrac9) # <src/libatrac9.h>
+target_sources(sspc_runtime PRIVATE src/runtime/audio/ajm.cpp)
+target_link_libraries(sspc_runtime PRIVATE sspc_atrac9)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
 # (src/runtime/gpu/vulkan). No loader is linked: the system vulkan-1.dll is loaded at run time, as the bridge does.
 target_link_libraries(sspc_runtime PRIVATE Vulkan::Headers)
@@ -299,6 +315,7 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/input/binding_rules.cpp
     src/input/device_tracker.cpp
     src/input/gamepad_tuning.cpp
+    src/settings/experiments.cpp
     src/settings/registry.cpp
     src/settings/settings_checks.cpp
     src/settings/settings_service.cpp

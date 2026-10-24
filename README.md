@@ -65,7 +65,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
    |---|---|
    | `SecondSonPC.exe` | the runtime |
    | `play.cmd` | starts the game with every improvement that is on for players, after backing up the saves |
-   | `play_experimental.cmd` | `play.cmd` plus two faster experiments with less even frame pacing (REA-3 + AQ, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md)) |
+   | `play_experimental.cmd` | `play.cmd` plus faster experiments (REA-3 + AQ + R10's MAIN_FREE, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md), [R10_PACING.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_PACING.md)): +19 % FPS on the owner's save, +14 % in a fight, but a lower 1 % low in Neon Dash |
    | `SecondSonPC.toml` | defaults: window, language, keys, PC settings |
    | `data\static_templates.txt` | the data the shader preparation predicts the game's shaders from |
    | `sspc_dlss.dll`, `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `sl.*.dll`, `NvLowLatencyVk.dll` | NVIDIA DLSS 310.9.1, Streamline 2.14.1, Reflex |
@@ -251,12 +251,11 @@ The game imports 417 system functions. Their owner in the current build (snapsho
 | shadPS4 (bridge) | 61 | 8 |
 | shadPS4 common stub | 20 | 1 |
 
-The bridge functions the game actually calls:
-- `sceAjmInitialize`, `sceAjmModuleRegister` (ATRAC9 audio decoding);
-- `sceCommonDialogInitialize`;
-- `sceNetInit`, `sceNetPoolCreate`, `sceNetInetNtop`;
-- `sceLibcHeapGetTraceInfo`, `fflush`;
-- the common stub `vprintf`.
+R10 moved the rest of what the game calls onto SecondSonPC's own code, and `play.cmd` turns it on:
+- `SSPC_R10_SYSRT=native`: CommonDialog, libSceNet and the libc functions the game calls (`sceLibcHeapGetTraceInfo`, `fflush`, `vprintf`). The owners of the 417 imports go from 338 / 59 / 18 / 2 (native / bridge / common stub / unresolved) to 350 / 49 / 17 / 1, and the imports called in a normal run that SecondSonPC does not own go from 9 to 2, both libSceAjm's ([R10_SYSRT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_SYSRT.md)).
+- `SSPC_R10_AJM=native`: all 11 libSceAjm imports, with ATRAC9 decoded by LibAtrac9 (MIT); 15 192 frames decode the same as with shadPS4 ([R10_AJM.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_AJM.md)). The game itself only calls `sceAjmInitialize` and `sceAjmModuleRegister`: its music and dialogue go through Wwise.
+
+`bridge` instead of `native` gives either one back to shadPS4.
 
 shadPS4 is also what the build is assembled on: its CMake target, its third-party libraries (SDL3, Vulkan headers, VMA, fmt, toml11, xbyak, Zydis) and, as A/B references only, its renderer (`--gpu-backend bridge`) and shader recompiler (`SSPC_OWN_SHADERS=bridge`). Building without it is on the [roadmap](#roadmap).
 
@@ -276,18 +275,24 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 | GPU: PM4 command processor (graphics + async compute), Vulkan backend | own, default |
 | Shader translation GCN → SPIR-V | own, default for compute, vertex and pixel programs; shadPS4's recompiler only as an A/B reference and for the programs the own translator declines |
 | Engine render functions (G-buffer and shadow passes, materials, constant update engine) | 18 own reconstructions, verified in game; off by default (`SSPC_NATIVE_ENGINE`) except the native G-buffer draw `0x1a1770` in `play.cmd` |
-| Ajm / ATRAC9 audio decoding, common dialogs, a few network / libc functions | shadPS4 |
+| Ajm / ATRAC9 audio decoding, common dialogs, network, the libc functions the game calls | own in `play.cmd` (R10: `SSPC_R10_AJM`, `SSPC_R10_SYSRT`); shadPS4 with `bridge` |
 
 ### What is new
 
 **October 2026, the last week** (all in `main`):
 
+- **R10 — five directions at once** ([R10_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_FINAL_REPORT.md)):
+  - **Own Ajm / ATRAC9, common dialogs, network and libc** (see [above](#playstation-functions-the-game-imports)) are on in `play.cmd`.
+  - **Experiments in the settings menu.** Every switch of `play.cmd` and every experiment is on the new **Experiments** page, with what it measured, so a player can try what works better on their PC (see [PC settings](#pc-settings)).
+  - **MAIN_FREE** makes REA-3 + AQ faster and more even, but it is in `play_experimental.cmd` only (below).
+  - Measured and left off: compute pipeline prefetch and a shared work pool for pipeline builds (with an empty shader cache Neon Dash 12.9 → 26.1 FPS, one run; with a warm cache no change), spreading heavy threads over cores (no gain), runs across pixel shader changes (city slower), native shadow draws (no FPS change) ([R10_CP.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_CP.md), [R10_CPU_GPU_SCHEDULER.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_CPU_GPU_SCHEDULER.md)).
 - **R9 — gameplay, not just standing scenes.** A gameplay profiler and fixed routes (fight, traverse, a player's save), on top of which two changes went into `play.cmd`:
   - **F1:** the driver's 827 MiB pipeline cache was saved under the shader cache's lock once a minute, freezing the game for 1–5 s. It is now saved off that lock.
   - **F3:** the vertex heap's window into guest memory is reserved with headroom, and old windows are released, so 2.5 GB re-imports and 220–250 ms stalls are gone.
 
   Fight 44.5 → 46.0 FPS, 1 % low 7.5 → 25.6, worst frame 3 166 → 82 ms; traverse 47.4 → 51.3, 1 % low 6.1 → 27.9 ([R9_GAMEPLAY_PERFORMANCE.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_GAMEPLAY_PERFORMANCE.md)).
 - **R9 REA-3 and AQ, experimental.** REA-3 has the GPU take the game's second async compute wait of a frame; AQ runs the game's compute on a Vulkan queue of its own. The hang after 16 minutes is fixed by a safe reset, and the device loss with AQ is fixed. With both, the owner's save runs at +11 % FPS, but frames still alternate 17 / 43 ms, so both stay out of `play.cmd` and only `play_experimental.cmd` turns them on ([R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md)).
+- **R10 MAIN_FREE, experimental.** The 17 / 43 ms pairs came from AQ ordering every graphics batch after every compute batch before it: the two queues overlapped 2–3 ms of a 28 ms frame. With `SSPC_R10_AQ_MAIN_FREE=1` a graphics batch waits only for the compute it depends on (the game's waits, shared memory, the queue's own order). REA-3 + AQ + MAIN_FREE against `play.cmd` (medians, FPS / 1 % low / P99 frame time): owner's save 31.6 / 19.0 / 38.5 ms → 37.6 / 19.7 / 38.5 ms (n = 4), fight 46.6 / 24.8 / 31.2 → 53.0 / 26.9 / 27.8 (n = 4), city traverse 48.4 / 22.7 → 50.7 / 23.2 (n = 2), beach the same; Neon Dash 38.9 / 18.9 → 38.1 / 16.3 (n = 2) is worse, so it is in `play_experimental.cmd` only. Vulkan Validation with Synchronization Validation: no messages. Harbour, village and a 20-minute run were not tested ([R10_PACING.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_PACING.md)).
 - **R8 — the command processor thread.**
   - **Emitter batching:** the Vulkan recording thread publishes its commands once per record. This takes 2.2 ms a frame off it, and the city bench goes 39.1 → 41.5 FPS ([R8_T2_OPTIMIZATION.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R8_T2_OPTIMIZATION.md)).
   - The frontend and the Vulkan emitter run on threads of their own, with a 128-entry command ring: the live city goes 28.6 → 36.1 FPS.
@@ -375,7 +380,8 @@ The native engine work replaces individual engine functions with SecondSonPC's i
 
 The PC options live inside the game's own menu: **Esc (Options) → Settings → "Additional settings"**. This is the line that used to read "HDR Rendering — Unavailable"; the string is replaced as it is read, and the game's files are not changed.
 
-- There are seven pages: **Graphics, Display, Controls, Keys, Audio, Game, Advanced**.
+- There are eight pages: **Graphics, Display, Controls, Keys, Audio, Game, Advanced, Experiments**.
+- **Experiments** lists the runtime's switches by group: the command processor, Vulkan recording, pipelines and memory, GPU queues and frame pacing, processor threads, R10's draws from the engine's data, the system libraries. Each says what it does, what it measured and whether `play.cmd` or `play_experimental.cmd` turns it on. The launcher's value is the default; what a player changes is saved in their settings file and applies from the next start, because those subsystems read it once at start. "Reset this page" returns to the launcher's values. The log marks every changed one with `EXPERIMENT`.
 - The window works with keyboard, mouse and gamepad navigation, with prompts for the last device used.
 - Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, frame-rate limit, mouse and motion settings, volume.
 - Window mode, size and monitor changes ask for confirmation for 15 s.
@@ -396,17 +402,18 @@ Keyboard and mouse are handled natively, with PC key bindings. The game draws ev
   <img src=".github/readme/prw2.png" alt="Original-style controller prompts and alternative button layouts" width="900">
 </p>
 
-## Branches
+## Archive
 
-`main` is the playable build. Work that is not in it lives in branches:
+`main` is the playable build and the only branch. Earlier work that is not in it is kept in tags:
 
-| Branch | What | State |
+| Tag | What | State |
 |---|---|---|
-| [`feature/native-engine-r8`](../../tree/feature/native-engine-r8) (+ `feature/r8-cp-profile`, `r8-native-cp`, `r8-render-layer`, `r8-recomp`, `r8-verify`) | R8 directions: the native render layer, a CUE audit, a deterministic verification mode | the R8 core, profile, CP channel, native G-buffer draw and emitter batching are in `main`; the rest is research |
-| [`feature/fork-port-prep-workers`](../../tree/feature/fork-port-prep-workers) | ideas from the axylpup shadPS4 fork; **potato mode** for weak PCs (`[Graphics] potatoMode` levels 1–4: fewer shadow maps and small objects) | the frontend and emitter threads are in `main`; potato mode only in the branch |
-| [`feature/native-missions`](../../tree/feature/native-missions) (on top of [`feature/native-rebirth`](../../tree/feature/native-rebirth)) | **Native Rebirth**: a separate native program that reads the game's packages itself, renders with its own Vulkan renderer, plays Delsin's original animations on the original Havok collision and runs the prologue's graffiti mission | research vertical slice, not the game |
-| [`experiment/bbport-gpu`](../../tree/experiment/bbport-gpu) | BBPort's GPU library as the backend | rejected: 25 vs 40 FPS, effects missing |
-| [`feature/uncharted-bbport-optimizations`](../../tree/feature/uncharted-bbport-optimizations) | uncharted_pc / bbport techniques: threaded recording, preparation workers, LTO, PGO | measured, nothing taken |
+| [`archive/feature/native-engine-r8`](../../tree/archive/feature/native-engine-r8) (+ `archive/feature/r8-cp-profile`, `r8-native-cp`, `r8-render-layer`, `r8-recomp`, `r8-verify`) | R8 directions: the native render layer, a CUE audit, a deterministic verification mode | the R8 core, profile, CP channel, native G-buffer draw and emitter batching are in `main`; the rest is research |
+| [`archive/feature/fork-port-prep-workers`](../../tree/archive/feature/fork-port-prep-workers) | ideas from the axylpup shadPS4 fork; **potato mode** for weak PCs (`[Graphics] potatoMode` levels 1–4: fewer shadow maps and small objects) | the frontend and emitter threads are in `main`; potato mode only in the tag |
+| [`archive/feature/native-missions`](../../tree/archive/feature/native-missions) (on top of [`archive/feature/native-rebirth`](../../tree/archive/feature/native-rebirth)) | **Native Rebirth**: a separate native program that reads the game's packages itself, renders with its own Vulkan renderer, plays Delsin's original animations on the original Havok collision and runs the prologue's graffiti mission | research vertical slice, not the game |
+| [`archive/experiment/bbport-gpu`](../../tree/archive/experiment/bbport-gpu) | BBPort's GPU library as the backend | rejected: 25 vs 40 FPS, effects missing |
+| [`archive/feature/uncharted-bbport-optimizations`](../../tree/archive/feature/uncharted-bbport-optimizations) | uncharted_pc / bbport techniques: threaded recording, preparation workers, LTO, PGO | measured, nothing taken |
+| [`archive/docs-r10-20261024`](../../tree/archive/docs-r10-20261024) | R10 as developed: its six reports in `docs/`, its tools in `tools/r10` | the code is in `main` |
 
 The tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023) keeps the removed development scripts: A/B stand, measurement routes, analysis tools, the `play_*.cmd` variants.
 
@@ -423,7 +430,7 @@ SecondSonPC loader and runtime
         +-- save data, WASAPI audio, video decoding
         +-- offline network / NP / trophies
         +-- PC settings window in the game's menu, input, button prompts
-        +-- [shadPS4 bridge: Ajm, common dialogs, a few net / libc functions]
+        +-- Ajm / ATRAC9, common dialogs, network, libc (R10, on in play.cmd)
         |
         +-- native engine: hash-pinned replacements of engine functions
         |     (hand-written / recompiled with AVX; verify, guarded, native)
@@ -446,7 +453,7 @@ Vulkan 1.3 driver
 - **Intel CPUs** lack SSE4a. In a forced test on AMD, the 73 short `extrq` emulated through faults cost ~10 % FPS at the start of a scene. A real Intel CPU has not been tested ([SSPC-011](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md)).
 - **Tested hardware.** Only one PC was tested: Ryzen 5 5500, RTX 2060 and Windows 10. AMD and Intel GPUs and other drivers are unknown.
 - **Game version.** Only CUSA00004 with update 01.07 (EU) is tested; the engine replacements install only on that executable.
-- **From shadPS4.** Ajm / ATRAC9, common dialogs and a few network / libc functions still come from shadPS4, and the build still needs `third_party/shadPS4`.
+- **From shadPS4.** The build still needs `third_party/shadPS4`: its CMake target, its third-party libraries, and the bridge as the A/B reference (the `bridge` values of the switches). 49 imports that the game does not call in a normal run still belong to the bridge.
 - **Memory.** On a PC without a page file, total committed memory can reach the Windows limit in long sessions; keep the page file on. Fixed causes are in [`KNOWN_ISSUES.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md).
 - **Shader preparation** cannot predict every program: 166 of about 304 000 predicted shader requests are declined by the own translator (for example an `image_sample` whose resource is not known before the game runs). The game translates those the first time it uses them, which can cause one short stutter.
 - **Frame generation** has not been reviewed frame by frame, and input latency with it is not measured.
@@ -458,8 +465,9 @@ Vulkan 1.3 driver
 - [x] Own loader, kernel, threads, memory, exceptions, CPU patcher
 - [x] File system, system services, save data, offline network / trophies
 - [x] WASAPI audio output, video decoding
-- [ ] Ajm / ATRAC9 decoding
-- [ ] Common dialogs, remaining network and libc functions
+- [x] Ajm / ATRAC9 decoding (R10, LibAtrac9)
+- [x] Common dialogs, network and the libc functions the game calls (R10)
+- [ ] The imports the game does not call in a normal run (49 at the bridge)
 
 ### Graphics and performance
 - [x] Own PM4 command processor and Vulkan backend (default), four threads
@@ -468,7 +476,7 @@ Vulkan 1.3 driver
 - [x] Free frame pacing
 - [x] City: draw runs (CITY-OPT 1–6), trivial waits (R6-P), emitter batching (R8)
 - [x] Gameplay: no pipeline-cache freezes (F1), no vertex heap re-imports (F3)
-- [ ] REA-3 / AQ with even frame pacing (then into `play.cmd`)
+- [ ] REA-3 / AQ with even frame pacing (then into `play.cmd`): R10 MAIN_FREE fixed the 17 / 43 ms pairs; Neon Dash and a 20-minute run remain
 - [ ] Less command processor work for the remaining draws
 - [ ] Potato mode for weak PCs in `main`
 
@@ -481,6 +489,7 @@ Vulkan 1.3 driver
 
 ### PC experience
 - [x] PC settings window in the game's menu
+- [x] Experiments page: every runtime switch on and off from the menu (R10)
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
 - [x] A release package for the game's folder (`build.ps1`, `play.cmd`)
 - [ ] Tested on more hardware (AMD / Intel GPUs, Intel CPUs)
@@ -491,7 +500,7 @@ Vulkan 1.3 driver
 
 ## Reports
 
-Every phase ends with a report: what was measured, what was kept, what was rejected and why. They are not part of the build, so they are not in `main`: the full list, **135 reports** at the tag `archive/docs-20261023`, in the branches and in the tools archive, grouped by area, is in **[`REPORTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English.
+Every phase ends with a report: what was measured, what was kept, what was rejected and why. They are not part of the build, so they are not in `main`: the full list, **135 reports** at the tag `archive/docs-20261023` and in the other archive tags, grouped by area, is in **[`REPORTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English. R10's six reports are at the tag `archive/docs-r10-20261024`, starting with [R10_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_FINAL_REPORT.md).
 
 ## Contributing
 
@@ -513,7 +522,7 @@ Third-party components remain under their own licences. These include shadPS4 (G
 ## Acknowledgements
 
 - The shadPS4 project, whose emulator core the port started from and still builds on.
-- The axylpup shadPS4 fork for Second Son, whose split of command processing inspired the fork-port branch.
+- The axylpup shadPS4 fork for Second Son, whose split of command processing inspired the fork-port work (`archive/feature/fork-port-prep-workers`).
 - The BBPort (Bloodborne PC) and uncharted_pc projects, whose techniques were measured here.
 - Ghidra, LLVM and the authors of the open-source Vulkan tools and libraries used here.
 - Researchers documenting PlayStation 4 hardware, GCN and executable formats.

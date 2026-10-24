@@ -15,7 +15,10 @@
 #include "runtime/kernel/kernel_memory.h"
 #include "runtime/kernel/signal.h"
 #include "runtime/kernel/thread.h"
+#include "runtime/libc/libc_stdio.h"
+#include "runtime/net/net_core.h"
 #include "runtime/pad/pad.h"
+#include "runtime/system/common_dialog.h"
 #include "runtime/savedata/savedata.h"
 #include "runtime/system/system_service.h"
 #include "runtime/user/user_service.h"
@@ -30,6 +33,7 @@ std::span<const Runtime::Export> VideodecExports(); // runtime/media/videodec.cp
 
 namespace SecondSon::Audio {
 std::span<const Runtime::Export> AudioOutExports(); // runtime/audio/audio_out.cpp
+std::span<const Runtime::Export> AjmExports();      // runtime/audio/ajm.cpp (R10: empty unless SSPC_R10_AJM)
 }
 
 namespace SecondSon::Runtime {
@@ -100,9 +104,15 @@ std::vector<Export> Collect() {
                              Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
                              Kernel::DirectMemoryExports(), Kernel::ProcessExports(), Kernel::Threads::ThreadExports(),
                              Kernel::Signals::SignalExports(), Kernel::GuestErrno::Exports(),
+                             Audio::AjmExports(), // R10 (empty unless SSPC_R10_AJM=native|verify)
                              Kernel::MemoryApi::Exports(), Kernel::Clock::Exports(),
                              Net::NetUtilExports(), Np::NpManagerExports(), Offline::OfflineExports(), Libc::LibcMemExports(), Gpu::Gnm::GnmExports(), Gpu::VideoOut::Exports(),
                              std::span<const Export>(kFilesystemObservers)}) {
+        all.insert(all.end(), group.begin(), group.end());
+    }
+    // R10 sysrt (docs/R10_SYSRT.md): CommonDialog, libSceNet's library state, libSceLibcInternal's stdout and heap
+    // trace information - experimental groups sysrt-dialog / sysrt-net / sysrt-libc (SSPC_R10_SYSRT=native)
+    for (const auto group : {CommonDialog::CommonDialogExports(), Net::NetCoreExports(), Libc::LibcStdioExports()}) {
         all.insert(all.end(), group.begin(), group.end());
     }
     return all;

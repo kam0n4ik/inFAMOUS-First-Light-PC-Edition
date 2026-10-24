@@ -9,7 +9,7 @@ https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition
    later starts take a few seconds.
 
 play.cmd               the game with every improvement that is on for players
-play_experimental.cmd  play.cmd plus two faster experiments with less even frame pacing
+play_experimental.cmd  play.cmd plus faster experiments (REA-3, AQ, MAIN_FREE); Neon Dash is less even
 SecondSonPC.toml       defaults (window, language, keys); your changes from the in-game window are kept in
                        %LOCALAPPDATA%\SecondSonPC\settings.toml
 userdata\              saves (copied to userdata\savedata_backups\ before every start)
@@ -17,4 +17,6 @@ cache\shaders\         the prepared shaders (safe to delete: they are prepared a
 logs\                  SecondSonPC.log - attach it to a bug report
 
 PC settings: Esc (Options) -> Settings -> "Additional settings".
+Experiments: the last page of that window turns every switch of play.cmd and every experiment on or off;
+             a change applies from the next start, "Reset this page" goes back to the launcher's values.
 Requirements, known issues, benchmarks: README.md on the project page.

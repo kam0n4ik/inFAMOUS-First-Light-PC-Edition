@@ -269,7 +269,7 @@ public:
     bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                        u32 pattern) override;
     void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
-    void WaitMetByHeldFence(u32 queue) override;
+    void WaitMetByHeldFence(u32 queue, u64 after_seq) override;
 
     // Cp::RegisterSink (thread 1: the processor's register file)
     void OnWrite(Cp::Space space, u32 offset, const u32* values, u32 count) override;
@@ -309,7 +309,8 @@ private:
         std::vector<u8> payload;             ///< CP-9 Write: the data (capacity reused)
         Cp::DmaKind gds_kind{};              ///< CP-9 Gds (memory in src)
         u32 gds_offset = 0, pattern = 0;     ///< Gds; Zpass: the DB mask, the stride
-        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
+        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC);
+                                              ///< WaitMet: seq = the meeting fence's after_seq (R10; 0: none)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
         GS::StageView stage, ps; ///< VS or CS; PS
@@ -571,12 +572,20 @@ private:
     /// smp_mask; 17: another kind of image or sampler, 18: one past kMaxSharpIndex), thread 2 pushes only those
     /// (Executor::DrawRunMembers); verify: each member prepared in full too and compared (as GBUFFER_RUNS=verify)
     u8 gmat_ = 0; ///< 0 off, 1 on, 2 verify
+    /// SSPC_R10_RUN_PS (0 off, 1 on, 2 verify): members of mesh 0x1a1960 / shadow 0x43d480 runs whose PS user data
+    /// differ (the run ended at group PsUserData before) join with their PS plan decoded again (as a G-buffer run's
+    /// members); SSPC_R10_RUN_PS_MATERIAL=1: with T#s / S#s of their own too (as SSPC_CITY_GB_RUN_MATERIAL)
+    u8 run_ps_ = 0;
+    u8 run_ps_mat_ = 0;
+    std::array<std::atomic<u64>, 4> run_ps_joined_{}; ///< by source: members joined with a PS of their own (R10)
     /// members joined with images or samplers of their own; those images / samplers
     std::atomic<u64> gmat_joined_{0}, gmat_images_{0}, gmat_samplers_{0};
     /// R8: bindings a member has again because the member before it had them as its own (thread 2 records a member on
     /// the descriptors the one before left: the run's again over those - 19: more than RunMember::kMaxBuffers then)
     std::atomic<u64> run_restored_{0};
-    std::array<std::atomic<u64>, 64> gb_groups_{}; ///< G-buffer members refused for groups (3): the groups that changed
+    /// members refused for groups (3) by the run's engine source (DrawRuns::Source: 1 mesh, 2 shadow, 3 G-buffer): the
+    /// groups that changed (R8: G-buffer only; R10: every source)
+    std::array<std::array<std::atomic<u64>, 64>, 4> gb_groups_{};
     bool batch_on_ = false;
     u32 batch_ab_ = 0;
     std::vector<Vk::BatchDraw> batch_items_;
@@ -589,6 +598,10 @@ private:
     std::atomic<u64> reuse_same_{0}, reuse_copied_{0}, reuse_mismatches_{0};
     GS::ShaderFrontend* frontend_ = nullptr;
     NativeGBuffer ngb_; ///< SSPC_NATIVE_GBUFFER: the engine-descriptor G-buffer path (reads the environment itself)
+    /// R10 (SSPC_R10_NATIVE_DRAWS): the same path for the mesh (0x1a1960) and shadow casters' (0x43d480) draws, from the
+    /// CUE state their probes captured (draw_runs.h EngineStages); [0] mesh, [1] shadow
+    std::array<NativeGBuffer, 2> ndr_{NativeGBuffer("SSPC_R10_NATIVE_DRAWS", "R10 native mesh draws 0x1a1960"),
+                                      NativeGBuffer("SSPC_R10_NATIVE_DRAWS", "R10 native shadow draws 0x43d480")};
     Cp::GroupMask ngb_pending_ = 0; ///< the groups changed at draws ngb_ prepared without the frontend
     const std::atomic<u64>* map_gen_ = nullptr;
     const Vk::Timeline* timeline_ = nullptr;
