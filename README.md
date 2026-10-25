@@ -43,7 +43,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   - The game's shaders are predicted from its own pack files and compiled once, before the game starts.
   - Translated SPIR-V and the driver's pipeline cache are kept on disk.
   - The pipeline cache is saved without blocking the renderer (R9 F1), which removed 1–5 s freezes once a minute.
-- **Free frame pacing.** Frame pacing is not tied to the PS4's 59.94 Hz vblank. The frame-rate limit is 30, 60, 90, 120, 144, 165, 240 or unlimited, and the game's clock was measured to be independent of FPS. The 1 % lows went from 29 to 47–49 FPS on the beach and in the harbour.
+- **Free frame pacing.** Frame pacing is not tied to the PS4's 59.94 Hz vblank. The frame-rate limit is 30, 40, 50, 60, 90, 120, 144, 165, 240 or unlimited, with vertical sync on or off and both switched without a restart, and the game's clock was measured to be independent of FPS. The 1 % lows went from 29 to 47–49 FPS on the beach and in the harbour.
 - **DLSS, FSR 3.1, FSR 3.1 frame generation and NVIDIA Reflex inside the game's frame.** Motion vectors, depth and jitter are taken from the game. The HUD is drawn afterwards at full resolution.
 - **The engine's own functions, rebuilt and proven.** 18 render functions of the engine (G-buffer and shadow passes, materials, the constant update engine) have SecondSonPC implementations. They are hand-written or produced by the project's static recompiler (Ghidra P-code → C++, AVX), and each is verified call by call against the original in the running game: 0 mismatches over tens of millions of calls.
 - **PC-native around the game.**
@@ -67,7 +67,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
    |---|---|
    | `SecondSonPC.exe` | the runtime |
    | `play.cmd` | starts the game with every improvement that is on for players, after backing up the saves |
-   | `play_experimental.cmd` | `play.cmd` plus faster experiments (REA-3 + AQ + R10's MAIN_FREE, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md), [R10_PACING.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_PACING.md)): +19 % FPS on the owner's save, +14 % in a fight, but a lower 1 % low in Neon Dash |
+   | `play_experimental.cmd` | `play.cmd` plus faster experiments (REA-3 + AQ + R10's MAIN_FREE + R11's AQ_IMAGES and AQ_ORDER_EPOCH, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md), [R10_PACING.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_PACING.md), [R11_NEON.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_NEON.md)): +17 % FPS on the owner's save and +9 % in a fight against `play.cmd`, but a lower 1 % low in Neon Dash |
    | `SecondSonPC.toml` | defaults: window, language, keys, PC settings |
    | `data\static_templates.txt` | the data the shader preparation predicts the game's shaders from |
    | `sspc_dlss.dll`, `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `sl.*.dll`, `NvLowLatencyVk.dll` | NVIDIA DLSS 310.9.1, Streamline 2.14.1, Reflex |
@@ -283,6 +283,27 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 
 **October 2026, the last week** (all in `main`):
 
+- **R11 — even frames without frame generation, more PC settings** ([R11_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_FINAL_REPORT.md)). Medians against R10's `play.cmd`, vertical sync off and no frame limit, n = 3 (city scenes n = 2):
+  - **Early batch submission, on in `play.cmd`** (`SSPC_R11_EARLY_SUBMIT=256`): while the GPU is idle, the recording thread hands it a batch after 256 commands instead of 500 ([R11_T2.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_T2.md)).
+    - Neon Dash: frames over 33 ms 566 → 100 a minute, 1 % low 17.1 → 23.3 FPS, P99 44.8 → 37.8 ms, 48.2 → 50.1 FPS.
+    - Owner's save 31.8 → 32.6 FPS. Fight, traverse, beach, harbour and village change by 0 to +2.5 %; none got slower.
+  - **Texture compute on the async queue, order waits only between epochs, in `play_experimental.cmd`** (`SSPC_R11_AQ_IMAGES`, `SSPC_R11_AQ_ORDER_EPOCH`, on top of REA-3 + AQ + MAIN_FREE): fight 46.5 → 51.0 FPS, owner's save 31.8 → 38.2 FPS. Neon Dash is still less even (1 % low 16.2, P99 47.0 ms), so it stays out of `play.cmd` ([R11_NEON.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_NEON.md)).
+  - **Display, live** ([R11_DISPLAY_SETTINGS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_DISPLAY_SETTINGS.md)):
+    - vertical sync On (FIFO), Off (IMMEDIATE) or Off without tearing (MAILBOX), switched without a restart;
+    - frame limits 30, 40, 50, 60, 90, 120, 144, 165, 240 and unlimited, with vertical sync on or off;
+    - one "Window mode" row (windowed / borderless) and the monitor;
+    - window and resolution changes roll back after 15 s unless confirmed.
+  - **Motion blur, in Graphics**: on / off and a strength of 0–100 %, live ([R11_POSTFX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_POSTFX.md)).
+    - It switches the game's own blur pass and changes nothing else of the picture. It is on by default, as in the game.
+    - Turned off, Neon Dash goes 53.0 → 63.6 FPS and a fight 47.4 → 48.5: that is the effect's cost, not an optimization.
+    - Film grain and depth of field were not added: in the tested scenes they do not change the frame.
+  - **Every R11 switch is on the Experiments page**, also the ones that are off by default. Measured and left off: submission on a thread of its own (`SSPC_R11_ASYNC_SUBMIT`), finished compute seen earlier (`SSPC_R11_FAST_LABEL`, no gain on top of early submission), and the game's compute waits asleep instead of spinning (`SSPC_R11_LABEL_WAIT`, Neon Dash −3.4 %).
+  - **The game's main thread** spends 75–79 % of its time waiting for its own async compute, and its own logic takes at most 0.12 ms a frame. Native replacements there would not help ([R11_MAIN_THREAD.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_MAIN_THREAD.md)).
+  - **Checks**:
+    - settings self-test: 165 checks, 0 failures;
+    - Vulkan Validation and Synchronization Validation: no new messages, including three swapchain re-creations from vertical sync switches;
+    - 30-minute runs with vertical sync and limit switches during play;
+    - one of three 30-minute runs with early submission lost the GPU (see [Known issues](#known-issues)).
 - **R10 — five directions at once** ([R10_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_FINAL_REPORT.md)):
   - **Own Ajm / ATRAC9, common dialogs, network and libc** (see [above](#playstation-functions-the-game-imports)) are on in `play.cmd`.
   - **Experiments in the settings menu.** Every switch of `play.cmd` and every experiment is on the new **Experiments** page, with what it measured, so a player can try what works better on their PC (see [PC settings](#pc-settings)).
@@ -383,10 +404,15 @@ The native engine work replaces individual engine functions with SecondSonPC's i
 The PC options live inside the game's own menu: **Esc (Options) → Settings → "Additional settings"**. This is the line that used to read "HDR Rendering — Unavailable"; the string is replaced as it is read, and the game's files are not changed.
 
 - There are eight pages: **Graphics, Display, Controls, Keys, Audio, Game, Advanced, Experiments**.
-- **Experiments** lists the runtime's switches by group: the command processor, Vulkan recording, pipelines and memory, GPU queues and frame pacing, processor threads, R10's draws from the engine's data, the system libraries. Each says what it does, what it measured and whether `play.cmd` or `play_experimental.cmd` turns it on. The launcher's value is the default; what a player changes is saved in their settings file and applies from the next start, because those subsystems read it once at start. "Reset this page" returns to the launcher's values. The log marks every changed one with `EXPERIMENT`.
+- **Experiments** lists the runtime's switches by group: the command processor, Vulkan recording, pipelines and memory, GPU queues and frame pacing, processor threads, R10's draws from the engine's data, the system libraries. Each says what it does, what it measured and whether `play.cmd` or `play_experimental.cmd` turns it on. Switches that are off by default are listed too, so every one of them can be tried. The launcher's value is the default; what a player changes is saved in their settings file and applies from the next start, because those subsystems read it once at start. "Reset this page" returns to the launcher's values. The log marks every changed one with `EXPERIMENT`.
 - The window works with keyboard, mouse and gamepad navigation, with prompts for the last device used.
-- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, frame-rate limit, mouse and motion settings, volume.
-- Window mode, size and monitor changes ask for confirmation for 15 s.
+- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, motion blur and its strength, vertical sync, frame-rate limit, mouse and motion settings, volume.
+- **Display**:
+  - vertical sync is On (FIFO), Off (IMMEDIATE) or Off without tearing (MAILBOX);
+  - the frame-rate limit is 30, 40, 50, 60, 90, 120, 144, 165, 240 or unlimited;
+  - "Window mode" is windowed or borderless;
+  - the monitor list shows each display's desktop size and refresh rate.
+- Window mode, resolution and monitor changes ask for confirmation for 15 s and roll back if it is not given.
 - Options that need a restart show a badge, and unavailable options say why.
 - The window scales with the game window and DPI, from 800 × 600 to 4K and 21:9.
 
@@ -448,6 +474,7 @@ The game renders at the window's size, or the display's in full screen, not at a
 | [`archive/experiment/bbport-gpu`](../../tree/archive/experiment/bbport-gpu) | BBPort's GPU library as the backend | rejected: 25 vs 40 FPS, effects missing |
 | [`archive/feature/uncharted-bbport-optimizations`](../../tree/archive/feature/uncharted-bbport-optimizations) | uncharted_pc / bbport techniques: threaded recording, preparation workers, LTO, PGO | measured, nothing taken |
 | [`archive/docs-r10-20261024`](../../tree/archive/docs-r10-20261024) | R10 as developed: its six reports in `docs/`, its tools in `tools/r10` | the code is in `main` |
+| [`archive/docs-r11-20261025`](../../tree/archive/docs-r11-20261025) | R11 as developed: its six reports in `docs/`, its tools in `tools/r11` | the code is in `main` |
 
 The tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023) keeps the removed development scripts: A/B stand, measurement routes, analysis tools, the `play_*.cmd` variants.
 
@@ -491,6 +518,8 @@ Vulkan 1.3 driver
 - **Memory.** On a PC without a page file, total committed memory can reach the Windows limit in long sessions; keep the page file on. Fixed causes are in [`KNOWN_ISSUES.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md).
 - **Shader preparation** cannot predict every program: 166 of about 304 000 predicted shader requests are declined by the own translator (for example an `image_sample` whose resource is not known before the game runs). The game translates those the first time it uses them, which can cause one short stutter.
 - **Frame generation** has not been reviewed frame by frame, and input latency with it is not measured.
+- **GPU loss once with early submission.** In one of three 30-minute runs with `SSPC_R11_EARLY_SUBMIT=256` the driver reset the GPU after 18.5 minutes (`VK_ERROR_DEVICE_LOST`). Its exact repeat, another run and a run without it were clean, and the cause is not known. Such resets also happened on that PC before R11. If it happens to you, turn off "Early batch submission (R11)" on the Experiments page: that is R10's behaviour.
+- **Not tested in R11:** flying, cut-scenes, vertical sync switches together with DLSS / FSR frame generation, gamepad navigation of the new rows, two monitors.
 - There is no full-campaign compatibility guarantee.
 
 ## Roadmap
@@ -511,7 +540,8 @@ Vulkan 1.3 driver
 - [x] City: draw runs (CITY-OPT 1–6), trivial waits (R6-P), emitter batching (R8)
 - [x] Gameplay: no pipeline-cache freezes (F1), no vertex heap re-imports (F3)
 - [x] REA-3 / AQ with even frame pacing in fights and on the owner's save (R10 MAIN_FREE, `play_experimental.cmd`)
-- [ ] REA-3 / AQ / MAIN_FREE into `play.cmd`, after Neon Dash (1 % low and P99 below `play.cmd` now) and a 20-minute run
+- [x] Even frames in Neon Dash without frame generation (R11 early batch submission, `play.cmd`)
+- [ ] REA-3 / AQ / MAIN_FREE / AQ_IMAGES into `play.cmd`, after Neon Dash (1 % low and P99 below `play.cmd` now)
 - [ ] Less command processor work for the remaining draws
 - [ ] Potato mode for weak PCs in `main`
 
@@ -524,7 +554,9 @@ Vulkan 1.3 driver
 
 ### PC experience
 - [x] PC settings window in the game's menu
-- [x] Experiments page: every runtime switch on and off from the menu (R10)
+- [x] Experiments page: every runtime switch on and off from the menu (R10), also the ones off by default (R11)
+- [x] Live vertical sync (FIFO / IMMEDIATE / MAILBOX), more frame limits, window mode with roll-back (R11)
+- [x] Motion blur on / off and its strength (R11)
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
 - [x] Native mouse camera (no stick emulation)
 - [x] Any resolution and aspect ratio (4:3 to 32:9, Hor+, HUD, FOV, movies 16:9)
@@ -538,7 +570,7 @@ Vulkan 1.3 driver
 
 ## Reports
 
-Every phase ends with a report: what was measured, what was kept, what was rejected and why. They are not part of the build, so they are not in `main`: the full list, **135 reports** at the tag `archive/docs-20261023` and in the other archive tags, grouped by area, is in **[`REPORTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English. R10's six reports are at the tag `archive/docs-r10-20261024`, starting with [R10_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_FINAL_REPORT.md).
+Every phase ends with a report: what was measured, what was kept, what was rejected and why. They are not part of the build, so they are not in `main`: the full list, **135 reports** at the tag `archive/docs-20261023` and in the other archive tags, grouped by area, is in **[`REPORTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md)**. Most are written in Russian, the newer ones partly in English. R10's six reports are at the tag `archive/docs-r10-20261024`, starting with [R10_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_FINAL_REPORT.md); R11's six are at the tag `archive/docs-r11-20261025`, starting with [R11_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_FINAL_REPORT.md).
 
 ## Contributing
 

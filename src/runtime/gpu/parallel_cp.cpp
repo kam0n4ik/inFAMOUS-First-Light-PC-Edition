@@ -1795,6 +1795,17 @@ void ParallelCp::Loop() {
         u64 extra = 0;
         if (!stop) {
             extra = Execute(r, h, t);
+            if (r11_poll_ticks_ != 0) {
+                // R11 SSPC_R11_FAST_LABEL: a completed batch's labels go to thread 1 now, not at the next round end or
+                // fence record (the executor keeps them: CP-9)
+                const u64 now = __rdtsc();
+                if (now - r11_last_poll_ >= r11_poll_ticks_) {
+                    r11_last_poll_ = now;
+                    if (exec_.PollIfCompleted()) {
+                        add(r11_polls_, 1);
+                    }
+                }
+            }
             if (lazy) {
                 exec_.ServeKeptBack();
             }
@@ -2021,6 +2032,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
             } else {
                 exec_.Draw(r.draw);
             }
+            exec_.R11EarlySubmitPoint(); // (R11 SSPC_R11_EARLY_SUBMIT: between records)
             break;
         case Kind::Dispatch:
             if (frontend_ != nullptr) {
@@ -2032,6 +2044,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
             } else {
                 exec_.DispatchWith(r.dispatch, r.has_cs ? &r.cs : nullptr);
             }
+            exec_.R11EarlySubmitPoint();
             break;
         case Kind::CacheAction:
             exec_.CacheAction(r.cache);

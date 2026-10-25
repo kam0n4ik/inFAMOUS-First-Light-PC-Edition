@@ -39,6 +39,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/native_render_ops.cpp
     src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
+    src/engine/render/post_effects.cpp
     src/engine/ui/game_menu.cpp
     src/engine/render/display_plan.cpp
     src/engine/render/render_resolution.cpp
@@ -121,6 +122,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/upscale/upscalers.cpp
     src/runtime/gpu/upscale/fsr_framegen.cpp
     src/runtime/gpu/vulkan/vk_executor_upscale.cpp
+    src/runtime/gpu/vulkan/vk_executor_r11.cpp
     src/runtime/gpu/host_shaders.cpp
     src/runtime/gpu/image_layout.cpp
     src/runtime/gpu/native_backend.cpp
@@ -223,6 +225,9 @@ target_sources(sspc_runtime PRIVATE ${SSPC_R10_SYSRT_SOURCES})
 # R10 sched (docs/R10_CPU_GPU_SCHEDULER.md): the latency probe and the pipeline workers' pool (cmake/r10/sched.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/r10/sched.cmake)
 target_sources(sspc_runtime PRIVATE ${SSPC_R10_SCHED_SOURCES})
+# R11 main (docs/R11_MAIN_THREAD.md): Game:Main's waits (cmake/r11/main.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/r11/main.cmake)
+target_sources(sspc_runtime PRIVATE ${SSPC_R11_MAIN_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # R10 (docs/R10_AJM.md): libSceAjm, SecondSonPC's own (runtime/audio/ajm.cpp, SSPC_R10_AJM=native|verify), on its

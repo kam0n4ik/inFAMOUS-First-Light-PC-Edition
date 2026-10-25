@@ -72,6 +72,7 @@
 #include "engine/mouse_camera.h"
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
+#include "engine/render/post_effects.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
 #include "engine/render/draw_runs.h"
@@ -813,7 +814,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         {
             // the settings menu: what the upscaling rows can do with this GPU (known now the device exists)
             namespace Cap = Settings::Capability;
-            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter | Cap::FpsCounter;
+            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter | Cap::FpsCounter |
+                       Cap::PresentModeSwitch; // (R11: the vertical sync switches while running)
             if (Gpu::Upscale::GetStatus().dlss_available) {
                 caps |= Cap::Dlss;
             }
@@ -881,6 +883,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
         // (REA-3: the gate goes through SecondSonPC's Gnm driver too)
         Engine::Render::Trace::InstallDeferComputeWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
+        // (R11: the labels' wake-ups come from SecondSonPC's command processor)
+        Engine::Render::Trace::InstallLabelWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
     } else if (char es[4] = {}; GetEnvironmentVariableA("SSPC_P54_EARLY_SUBMIT", es, sizeof(es)) == 1 && es[0] == '1') {
         SSPC_LOG(Loader, Warning, "SSPC_P54_EARLY_SUBMIT=1 ignored: only SecondSonPC's GPU backend (--gpu-backend "
                  "sspc) hands frames on early");
@@ -892,6 +896,11 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
     Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
                                cfg.pc.particle_resolution);
+    // R11 post effects (both backends): the game's own unless [Graphics] motionBlur / motionBlurStrength (SSPC_POSTFX_*;
+    // film grain and depth of field only SSPC_POSTFX_FILM_GRAIN / SSPC_POSTFX_DOF; docs/R11_POSTFX.md)
+    Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),
+                                    {.motion_blur = cfg.pc.motion_blur,
+                                     .motion_blur_strength = cfg.pc.motion_blur_strength});
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
     // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {

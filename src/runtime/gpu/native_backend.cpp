@@ -453,6 +453,12 @@ public:
             presenter_->SetFrameGen(on);
         }
     }
+    bool SetPresentMode(const std::string& present_mode) {
+        if (presenter_) {
+            presenter_->SetPresentMode(present_mode);
+        }
+        return presenter_ != nullptr;
+    }
 
 private:
     std::unique_ptr<GS::ShaderFrontend> frontend_;
@@ -487,6 +493,8 @@ private:
     bool nodrain_wait_ = false; ///< SSPC_CP_ROUND_NODRAIN=2
     u64 nodrain_rounds_ = 0;
     std::vector<std::pair<u32, u64>> completions_;
+    bool r11_fast_label_ = false;     ///< R11 SSPC_R11_FAST_LABEL=1 (needs CP-9)
+    u64 r11_mid_slice_applies_ = 0;   ///< ... completions applied between packets (the GPU thread)
     /// Thread 1: the queues' completions the executor kept (CP-9) handed to the processor (labels written).
     void ApplyCompletions() {
         if (nodrain_ && executor_->TakeCompletions(completions_)) {
@@ -857,6 +865,20 @@ bool Backend::Start(const Options& o, std::string& error) {
             executor_->SetDeferCompletions(true);
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ROUND_NODRAIN=1 - the processor's round ends without draining "
                                    "the recording thread (it polls the GPU in stream order)");
+            // R11 (docs/R11_MAIN_THREAD.md): SSPC_R11_FAST_LABEL=1 - a completed batch's labels sooner: the recording
+            // thread polls between its records (every SSPC_R11_FAST_LABEL_US, 100), this thread hands the kept
+            // completions to the processor between packets (not only between the queues' slices)
+            if (char f[4] = {}; GetEnvironmentVariableA("SSPC_R11_FAST_LABEL", f, sizeof(f)) == 1 && f[0] == '1') {
+                char u[16] = {};
+                const u64 us = GetEnvironmentVariableA("SSPC_R11_FAST_LABEL_US", u, sizeof(u)) > 0
+                                   ? std::clamp<u64>(std::strtoull(u, nullptr, 10), 10, 10'000)
+                                   : 100;
+                parallel_->SetR11FastPoll(us * std::max<u64>(Kernel::Clock::TscFrequency() / 1'000'000, 1));
+                r11_fast_label_ = true;
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R11_FAST_LABEL=1 - the recording thread polls the GPU between "
+                                       "its records (every {} us), the processor writes the completed labels between "
+                                       "packets", us);
+            }
         }
         if (po.async_writes) {
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ASYNC_WRITES=1 - WRITE_DATA / fills and GDS DMA on the timeline "
@@ -1474,6 +1496,10 @@ void Backend::Loop() {
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
                     progress = true;
+                    if (r11_fast_label_ && executor_->CompletionsReady()) {
+                        ++r11_mid_slice_applies_;
+                        ApplyCompletions(); // (R11: between packets - the labels thread 2 just polled)
+                    }
                     continue;
                 }
                 if (st == Cp::StepStatus::Blocked) {
@@ -1932,6 +1958,7 @@ void Backend::Stop() {
         frontend_->Stop();
     }
     if (ctx_) {
+        Vk::Emit::DrainSubmits(); // (R11 SSPC_R11_ASYNC_SUBMIT: the submitter's last jobs, before the queue's lock)
         std::scoped_lock lock{ctx_->QueueMutex()};
         Vk::Fn().vkDeviceWaitIdle(ctx_->Device());
     }
@@ -2536,6 +2563,17 @@ std::string Backend::Report() {
         out += fmt::format("batch submissions by cause: full {}, held fence {}, processor idle {}, synchronize {}, "
                            "flip {}\n",
                            s.flushes_full, s.flushes_fence, s.flushes_idle, s.flushes_sync, s.flushes_flip);
+        // R11 t2 (docs/R11_T2.md): the recording thread's time in Flush, the early submissions, the async ones
+        out += fmt::format("R11 batch ends: {} batches, {:.0f} ms in Flush on the recording thread, vkQueueSubmit2 "
+                           "{:.0f} ms there; early submissions (SSPC_R11_EARLY_SUBMIT) {} ({:.0f} commands each), GPU "
+                           "checks {} ({:.1f} ms); submitter thread (SSPC_R11_ASYNC_SUBMIT) {} batches, {:.0f} ms in "
+                           "vkQueueSubmit2\n",
+                           s.batches, static_cast<double>(s.r11_flush_ns) / 1e6, static_cast<double>(s.submit_ns) / 1e6,
+                           s.r11_early,
+                           s.r11_early != 0 ? static_cast<double>(s.r11_early_commands) / static_cast<double>(s.r11_early)
+                                            : 0.0,
+                           s.r11_early_checks, static_cast<double>(s.r11_early_check_ns) / 1e6, s.r11_async,
+                           executor_->R11AsyncSubmitMs());
         if (cp_ != nullptr) {
             const u64 w = cp_->Registers().Writes(), c = cp_->Registers().Changes();
             out += fmt::format("register writes {}, of them changing a value {} ({:.1f} %)\n", w, c,
@@ -2586,6 +2624,11 @@ std::string Backend::Report() {
             if (nodrain_) {
                 out += fmt::format("round ends without a drain (CP-9, SSPC_CP_ROUND_NODRAIN): {}\n", nodrain_rounds_);
             }
+            if (r11_fast_label_) {
+                out += fmt::format("R11 fast labels (SSPC_R11_FAST_LABEL): recording thread polls that collected {}, "
+                                   "completions applied between packets {}\n", parallel_->R11Polls(),
+                                   r11_mid_slice_applies_);
+            }
             if (executor_ && executor_->AsyncLane()) {
                 const auto& es = executor_->Stats();
                 out += fmt::format("async compute lane (AQ, SSPC_FB_ASYNC_COMPUTE): batches on the lane {}, on the main "
@@ -2611,6 +2654,7 @@ std::string Backend::Report() {
                                        "{}, of them behind an earlier batch than the queue's last {}, already complete {}\n",
                                        es.r10_held_exact, es.r10_held_earlier, es.r10_held_complete);
                 }
+                out += executor_->R11DiagReport(); // (R11 neon: SSPC_R11_DIAG_AQ=1)
             }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
@@ -2821,6 +2865,29 @@ void SetFrameGen(bool on) {
 
 void SetFpsCounter(bool on) {
     Vk::SetFpsCounterShown(on);
+}
+
+bool SetPresentMode(const std::string& present_mode) {
+    return g_backend != nullptr && g_backend->SetPresentMode(present_mode);
+}
+
+PresentModes GetPresentModes() {
+    const Vk::PresentModeInfo i = Vk::GetPresentModeInfo();
+    PresentModes out;
+    out.known = i.known;
+    if (i.known) {
+        for (const VkPresentModeKHR m : {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                         VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR}) {
+            if ((i.supported & (1u << static_cast<u32>(m))) != 0) {
+                out.supported += fmt::format("{}{}", out.supported.empty() ? "" : ", ", Vk::PresentModeName(m));
+            }
+        }
+        out.current = Vk::PresentModeName(i.current);
+        out.wanted = Vk::PresentModeName(i.wanted);
+        out.immediate = (i.supported & (1u << VK_PRESENT_MODE_IMMEDIATE_KHR)) != 0;
+        out.mailbox = (i.supported & (1u << VK_PRESENT_MODE_MAILBOX_KHR)) != 0;
+    }
+    return out;
 }
 
 bool SetFrameLimit(const std::string& limit) {
