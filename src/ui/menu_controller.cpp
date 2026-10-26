@@ -39,6 +39,7 @@
 
 namespace SecondSon::Runtime::Trophies {
 bool Icon(s32 id, std::vector<u8>& png); // runtime/np/offline_services.cpp
+bool Text(s32 id, std::string_view language, std::string& name, std::string& desc);
 }
 
 namespace SecondSon::Ui {
@@ -97,6 +98,7 @@ struct State {
     // the trophy notice (its own overlay): the one on screen and when it came
     Win32Overlay trophy;
     s32 trophy_id = -1;
+    std::string trophy_name; // as the game writes it, in the menu's language
     u64 trophy_start_ns = 0;
     std::shared_ptr<const Image> trophy_icon;
     bool dev_f1 = false;         // SSPC_DEV_F1=1 (development): F1 opens the menu anywhere
@@ -669,22 +671,6 @@ std::mutex g_trophy_mutex;
 std::deque<s32> g_trophy_queue; // earned, not shown yet
 std::atomic<u32> g_trophy_event{0};
 
-// the eboot's names of the trophies, by id (its table "Platinum", "PainBuildsCharacter", ..., "OverkillMuch")
-constexpr std::array<const char*, 48> kTrophyNames = {
-    "inFAMOUS Second Son",    "Pain Builds Character", "It Takes a Village",       "Your Little Secret",
-    "Temperance",             "Malice",                "Courage",                  "Contempt",
-    "Forgive but Never Forget", "My Brother's Keeper", "Fate Worse than Death",    "The Bitch Is Dead",
-    "The High Road",          "The Hero They Deserve", "Let Me Get the Door for You", "Spinoff",
-    "Everyone's a Critic",    "Just Say No",           "Freedom of Speech",        "What Did You Call Me",
-    "Someone Your Own Size",  "Walk It Off",           "Kicking and Screaming",    "Avatar of Good",
-    "Avatar of Evil",         "Follow the Glow",       "Shardcore",                "Poke Your Eye Out",
-    "Nothing to See Here",    "Inside Track",          "Get Off My Streets",       "Not Very Hidden",
-    "King of the Tag",        "Prank Call",            "Hello Operator",           "Final Showdown",
-    "One Down",               "I Like It Here",        "This Is My House",         "CARnage",
-    "Drop Everything",        "Frequent Flyer",        "Who Put This Here",        "Triple Attack",
-    "Double Smoke Stack Attack", "Cough Drop",         "Sure Shot",                "Overkill Much",
-};
-
 /// A PNG -> premultiplied BGRA (WIC); nullptr when it does not decode.
 std::shared_ptr<const Image> DecodePng(const std::vector<u8>& png) {
     const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED); // (RPC_E_CHANGED_MODE: COM is up already)
@@ -751,9 +737,8 @@ bool DrawTrophy(u64 now) {
     const char* title = platinum ? (ru ? "Вы получили платиновый трофей" : "You have earned the platinum trophy.")
                                  : (ru ? "Вы получили трофей" : "You have earned a trophy.");
     list.Text({x, panel.y + 18 * s, iw, 26 * s}, title, 17 * s, {196, 198, 204, a(255)});
-    const bool known = st.trophy_id >= 0 && st.trophy_id < static_cast<s32>(kTrophyNames.size());
-    list.Text({x, panel.y + 48 * s, iw, 32 * s}, known ? kTrophyNames[st.trophy_id] : "?", 22 * s,
-              {255, 255, 255, a(255)}, Align::Left, FontWeight::Semibold);
+    list.Text({x, panel.y + 48 * s, iw, 32 * s}, st.trophy_name, 22 * s, {255, 255, 255, a(255)}, Align::Left,
+              FontWeight::Semibold);
     return st.trophy.Present(st.hwnd, list);
 }
 
@@ -770,11 +755,16 @@ bool ShowNextTrophy() {
         g_trophy_queue.pop_front();
     }
     std::vector<u8> png;
+    const bool ru = Settings::Instance().Initialized() ? Ru(Settings::Instance().Current()) : true;
+    std::string desc;
+    if (!Runtime::Trophies::Text(id, ru ? "russian" : "english", st.trophy_name, desc)) {
+        st.trophy_name = (ru ? "Трофей " : "Trophy ") + std::to_string(id);
+    }
     st.trophy_id = id;
     st.trophy_icon = Runtime::Trophies::Icon(id, png) ? DecodePng(png) : nullptr;
     st.trophy_start_ns = NowNs();
     const bool shown = DrawTrophy(st.trophy_start_ns);
-    SSPC_LOG(App, Info, "trophy notice {}: {}{}", shown ? "shown" : "not shown", id,
+    SSPC_LOG(App, Info, "trophy notice {}: {} \"{}\"{}", shown ? "shown" : "not shown", id, st.trophy_name,
              st.trophy_icon != nullptr ? "" : " (no icon)");
     return true;
 }

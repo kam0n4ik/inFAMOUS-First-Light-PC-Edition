@@ -698,6 +698,53 @@ void Configure(const std::filesystem::path& earned_file, const std::filesystem::
              g_trophy_count, unseen.size(), earned_file.string());
 }
 
+/// Trophy `id`'s name and description as the game writes them in `language` (its text table
+/// art\cache\lang_<language>_text.xpps: "u_trophy_<key>_name\0<text>\0"); false when the game has no such text.
+bool Text(s32 id, std::string_view language, std::string& name, std::string& desc) {
+    // the text keys by trophy id (the eboot's trophy names, as the text table spells them)
+    static constexpr std::array<const char*, 48> kKeys = {
+        "platinum", "pain_builds_character", "it_takes_a_village", "your_little_secret", "redeem_fetch",
+        "corrupt_fetch", "redeem_eugene", "corrupt_eugene", "forgive_but_never_forget", "my_brothers_keeper",
+        "fate_worse_than_death", "the_bitch_is_dead", "the_high_road", "the_hero_they_deserve",
+        "let_me_get_the_door_for_you", "spinoff", "everyones_a_critic", "drugdealers", "activists", "gang", "sbt",
+        "heal", "wounded", "avatar_of_good", "avatar_of_evil", "follow_the_glow", "shardcore", "poke_your_eye_out",
+        "nothing_to_see_here", "audio_logs", "get_off_my_streets", "not_very_hidden", "king_of_the_tag",
+        "one_showdown", "half_showdowns", "all_showdowns", "one_district", "i_like_it_here", "this_is_my_house",
+        "carnage", "drop_everything", "frequent_flyer", "who_put_this_here", "triple_attack",
+        "double_smoke_stack_attack", "cough_drop", "sure_shot", "overkill_much",
+    };
+    if (id < 0 || id >= static_cast<s32>(kKeys.size())) {
+        return false;
+    }
+    std::filesystem::path trp;
+    {
+        std::scoped_lock lock{Offline::g_trophy_mutex};
+        trp = Offline::g_trophy_trp;
+    }
+    if (trp.empty()) {
+        return false;
+    }
+    // <game>\sce_sys\trophy\trophy00.trp -> <game>\art\cache\lang_<language>_text.xpps
+    const auto file = trp.parent_path().parent_path().parent_path() / "art" / "cache" /
+                      ("lang_" + std::string(language) + "_text.xpps");
+    std::ifstream f(file, std::ios::binary);
+    const std::string table{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+    const auto value = [&table](const std::string& key) {
+        const std::string k = key + '\0';
+        const size_t at = table.find(k);
+        if (at == std::string::npos) {
+            return std::string();
+        }
+        const size_t from = at + k.size(), end = table.find('\0', from);
+        return table.substr(from, end == std::string::npos ? 0 : std::min<size_t>(end - from, 256));
+    };
+    const std::string key = std::string("u_trophy_") + kKeys[id];
+    name = value(key + "_name");
+    // (the one key the table spells differently: "wounded" is named, "wound" described)
+    desc = value(id == 22 ? std::string("u_trophy_wound_desc") : key + "_desc");
+    return !name.empty();
+}
+
 /// Trophy `id`'s icon (PNG bytes) from the game's trophy file; false without it.
 bool Icon(s32 id, std::vector<u8>& png) {
     std::filesystem::path trp;

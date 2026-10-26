@@ -451,7 +451,8 @@ The game was made for PlayStation Network: online missions, add-ons bought in th
 - All 48 trophies can be earned, the platinum included: it comes on its own with the last one.
 - Each trophy shows a notice at the top left of the game for 6 seconds, with its icon from the game's own trophy file.
 - Earned trophies are kept in `userdata\home\trophies\CUSA00004.txt`, one line `<number> <time>` each, and the game reads them back at every start. A line `<number> 0` is a trophy added by hand: its notice is shown at the next start.
-- The names are the game's internal English ones, and grades (bronze, silver, gold) are not shown: the trophy texts are encrypted with the console's key.
+- The names are the official ones, in Russian or English as the menu is: the game's own text table has every trophy's name and description (`u_trophy_<key>_name`), read from your copy of the game. Grades (bronze, silver, gold) are not shown: they are only in the trophy file's encrypted part.
+- The same text table keeps two trophies that were cut: **"Deadliest Catch"** («Крупная рыба», subdue a D.U.P. Commander without killing him) and **"Hard Mode"** (finish the game in Hard Mode), and an earlier description of "Unstoppable": "Finish the game in Challenge Mode".
 - Trophies earned with builds before this one were not kept. The game gives a trophy again when its condition is met again.
 
 These are new and not yet played through from start to end: if a Paper Trail or Cole's Legacy mission does not open, or a trophy shows no notice, open an issue with `logs\SecondSonPC.log`.
