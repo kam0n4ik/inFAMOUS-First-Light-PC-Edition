@@ -478,6 +478,8 @@ void SettingsMenu::RebuildRows() {
         AddHeader("Effects", "Эффекты"); // (R11 postfx: the game's own post-processing)
         setting("graphics.motionBlur");
         setting("graphics.motionBlurStrength");
+        setting("graphics.reflectionQuality"); // (R12 refl)
+        setting("graphics.rainShadows");       // (R12 rain)
         const size_t before = rows_.size();
         AddHeader("The bridge's frame (shadPS4)", "Кадр моста (shadPS4)");
         setting("graphics.fsr");

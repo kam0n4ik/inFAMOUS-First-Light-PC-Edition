@@ -7,6 +7,7 @@
 // translated SPIR-V is the bridge's, so its bindings and push constants are filled the same way.
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_executor_upscale.h"
+#include "runtime/gpu/r12/light_stats.h"
 
 #include <algorithm>
 #include <bit>
@@ -39,6 +40,7 @@
 #include "runtime/gpu/vulkan/vk_formats.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_presenter.h"
+#include "runtime/gpu/vulkan/vk_r12_psort_spv.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 #include "runtime/filesystem/fs_host.h"
 #include "runtime/media/videodec.h"
@@ -875,7 +877,30 @@ void Executor::GlobalBarrier(u32 site) {
     ++stats_.global_barriers;
 }
 
+// R12 lights: the tiled lighting compute shader's GPU address (the same in every run since R9, 2026-10-18 [E]; its
+// footer hash is logged when SSPC_R12_LIGHT_LIST_KEEP=1 registers its output)
+constexpr u64 kR12TiledLightingCs = 0x2edafa400;
+
 void Executor::NoteOrderRange(const void* plan_ptr, u64 shader, u32 queue, bool dispatch) {
+    if (const u64 watched = R12::ReadersOf(); watched != 0 && R12::LightCensusOn()) {
+        // R12 diagnostics (SSPC_R12_READERS_OF=<hex address>): each shader binding a buffer over that address, once
+        for (const auto& b : static_cast<const GS::ResourceBindingPlan*>(plan_ptr)->buffers) {
+            if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.address <= watched &&
+                watched < b.address + b.size) {
+                if (b.size >= (256ull << 20)) {
+                    // (a heap-size binding over it - the host import: counted, the first one logged)
+                    static std::atomic<u64> heap_binds{0};
+                    if (heap_binds.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        R12::NoteDetail(fmt::format("first heap-size binding over {:#x}: {} {:#x} [{:#x}, +{:#x})",
+                                                    watched, dispatch ? "dispatch" : "draw", shader, b.address, b.size));
+                    }
+                    continue;
+                }
+                R12::NoteDetail(fmt::format("{} {:#x} q{} {} [{:#x}, +{:#x}) over {:#x}", dispatch ? "dispatch" : "draw",
+                                            shader, queue, b.written ? "WRITES" : "reads", b.address, b.size, watched));
+            }
+        }
+    }
     // SSPC_DIAG_ORDER_RANGE=<hex address>[:<hex size>] (SSPC-020): every draw/dispatch binding that memory, in recording
     // order with the flip and queue -> logs\p45\order_range.txt (flips 1400..1460)
     static const std::pair<u64, u64> range = [] {
@@ -2839,6 +2864,10 @@ bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 str
     // the end event: the counts of the query's draws, one per DB record (the guest sums the DBs)
     occ_.open = false;
     ++occ_queries_;
+    if (R12::LightCensusOn()) {
+        R12::Stats().occ_queries.fetch_add(1, std::memory_order_relaxed);
+        R12::Stats().occ_draws.fetch_add(occ_.slots.size(), std::memory_order_relaxed);
+    }
     if ((occ_queries_ & 0xFFFF) == 1) {
         SSPC_LOG(GPU, Info, "occlusion queries: {} done, {} draws counted, {} refused, {} begun again before their end, "
                             "{} draws over a query's DB records",
@@ -2880,10 +2909,16 @@ bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 str
     if (LabelChanges(kLabelOther | 4)) {
         Label(kLabelOther | 4, "T occlusion counts on the timeline");
     }
+    if (prof_) {
+        ProfMark(3, "before a command: its barriers, uploads, render pass changes");
+    }
     InspMark(Inspector::kGpuTransfer);
     for (size_t k = 0; k < occ_.slots.size(); ++k) {
         Fn().vkCmdCopyQueryPoolResults(cur_.cb, occ_pool_, occ_.slots[k], 1, where[k].first, where[k].second, 4,
                                        VK_QUERY_RESULT_WAIT_BIT);
+    }
+    if (prof_) {
+        ProfMark(7, "occlusion counts copied to the guest's DB records (R12 key)");
     }
     OcclusionResetSlots(occ_.slots);
     ranges();
@@ -4487,6 +4522,11 @@ bool Executor::DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescript
     // no colour: CB_TARGET_MASK 0 or CB_COLOR0_INFO.FORMAT invalid; DB_DEPTH_SIZE.PITCH_TILE_MAX = width / 8 - 1
     const bool hit = skip_width != 0 && (regs.Get(kCbTargetMask) == 0 || ((regs.Get(0xA31C) >> 2) & 0x1F) == 0) &&
                      (regs.Get(kDbZInfo) & 3) != 0 && ((regs.Get(0xA016) & 0x7FF) + 1) * 8 == skip_width;
+    if (R12::LightCensusOn() && (regs.Get(kCbTargetMask) == 0 || ((regs.Get(0xA31C) >> 2) & 0x1F) == 0) &&
+        (regs.Get(kDbZInfo) & 3) != 0) { // (R12 light census: the spot shadow atlas is the 1024-wide depth target)
+        (((regs.Get(0xA016) & 0x7FF) + 1) * 8 == 1024 ? R12::Stats().atlas_draws : R12::Stats().cascade_draws)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
     if (hit) {
         static std::atomic<u64> n{0};
         if (const u64 k = n.fetch_add(1, std::memory_order_relaxed); (k & (k - 1)) == 0 && k >= 1024) {
@@ -4849,6 +4889,50 @@ Executor::InstVariant* Executor::InstancedVariant(const GS::Module& vs) {
         v.module = std::move(m);
     }
     return &v;
+}
+
+const GS::Module* Executor::PsortVariant(const GS::Module& cs, u64 address) {
+    if (psort_on_ < 0) {
+        char v[4] = {};
+        psort_on_ = GetEnvironmentVariableA("SSPC_R12_PSORT", v, sizeof(v)) == 1 && v[0] == '1' ? 1 : 0;
+        SSPC_LOG(GPU, Info, "SSPC_R12_PSORT: {}", psort_on_ != 0 ? "on (cs 0x2edaa0c00's ranking loop without the exec-mask emulation)" : "off");
+        if (psort_on_ == 0) {
+            return nullptr;
+        }
+    }
+    const std::vector<u32>& spirv = cs.result.spirv;
+    if (spirv.size() != kR12PsortOrigWords) {
+        return nullptr; // (most programs: one compare)
+    }
+    auto [it, fresh] = psort_variants_.try_emplace(cs.id);
+    if (fresh) {
+        u64 h = 1469598103934665603ull; // FNV-1a over the SPIR-V's bytes (as tools/r12/psort_patch.py)
+        for (const u32 w : spirv) {
+            for (u32 b = 0; b < 4; ++b) {
+                h = (h ^ ((w >> (b * 8)) & 0xFFu)) * 1099511628211ull;
+            }
+        }
+        if (h != kR12PsortOrigFnv) {
+            SSPC_LOG(GPU, Info, "SSPC_R12_PSORT: cs {:#x} module {}: another SPIR-V ({:016x}), used as it is",
+                     address, cs.id, h);
+            return nullptr;
+        }
+        auto m = std::make_unique<GS::Module>();
+        m->id = psort_next_module_++; // (>= 0x40000000: transient, not in the precompile manifest)
+        m->key = cs.key;
+        m->keyed = cs.keyed;
+        m->result = cs.result;
+        m->result.spirv.assign(std::begin(kR12PsortSpirv), std::end(kR12PsortSpirv));
+        m->runtime = cs.runtime;
+        m->start = cs.start;
+        m->prepared = true;
+        m->spirv_hash = GS::HashSpirv(m->result.spirv);
+        m->state.store(GS::ModuleState::Ready, std::memory_order_release);
+        SSPC_LOG(GPU, Info, "SSPC_R12_PSORT: cs {:#x} module {} -> variant {} ({} -> {} SPIR-V words)", address,
+                 cs.id, m->id, spirv.size(), m->result.spirv.size());
+        it->second = std::move(m);
+    }
+    return it->second.get();
 }
 
 bool Executor::GatherInstanced(u64 align) {
@@ -6557,13 +6641,21 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     DiagCaptureDraw(prep.pipeline, color_img, true);
     stage(stats_.t_emit);
     if (prof_) {
-        ProfMark((u64{prep.pipeline} << 2) | 0,
-                 fmt::format("draw pipeline {} vs {:#x} ps {:#x} prim {} target {}x{} rt0 fmt {} depth {}", prep.pipeline,
-                             vs.address, has_ps ? ps.address : 0, d.primitive_type, key.width, key.height,
-                             color_img[0] != nullptr ? color_img[0]->layout.pixel_format : 0, depth_img != nullptr));
-        ProfDescribe((u64{prep.pipeline} << 2) | 0, "draw: vertex stage", &vs, bound);
+        // R12 wfx: the key also tells the targets apart (16 bits of a hash of the rt0 and depth guest addresses in
+        // bits 48..63; the low bits stay the pipeline's) - the same pipeline in two passes shows as two rows, each with
+        // its targets' addresses, which name the engine's pass (frame trace, RENDER_ENGINE_PASSES.md)
+        const u64 rt0_addr = color_img[0] != nullptr ? color_img[0]->layout.guest_address : 0;
+        const u64 depth_addr = depth_img != nullptr ? depth_img->layout.guest_address : 0;
+        const u64 tgt_hash = ((rt0_addr * 0x9E3779B97F4A7C15ull) ^ (depth_addr * 0xC2B2AE3D27D4EB4Full)) >> 48;
+        ProfMark((tgt_hash << 48) | (u64{prep.pipeline} << 2) | 0,
+                 fmt::format("draw pipeline {} vs {:#x} ps {:#x} prim {} target {}x{} rt0 fmt {} depth {} rt0 {:#x} "
+                             "ds {:#x}",
+                             prep.pipeline, vs.address, has_ps ? ps.address : 0, d.primitive_type, key.width,
+                             key.height, color_img[0] != nullptr ? color_img[0]->layout.pixel_format : 0,
+                             depth_img != nullptr, rt0_addr, depth_addr));
+        ProfDescribe((tgt_hash << 48) | (u64{prep.pipeline} << 2) | 0, "draw: vertex stage", &vs, bound);
         if (has_ps) {
-            ProfDescribe((u64{prep.pipeline} << 2) | 0x8000000000000000ull, "draw: pixel stage", &ps, bound);
+            ProfDescribe(((tgt_hash << 48) | (u64{prep.pipeline} << 2)) ^ 0x8000000000000000ull, "draw: pixel stage", &ps, bound);
         }
     }
     if (texdump_.active) { // (F8: the textures this draw reads, once each)
@@ -7379,7 +7471,13 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         }
     }
     std::string err;
-    const PipelineObjects* pipe = pipelines_.Compute(*csv.module, csv.plan, err);
+    const GS::Module* cs_module = csv.module;
+    if (psort_on_ != 0) { // SSPC_R12_PSORT: the particle ranking CS's variant (the same bindings and plan)
+        if (const GS::Module* v = PsortVariant(*csv.module, csv.address); v != nullptr) {
+            cs_module = v;
+        }
+    }
+    const PipelineObjects* pipe = pipelines_.Compute(*cs_module, csv.plan, err);
     DiagDumpShader(csv.address, csv.program != nullptr ? &csv.program->code : nullptr, csv.module->result.spirv,
                    csv.runtime, 0);
     if (pipe == nullptr) {
@@ -7762,6 +7860,40 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     // (a storage image write alone is ordered by the image's own barriers: not an unknown write)
     if (acc_unknown) {
         ++stats_.unknown_by[1];
+    }
+    if (R12::LightCensusOn()) {
+        // (R12 diagnostics: which dispatches make the large batch-end write-backs; SSPC_R12_WRITER_DETAIL=<hex cs>:
+        // that shader's guest buffers, each distinct set once)
+        for (const auto& [wb, we] : acc_writes_) {
+            if (we - wb >= (256u << 10)) {
+                R12::NoteWriter(csv.address, wb, we - wb);
+            }
+        }
+        if (csv.address == R12::DetailShader()) {
+            std::string line;
+            for (const auto& b : csv.plan.buffers) {
+                if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.size != 0) {
+                    line += fmt::format(" {}{:#x}+{:#x}", b.written ? "W" : "R", b.address, b.size);
+                }
+            }
+            R12::NoteDetail(fmt::format("cs {:#x} q{} groups {}x{}x{}{}:{}", csv.address, d.queue, d.groups[0],
+                                        d.groups[1], d.groups[2], d.indirect ? " indirect" : "", line));
+        }
+    }
+    if (buffers_.Lazy() == 3 && csv.address == kR12TiledLightingCs) {
+        // R12 (SSPC_R12_LIGHT_LIST_KEEP=1): the tiled lighting's written buffer - the per-tile light index list (1-64
+        // MiB) - is GPU-only: kept back from the host (docs/R12_LIGHTS.md)
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            SSPC_LOG(GPU, Info, "R12: tiled lighting CS {:#x} (footer hash {:#018x}) groups {}x{}x{}", csv.address,
+                     csv.footer_hash, d.groups[0], d.groups[1], d.groups[2]);
+        }
+        for (const auto& b : csv.plan.buffers) {
+            if (b.kind == GS::BufferKind::Guest && b.status == GS::ResourceStatus::Ok && b.written &&
+                b.size >= (1ull << 20) && b.size <= (64ull << 20)) {
+                buffers_.AddGpuOnlyRange(b.address, b.size);
+            }
+        }
     }
     NoteAccesses(acc_reads_, acc_writes_, acc_unknown, tag);
     const u64 dispatch_ticks = GS::Ticks() - t0;

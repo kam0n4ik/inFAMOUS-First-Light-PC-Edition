@@ -283,6 +283,15 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 
 **October 2026, the last week** (all in `main`):
 
+- **R12 — weather, local lights and reflections** (reports: [R12_WEATHER.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_WEATHER.md), [R12_WEATHER_PROFILE.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_WEATHER_PROFILE.md), [R12_LIGHTS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_LIGHTS.md), [R12_REFLECTIONS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_REFLECTIONS.md), [R12_RAIN_SHADOWS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_RAIN_SHADOWS.md)). Medians on the development PC, vertical sync off, no frame limit:
+  - **Where the weather's cost is.** The game picks its time of day (sky, rain, wetness) when a world loads, from the mission and the story's progress; it cannot be switched live. Every city time of day is wet. Wetness costs 4.5 % FPS at dusk and 9.8 % in rain by day, and almost all of it is the **rain shadow maps**: a view from above, about 1 000 depth draws a frame, which the game uses to keep the ground dry under bridges and roofs. The wet-surface pass itself is one full-screen draw, 0.4 ms on the GPU.
+  - **Graphics → "Rain shadows"** (new, live): *Original* (default) or *Off — nothing is sheltered from the rain*. Off, nothing is drawn into those maps: about 1 000 draws a frame less in wet weather, and the ground under bridges, roofs and in passages is as wet as the open street. Rain, fog and puddles in the open do not change. This trades picture for speed; its FPS is still being measured.
+  - **Graphics → "Reflection quality"** (new, live): *Original* (default) or *Low — no screen-space reflections*. Low saves about 0.4 ms of GPU time: owner's save +1.7 % (3 of 3 pairs), Neon Dash 51.7 → 55.0 FPS. The water's own reflection stays (without it the bay is black). Original and a "High" level were the same, so there is one.
+  - **GPU writes kept in video memory, experimental** (`SSPC_FB_LAZY_WB=1` with `SSPC_REA_HEAP_READS=1`, on the Experiments page, off by default). Every frame the GPU writes the particle pools (85 % of the bytes) and the lights' per-tile list, and they were copied back to the CPU's memory each frame. Now a block is copied only when the CPU reads it. Owner's save 33.1 → 41.8 FPS (+26 %), 1 % low 27.9 → 33.1; city traverse +4.8 %; beach +8.8 %; fight unchanged (n = 3). A race that crashed Neon Dash in 2 of 11 runs is fixed (0 of 14 after it), and a 32-minute run with them was clean.
+  - **Particle sort, experimental** (`SSPC_R12_PSORT=1`). The game's particle ranking shader spent 8.5 ms of GPU time a frame on a loop that emulated the console's lane masks; an equivalent loop takes 1.5 ms. It replaces only that exact shader (SPIR-V length and hash), and matches the original bit for bit on a test stand (200 of 200). On top of the previous switches: owner's save 38.5 → 42.3 FPS, frames over 33 ms 106 → 2 a minute.
+  - **Local lights themselves are cheap**: street lamps, headlights and spotlights cost 1.6–1.8 ms of tiled lighting and 0.33 ms of shadow atlas on the GPU; the glows' occlusion queries still keep them from shining through walls.
+  - **A weather tool for measurements** (`SSPC_R12_WEATHER=log|dry`, Experiments → Stand tools): logs the engine's weather values, or dries the surfaces of the loaded time of day and restores them on exit; saves are never written.
+  - **Checks**: settings self-test 177 checks, 0 failures; Vulkan Validation and Synchronization Validation with the experimental switches: no messages; a 32-minute fight-and-run session with all of them: no GPU loss, no errors. The experimental switches go into `play.cmd` only after the final comparison with R11 that is still running.
 - **R11 — even frames without frame generation, more PC settings** ([R11_FINAL_REPORT.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_FINAL_REPORT.md)). Medians against R10's `play.cmd`, vertical sync off and no frame limit, n = 3 (city scenes n = 2):
   - **Early batch submission, on in `play.cmd`** (`SSPC_R11_EARLY_SUBMIT=256`): while the GPU is idle, the recording thread hands it a batch after 256 commands instead of 500 ([R11_T2.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_T2.md)).
     - Neon Dash: frames over 33 ms 566 → 100 a minute, 1 % low 17.1 → 23.3 FPS, P99 44.8 → 37.8 ms, 48.2 → 50.1 FPS.
@@ -404,9 +413,9 @@ The native engine work replaces individual engine functions with SecondSonPC's i
 The PC options live inside the game's own menu: **Esc (Options) → Settings → "Additional settings"**. This is the line that used to read "HDR Rendering — Unavailable"; the string is replaced as it is read, and the game's files are not changed.
 
 - There are eight pages: **Graphics, Display, Controls, Keys, Audio, Game, Advanced, Experiments**.
-- **Experiments** lists the runtime's switches by group: the command processor, Vulkan recording, pipelines and memory, GPU queues and frame pacing, processor threads, R10's draws from the engine's data, the system libraries. Each says what it does, what it measured and whether `play.cmd` or `play_experimental.cmd` turns it on. Switches that are off by default are listed too, so every one of them can be tried. The launcher's value is the default; what a player changes is saved in their settings file and applies from the next start, because those subsystems read it once at start. "Reset this page" returns to the launcher's values. The log marks every changed one with `EXPERIMENT`.
+- **Experiments** lists the runtime's switches by group: the command processor, Vulkan recording, pipelines and memory, GPU queues and frame pacing, processor threads, R10's draws from the engine's data, the system libraries, R12's particles and weather, and R12's stand tools (diagnostics, off). Each says what it does, what it measured and whether `play.cmd` or `play_experimental.cmd` turns it on. Switches that are off by default are listed too, so every one of them can be tried. The launcher's value is the default; what a player changes is saved in their settings file and applies from the next start, because those subsystems read it once at start. "Reset this page" returns to the launcher's values. The log marks every changed one with `EXPERIMENT`.
 - The window works with keyboard, mouse and gamepad navigation, with prompts for the last device used.
-- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, motion blur and its strength, vertical sync, frame-rate limit, mouse and motion settings, volume.
+- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, motion blur and its strength, reflection quality, rain shadows, vertical sync, frame-rate limit, mouse and motion settings, volume.
 - **Display**:
   - vertical sync is On (FIFO), Off (IMMEDIATE) or Off without tearing (MAILBOX);
   - the frame-rate limit is 30, 40, 50, 60, 90, 120, 144, 165, 240 or unlimited;
@@ -475,6 +484,7 @@ The game renders at the window's size, or the display's in full screen, not at a
 | [`archive/feature/uncharted-bbport-optimizations`](../../tree/archive/feature/uncharted-bbport-optimizations) | uncharted_pc / bbport techniques: threaded recording, preparation workers, LTO, PGO | measured, nothing taken |
 | [`archive/docs-r10-20261024`](../../tree/archive/docs-r10-20261024) | R10 as developed: its six reports in `docs/`, its tools in `tools/r10` | the code is in `main` |
 | [`archive/docs-r11-20261025`](../../tree/archive/docs-r11-20261025) | R11 as developed: its six reports in `docs/`, its tools in `tools/r11` | the code is in `main` |
+| [`archive/docs-r12-20261026`](../../tree/archive/docs-r12-20261026) | R12 as developed: its five reports in `docs/`, its tools in `tools/r12` | the code is in `main` |
 
 The tag [`archive/dev-tools-20261023`](../../tree/archive/dev-tools-20261023) keeps the removed development scripts: A/B stand, measurement routes, analysis tools, the `play_*.cmd` variants.
 
@@ -520,6 +530,7 @@ Vulkan 1.3 driver
 - **Frame generation** has not been reviewed frame by frame, and input latency with it is not measured.
 - **GPU loss once with early submission.** In one of three 30-minute runs with `SSPC_R11_EARLY_SUBMIT=256` the driver reset the GPU after 18.5 minutes (`VK_ERROR_DEVICE_LOST`). Its exact repeat, another run and a run without it were clean, and the cause is not known. Such resets also happened on that PC before R11. If it happens to you, turn off "Early batch submission (R11)" on the Experiments page: that is R10's behaviour.
 - **Not tested in R11:** flying, cut-scenes, vertical sync switches together with DLSS / FSR frame generation, gamepad navigation of the new rows, two monitors.
+- **R12 is still under its final check.** The experimental switches above are off by default; their comparison with R11 over every scene is running. "Rain shadows: Off" has not yet been checked frame by frame. Not tested in R12: flying, cut-scenes, light from Delsin's powers (none on the routes), harbour and village with the particle sort.
 - There is no full-campaign compatibility guarantee.
 
 ## Roadmap
@@ -542,7 +553,9 @@ Vulkan 1.3 driver
 - [x] REA-3 / AQ with even frame pacing in fights and on the owner's save (R10 MAIN_FREE, `play_experimental.cmd`)
 - [x] Even frames in Neon Dash without frame generation (R11 early batch submission, `play.cmd`)
 - [ ] REA-3 / AQ / MAIN_FREE / AQ_IMAGES into `play.cmd`, after Neon Dash (1 % low and P99 below `play.cmd` now)
-- [ ] Less command processor work for the remaining draws
+- [x] Weather, local lights and reflections measured pass by pass; particle sort 8.5 → 1.5 ms, GPU writes kept in video memory (R12, experimental)
+- [ ] R12's GPU-write and particle switches into `play.cmd`, after the final comparison
+- [ ] Less command processor work for the remaining draws (the rain shadow maps' ~1 000 depth draws first)
 - [ ] Potato mode for weak PCs in `main`
 
 ### Native engine
@@ -557,6 +570,7 @@ Vulkan 1.3 driver
 - [x] Experiments page: every runtime switch on and off from the menu (R10), also the ones off by default (R11)
 - [x] Live vertical sync (FIFO / IMMEDIATE / MAILBOX), more frame limits, window mode with roll-back (R11)
 - [x] Motion blur on / off and its strength (R11)
+- [x] Reflection quality and rain shadows in Graphics (R12)
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
 - [x] Native mouse camera (no stick emulation)
 - [x] Any resolution and aspect ratio (4:3 to 32:9, Hor+, HUD, FOV, movies 16:9)

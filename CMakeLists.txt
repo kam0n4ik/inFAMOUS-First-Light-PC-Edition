@@ -34,12 +34,16 @@ add_library(sspc_runtime STATIC
     src/engine/render/dcb_scan.cpp
     src/engine/render/frame_trace.cpp
     src/engine/render/draw_census.cpp
+    src/engine/render/light_census.cpp
     src/engine/render/draw_runs.cpp
     src/engine/render/native_draw.cpp
     src/engine/render/native_render_ops.cpp
     src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
     src/engine/render/post_effects.cpp
+    src/engine/render/weather.cpp
+    src/engine/render/reflections.cpp
+    src/engine/render/rain_shadows.cpp
     src/engine/ui/game_menu.cpp
     src/engine/render/display_plan.cpp
     src/engine/render/render_resolution.cpp

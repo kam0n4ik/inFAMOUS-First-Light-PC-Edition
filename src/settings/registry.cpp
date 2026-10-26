@@ -130,6 +130,14 @@ constexpr Choice kParticleResolutions[] = {
     {"half", "Half", "Половина"},
     {"quarter", "Quarter", "Четверть"},
 };
+constexpr Choice kReflectionQualities[] = { // (R12 refl; docs/R12_REFLECTIONS.md)
+    {"original", "Original", "Исходное"},
+    {"low", "Low (no screen-space reflections)", "Низкое (без экранных отражений)"},
+};
+constexpr Choice kRainShadows[] = { // (R12 rain; docs/R12_RAIN_SHADOWS.md)
+    {"original", "Original", "Исходные"},
+    {"off", "Off (nothing covered from the rain)", "Выключены (ничто не укрыто от дождя)"},
+};
 constexpr Choice kUpscalers[] = {
     {"off", "Off (Render scale)", "Выключено (масштаб рендеринга)"},
     {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
@@ -561,6 +569,41 @@ void Build(Registry& r) {
             c.pc.motion_blur_strength = static_cast<u32>(std::get<s64>(x));
         },
         .requires_on = "graphics.motionBlur",
+    });
+    // ------------------------------------------------------------------ Graphics: reflections (R12 refl)
+    v.push_back(Desc{
+        .id = "graphics.reflectionQuality", .table = "Graphics", .key = "reflectionQuality",
+        .category = Category::Graphics, .type = Type::Choice, .apply = Apply::Live, .choices = kReflectionQualities,
+        .en = "Reflection quality", .ru = "Качество отражений",
+        .help_en = "Original: as in the game. Low: without the game's screen-space reflections - what is on screen "
+                   "(lamps, signs, headlights, buildings) mirrored in wet roads and puddles. The lights themselves, "
+                   "their highlights on wet surfaces, the wetness, the reflection maps and the water's own reflection "
+                   "stay. Saves about 0.4 ms of GPU time per frame (about 2% FPS in the evening city). Applies at "
+                   "once.",
+        .help_ru = "«Исходное» — как в игре. «Низкое» — без экранных отражений игры: того, что видно на экране "
+                   "(фонари, вывески, фары, дома), в мокрой дороге и лужах. Сами источники света, их блики на мокром, "
+                   "мокрота, карты отражений и собственное отражение воды остаются. Экономит около 0,4 мс работы "
+                   "видеокарты на кадр (около 2 % FPS в вечернем городе). Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.reflection_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.reflection_quality = std::get<std::string>(x); },
+    });
+    // ------------------------------------------------------------------ Graphics: rain shadows (R12 rain)
+    v.push_back(Desc{
+        .id = "graphics.rainShadows", .table = "Graphics", .key = "rainShadows", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Live, .choices = kRainShadows, .en = "Rain shadows",
+        .ru = "Тени дождя",
+        .help_en = "Original: as in the game. Off: nothing is drawn into the game's top-down map of what covers the "
+                   "ground from the rain (about 1000 draws a frame in wet weather) - the map stays, but empty, so "
+                   "the wetness treats every place as open to the sky: the ground under bridges, awnings and roofs "
+                   "gets as wet as the street. Rain, puddles and reflections stay. Saves processor time in wet "
+                   "weather; nothing in dry weather. Applies at once.",
+        .help_ru = "«Исходные» — как в игре. «Выключены» — в карту укрытий от дождя (вид сверху, около 1000 "
+                   "отрисовок за кадр в мокрую погоду) ничего не рисуется: карта остаётся, но пустая, и мокрота "
+                   "считает всё открытым небу — земля под мостами, навесами и крышами становится такой же мокрой, "
+                   "как улица. Дождь, лужи и отражения остаются. Экономит время процессора в мокрую погоду, в сухую "
+                   "погоду ничего не меняет. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.rain_shadows; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.rain_shadows = std::get<std::string>(x); },
     });
     // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; depth of
     // field: see kMissing; R11_POSTFX.md)

@@ -20,6 +20,45 @@ constexpr Choice kCpRings[] = {
     {"128", "128 records (play.cmd)", "128 записей (play.cmd)"},
     {"512", "512 records", "512 записей"},
 };
+constexpr Choice kWeatherStates[] = {
+    {"", "Off (the game's own)", "Выключено (как в игре)"},
+    {"log", "Journal only", "Только журнал"},
+    {"dry", "Dry surfaces", "Сухие поверхности"},
+};
+constexpr Choice kReflDiags[] = {
+    {"", "Off", "Выключено"},
+    {"ssroff", "No screen-space reflections", "Без экранных отражений"},
+    {"ssrflip", "Screen-space reflections every other frame", "Экранные отражения через кадр"},
+    {"ssrcycle", "Screen-space reflections every other second", "Экранные отражения через секунду"},
+    {"planaroff", "No planar reflections", "Без планарных отражений"},
+    {"wateroff", "No water reflection (black)", "Без отражения воды (чёрное)"},
+};
+constexpr Choice kReflStats[] = {
+    {"", "Off", "Выключено"},
+    {"5", "Every 5 s", "Раз в 5 с"},
+};
+constexpr Choice kRainStats[] = {
+    {"", "Off", "Выключено"},
+    {"5", "Every 5 s", "Раз в 5 с"},
+};
+constexpr Choice kRainDistances[] = {
+    {"", "Off (the game's 10000)", "Выключено (как в игре, 10000)"},
+    {"5000", "5000", "5000"},
+    {"2500", "2500", "2500"},
+};
+constexpr Choice kRainCycles[] = {
+    {"", "Off", "Выключено"},
+    {"10", "Every 10 s", "Каждые 10 с"},
+};
+constexpr Choice kWriterDetails[] = {
+    {"", "Off", "Выключено"},
+    {"2edafa400", "Tiled lighting shader", "Шейдер тайлового освещения"},
+};
+constexpr Choice kReadersOf[] = {
+    {"", "Off", "Выключено"},
+    {"2edc12000", "Per-tile light list", "Список света по тайлам"},
+    {"26d558000", "Particle pool", "Пул частиц"},
+};
 
 constexpr std::string_view kCpEn = "Command processor", kCpRu = "Обработчик команд GPU";
 constexpr std::string_view kVkEn = "Vulkan recording", kVkRu = "Запись команд Vulkan";
@@ -28,6 +67,8 @@ constexpr std::string_view kQueueEn = "GPU queues and frame pacing", kQueueRu = 
 constexpr std::string_view kCpuEn = "Processor threads", kCpuRu = "Потоки процессора";
 constexpr std::string_view kEngineEn = "Draws from the engine's data (R10)", kEngineRu = "Отрисовка из данных движка (R10)";
 constexpr std::string_view kSysEn = "System libraries", kSysRu = "Системные библиотеки";
+constexpr std::string_view kStandEn = "Stand tools (R12)", kStandRu = "Инструменты стенда (R12)";
+constexpr std::string_view kFxEn = "Particles and weather (R12)", kFxRu = "Частицы и погода (R12)";
 
 constexpr Experiment kExperiments[] = {
     // ---- command processor (play.cmd)
@@ -130,6 +171,40 @@ constexpr Experiment kExperiments[] = {
      .help_ru = "Эксперимент, выключено. Новые compute-конвейеры начинают собираться, как только подготовлен их "
                 "dispatch. С пустым кэшем шейдеров (первое прохождение, новый драйвер) Neon Dash 12,9 → 26,1 FPS, "
                 "самый долгий фриз 5,5 → 2,5 с (один прогон); с прогретым кэшем ничего не меняет."},
+    {.env = "SSPC_R12_LIGHT_LIST_KEEP", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .en = "Light index list stays in video memory (R12)", .ru = "Список источников света — только в видеопамяти (R12)",
+     .help_en = "Experiment, off. The per-tile light list the GPU builds every frame (6.25 MiB) is no longer copied "
+                "back to the CPU's memory: only the GPU reads it (0 CPU reads measured); a CPU access still gets it "
+                "written back first. The picture is the same. No FPS change (user 32.85 -> 32.79, fight 46.83 -> "
+                "46.94, n = 3): its write-back is cheap - the particle pools are what costs (see below). "
+                "Measurements: docs/R12_LIGHTS.md.",
+     .help_ru = "Эксперимент, выключено. Список источников света по тайлам, который видеокарта строит каждый кадр "
+                "(6,25 МиБ), больше не копируется обратно в память процессора: его читает только видеокарта "
+                "(чтений процессором — 0); при обращении процессора он сначала записывается обратно. Картинка та же. "
+                "FPS не меняется (user 32,85 → 32,79, бой 46,83 → 46,94, n = 3): его write-back дешёвый, дорого "
+                "стоят пулы частиц (см. ниже). Замеры — docs/R12_LIGHTS.md."},
+    {.env = "SSPC_FB_LAZY_WB", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .en = "GPU writes stay in video memory until read (FB-7)",
+     .ru = "Данные видеокарты — в видеопамяти до чтения (FB-7)",
+     .help_en = "Experiment, off. Large ranges the GPU writes every frame (the particle pools, the light list) are "
+                "no longer copied back to the CPU's memory each frame; a CPU access waits for its 64 KiB block "
+                "(2-9 ms, ~60-170 a run). R12 (n = 3): user 33.14 -> 41.43 FPS (+25 %), 1 % low 27.9 -> 32.6; "
+                "city 47.83 -> 48.20, fight neutral; Neon Dash within its spread. The picture is the same "
+                "(poison test, Validation 0).",
+     .help_ru = "Эксперимент, выключено. Большие диапазоны, которые видеокарта пишет каждый кадр (пулы частиц, "
+                "список света), больше не копируются в память процессора каждый кадр; обращение процессора ждёт "
+                "свой блок 64 КиБ (2–9 мс, ~60–170 за прогон). R12 (n = 3): user 33,14 → 41,43 FPS (+25 %), "
+                "1 % low 27,9 → 32,6; город 47,83 → 48,20, бой без изменений; Neon Dash — в пределах разброса. "
+                "Картинка та же (тест отравления, Validation 0)."},
+    {.env = "SSPC_REA_HEAP_READS", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .requires_env = "SSPC_FB_LAZY_WB", .en = "Vertex heap reads skip write-backs (REA-2)",
+     .ru = "Чтение кучи вершин без write-back (REA-2)",
+     .help_en = "Experiment, off. With the previous switch: the game's vertex-data heaps (read-only, >= 256 MiB) "
+                "no longer force the write-back of what the GPU wrote inside their range. R12 (n = 3, both): user "
+                "41.75 FPS (+26 %), city 50.13 (+4.8 %), 1 % low 20.5 -> 24.2; fight neutral.",
+     .help_ru = "Эксперимент, выключено. Вместе с предыдущим: кучи вершин игры (только чтение, ≥ 256 МиБ) больше "
+                "не заставляют записывать обратно то, что видеокарта записала в их диапазоне. R12 (n = 3, оба "
+                "флага): user 41,75 FPS (+26 %), город 50,13 (+4,8 %), 1 % low 20,5 → 24,2; бой без изменений."},
 
     // ---- GPU queues and frame pacing (play_experimental.cmd)
     {.env = "SSPC_REA_DEFER_WAIT_B", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
@@ -225,6 +300,14 @@ constexpr Experiment kExperiments[] = {
      .help_ru = "Эксперимент, выключено. Отрисовки теней (0x43d480) готовятся из состояния движка, без обхода "
                 "таблиц ресурсов (15,2 млн проверок, расхождений нет). Изменения FPS не замерено."},
 
+    // ---- particles and weather (R12)
+    {.env = "SSPC_R12_PSORT", .group_en = kFxEn, .group_ru = kFxRu, .on = "1", .off = "0",
+     .en = "Fast particle sort (R12)", .ru = "Быстрая сортировка частиц (R12)",
+     .help_en = "Experiment, off. The particles' ranking shader (0x2edaa0c00, 80 runs a frame in the owner's save) "
+                "without the emulation of the console's lane masks: 8.5 -> 1.5 ms of GPU a frame there, the same results.",
+     .help_ru = "Эксперимент, выключено. Шейдер ранжирования частиц (0x2edaa0c00, 80 запусков за кадр в сохранении "
+                "владельца) без эмуляции масок линий консоли: 8,5 -> 1,5 мс видеокарты за кадр, результат тот же."},
+
     // ---- system libraries (play.cmd)
     {.env = "SSPC_R10_AJM", .group_en = kSysEn, .group_ru = kSysRu, .on = "native", .off = "bridge",
      .en = "Own audio decoder (AJM / ATRAC9)", .ru = "Свой декодер звука (AJM / ATRAC9)",
@@ -238,6 +321,107 @@ constexpr Experiment kExperiments[] = {
                 "On in play.cmd. Off: shadPS4's.",
      .help_ru = "CommonDialog, libSceNet и часть libc на собственном коде SecondSonPC (102 проверки самотеста). "
                 "Включено в play.cmd. Выключено — как в shadPS4."},
+
+    // ---- stand tools (R12 weather, docs/R12_WEATHER.md)
+    {.env = "SSPC_R12_WEATHER", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kWeatherStates, .unset_shows = "", .en = "Weather state for measurements",
+     .ru = "Состояние погоды для замеров",
+     .help_en = "Stand tool, off. Journal only: writes the engine's weather values to weather.log (~2 us a frame). "
+                "Dry surfaces: wetness and puddles at 0 in the time of day the game loaded, its own values restored "
+                "on exit; saves are never written. Rain and night come from the save, not from this switch. Takes "
+                "effect at the next start.",
+     .help_ru = "Инструмент стенда, выключено. «Только журнал» — значения погоды движка пишутся в weather.log "
+                "(~2 мкс на кадр). «Сухие поверхности» — мокрота и лужи 0 во времени суток, которое загрузила "
+                "игра; на выходе возвращаются её значения, сохранения не меняются. Дождь и ночь задаёт сохранение, "
+                "а не этот переключатель. Действует со следующего запуска."},
+    // R12 reflections (docs/R12_REFLECTIONS.md); the player's switch is [Graphics] reflectionQuality
+    {.env = "SSPC_R12_REFL_STATS", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kReflStats, .unset_shows = "", .en = "Reflection statistics", .ru = "Статистика отражений",
+     .help_en = "Diagnostics, off. A log line every few seconds: the reflection passes' calls and the time of day's "
+                "reflection values. The picture is unchanged.",
+     .help_ru = "Диагностика, выключено. Строка журнала раз в несколько секунд: вызовы проходов отражений и "
+                "значения отражений времени суток. Картинка не меняется."},
+    {.env = "SSPC_R12_REFL_DIAG", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kReflDiags, .unset_shows = "", .en = "Reflection diagnostics (changes the picture)",
+     .ru = "Диагностика отражений (меняет картинку)",
+     .help_en = "Diagnostics for A/B runs, off. Skips one reflection pass to measure its cost; without the water "
+                "reflection the water turns black (the game has no other path), so it is not a quality level.",
+     .help_ru = "Диагностика для A/B, выключено. Пропускает один проход отражений, чтобы измерить его цену; без "
+                "отражения воды вода чёрная (другого пути у игры нет), поэтому это не уровень качества."},
+    {.env = "SSPC_R12_REFL_HOOK", .group_en = kStandEn, .group_ru = kStandRu, .on = "0", .off = "",
+     .en = "No reflection probe", .ru = "Без пробы отражений",
+     .help_en = "Diagnostics, off. The reflection probe is not installed: the game's own path, and «Reflection "
+                "quality» has no effect.",
+     .help_ru = "Диагностика, выключено. Проба отражений не ставится: путь игры как есть, пункт «Качество "
+                "отражений» не действует."},
+    // R12 rain shadows (docs/R12_RAIN_SHADOWS.md); the player's switch is [Graphics] rainShadows
+    {.env = "SSPC_R12_RAIN_STATS", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kRainStats, .unset_shows = "", .en = "Rain shadow statistics", .ru = "Статистика теней дождя",
+     .help_en = "Diagnostics, off. A log line every few seconds: the rain shadow maps' updates, emptied and "
+                "released maps, their cascades, the wetness and the rain shadow distance. The picture is unchanged.",
+     .help_ru = "Диагностика, выключено. Строка журнала раз в несколько секунд: обновления, опустошённые и "
+                "освобождённые карты теней дождя, их каскады, мокрота и дальность теней дождя. Картинка не "
+                "меняется."},
+    {.env = "SSPC_R12_RAIN_DIST", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kRainDistances, .unset_shows = "", .en = "Rain shadow distance (changes the picture)",
+     .ru = "Дальность теней дождя (меняет картинку)",
+     .help_en = "Diagnostics for A/B runs, off. Writes the engine's own CSM1_RAIN_SHADOW_DISTANCE (10000 in the "
+                "game) before each rain shadow update, to measure what a shorter map saves. Not a quality level.",
+     .help_ru = "Диагностика для A/B, выключено. Записывает собственный параметр движка CSM1_RAIN_SHADOW_DISTANCE "
+                "(в игре 10000) перед каждым обновлением теней дождя, чтобы измерить, что даёт меньшая карта. Не "
+                "уровень качества."},
+    {.env = "SSPC_R12_RAIN_CYCLE", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kRainCycles, .unset_shows = "", .en = "Rain shadows on and off (changes the picture)",
+     .ru = "Тени дождя вкл/выкл по очереди (меняет картинку)",
+     .help_en = "Diagnostics, off. Switches the rain shadows off and back on every few seconds - the path of the "
+                "live switch, over and over, to check it in motion. Overrides «Rain shadows».",
+     .help_ru = "Диагностика, выключено. Каждые несколько секунд выключает и снова включает тени дождя — путь "
+                "переключения на лету, много раз подряд, для проверки в движении. Перекрывает пункт «Тени дождя»."},
+    {.env = "SSPC_R12_RAIN_DIAG", .group_en = kStandEn, .group_ru = kStandRu, .on = "release", .off = "",
+     .en = "Rain shadows off by releasing the maps (breaks the picture)",
+     .ru = "Тени дождя выкл. освобождением карт (ломает картинку)",
+     .help_en = "Diagnostics, off. «Rain shadows: Off» takes the game's own dry-weather path (the maps are released) "
+                "while it rains: on this emulator the whole frame turns grey and loses its haze. Kept only to show "
+                "why the setting empties the map instead.",
+     .help_ru = "Диагностика, выключено. «Тени дождя: выключены» идут путём игры для сухой погоды (карты "
+                "освобождаются) во время дождя: на этом эмуляторе весь кадр становится серым и теряет дымку. "
+                "Оставлено только чтобы показать, почему пункт вместо этого опустошает карту."},
+    {.env = "SSPC_R12_RAIN_HOOK", .group_en = kStandEn, .group_ru = kStandRu, .on = "0", .off = "",
+     .en = "No rain shadow hooks", .ru = "Без перехвата теней дождя",
+     .help_en = "Diagnostics, off. The rain shadow hooks are not installed: the game's own path, and «Rain "
+                "shadows» has no effect.",
+     .help_ru = "Диагностика, выключено. Перехват теней дождя не ставится: путь игры как есть, пункт «Тени "
+                "дождя» не действует."},
+    // R12 lights (docs/R12_LIGHTS.md)
+    {.env = "SSPC_R12_LIGHT_CENSUS", .group_en = kStandEn, .group_ru = kStandRu, .on = "1", .off = "",
+     .en = "Light census", .ru = "Перепись источников света",
+     .help_en = "Diagnostics, off. A log line every 10 s: the lights the engine puts into the frame by kind, with a "
+                "shadow, the shadow atlas's draws, the glows' occlusion queries and the largest GPU writers. The "
+                "picture is unchanged.",
+     .help_ru = "Диагностика, выключено. Строка журнала раз в 10 с: источники света в кадре по видам, с тенью, "
+                "draw атласа теней, occlusion queries свечений и самые большие записи видеокарты. Картинка не "
+                "меняется."},
+    {.env = "SSPC_R12_WRITER_DETAIL", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kWriterDetails, .unset_shows = "", .requires_env = "SSPC_R12_LIGHT_CENSUS",
+     .en = "Writes of one shader", .ru = "Записи одного шейдера",
+     .help_en = "Diagnostics, off. With the light census: each distinct buffer range the chosen shader writes is "
+                "logged once.",
+     .help_ru = "Диагностика, выключено. Вместе с переписью света: каждый диапазон буферов, который пишет "
+                "выбранный шейдер, пишется в журнал один раз."},
+    {.env = "SSPC_R12_READERS_OF", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kReadersOf, .unset_shows = "", .requires_env = "SSPC_R12_LIGHT_CENSUS",
+     .en = "Shaders reading a range", .ru = "Шейдеры, читающие диапазон",
+     .help_en = "Diagnostics, off. With the light census: the shaders that bind the chosen range are logged.",
+     .help_ru = "Диагностика, выключено. Вместе с переписью света: в журнал пишутся шейдеры, которые подключают "
+                "выбранный диапазон."},
+    {.env = "SSPC_R12_LAZY_TRACE", .group_en = kStandEn, .group_ru = kStandRu, .on = "1", .off = "",
+     .requires_env = "SSPC_FB_LAZY_WB", .en = "Log the waits for kept-back blocks",
+     .ru = "Журнал ожиданий отложенных блоков",
+     .help_en = "Diagnostics, off. With FB-7: each CPU wait for a block kept in video memory is logged with its "
+                "time (at most 4000), to match long frames with these waits.",
+     .help_ru = "Диагностика, выключено. Вместе с FB-7: каждое ожидание процессором блока, оставленного в "
+                "видеопамяти, пишется в журнал со временем (не больше 4000), чтобы сопоставить их с длинными "
+                "кадрами."},
 };
 
 std::string GetEnv(std::string_view name) {

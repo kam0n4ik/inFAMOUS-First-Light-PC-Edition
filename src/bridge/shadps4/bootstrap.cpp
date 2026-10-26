@@ -73,8 +73,12 @@
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/post_effects.h"
+#include "engine/render/weather.h"
+#include "engine/render/rain_shadows.h"
+#include "engine/render/reflections.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
+#include "engine/render/light_census.h"
 #include "engine/render/draw_runs.h"
 #include "native_engine/native_function_registry.h"
 #include "engine/render/native_draw.h"
@@ -877,6 +881,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Gpu::R8::Verify::Frame::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (R8-V3)
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::DrawCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (CITY-OPT diagnostics)
+    Engine::Render::LightCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (R12 diagnostics)
     Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::Trace::InstallCriticalComputeFromEnvironment(linker.GetModule(eboot_index)->Base());
     if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)
@@ -896,11 +901,19 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
     Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
                                cfg.pc.particle_resolution);
+    // R12 weather (diagnostics, SSPC_R12_WEATHER only): the stand's reproducible weather states (docs/R12_WEATHER.md)
+    Engine::Render::Weather::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
     // R11 post effects (both backends): the game's own unless [Graphics] motionBlur / motionBlurStrength (SSPC_POSTFX_*;
     // film grain and depth of field only SSPC_POSTFX_FILM_GRAIN / SSPC_POSTFX_DOF; docs/R11_POSTFX.md)
     Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),
                                     {.motion_blur = cfg.pc.motion_blur,
                                      .motion_blur_strength = cfg.pc.motion_blur_strength});
+    // R12 reflections (both backends; docs/R12_REFLECTIONS.md): the game's own unless [Graphics] reflectionQuality
+    // (SSPC_REFLECTION_QUALITY); diagnostics SSPC_R12_REFL_STATS / _DIAG
+    Engine::Render::Reflections::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.reflection_quality);
+    // R12 rain shadows (both backends; docs/R12_RAIN_SHADOWS.md): the game's own unless [Graphics] rainShadows
+    // (SSPC_RAIN_SHADOWS); diagnostics SSPC_R12_RAIN_STATS / _DIST / _HOOK
+    Engine::Render::RainShadows::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.rain_shadows);
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
     // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {
