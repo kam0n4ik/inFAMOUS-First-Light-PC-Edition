@@ -628,7 +628,9 @@ constexpr GuestFunction kResetAssumed[] = {
     {0x1691e0, 0x2fe, 0xb1a4bc684bc8e25full}, // the submission: counter and position RELEASE_MEMs, INDIRECT_BUFFER
     {0x169020, 0x162, 0xccb01dd6297693f6ull}, // the overflow handler: reuses the space below the position label
 };
-constexpr u32 kPositionGrace = 40; ///< delays of 50 us past the counter (the position write is the next fence)
+// delays of 50 us past the counter: the position write is the next fence, which a frame held up by new shaders can
+// keep from the GPU for more than 2 ms (10-27: once in 173151 frames at 6 FPS); 20 ms, only in such a stall
+constexpr u32 kPositionGrace = 400;
 bool g_safe_reset = false;
 // (the main thread's: wait B deferred in this frame - the barrier only completes such a wait, so loading screens and a
 // queue being torn down, whose SubmitFrame has no deferred wait, are left as they were)

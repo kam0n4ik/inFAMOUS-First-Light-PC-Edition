@@ -2,10 +2,14 @@
 #include "ui/menu_controller.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -16,6 +20,7 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 #include <windows.h>
+#include <wincodec.h>
 
 #include "base/log.h"
 #include "engine/render/render_resolution.h"
@@ -31,6 +36,10 @@
 #include "ui/overlay_win32.h"
 #include "ui/prompt_service.h"
 #include "ui/settings_menu.h"
+
+namespace SecondSon::Runtime::Trophies {
+bool Icon(s32 id, std::vector<u8>& png); // runtime/np/offline_services.cpp
+}
 
 namespace SecondSon::Ui {
 
@@ -85,6 +94,11 @@ struct State {
     // PC Edition: the PC settings are an entry of the game's own Settings screen (Esc / Options during play)
     u32 poll_event = 0;          // SDL user event of the game-menu poll timer
     u32 prompt_event = 0;        // SDL user event of the button icons' timer (ui/prompt_service.h)
+    // the trophy notice (its own overlay): the one on screen and when it came
+    Win32Overlay trophy;
+    s32 trophy_id = -1;
+    u64 trophy_start_ns = 0;
+    std::shared_ptr<const Image> trophy_icon;
     bool dev_f1 = false;         // SSPC_DEV_F1=1 (development): F1 opens the menu anywhere
     bool game_menu_open = false; // one of the game's pausing screens is shown
     bool entry_shown = false;    // the game's Settings screen is in front (its "Additional settings" item opens ours)
@@ -646,6 +660,152 @@ void TrackPad(const SDL_Event& e, bool down) {
     }
 }
 
+// ---- the trophy notices (runtime/np/offline_services.cpp: a trophy earned, on any thread -> NotifyTrophy)
+
+constexpr u64 kTrophyShowNs = 6'000'000'000; // on screen
+constexpr u64 kTrophyFadeNs = 400'000'000;   // its fade-out at the end
+
+std::mutex g_trophy_mutex;
+std::deque<s32> g_trophy_queue; // earned, not shown yet
+std::atomic<u32> g_trophy_event{0};
+
+// the eboot's names of the trophies, by id (its table "Platinum", "PainBuildsCharacter", ..., "OverkillMuch")
+constexpr std::array<const char*, 48> kTrophyNames = {
+    "inFAMOUS Second Son",    "Pain Builds Character", "It Takes a Village",       "Your Little Secret",
+    "Temperance",             "Malice",                "Courage",                  "Contempt",
+    "Forgive but Never Forget", "My Brother's Keeper", "Fate Worse than Death",    "The Bitch Is Dead",
+    "The High Road",          "The Hero They Deserve", "Let Me Get the Door for You", "Spinoff",
+    "Everyone's a Critic",    "Just Say No",           "Freedom of Speech",        "What Did You Call Me",
+    "Someone Your Own Size",  "Walk It Off",           "Kicking and Screaming",    "Avatar of Good",
+    "Avatar of Evil",         "Follow the Glow",       "Shardcore",                "Poke Your Eye Out",
+    "Nothing to See Here",    "Inside Track",          "Get Off My Streets",       "Not Very Hidden",
+    "King of the Tag",        "Prank Call",            "Hello Operator",           "Final Showdown",
+    "One Down",               "I Like It Here",        "This Is My House",         "CARnage",
+    "Drop Everything",        "Frequent Flyer",        "Who Put This Here",        "Triple Attack",
+    "Double Smoke Stack Attack", "Cough Drop",         "Sure Shot",                "Overkill Much",
+};
+
+/// A PNG -> premultiplied BGRA (WIC); nullptr when it does not decode.
+std::shared_ptr<const Image> DecodePng(const std::vector<u8>& png) {
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED); // (RPC_E_CHANGED_MODE: COM is up already)
+    IWICImagingFactory* f = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    auto img = std::make_shared<Image>();
+    bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f))) &&
+              SUCCEEDED(f->CreateStream(&stream)) &&
+              SUCCEEDED(stream->InitializeFromMemory(const_cast<BYTE*>(png.data()), static_cast<DWORD>(png.size()))) &&
+              SUCCEEDED(f->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &dec)) &&
+              SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(f->CreateFormatConverter(&conv)) &&
+              SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                         WICBitmapPaletteTypeCustom)) &&
+              SUCCEEDED(conv->GetSize(&img->width, &img->height)) && img->width > 0 && img->width <= 1024 &&
+              img->height > 0 && img->height <= 1024;
+    if (ok) {
+        img->bgra.resize(u64{img->width} * img->height * 4);
+        ok = SUCCEEDED(conv->CopyPixels(nullptr, img->width * 4, static_cast<UINT>(img->bgra.size()), img->bgra.data()));
+    }
+    for (IUnknown* u : std::initializer_list<IUnknown*>{conv, frame, dec, stream, f}) {
+        if (u != nullptr) {
+            u->Release();
+        }
+    }
+    if (SUCCEEDED(co)) {
+        CoUninitialize();
+    }
+    return ok ? img : nullptr;
+}
+
+/// Draws the notice at `now` (top left of the client area, as the console shows it); false once its time is over.
+bool DrawTrophy(u64 now) {
+    auto& st = S();
+    const u64 age = now - st.trophy_start_ns;
+    RECT cr{};
+    if (age >= kTrophyShowNs || !GetClientRect(st.hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) {
+        st.trophy.Hide();
+        return false;
+    }
+    const float fade = age + kTrophyFadeNs > kTrophyShowNs
+                           ? static_cast<float>(kTrophyShowNs - age) / static_cast<float>(kTrophyFadeNs)
+                           : 1.0f;
+    const auto a = [fade](u8 alpha) { return static_cast<u8>(static_cast<float>(alpha) * fade); };
+    const float w = static_cast<float>(cr.right), h = static_cast<float>(cr.bottom);
+    const float s = std::max(h / 1080.0f, 0.5f);
+    const bool ru = Settings::Instance().Initialized() ? Ru(Settings::Instance().Current()) : true;
+    const bool platinum = st.trophy_id == 0;
+    const Rect panel{48 * s, 48 * s, 500 * s, 100 * s};
+    DrawList list;
+    list.Reset(w, h);
+    list.SetSurface(panel);
+    list.FillRect(panel, {18, 18, 20, a(230)}, 6 * s);
+    list.StrokeRect(panel, {255, 255, 255, a(30)}, 1.0f * s, 6 * s);
+    const Rect icon{panel.x + 14 * s, panel.y + 14 * s, 72 * s, 72 * s};
+    if (st.trophy_icon != nullptr) {
+        list.DrawImage(icon, st.trophy_icon, a(255));
+    } else {
+        list.FillRect(icon, {60, 60, 66, a(255)}, 4 * s);
+    }
+    const float x = icon.Right() + 16 * s, iw = panel.Right() - x - 16 * s;
+    const char* title = platinum ? (ru ? "Вы получили платиновый трофей" : "You have earned the platinum trophy.")
+                                 : (ru ? "Вы получили трофей" : "You have earned a trophy.");
+    list.Text({x, panel.y + 18 * s, iw, 26 * s}, title, 17 * s, {196, 198, 204, a(255)});
+    const bool known = st.trophy_id >= 0 && st.trophy_id < static_cast<s32>(kTrophyNames.size());
+    list.Text({x, panel.y + 48 * s, iw, 32 * s}, known ? kTrophyNames[st.trophy_id] : "?", 22 * s,
+              {255, 255, 255, a(255)}, Align::Left, FontWeight::Semibold);
+    return st.trophy.Present(st.hwnd, list);
+}
+
+/// The next trophy waiting, on screen (main thread); false when none waits.
+bool ShowNextTrophy() {
+    auto& st = S();
+    s32 id = -1;
+    {
+        std::scoped_lock lock{g_trophy_mutex};
+        if (g_trophy_queue.empty()) {
+            return false;
+        }
+        id = g_trophy_queue.front();
+        g_trophy_queue.pop_front();
+    }
+    std::vector<u8> png;
+    st.trophy_id = id;
+    st.trophy_icon = Runtime::Trophies::Icon(id, png) ? DecodePng(png) : nullptr;
+    st.trophy_start_ns = NowNs();
+    const bool shown = DrawTrophy(st.trophy_start_ns);
+    SSPC_LOG(App, Info, "trophy notice {}: {}{}", shown ? "shown" : "not shown", id,
+             st.trophy_icon != nullptr ? "" : " (no icon)");
+    return true;
+}
+
+void OnTrophyTimer(void*) {
+    auto& st = S();
+    if (st.trophy_id >= 0 && !DrawTrophy(NowNs())) {
+        st.trophy_id = -1;
+        st.trophy_icon.reset();
+        ShowNextTrophy();
+    }
+}
+
+void OnTrophyEvent() {
+    auto& st = S();
+    if (st.hwnd == nullptr) {
+        return;
+    }
+    if (!st.trophy.Ok()) {
+        std::string error;
+        if (!st.trophy.Init(error)) {
+            SSPC_LOG(App, Warning, "trophy notice: no overlay ({})", error);
+            return;
+        }
+        st.trophy.SetTimer(&OnTrophyTimer, nullptr, 33);
+    }
+    if (st.trophy_id < 0) {
+        ShowNextTrophy();
+    }
+}
+
 u32 GamePollTimer(void*, SDL_TimerID, u32 interval) {
     SDL_Event ev{};
     ev.type = S().poll_event;
@@ -869,6 +1029,16 @@ MenuController& Menu() {
     return controller;
 }
 
+void NotifyTrophy(s32 trophy) {
+    std::scoped_lock lock{g_trophy_mutex};
+    g_trophy_queue.push_back(trophy);
+    if (const u32 te = g_trophy_event.load(); te != 0) {
+        SDL_Event ev{};
+        ev.type = te;
+        SDL_PushEvent(&ev);
+    }
+}
+
 void MenuController::Install(const Options& options) {
     auto& st = S();
     st.opt = options;
@@ -898,6 +1068,15 @@ void MenuController::Install(const Options& options) {
     }
     if (st.poll_event != 0) {
         SDL_AddTimer(kGamePollMs, &GamePollTimer, nullptr);
+    }
+    g_trophy_event = SDL_RegisterEvents(1);
+    if (g_trophy_event != 0) {
+        std::scoped_lock lock{g_trophy_mutex};
+        if (!g_trophy_queue.empty()) {
+            SDL_Event ev{};
+            ev.type = g_trophy_event;
+            SDL_PushEvent(&ev);
+        }
     }
     auto& service = Settings::Instance();
     service.SetCapabilities(options.capabilities);
@@ -1053,6 +1232,10 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
     // the controller's, a click on it); the mouse chooses and clicks the game's items
     if (st.poll_event != 0 && e.type == st.poll_event) {
         OnGamePoll();
+        return EventRoute::Consumed;
+    }
+    if (const u32 te = g_trophy_event.load(); te != 0 && e.type == te) {
+        OnTrophyEvent();
         return EventRoute::Consumed;
     }
     // F1 only for development (SSPC_DEV_F1=1), or when the game's screens cannot be seen (another eboot)

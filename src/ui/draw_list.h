@@ -1,8 +1,9 @@
-// SecondSonPC — what SecondSonPC's menu draws, independent of who draws it: rectangles, lines, circles, triangles and
-// UTF-8 text in window client pixels. The Win32 overlay renders it now (ui/overlay_win32.*); a pass of SecondSonPC's
+// SecondSonPC — what SecondSonPC's menu draws, independent of who draws it: rectangles, lines, circles, triangles,
+// images and UTF-8 text in window client pixels. The Win32 overlay renders it now (ui/overlay_win32.*); a pass of SecondSonPC's
 // own presenter can render the same list later (P4.6 contract, docs/PC_SETTINGS_IMPLEMENTATION.md §9). Own code.
 #pragma once
 
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,6 +47,13 @@ inline float FontStretch(FontWeight w) {
     return w == FontWeight::GameSlab ? 0.84f : w == FontWeight::GameItem ? 0.92f : 1.0f;
 }
 
+/// Pixels for DrawList::Image: BGRA, premultiplied alpha, rows top-down. Shared: a renderer may keep its own copy of
+/// the same image (keyed by the object) while the image lives.
+struct Image {
+    u32 width = 0, height = 0;
+    std::vector<u8> bgra;
+};
+
 struct DrawCmd {
     enum class Kind : u8 {
         FillRect,       // rect, radius, color
@@ -58,6 +66,7 @@ struct DrawCmd {
         Text,           // rect = box, text, size, align, weight, wrap (else one line, vertically centred, ellipsis)
         PushClip,       // rect
         PopClip,
+        Image,          // rect, image, color.a = opacity
     };
     Kind kind = Kind::FillRect;
     Rect rect;
@@ -70,6 +79,7 @@ struct DrawCmd {
     Align align = Align::Left;
     FontWeight weight = FontWeight::Regular;
     bool wrap = false;
+    std::shared_ptr<const Image> image;
 };
 
 class DrawList {
@@ -127,6 +137,11 @@ public:
               FontWeight weight = FontWeight::Regular, bool wrap = false) {
         Add({.kind = DrawCmd::Kind::Text, .rect = box, .color = c, .text = std::string(text), .size = size,
              .align = align, .weight = weight, .wrap = wrap});
+    }
+    void DrawImage(Rect r, std::shared_ptr<const Image> image, u8 opacity = 255) {
+        if (image != nullptr && image->width != 0 && image->height != 0) {
+            Add({.kind = DrawCmd::Kind::Image, .rect = r, .color = {255, 255, 255, opacity}, .image = std::move(image)});
+        }
     }
     void PushClip(Rect r) {
         Add({.kind = DrawCmd::Kind::PushClip, .rect = r});

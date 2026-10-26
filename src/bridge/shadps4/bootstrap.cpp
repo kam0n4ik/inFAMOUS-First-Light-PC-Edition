@@ -151,6 +151,10 @@ namespace Libraries::Kernel {
 extern char const* g_environment[64];
 }
 
+namespace SecondSon::Runtime::Trophies {
+void Configure(const std::filesystem::path& earned_file, const std::filesystem::path& trp); // runtime/np
+}
+
 // shadPS4 library entry points started explicitly on the sspc path (StartBridgeLibraries).
 namespace Libraries::GnmDriver {
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
@@ -1543,6 +1547,9 @@ void RunGame(const App::Config& cfg) {
     }
     SSPC_LOG(SaveData, Info, "/savedata0 root: {}\\<user>\\savedata\\{}\\<dir>",
              (cfg.user_data_dir / "home").string(), id);
+    // the earned trophies beside the saves (kept on this PC; the icons are the game's)
+    ::SecondSon::Runtime::Trophies::Configure(cfg.user_data_dir / "home" / "trophies" / (id + ".txt"),
+                                              game_folder / "sce_sys" / "trophy" / "trophy00.trp");
 
     const std::string guest_eboot_path = "/app0/eboot.bin";
     Common::SecondSonBootstrap::GameInfo info{

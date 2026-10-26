@@ -54,6 +54,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   - Any resolution and aspect ratio from 4:3 to 32:9, with Hor+, an unstretched HUD, an FOV setting and movies kept 16:9 ([Resolutions and aspect ratios](#resolutions-and-aspect-ratios)).
   - Audio goes out through WASAPI; cutscene video is decoded natively.
   - `play.cmd` backs up your saves before every start.
+- **What PSN gave, without PSN.** The game is signed in from the start (as `t.me/cloudeluxe`), and the shut-down Paper Trail server is answered locally, so the online Paper Trail missions open. The pre-order and promotion add-ons on the disc are unlocked (Cole's Legacy: Cole's jacket and its missions; the Penny Arcade, Exist, Jos, Skeleton and Handprint vests). Trophies are earned and kept on your PC, with a notice and the platinum ([What is new](#what-is-new)).
 - **No PS4 firmware.** The system libraries the game imports are implemented by the project (336 of 417 natively, the rest from the shadPS4 core linked in). Only your own copy of the game is needed.
 - **Measured, not guessed.** Every change is decided by an interleaved A/B on the same build, and experiments that lost are documented too: [135 reports](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md).
 
@@ -278,7 +279,9 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 | File system, system / user services, PlayGo, app content | own |
 | Save data | own |
 | Audio output (WASAPI), video decoding (`sceVideodec*`, cutscenes) | own |
-| Offline network, NP, trophies, HTTP | own (offline behaviour) |
+| Network, NP, HTTP | own: signed in to an emulated network, Paper Trail answered locally, nothing else goes online |
+| Add-ons (app content) | own: the add-ons on the disc unlocked |
+| Trophies | own: kept on this PC, notice over the game, platinum |
 | Keyboard / mouse input, pad API, button prompts | own |
 | PC settings window inside the game's menu | own |
 | GPU: PM4 command processor (graphics + async compute), Vulkan backend | own, default |
@@ -289,6 +292,12 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 ### What is new
 
 **October 2026, the last week** (all in `main`):
+
+- **Online missions, add-ons and trophies.**
+  - **Online ("Paper Trail")**: the game always sees a player signed in to the network, as `t.me/cloudeluxe`. The only server the game talks to, `api.infamouspapertrail.com` (Paper Trail, shut down by Sony), is answered by SecondSonPC itself: every step of the six cases that was done on the website counts as done, and the in-game steps are the game's own. So the "Paper Trail" missions under "Evidence" should open instead of asking you to connect to PSN, and their rewards (the Paper Trail vests) can be earned. No other request leaves the PC: the game's other network library stays offline.
+  - **Add-ons**: the pre-order and promotion add-ons were unlock keys; their content is on the disc. Every key the game asks for is now owned: Cole's Legacy (Cole's jacket and its missions) and the Penny Arcade, Exist, Jos, Skeleton and Handprint vests.
+  - **Trophies**: all 48 can be earned. They are kept in `userdata\home\trophies\CUSA00004.txt` (the game reads them back at every start), the platinum comes with the last one, and each trophy shows a notice at the top left of the game with its icon from the game's trophy file. The names are the game's internal English ones: the trophy texts are encrypted with the console's key.
+  - Also: the REA-3 safe reset waits up to 20 ms for a late position label (was 2 ms), so a frame held up by new shaders no longer triggers it.
 
 - **Fixed: the game hanging with the experimental switches** (the async compute lane with early or threaded submission). The log said `too many fences held on queue 1 … 128 fences held waiting for the GPU`, after 2 to 20 minutes of play. The GPU was not stuck: the game's compute queue had run 128 completion fences ahead of a GPU a few batches behind, and at that limit the command processor dropped the queue's whole submission, so the game waited for work that never came. The queue now waits for the GPU there and goes on, as the console's does. If the command processor ever stops a submission again, the log carries every batch in flight, what each waits for and the state of each queue.
 
@@ -570,6 +579,7 @@ Vulkan 1.3 driver
 - **Not tested in R11:** flying, cut-scenes, vertical sync switches together with DLSS / FSR frame generation, gamepad navigation of the new rows, two monitors.
 - **R12 is still under its final check.** The experimental switches above are off by default; their comparison with R11 over every scene is running. "Rain shadows: Off" has not yet been checked frame by frame. Not tested in R12: flying, cut-scenes, light from Delsin's powers (none on the routes), harbour and village with the particle sort.
 - **The launcher and the new graphics settings** are new: the launcher is in Russian only, and the FPS cost of shadow quality, texture quality, anisotropic filtering and anti-aliasing is not measured yet. If something looks wrong, set them back to *as in the game*.
+- **Online missions, add-ons and trophies are new** and not yet played through: the Paper Trail missions, the Cole's Legacy missions and each trophy's notice have been built, not tested in the game from start to end. The trophy grades (bronze, silver, gold) are not shown: they are in the encrypted trophy texts.
 - There is no full-campaign compatibility guarantee.
 
 ## Roadmap
@@ -580,6 +590,7 @@ Vulkan 1.3 driver
 - [x] WASAPI audio output, video decoding
 - [x] Ajm / ATRAC9 decoding (R10, LibAtrac9)
 - [x] Common dialogs, network and the libc functions the game calls (R10)
+- [x] Signed in to an emulated network, Paper Trail answered locally; the add-ons on the disc unlocked; trophies kept on the PC with notices and the platinum
 - [ ] The imports the game does not call in a normal run (49 at the bridge)
 
 ### Graphics and performance

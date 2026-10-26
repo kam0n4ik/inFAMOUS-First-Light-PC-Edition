@@ -1,10 +1,14 @@
-// SecondSonPC — libSceNpManager offline (NATIVE; group "np"; `--bridge np` sends it back to the oracle,
-// third_party/shadPS4/src/core/libraries/np/np_manager.cpp with shadNet disabled - its default and SecondSonPC's).
-// The PC Edition has no PlayStation Network: every user is signed out, presence is offline, account queries fail with
-// SIGNED_OUT, and the request IDs, their results and the callback registrations behave as the console's API does.
-// No state change ever happens offline, so sceNpCheckCallback has nothing to dispatch.
+// SecondSonPC — libSceNpManager emulated online (NATIVE; group "np"; `--bridge np` sends it back to the oracle,
+// third_party/shadPS4/src/core/libraries/np/np_manager.cpp with shadNet disabled).
+// The PC Edition has no PlayStation Network, so the user is signed in to an emulated one: the state is SIGNED_IN from
+// the start, presence is online, the account has a fixed online id, id and country, and the availability check passes.
+// That is what the game needs before it asks the Paper Trail server (offline_services.cpp answers it locally). The
+// request IDs, their results and the callback registrations behave as the console's API does; the state never
+// changes, so sceNpCheckCallback has nothing to dispatch.
 #include <array>
+#include <cstring>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #include "base/abi.h"
@@ -17,7 +21,6 @@ namespace {
 
 constexpr s32 kOk = 0;
 constexpr s32 kErrInvalidArgument = static_cast<s32>(0x80550003);
-constexpr s32 kErrSignedOut = static_cast<s32>(0x80550006);
 constexpr s32 kErrUserNotFound = static_cast<s32>(0x80550007);
 constexpr s32 kErrCallbackAlreadyRegistered = static_cast<s32>(0x80550008);
 constexpr s32 kErrInvalidSize = static_cast<s32>(0x80550011);
@@ -31,6 +34,24 @@ constexpr s32 kUserIdInvalid = -1;
 constexpr s32 kRequestIdOffset = 0x20000000; // the first request is 0x20000001
 constexpr s32 kRequestLimit = 0x20;
 constexpr size_t kCallbackMax = 8;
+
+constexpr std::string_view kOnlineId = "t.me/cloudeluxe"; // SceNpOnlineId: at most 16 characters
+constexpr u64 kAccountId = 0x5353504300000001ull;
+static_assert(kOnlineId.size() >= 3 && kOnlineId.size() <= 16);
+
+struct OnlineIdData {
+    char data[16];
+    char term;
+    char dummy[3];
+};
+static_assert(sizeof(OnlineIdData) == 20);
+
+struct CountryCode {
+    char data[2];
+    char term;
+    char padding[1];
+};
+static_assert(sizeof(CountryCode) == 4);
 
 enum class NpState : s32 { Unknown = 0, SignedOut = 1, SignedIn = 2 };
 enum class PresenceStatus : s32 { Offline = 0, Online = 1 };
@@ -129,7 +150,7 @@ s32 g_presence_next = 0;
 // ---- the API
 
 SSPC_SYSV_ABI s32 CheckCallback() {
-    return kOk; // (no state change offline)
+    return kOk; // (the emulated sign-in never changes)
 }
 
 SSPC_SYSV_ABI s32 CheckNpAvailabilityA(s32 req_id, s32 user_id) {
@@ -139,7 +160,7 @@ SSPC_SYSV_ABI s32 CheckNpAvailabilityA(s32 req_id, s32 user_id) {
     std::scoped_lock lock{g_mutex};
     s32 err = 0;
     Request* r = Find(req_id, err);
-    return r == nullptr ? err : Complete(*r, kErrSignedOut);
+    return r == nullptr ? err : Complete(*r, kOk);
 }
 
 SSPC_SYSV_ABI s32 CreateAsyncRequest(const CreateAsyncRequestParameter* param) {
@@ -182,44 +203,47 @@ SSPC_SYSV_ABI s32 PollAsync(s32 req_id, s32* result) {
     return kOk;
 }
 
-SSPC_SYSV_ABI s32 GetAccountCountryA(s32 user_id, void* country_code) {
+SSPC_SYSV_ABI s32 GetAccountCountryA(s32 user_id, CountryCode* country_code) {
     if (country_code == nullptr || user_id == kUserIdInvalid) {
         return kErrInvalidArgument;
     }
-    return kErrSignedOut;
+    *country_code = {{'u', 's'}, 0, {0}};
+    return kOk;
 }
 
 SSPC_SYSV_ABI s32 GetAccountIdA(s32 user_id, u64* account_id) {
     if (account_id == nullptr || user_id == kUserIdInvalid) {
         return kErrInvalidArgument;
     }
-    *account_id = 0;
-    return kErrSignedOut;
+    *account_id = kAccountId;
+    return kOk;
 }
 
 SSPC_SYSV_ABI s32 GetGamePresenceStatusA(s32 user_id, PresenceStatus* status) {
     if (status == nullptr || user_id == kUserIdInvalid) {
         return kErrInvalidArgument;
     }
-    *status = PresenceStatus::Offline;
+    *status = PresenceStatus::Online;
     return kOk;
 }
 
-SSPC_SYSV_ABI s32 GetOnlineId(s32 user_id, void* online_id) {
+SSPC_SYSV_ABI s32 GetOnlineId(s32 user_id, OnlineIdData* online_id) {
     if (user_id == kUserIdInvalid) {
         return kErrUserNotFound; // (the game's SDK is older than firmware 9.00: USER_NOT_FOUND, as the oracle)
     }
     if (online_id == nullptr) {
         return kErrInvalidArgument;
     }
-    return kErrSignedOut;
+    *online_id = {};
+    std::memcpy(online_id->data, kOnlineId.data(), kOnlineId.size());
+    return kOk;
 }
 
 SSPC_SYSV_ABI s32 GetState(s32 /*user_id*/, NpState* state) {
     if (state == nullptr) {
         return kErrInvalidArgument;
     }
-    *state = NpState::SignedOut; // (an invalid user too: SDK older than 9.00)
+    *state = NpState::SignedIn; // (an invalid user too: SDK older than 9.00)
     return kOk;
 }
 
@@ -299,6 +323,10 @@ const Export kExports[] = {
 #undef NP
 
 } // namespace
+
+std::string_view OnlineId() {
+    return kOnlineId;
+}
 
 std::span<const Export> NpManagerExports() {
     return kExports;

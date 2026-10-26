@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -56,6 +57,8 @@ struct Win32Overlay::Impl final : TextMeasure {
     ID2D1SolidColorBrush* brush = nullptr;
     std::map<std::tuple<int, int, bool>, IDWriteTextFormat*> formats; // (size * 4, weight, wrap)
     std::unordered_map<std::string, float> widths; // measured texts (a text layout each is the costly part of a build)
+    // the images drawn, on the render target (its resources): by image, while the image lives
+    std::map<const Image*, std::pair<std::weak_ptr<const Image>, ID2D1Bitmap*>> bitmaps;
     bool ok = false;
 
     HWND owner = nullptr;
@@ -82,6 +85,7 @@ struct Win32Overlay::Impl final : TextMeasure {
         for (auto& [k, f] : formats) {
             Release(f);
         }
+        ReleaseBitmaps();
         Release(brush);
         Release(rt);
         Release(game_fonts);
@@ -132,7 +136,39 @@ struct Win32Overlay::Impl final : TextMeasure {
         }
     }
 
+    void ReleaseBitmaps() {
+        for (auto& [k, b] : bitmaps) {
+            Release(b.second);
+        }
+        bitmaps.clear();
+    }
+
+    /// The render target's bitmap of `image` (made once while the image lives); nullptr when it cannot be made.
+    ID2D1Bitmap* Bitmap(const std::shared_ptr<const Image>& image) {
+        std::erase_if(bitmaps, [](auto& e) {
+            if (e.second.first.expired()) {
+                Release(e.second.second);
+                return true;
+            }
+            return false;
+        });
+        if (const auto it = bitmaps.find(image.get()); it != bitmaps.end()) {
+            return it->second.second;
+        }
+        ID2D1Bitmap* b = nullptr;
+        const auto props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        if (image->bgra.size() < u64{image->width} * image->height * 4 ||
+            FAILED(rt->CreateBitmap(D2D1::SizeU(image->width, image->height), image->bgra.data(), image->width * 4,
+                                    &props, &b))) {
+            return nullptr;
+        }
+        bitmaps.emplace(image.get(), std::make_pair(std::weak_ptr<const Image>(image), b));
+        return b;
+    }
+
     bool CreateRenderTarget() {
+        ReleaseBitmaps();
         Release(brush);
         Release(rt);
         // Software rasterization: the overlay never touches a GPU device (the game's renderer owns the GPU).
@@ -362,6 +398,11 @@ struct Win32Overlay::Impl final : TextMeasure {
                 if (clips > 0) {
                     rt->PopAxisAlignedClip();
                     --clips;
+                }
+                break;
+            case DrawCmd::Kind::Image:
+                if (ID2D1Bitmap* b = c.image != nullptr ? Bitmap(c.image) : nullptr; b != nullptr) {
+                    rt->DrawBitmap(b, ToD2D(c.rect), c.color.a / 255.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                 }
                 break;
             }
