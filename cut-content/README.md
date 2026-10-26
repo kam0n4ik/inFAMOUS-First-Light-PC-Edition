@@ -1,214 +1,192 @@
-# Вырезанный материал inFAMOUS Second Son
+# inFAMOUS Second Son: cut content
 
-*Cut content, beta leftovers and unused files found in the retail game. English summary at the end.*
+**English** · [Русский](README.ru.md)
 
-Всё ниже найдено в файлах самой игры: `eboot.bin`, пакеты `art\cache\*.xpps`, архивы озвучки `art\cache\psarc\*.psarc`, ролики `art\movies`. Исследовалась версия **«retail 0212.1422 i3_eu ship»**, европейская розничная сборка (CUSA00004). Внутреннее имя игры — **i3**, то есть inFAMOUS 3.
+Everything below was found in the game's own files: `eboot.bin`, the packages in `art\cache\*.xpps`, the voice archives in `art\cache\psarc\*.psarc` and the videos in `art\movies`. The build examined is **"retail 0212.1422 i3_eu ship"**, the European retail release (CUSA00004). The game's internal name is **i3**, inFAMOUS 3.
 
-«Не используется» здесь значит, что на файл или текст нет ни одной ссылки ни в коде игры, ни в данных миссий. Ссылки искались и по имени, и по хешу имени (h·101). Это сильный признак вырезанного, но не стопроцентная гарантия: в редких случаях игра собирает имя на ходу.
+"Unused" here means that nothing refers to the file or text: neither the game's code nor any mission's data. References were searched for both by name and by the hash of the name (h·101). That is strong evidence of cut content, but not absolute proof: in rare cases the game builds a name at run time.
 
-Озвучка взята из игры на двух языках: `_en.mp3` — оригинал, `_ru.mp3` — официальный русский дубляж.
+The voice lines come from the game in two languages: `_en.mp3` is the original, `_ru.mp3` the official Russian dub.
 
-**Содержание:** [Сюжет](#сюжет) · [Миссии и задания](#миссии-и-задания) · [Активности в районах](#активности-в-районах) · [Силы](#силы) · [Системы и сложность](#системы-и-сложность) · [Досье ДЕЗа](#досье-деза) · [Трофеи](#трофеи) · [Ролики](#ролики) · [Бета, демо, отладка](#бета-демо-отладка) · [Как это искалось](#как-это-искалось)
-
----
-
-## Сюжет
-
-### Банда «Акуран» была русской мафией
-
-Внутри игры банда до сих пор называется `russians` и `siberians`:
-- отдельный пакет персонажей `russians.xpps`;
-- анимации `RussianTaunt`, `RussianCall`, `RussianMelee`;
-- сообщения «Банда Акул уничтожена» и «ЧЛЕН БАНДЫ АКУЛ» в коде называются `u_gain_russians` и `u_legend_angry_russians`;
-- миссия Юджина по зачистке банды: `vde_ambush_siberians`, `vde_eliminate_siberians`, реплики `deadsiberian`.
-
-Остались реплики, где их прямо называют русскими:
-
-| Кто | Оригинал | Русская версия |
-|---|---|---|
-| Делсин | *Better find that poor SBT on the crane before those blood-thirsty **Russians** do.* | «Надо бы найти этого бедолагу на кране, пока **русские** его не разорвали». |
-| Делсин | *So Eugene, I just smashed up a bunch of those obnoxious **Russian** Akuran guys…* | «Юджин, я тут прихлопнул пару доставучих **русских** Акул…» |
-| Делсин | *…ripping the intestines out of these **eastern bloc** loud mouths…* | «…потрошу потихоньку этих **нетолерантных бандюков**…» (в переводе смягчили) |
-| Бандит | *Ha ha, they do not understand English!* | |
-| Бандит | *Yeah, maybe you could teach them English!* | «Ага, а вот давай-ка мы их щас научим!» |
-| Бандит | *Hey painter, how about if I paint your face with my fist?!* | «Слышь, маляр, щас я тебе мигом всю рожу размалюю!» |
-| Бандит | *Look out! The painter has a sword!* | «Берегитесь! У маляра меч!» |
-
-🔊 [`audio/russians_ru.mp3`](audio/russians_ru.mp3) · [`audio/russians_en.mp3`](audio/russians_en.mp3)
-
-### Энергоядра (Blast Cores) вместо ретрансляторов
-
-То, что Делсин поглощает ради бетонных сил, в финале называется *Core Relay* («ретранслятор»). Раньше это были **Blast Cores**, как в первых частях серии. Следы остались в нескольких текстах: «ДЕЗ отправляет большой отряд, чтобы вернуть **энергоядро**», «Gotta drain that Blast Core», «I need a blast core!».
-
-Целиком сохранилась вырезанная сцена из **первой миссии**: Делсин трогает ядро и получает новую силу.
-
-> **Делсин:** Ух ты… Синенькое.
-> **Реджи:** Эй, эй, эй, эй, ты что делаешь?! Делсин, господи, ты живой?!
-> **Делсин:** Помнишь, я потрогал того потного лысого мужика и обрел суперсилу? …Хе-хе. Я вроде еще кое-чем разжился…
-> **Реджи:** Мы пытаемся избавить тебя от всего этого, а не наоборот.
-> **Делсин:** Ну да, кто бы Августину избавил…
-> **Делсин** (позже): Ну, не так штырит, как от энергоядер, но тоже ничего… приятненько.
-
-🔊 [`audio/blast_cores_ru.mp3`](audio/blast_cores_ru.mp3) · [`audio/blast_cores_en.mp3`](audio/blast_cores_en.mp3)
-
-### Финал: третий выбор и «собрать группу»
-
-- Задание «Убить Августину» сначала зависело от выбора по Хэнку: остался текст *«Mission Kill Augustine is not available because you chose to spare Hank»*. В финальной игре такого условия нет.
-- Реплика про **третий выбор** (`m_cb_thirdchoice`): «Не, это очень важное решение. Давай, надо сначала прийти в себя».
-- Похоже, в финальной битве Делсину помогали **Юджин и Проныра**: «Эй, говорят, ты решил возродить группу!», «Я с тобой, верзила! Я и все мои друзья!», «Эй, Курилка, помощь нужна?», «Тебе повезло, что я рядом».
-- Неиспользуемые реплики злой концовки: «Сик семпер тираннис, сука», «Пора домой», «Вот теперь все». И Августина: «У этих людей должен быть настоящий герой».
-- Проныра, когда Делсин её освобождает: «Сначала запер меня, теперь освобождаешь? Ты уж определись». Августина в бою: «Иди вслед за братом!»
-
-🔊 [`audio/finale_ru.mp3`](audio/finale_ru.mp3) · [`audio/finale_en.mp3`](audio/finale_en.mp3)
-
-### Хэнк и его дочь
-
-Озвученные реплики **дочери Хэнка**, которой нет в игре: «Пап, ты где? Мне тут страшно. Забери меня отсюда». Ещё неиспользуемые реплики охоты на Хэнка: «Черт! Я так и не узнал, где Хэнк… Но я знаю, что он жив…».
-
-🔊 [`audio/hank_ru.mp3`](audio/hank_ru.mp3) · [`audio/hank_en.mp3`](audio/hank_en.mp3)
-
-### Реджи
-
-- **«Залечь на дно».** Реджи хотел, чтобы Делсин не высовывался, и предлагал обратиться к своим знакомым копам в Сиэтле. Делсин: «Я не для этого сюда пришел!», «Ну, так выколем эти глаза и отрежем эти уши!»
-- **Агенты в зелёных шапках** с медвежьей лапой. Делсин узнаёт о скрытых камерах через приложение, которое ему поставила Бетти: «Обещай, что когда вернемся домой, ты не арестуешь Бетти».
-- **«Пойду один».** Ссора, где Делсин отказывается брать Реджи с собой: «Ты не можешь меня ни заставить, ни остановить… И я решил, что пойду один». Сюда же подсказка *«Press … to turn Invisible and leave Reggie behind»*: уйти от Реджи невидимкой.
-
-🔊 [`audio/reggie_lay_low_ru.mp3`](audio/reggie_lay_low_ru.mp3) · [`audio/reggie_go_alone_ru.mp3`](audio/reggie_go_alone_ru.mp3) (и `_en`)
-
-### Проныра
-
-- Финальная битва с ней должна была идти в реальном клубе Сиэтла **«Crocodile»**: «Inside the Crocodile. Laser Girl's with me» («В „Крокодиле“. Вместе с девчонкой»).
-- Старый маршрут в район Фонарей через **сломанный мост**, с «конференц-звонком»: Реджи и Проныра оба на линии. Реджи: «Знаете, как говорится, третий лишний. Я отключаюсь». Проныра: «Как ты только его терпишь?»
-
-🔊 [`audio/crocodile_ru.mp3`](audio/crocodile_ru.mp3) · [`audio/old_bridge_call_ru.mp3`](audio/old_bridge_call_ru.mp3) (и `_en`)
-
-### Спейс-Нидл и Делсин
-
-- Другая версия подъёма на Спейс-Нидл, с поиском **лифтов**: «Реджи, ДЕЗ заблокировал лифт» — «Ломать лифты в полицейской академии не учат». Делсин: «А ты представляешь себе, сколько людей ежегодно получают травмы в лифтах? Я лучше своим ходом».
-- Делсин придумывает себе прозвище: «А может, Копченый герой…» (*Smokestack Jack*). И мечтает: «Если бы у меня были дым и лазеры, я мог бы устраивать мегашоу перед матчами НБА».
-
-🔊 [`audio/space_needle_ru.mp3`](audio/space_needle_ru.mp3) · [`audio/space_needle_en.mp3`](audio/space_needle_en.mp3)
-
-### Мелочи
-
-- **Девушки из Лоуэр-Гранит** благодарят Делсина за то, что он очистил улицы от наркоторговцев: «Хэй! Это же герой работающих девочек!» 🔊 [`audio/working_girls_ru.mp3`](audio/working_girls_ru.mp3)
-- **Пляж резервации:** Делсин разговаривает со своими старыми граффити («Про тебя я уж и забыл, мой черепаший дружок») и устраивает гонку к длинному дому. 🔊 [`audio/beach_graffiti_ru.mp3`](audio/beach_graffiti_ru.mp3)
+**Contents:** [Story](#story) · [Missions and objectives](#missions-and-objectives) · [District activities](#district-activities) · [Powers](#powers) · [Systems and difficulty](#systems-and-difficulty) · [The D.U.P. dossier](#the-dup-dossier) · [Trophies](#trophies) · [Videos](#videos) · [Beta, demo, debug](#beta-demo-debug) · [How it was found](#how-it-was-found)
 
 ---
 
-## Миссии и задания
+## Story
 
-- **«Операция „Фургон слежки“»** (*Surveillance Van Mission*). Есть название, задание «Уничтожьте фургон слежки», счётчик найденных фургонов по районам и метка «SURVEILLANCE VAN» на карте. В коде остался тип объекта `UndercoverVan`, в данных — пакет `undercover_van.xpps` с моделью и физикой. Ни одна миссия его не использует.
-- Подсказка «Информатор ДЕЗа спрятал где-то неподалеку **жесткий диск**. Используйте телефон, чтобы отыскать его»: вырезанный тип тайника.
-- Подсказка «Подобравшись к врагу со спины, нажмите…, чтобы **тихо нейтрализовать** его»: тихие убийства из стелса.
-- Задание из **плейтеста** `u_banner_playtest_03_chase`: «Поймайте Проныру и поглотите ее силы».
-- Заглушки `u_cb_golem_battle_ionic_placeholder_01/02` в битве с бетонным големом.
+### The Akuran gang was Russian
 
-## Активности в районах
+Inside the game the gang is still called `russians` and `siberians`:
+- a character package of its own, `russians.xpps`;
+- animations `RussianTaunt`, `RussianCall`, `RussianMelee`;
+- the messages "Akura Eliminated" and "AKURAN GANG MEMBER" are `u_gain_russians` and `u_legend_angry_russians`;
+- Eugene's mission against the gang uses `vde_ambush_siberians`, `vde_eliminate_siberians` and lines named `deadsiberian`.
 
-| Что | Следы |
+Lines that still call them Russian:
+
+| Who | Line |
 |---|---|
-| **Фургон слежки** | см. выше |
-| **Сторожевые башни** | «Сторожевая башня уничтожена» |
-| **Эвакуация** | Полиция сдерживает толпу у вертолётов, люди суют деньги: «В вертолете уже нет мест!», «Уберите свои деньги!». В коде остались действия людей `HoldBackMob` и `WaveMoney`. 🔊 [`audio/evacuation_ru.mp3`](audio/evacuation_ru.mp3) |
-| **Повтор районов на повышенной сложности** | «Поздравляем! Вы уничтожили все мобильные штабы ДЕЗа. Вы можете вновь вернуть их в игру через экран настроек, но это поднимет СЛОЖНОСТЬ игры». Пункт «Вернуть мобильные штабы ДЕЗа» и предупреждение «После этого находиться в городе станет значительно опаснее!» |
+| Delsin | *"Better find that poor SBT on the crane before those blood-thirsty **Russians** do."* |
+| Delsin | *"So Eugene, I just smashed up a bunch of those obnoxious **Russian** Akuran guys…"* |
+| Delsin | *"…ripping the intestines out of these **eastern bloc** loud mouths…"* (the Russian dub softened it to "intolerant thugs") |
+| Gang member | *"Ha ha, they do not understand English!"* |
+| Gang member | *"Yeah, maybe you could teach them English!"* |
+| Gang member | *"Hey painter, how about if I paint your face with my fist?!"* |
+| Gang member | *"Look out! The painter has a sword!"* |
 
-## Силы
+🔊 [`audio/russians_en.mp3`](audio/russians_en.mp3) · [`audio/russians_ru.mp3`](audio/russians_ru.mp3)
 
-В списке сил в коде (`POWERK_*`) остались силы, которых нет в меню прокачки:
-- **HealOther**: лечить других;
-- **PassiveShield** и **UpgradePassiveShieldOvercharge**: пассивный щит;
-- **DrainObject**: поглощать предметы;
-- **LaserBeam** (с апгрейдами стоимости BeamCost1/2): сплошной неоновый луч;
-- **ConcretePull**: бетонное притягивание;
-- **TvSummonAngel**: призыв ангела;
-- **TvMeleeGood/Evil**: добрый и злой ближний бой видео;
-- **SpyCamera**: шпионская камера;
+### Blast Cores instead of Core Relays
+
+What Delsin drains for his concrete powers is a *Core Relay* in the final game. It used to be a **Blast Core**, as in the earlier games. Traces are left in several texts: "The DUP are sending a large force to reclaim their **blast core**", "Gotta drain that Blast Core", "I need a blast core!".
+
+A cut scene from the **first mission** survives whole: Delsin touches a core and gets a new power.
+
+> **Reggie:** Whoa whoa whoa whoa, what are you doing?! Delsin, Jesus, you okay?!
+> **Delsin:** You remember when I touched that sweaty bald guy and got those super-powers? …Well, I think I just got a new one…
+> **Reggie:** We're trying to make what happened to you go away, not get worse.
+> **Delsin:** You think Augustine's getting rid of HER powers, huh?
+> **Delsin** (later): Okay, not quite the jolt of the Blast Cores back there, but still pleasant. In an awesome way.
+
+🔊 [`audio/blast_cores_en.mp3`](audio/blast_cores_en.mp3) · [`audio/blast_cores_ru.mp3`](audio/blast_cores_ru.mp3)
+
+### The ending: a third choice and "the band back together"
+
+- The "Kill Augustine" mission once depended on a choice about Hank: *"Mission Kill Augustine is not available because you chose to spare Hank."* The final game has no such condition.
+- A line about a **third choice** (`m_cb_thirdchoice`): *"Oh, no no, this is a big decision. Come on, I gotta get my head on straight."*
+- It looks like **Eugene and Fetch helped** in the final fight: *"Hey, I heard you were getting the band back together."*, *"I'm with you big guy, me and all my friends."*, *"Hey Smokes, need some help?"*, *"You're lucky I was available."*
+- Unused lines of the evil ending: *"Sic semper tyrannus…bitch."*, *"Guess it's time to go home."*, *"Now…I'll stop."* And Augustine: *"Those people deserved a REAL hero."*
+- Fetch, as Delsin frees her: *"First you lock me up, now you're breaking me out. What's up with that, D?"* Augustine in the fight: *"Join your brother!"*
+- A placeholder from the Augustine fight: *"Delsin uses an ionic power to attack Augustine, which causes her to flee temporarily."*
+
+🔊 [`audio/finale_en.mp3`](audio/finale_en.mp3) · [`audio/finale_ru.mp3`](audio/finale_ru.mp3)
+
+### Hank and his daughter
+
+Voiced lines for **Hank's daughter**, who is not in the game: *"Dad? Daddy? Let's go."*, *"Dad, where are you? This place scares me, I want to go."* And unused lines from the hunt for Hank: *"Dammit! Never got an answer about Hank… At least I know he's out there…"*
+
+🔊 [`audio/hank_en.mp3`](audio/hank_en.mp3) · [`audio/hank_ru.mp3`](audio/hank_ru.mp3)
+
+### Reggie
+
+- **"Lay low."** Reggie wanted Delsin to keep his head down and offered to ask his cop friends in Seattle. Delsin: *"Uh, I did not come here to 'lay low'."*, *"Fine, well then let's gouge out their eyes and slice off their ears."*
+- **Agents in green caps** with a bear paw on them (*"So, find the meanies in green beanies and take 'em out?"*). Delsin finds the hidden cameras with a phone app from Betty: *"Dude, promise when we get home you will not arrest Betty for stealing cable."*
+- **"I'm going alone."** An argument in which Delsin refuses to take Reggie along: *"Reg, I don't need you to 'let me' do anything. You can't 'make me' or 'stop me'… And I've decided, you are NOT going."* With it goes the hint *"Press … to turn Invisible and leave Reggie behind."*
+
+🔊 [`audio/reggie_lay_low_en.mp3`](audio/reggie_lay_low_en.mp3) · [`audio/reggie_go_alone_en.mp3`](audio/reggie_go_alone_en.mp3) (and `_ru`)
+
+### Fetch
+
+- The fight with her was to be set in Seattle's real **Crocodile** club: *"Inside the Crocodile. Laser Girl's with me."*
+- An older way to the Lantern District over a **broken bridge**, with a "conference call": Reggie and Fetch are both on the line. Reggie: *"Oh good…this is a conference call."*, *"You know what, two's company, three's a-nnoying. I'm gone."* Fetch: *"Man, how do you put up with that?"*
+
+🔊 [`audio/crocodile_en.mp3`](audio/crocodile_en.mp3) · [`audio/old_bridge_call_en.mp3`](audio/old_bridge_call_en.mp3) (and `_ru`)
+
+### The Space Needle and Delsin
+
+- Another version of the Space Needle climb, looking for **elevators**: *"Reggie, DUPs have the elevator locked down. You got any cop tricks to override it?"* / *"Hot-wiring elevators? Not exactly something they teach you at cop school."* Delsin: *"Do you have any idea how many people are injured in elevator accidents every year? I'm climbing to the top."*
+- Delsin tries a nickname, *"Smokestack Jack"*, and dreams: *"If I had smoke AND lasers, I could get a job doing the pre-game introduction of NBA players."*
+
+🔊 [`audio/space_needle_en.mp3`](audio/space_needle_en.mp3) · [`audio/space_needle_ru.mp3`](audio/space_needle_ru.mp3)
+
+### Small things
+
+- **The working girls of Lower Granite** thank Delsin for clearing the streets of dealers: *"Hey! The hero man to working girls everywhere!"* 🔊 [`audio/working_girls_en.mp3`](audio/working_girls_en.mp3)
+- **The reservation beach:** Delsin talks to his old graffiti (*"I had almost forgotten about you. My little turtle buddy."*) and races to the Longhouse. 🔊 [`audio/beach_graffiti_en.mp3`](audio/beach_graffiti_en.mp3)
+
+---
+
+## Missions and objectives
+
+- **"Surveillance Van Mission".** There is a title, an objective "Destroy Undercover Van", a per-district count "Surveillance Van Found" and a "SURVEILLANCE VAN" map marker. The code keeps an object type `UndercoverVan`, and the data a package `undercover_van.xpps` with a model and physics. No mission uses it.
+- A hint *"A D.U.P. Informant has hidden a hard drive in the area. Use your phone to locate it."*: a cut kind of hidden item.
+- A hint *"Press … from behind for a stealthy takedown."*: stealth takedowns.
+- A **playtest** objective, `u_banner_playtest_03_chase`: *"Catch Fetch and drain her powers."*
+
+## District activities
+
+| What | Traces |
+|---|---|
+| **Surveillance vans** | see above |
+| **Watchtowers** | "Watch Tower Destroyed" |
+| **Evacuation** | Police hold back a crowd at the helicopters, people wave money: *"The helicopter is already full!"*, *"I cannot take your money, the helicopters are full!"*, *"There will be more helicopters soon!"* The code keeps the crowd actions `HoldBackMob` and `WaveMoney`. 🔊 [`audio/evacuation_en.mp3`](audio/evacuation_en.mp3) |
+| **Replaying districts at a higher difficulty** | *"Congratulations! You have destroyed all the D.U.P. Mobile Command Centers. The D.U.P. Command Centers can be reset to a HARDER state from the Options screen."* An option "Reset D.U.P. Mobile Command Centers" and a warning *"This will make the city much more dangerous!"* |
+
+## Powers
+
+The game's list of powers (`POWERK_*`) keeps powers that are not in the upgrade menu:
+- **HealOther**: heal others;
+- **PassiveShield** and **UpgradePassiveShieldOvercharge**: a passive shield;
+- **DrainObject**: drain objects;
+- **LaserBeam** (with cost upgrades BeamCost1/2): a continuous neon beam;
+- **ConcretePull**;
+- **TvSummonAngel**: summon an angel;
+- **TvMeleeGood/Evil**: good and evil video melee;
+- **SpyCamera**;
 - **TwoPowerSets / ThreePowerSets**;
 - **Smoke/Laser/TvUpgradeIonic**, **SmokeUpgradeOrbitalDrop**, **LaserUpgradeDashDouble**;
-- **ProtoUpgrade15–20** и пустые слоты.
+- **ProtoUpgrade15–20** and empty slots.
 
-В текстах есть описания апгрейдов, которых нет даже в коде: бетон с запасом энергии +80% и ×2, дешёвые выстрелы (−25% / −50%), быстрое поглощение, 3–5 ракет «Бетонного шквала», снижение урона до 50%, а также +25% и +50% урона по бронированным для дыма, неона и видео.
+The text table describes upgrades that are not even in the code: concrete energy capacity +80 % and ×2, cheaper shots (−25 % / −50 %), faster draining, 3 to 5 Concrete Barrage missiles, up to 50 % less damage taken, and +25 % / +50 % damage to armored enemies for smoke, neon and video.
 
-**Запасные названия сил:** Concrete Tornado, Wing Surge, Heaven's Hellfire («Адское пламя с небес»), Video Jump, Summon Guardian, Channel Surfing. Сила бумаги внутри игры называется **steel**, сталь.
+**Alternative power names:** Concrete Tornado, Wing Surge, Heaven's Hellfire, Video Jump, Summon Guardian, Channel Surfing. Paper is called **steel** inside the game.
 
-**Старое управление:** «Нажмите и удерживайте сенсорную панель **обоими большими пальцами**, чтобы поглотить источник».
+**Old controls:** *"Press and hold the Touch Pad Button with both thumbs to drain…"*
 
-## Системы и сложность
+## Systems and difficulty
 
-- **Режим испытаний.** В настройках остались неиспользуемые варианты сложности: **«Сюжетный режим»** (*Story Mode*), **«Режим испытаний»** (*Challenge Mode*) и старая «Высокая» (*Hard*). Финальная игра предлагает «Низкая / Средняя / Эксперт».
-- **Система опыта.** Целый набор сообщений «+N **очк. опыта**» (*XP*): «Враг уничтожен», «Мирный житель убит», «Ярость», «Фургон слежки уничтожен», «Подозреваемые убиты», с множителем «(x)». В финале прокачка идёт через осколки.
-- **Погода «prototype».** В мире прописано отладочное время суток `time_of_day_prototype_001` со своим небом `skybox_prototype_001` и пакетами освещения `*-world_seaport(prototype)`. У настоящих погодных вариантов есть ролики-переходы, у этого нет.
+- **Challenge Mode.** The settings keep unused difficulty values: **Story Mode**, **Challenge Mode** and an old **Hard**. The final game offers Easy / Normal / Expert.
+- **An XP system.** A whole set of "+N **XP**" messages: "Enemy Obliterated", "Civilian Killed", "Rampage", "Surveillance Van Destroyed", "Suspects Killed", with a multiplier "(x)". In the final game upgrades are bought with Blast Shards.
+- **A "prototype" time of day.** The city lists a debug time of day, `time_of_day_prototype_001`, with its own sky `skybox_prototype_001` and lighting packages `*-world_seaport(prototype)`. The real weathers have transition videos; this one has none.
 
-## Досье ДЕЗа
+## The D.U.P. dossier
 
-В меню паузы есть досье на Делсина. Часть его пунктов игра не использует:
-- **Клички:** «Феникс» (в оригинале **Phoenix Jones** — реальный уличный супергерой из Сиэтла), «Мистер Спокойный», «Парень с лазером», «Звезда экрана».
-- **Статьи:** «Шпионаж», «Незаконное прослушивание телефонных разговоров», «Военные преступления», «Проникновение в воздушное пространство, запрещенное для полетов», «Препятствование работе ДЕЗа».
-- **Разделы:** «Фотографии в деле», «Репутация», «Участие в недавних событиях», «В последний раз был одет в».
-- У каждого уровня кармы есть описание в стиле полицейского досье, например: «Несостоявшийся художник, ранее привлекавшийся за незаконное проникновение на охраняемую территорию и вандализм…». У начального уровня «Вандал» вместо описания так и осталась заглушка **«Описание Вандала»**.
+The pause menu has a dossier on Delsin. The game does not use part of it:
+- **Aliases:** **"Phoenix Jones"** (a real-life street superhero from Seattle), "Mr. Cool", "Laser Guy", "TV Star".
+- **Charges:** "Espionage", "Illegal Wiretapping", "War Crimes", "Entering Restricted Airspace", "Disrupting D.U.P. Operations".
+- **Sections:** "Case Photos", "Public Image", "Recent Activity", "Last Seen Wearing".
+- Every karma level has a police-dossier description, for example: *"An unsuccessful artist with a history of trespassing and vandalism…"*. The starting level, "Vandal", still has the placeholder **"Vandal Desc"**.
 
-## Трофеи
+## Trophies
 
-В текстах игры остались два трофея, которых нет в финальной игре:
-- **«Крупная рыба»** (*Deadliest Catch*): «Одолейте командира ДЕЗа, не убивая его»;
-- **«Высокая сложность»** (*Hard Mode*): «Пройдите игру на высокой сложности».
+The text table keeps two trophies that are not in the final game:
+- **Deadliest Catch**: *"Subdue a D.U.P. Commander without killing him"*;
+- **Hard Mode**: *"Finish the game in Hard Mode"*.
 
-У трофея «Неудержимый» три версии описания: финальная «Пройдите игру на уровне сложности „Эксперт“», старая «…на высоком уровне сложности» и **«Пройдите режим испытаний»**.
+"Unstoppable" has three descriptions: the final *"Finish the game on Expert difficulty"*, an older *"Finish the game on Hard difficulty"* and **"Finish the game in Challenge Mode"**.
 
-## Ролики
+## Videos
 
-Ролики игры (`.bsf`) — это обычное видео H.264. Из 159 файлов нигде не используются пять:
+The game's videos (`.bsf`) are plain H.264 streams. Of its 159 videos, five are used nowhere:
 
-| Файл | Что это |
+| File | What it is |
 |---|---|
-| [`video/v_ustv_cb02.mp4`](video/v_ustv_cb02.mp4) | **Вырезанный выпуск новостей USTV.** «BREAKING NEWS: SALMON BAY, WASHINGTON»: снимки разрушенной резервации с воздуха, потом фото Делсина. Бегущая строка — заглушка «Lorem ipsum dolor sit amet…». Звука к нему в игре нет. |
-| [`video/splash_europe.mp4`](video/splash_europe.mp4) | Европейская заставка «Sony Computer Entertainment presents» и логотип Sucker Punch, 1080p. Возможно, выбирается по региону. |
-| [`video/tv_heaven_hell_2x2.mp4`](video/tv_heaven_hell_2x2.mp4), [`video/v_ustv_heaven_hell_2x2.mp4`](video/v_ustv_heaven_hell_2x2.mp4) | Водоворот рая и ада для экранов. |
-| [`video/v_tv_snow.mp4`](video/v_tv_snow.mp4) | Телевизионный «снег». |
+| [`video/v_ustv_cb02.mp4`](video/v_ustv_cb02.mp4) | **A cut USTV news broadcast.** "BREAKING NEWS: SALMON BAY, WASHINGTON": aerial pictures of a destroyed settlement, then a photo of Delsin. The ticker is placeholder text, "Lorem ipsum dolor sit amet…". The game has no audio for it. |
+| [`video/splash_europe.mp4`](video/splash_europe.mp4) | The European splash, "Sony Computer Entertainment presents" and the Sucker Punch logo, 1080p. Possibly chosen by region. |
+| [`video/tv_heaven_hell_2x2.mp4`](video/tv_heaven_hell_2x2.mp4), [`video/v_ustv_heaven_hell_2x2.mp4`](video/v_ustv_heaven_hell_2x2.mp4) | A heaven-and-hell swirl for screens. |
+| [`video/v_tv_snow.mp4`](video/v_tv_snow.mp4) | TV static. |
 
 <img src="images/ustv_cb02_salmon_bay.jpg" width="49%"> <img src="images/ustv_cb02_delsin.jpg" width="49%">
 
-**Второй вырезанный выпуск, `v_ustv_cb01`.** От него остался только голос диктора, на английском и русском (51 с), а видео нет. У всех используемых выпусков звук и видео совпадают по длине почти до сотой секунды, а здесь 51 с против 44 с. Значит, cb01 и cb02 — два разных выпуска.
-- 🔊 [`audio/news_cb01_ru.mp3`](audio/news_cb01_ru.mp3) · [`audio/news_cb01_en.mp3`](audio/news_cb01_en.mp3)
-- 🎞 [`video/ustv_cb02_plus_cb01_voice_ru.mp4`](video/ustv_cb02_plus_cb01_voice_ru.mp4) (и `_en`): **склейка для удобства**, картинка cb02 с голосом cb01. В игре они не были вместе.
+**A second cut broadcast, `v_ustv_cb01`.** Only the anchor's voice is left, in English and Russian (51 s); there is no video. In every broadcast the game uses, audio and video match in length to within a tenth of a second; here it is 51 s against 44 s, so cb01 and cb02 are two different broadcasts.
+- 🔊 [`audio/news_cb01_en.mp3`](audio/news_cb01_en.mp3) · [`audio/news_cb01_ru.mp3`](audio/news_cb01_ru.mp3)
+- 🎞 [`video/ustv_cb02_plus_cb01_voice_en.mp4`](video/ustv_cb02_plus_cb01_voice_en.mp4) (and `_ru`): **an edit made for convenience**, the cb02 picture with the cb01 voice. They were never together in the game.
 
-Раскадровки всех роликов лежат в [`images/`](images/).
+Contact sheets of all the videos are in [`images/`](images/).
 
-## Бета, демо, отладка
+## Beta, demo, debug
 
-- **Режимы сборки.** В коде есть перечисление режимов, в которых могла собираться игра: *Normal, Focus, Demo, Floor, Sampler, Preview, Kiosk, Taste, Beta, Retail, Review, Moderator*. То есть были выставочные (Floor, Kiosk), демо (Demo, Sampler, Taste), бета и сборки для прессы (Review).
-- **Ролики, от которых остались только имена:** `v_e3_trailer`, `v_e3_countdown`, `v_e3_logo_loop`, `v_gamescom_trailer`, `v_gamescom_countdown`, `v_ps4_launch_trailer`, `v_demo_preview_intro`, `v_zeke_date`. Похоже, это трейлеры и отсчёты для выставочных сборок; `v_zeke_date` — какой-то ролик с Зиком. Самих файлов в игре нет.
-- **Отладочное меню загрузки** (`load_menu_catalog.log`): тестовые миры `combat_test_world_01`, `x_parkour_test` (паркур), `dup_control_room`, `djm_xn_world`, `testscene2` и наборы `i3_experiments`, `char_viz`, `ctw1`, `djm_xn_story`, `rc`. Пакетов этих миров в розничной сборке нет. В коде остались `DebugMenu`, `DevMenu` и телепорт к метке `TeleportToMark`.
-- **«batman»** — внутреннее имя роликов Августины в диспетчерской (`v_ctn_batman_controlroom`, `v_batman`).
-- **ПК-версия не планировалась.** В коде нет DirectX, XInput, Steam или Windows. Таблица клавиш (Escape…Num /, мышь) относится к инструментам разработчиков. Библиотека мыши PS4 подключена, но игра её не вызывает.
+- **Build modes.** The code lists the modes the game could be built in: *Normal, Focus, Demo, Floor, Sampler, Preview, Kiosk, Taste, Beta, Retail, Review, Moderator*. So there were show-floor builds (Floor, Kiosk), demos (Demo, Sampler, Taste), a beta and press builds (Review).
+- **Videos of which only the names are left:** `v_e3_trailer`, `v_e3_countdown`, `v_e3_logo_loop`, `v_gamescom_trailer`, `v_gamescom_countdown`, `v_ps4_launch_trailer`, `v_demo_preview_intro`, `v_zeke_date`. They look like trailers and countdowns for show builds; `v_zeke_date` is some video with Zeke. The files are not in the game.
+- **A debug load menu** (`load_menu_catalog.log`): test worlds `combat_test_world_01`, `x_parkour_test`, `dup_control_room`, `djm_xn_world`, `testscene2`, and sets `i3_experiments`, `char_viz`, `ctw1`, `djm_xn_story`, `rc`. Their packages are not in the retail build. The code keeps `DebugMenu`, `DevMenu` and a `TeleportToMark`.
+- **"batman"** is the internal name of the videos of Augustine in the control room (`v_ctn_batman_controlroom`, `v_batman`).
+- **A PC version was never planned.** The code has no DirectX, XInput, Steam or Windows. Its key table (Escape…Num /, mouse) belongs to the developers' tools. The PS4 mouse library is linked, but the game never calls it.
 
-## Как это искалось
+## How it was found
 
-- Тексты взяты из таблиц `lang_english_text.xpps` и `lang_russian_text.xpps`. Это 12 133 строки; каждая проверена на ссылки во всех пакетах игры и в `eboot.bin`.
-- Озвучка извлечена из `psarc` и декодирована через [vgmstream](https://github.com/vgmstream/vgmstream).
-- Ролики переупакованы из сырого H.264 в mp4 без перекодирования (`ffmpeg -f h264 -i x.bsf -c copy x.mp4`). Склейка и раскадровки сделаны отдельно.
-- Ничего из этого не включено в игру через SecondSonPC. Это только находки. Включено отдельно: онлайн-миссии «Бумажный след», дополнения и трофеи, см. главный [README](../README.md#online-missions-add-ons-and-trophies).
+- The texts come from the tables `lang_english_text.xpps` and `lang_russian_text.xpps`: 12,133 strings, each checked for references in every game package and in `eboot.bin`.
+- The voice lines were extracted from the `psarc` archives and decoded with [vgmstream](https://github.com/vgmstream/vgmstream).
+- The videos were rewrapped from raw H.264 to mp4 without re-encoding (`ffmpeg -f h264 -i x.bsf -c copy x.mp4`). The edit and the contact sheets were made separately.
+- None of this is turned on in the game by SecondSonPC: these are findings only. What is turned on, separately: the Paper Trail online missions, the add-ons and trophies, see the main [README](../README.md#online-missions-add-ons-and-trophies).
 
-Все права на материалы игры принадлежат Sony Interactive Entertainment и Sucker Punch Productions. Здесь они приведены как исследование истории разработки.
-
----
-
-### English summary
-
-Cut and unused content from the retail EU build of inFAMOUS Second Son (internally *i3*):
-- the **Akuran gang was originally Russian**: internally `russians`/`siberians`, with leftover voice lines;
-- **Blast Cores** were renamed to Core Relays; there is an unused first-mission scene where Delsin touches one;
-- a **third ending choice** and **Eugene and Fetch helping in the final fight**;
-- **Hank's daughter** has voice lines;
-- the Fetch fight was set **inside the Crocodile** club;
-- an older **Space Needle** with elevators;
-- a cut **Surveillance Van** activity (code type and model left), **watchtowers**, an **evacuation** scene, and a district-reset option at higher difficulty;
-- an **XP system**, **Story / Challenge Mode** difficulty, and a "prototype" time of day;
-- cut **powers** (heal other, passive shield, laser beam, summon angel, spy camera…);
-- unused **D.U.P. dossier** entries (alias "Phoenix Jones");
-- two cut **trophies** (Deadliest Catch, Hard Mode);
-- two **unused USTV news broadcasts** (video and voice);
-- **build modes** (Demo, Kiosk, Beta, Review…), names of E3/Gamescom trailers, and a debug world list.
-
-Audio is provided in English and the official Russian dub.
+All rights to the game's material belong to Sony Interactive Entertainment and Sucker Punch Productions. It is shown here as research into the game's development history.

@@ -460,7 +460,7 @@ These are new and not yet played through from start to end: if a Paper Trail or 
 
 ## Cut content
 
-**[Вырезанный материал / Cut content →](cut-content/README.md)** What the retail game still carries from its development, found while porting it: the Akuran gang that was Russian, Blast Cores, a third ending choice, Hank's daughter, a Surveillance Van activity, an XP system, Story and Challenge modes, cut powers and trophies, two unused USTV news broadcasts, build modes (Demo, Kiosk, Beta, Review) and debug worlds. With the voice lines in English and the official Russian dub, and the unused videos. Written in Russian, with an English summary.
+**[Cut content →](cut-content/README.md)** ([по-русски](cut-content/README.ru.md)) What the retail game still carries from its development, found while porting it: the Akuran gang that was Russian, Blast Cores, a third ending choice, Hank's daughter, a Surveillance Van activity, an XP system, Story and Challenge modes, cut powers and trophies, two unused USTV news broadcasts, build modes (Demo, Kiosk, Beta, Review) and debug worlds. With the voice lines in English and the official Russian dub, and the unused videos. In English and Russian.
 
 ## Launcher
 
