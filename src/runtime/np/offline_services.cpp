@@ -678,13 +678,24 @@ void Configure(const std::filesystem::path& earned_file, const std::filesystem::
     std::ifstream f(earned_file);
     s32 id = 0;
     s64 time = 0;
+    std::vector<s32> unseen; // time 0: earned before trophies were kept (restored by hand), its notice not shown yet
     while (f >> id >> time) {
         if (id >= 0 && id < kTrophyNumMax) {
             g_trophy_earned[id] = time;
+            if (time == 0) {
+                unseen.push_back(id);
+            }
         }
     }
-    SSPC_LOG(SystemService, Info, "trophies: {} of {} earned ({})", g_trophy_earned.size(), g_trophy_count,
-             earned_file.string());
+    f.close();
+    for (const s32 u : unseen) {
+        TrophyEarn(u); // its notice once the game window is there, and the time it is shown at
+    }
+    if (!unseen.empty()) {
+        TrophySave();
+    }
+    SSPC_LOG(SystemService, Info, "trophies: {} of {} earned, {} restored ({})", g_trophy_earned.size(),
+             g_trophy_count, unseen.size(), earned_file.string());
 }
 
 /// Trophy `id`'s icon (PNG bytes) from the game's trophy file; false without it.
