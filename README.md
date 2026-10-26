@@ -4,7 +4,7 @@
 
 The original PlayStation 4 game runs on Windows on SecondSonPC; its executable and data are left unchanged. SecondSonPC brings its own loader, kernel, memory manager and system services, its own GPU command processor, Vulkan 1.3 backend and GCN → SPIR-V shader translator, and native replacements of selected functions of the game's engine. The game's own x86-64 code runs directly on the PC's processor: there is no CPU emulation.
 
-> **Status: in development, playable.** The game starts, loads saves and is played through. On the development PC (Ryzen 5 5500, RTX 2060 6 GB), gameplay in the city runs at 46–51 FPS with a 1 % low of 26–28; the test scenes run at 36–53 FPS ([Benchmarks](#benchmarks)).
+> **Status: in development, playable.** The game starts, loads saves and is played through. On the development PC (Ryzen 5 5500, RTX 2060 6 GB), gameplay in the city runs at 48–50 FPS, the beach at 66 FPS and a heavy save over the waterfront at 33 FPS; with R12's experimental switches that save runs at 42 FPS and the beach at 72 ([Benchmarks](#benchmarks)).
 
 <p align="center">
   <img src=".github/readme/pc-edition-banner.png" alt="inFAMOUS: Second Son — PC Edition" width="100%">
@@ -125,15 +125,20 @@ All measurements are interleaved A/B series on one build, usually 3–6 runs per
   <img alt="Average FPS and 1 % low by scene" src=".github/readme/current.svg" width="880">
 </picture>
 
-| Scene | FPS | 1 % low | Preset | Date, runs | Source |
-|---|---:|---:|---|---|---|
-| Traverse (city) | 51.3 | 27.9 | `play.cmd` | 10-23, 6 | [R9](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `final_trav`, traverse phase |
-| Fight (city) | 46.0 | 25.6 | `play.cmd` | 10-23, 6 | [R9](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_GAMEPLAY_PERFORMANCE.md) §8.3, series `safe_fight`, fight phase |
-| Beach | 53.1 | 35.5 | `play.cmd` without emitter batching, F1, F3 | 10-22, 3 | [NATIVE_GBUFFER_DRAW_0x1a1770](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_GBUFFER_DRAW_0x1a1770.md) §9.10 |
-| Harbour | 43.2 | 32.6 | same | 10-22, 3 | same |
-| Village | 37.6 | 30.2 | same | 10-22, 3 | same |
-| Live city | 36.1 | 24.7 | threads of `play.cmd` without native G-buffer, batching, F1, F3 | 10-22, 3 | series `s2_live` (raw series, no separate report) |
-| Owner's save | 30.0 | 21.6 | `play.cmd` | 10-23, 3 | [R9_REA3_FIX](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md) §2.5 |
+The chart above is from 10-23; the table has the current numbers. "R12 exp." is `play.cmd` plus `SSPC_FB_LAZY_WB=1` and `SSPC_REA_HEAP_READS=1` (experimental, see [What is new](#what-is-new)).
+
+| Scene | `play.cmd` FPS | 1 % low | R12 exp. FPS | 1 % low | Date, runs | Source |
+|---|---:|---:|---:|---:|---|---|
+| Traverse (city) | 47.8 | 20.5 | 50.1 | 24.2 | 10-26, 3 | [R12_LIGHTS](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_LIGHTS.md), series `ab3` |
+| Fight (city) | 49.0 | 26.6 | 48.8 | 25.1 | 10-26, 3 | same |
+| Owner's save (dusk, wet) | 33.1 | 27.9 | 41.8 | 33.1 | 10-26, 3 | same |
+| Beach | 65.7 | 50.7 | 71.5 | 58.3 | 10-26, 2 | [R12_LIGHTS](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_LIGHTS.md), series `ab2` |
+| Neon Dash (rain at night) | 50.2 | 22.0 | 55.2 | 18.7 | 10-26, 3 | same; the route's spread is 46–59 FPS |
+| Rain by day, standing | 42.6 | 37.6 | – | – | 10-26, 3 | [R12_WEATHER](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_WEATHER.md) §3, series `ab4` |
+| Harbour | 43.2 | 32.6 | – | – | 10-22, 3 | [NATIVE_GBUFFER_DRAW_0x1a1770](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_GBUFFER_DRAW_0x1a1770.md) §9.10 (before emitter batching, F1, F3) |
+| Village | 37.6 | 30.2 | – | – | 10-22, 3 | same |
+
+With the particle sort on top (`SSPC_R12_PSORT=1`) the owner's save went 38.5 → 42.3 FPS in a series run under background load; it is being measured again.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/readme/fps-ab-dark.svg">
@@ -520,7 +525,7 @@ Vulkan 1.3 driver
 
 ## Known issues
 
-- **Performance.** Dense scenes are bound by CPU-side command processing, Vulkan recording and the game's async compute: the open city runs at ~36 FPS and gameplay at 46–51 FPS on the development PC, far from a locked 60.
+- **Performance.** Dense scenes are bound by CPU-side command processing, Vulkan recording and the game's async compute: gameplay in the city runs at 48–50 FPS and a heavy save at 33 FPS (42 with R12's experimental switches) on the development PC, far from a locked 60.
 - **Intel CPUs** lack SSE4a. In a forced test on AMD, the 73 short `extrq` emulated through faults cost ~10 % FPS at the start of a scene. A real Intel CPU has not been tested ([SSPC-011](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/KNOWN_ISSUES.md)).
 - **Tested hardware.** Only one PC was tested: Ryzen 5 5500, RTX 2060 and Windows 10. AMD and Intel GPUs and other drivers are unknown.
 - **Game version.** Only CUSA00004 with update 01.07 (EU) is tested; the engine replacements install only on that executable.
