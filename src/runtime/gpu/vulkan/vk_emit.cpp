@@ -1250,4 +1250,15 @@ std::string Report() {
                     : std::string{});
 }
 
+std::string HangReport() {
+    if (!g_on) {
+        return "emitter off";
+    }
+    const u64 jr = g_job_r.load(), jw = g_job_w.load();
+    return fmt::format("emitter passed {} of {} published (asleep {}); submitter: jobs run {} of {} (the next one waits "
+                       "for {}), asleep {}, begin/end refused {}",
+                       g_r.load(), g_w.load(), g_sleeping.load(), jr, jw,
+                       g_async && jw > jr ? g_jobs[jr % kJobs].pos : 0, g_sub_sleeping.load(), g_cb_errors.load());
+}
+
 } // namespace SecondSon::Gpu::Vk::Emit

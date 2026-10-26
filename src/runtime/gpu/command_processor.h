@@ -374,6 +374,7 @@ struct Counters {
     u64 type2 = 0;
     u64 draws = 0, dispatches = 0, dispatches_disabled = 0, flips = 0;
     u64 fences = 0, fences_deferred = 0, fences_written = 0, fences_dropped = 0;
+    u64 fences_full_waits = 0; ///< a fence with every slot of its queue held: the queue waited for the GPU (retried)
     u64 waits = 0, waits_blocked = 0, cache_actions = 0;
     /// Isolated: how long the WAIT_REG_MEM that blocked stayed blocked (<50 us, 100, 200, 500 us, 1, 1.5, 2, 5, 10 ms,
     /// longer; P4.6: the GPU thread's polling granularity)
@@ -467,6 +468,8 @@ public:
     void SetFenceClockAge(u32 queue, u64 packet_addr, u64 after_seq, u64 age_ns);
     u64 SubmittedWork(u32 queue) const;
     u64 CompletedWork(u32 queue) const;
+    /// Each queue with work: its work numbers given and completed, its held fences (a stall's report).
+    std::string QueueReport() const;
 
     /// Drops everything in flight (pending submissions, buffers, held fences — counted as dropped, never written),
     /// registers to the power-on state, errors cleared. The processor is usable again afterwards.
@@ -501,6 +504,7 @@ public:
         return std::span<const u8, kGdsBytes>(gds_ptr_, kGdsBytes);
     }
     bool QueueFaulted(u32 queue) const;
+    /// A WAIT_REG_MEM whose condition does not hold, or a fence waiting for a slot (every one held): Step retries it.
     bool QueueBlocked(u32 queue) const;
     /// The memory address (or 1 << 63 | register) the queue's blocked WAIT_REG_MEM polls; 0 when it is not blocked.
     u64 BlockedPoll(u32 queue) const;

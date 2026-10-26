@@ -290,6 +290,8 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 
 **October 2026, the last week** (all in `main`):
 
+- **Fixed: the game hanging with the experimental switches** (the async compute lane with early or threaded submission). The log said `too many fences held on queue 1 … 128 fences held waiting for the GPU`, after 2 to 20 minutes of play. The GPU was not stuck: the game's compute queue had run 128 completion fences ahead of a GPU a few batches behind, and at that limit the command processor dropped the queue's whole submission, so the game waited for work that never came. The queue now waits for the GPU there and goes on, as the console's does. If the command processor ever stops a submission again, the log carries every batch in flight, what each waits for and the state of each queue.
+
 - **A launcher and four more graphics settings** ([Launcher](#launcher)).
   - `SecondSonPC.exe` started on its own opens a launcher window: every PC setting by section, the launch profile (`play.cmd` or `play_experimental.cmd`), the video card, processor and memory, and Play. It is SecondSonPC's own code (Direct2D and DirectWrite, no browser engine), and it is part of `SecondSonPC.exe`: no console window flashes up before it.
   - **Graphics → "Shadow quality"**: the size of the sun's shadow maps, 2048 in the game. *High* 4096 (rain's 2048), sharper shadow edges, about +75 MiB of video memory; *Low* 1024 (rain's 512). From the next start: the game creates those maps once.

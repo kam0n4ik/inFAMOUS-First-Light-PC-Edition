@@ -394,6 +394,9 @@ public:
     /// R11 (SSPC_R11_FAST_LABEL): Poll when the oldest batch in flight completed (one timeline query otherwise); true
     /// when it polled. The executor's thread, between records.
     bool PollIfCompleted();
+    /// The batches in flight and what each waits for, the semaphores, each queue's work noted / reported, the
+    /// submitter's and the emitter's positions - logged (a stall; the executor's thread, or with it drained)
+    void LogStall(std::string_view why);
     /// FrameBreak CP-9 (SSPC_CP_ASYNC_WRITES): what WriteOnTimeline / GdsOnTimeline refuse by their shape alone (any
     /// thread: nothing but the GDS buffer's size, fixed); the rest of their refusals (an import) only when they run.
     static bool TimelineWriteShapeOk(u64 dst, u64 bytes) {
@@ -512,6 +515,7 @@ private:
         u8 r11_ovf = 0;
         std::vector<std::pair<u32, u32>> r11_epoch;
         u32 r11_nondisp = 0; ///< (SSPC_R11_AQ_ORDER_EPOCH) guest queues with a command other than a dispatch in it
+        u64 w_main = 0, w_lane = 0, w_bind = 0; ///< the values its submission waits for (HangCheck's report)
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};
@@ -1412,6 +1416,13 @@ private:
     u32 r11_early_backlog_ = 0; ///< ... the main batches not completed it may still have
     u64 r11_early_next_ = 0;    ///< commands_ at which the GPU's value is read next
     void R11EarlySubmitCheck();
+    /// AQ: batches in flight not done and neither semaphore moved for 3 s - what each batch waits for, the submitter's
+    /// and the emitter's positions, logged once per stall (the 10-26 hang: "too many fences held on queue 1")
+    void HangCheck(u64 main_v, u64 lane_v);
+    u64 hang_main_ = 0, hang_lane_ = 0, hang_t_ = 0;
+    bool hang_logged_ = false;
+    /// each guest queue's highest work number noted in a batch / reported complete (LogStall)
+    std::array<u64, Cp::kNumQueues> noted_max_{}, reported_max_{};
     /// SSPC_R11_ASYNC_SUBMIT=1 (Emit::AsyncSubmit): a batch's vkQueueSubmit2 made by the submitter thread
     bool r11_async_ = false;
     struct R11SubmitJob {

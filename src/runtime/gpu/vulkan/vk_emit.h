@@ -60,5 +60,7 @@ bool DrainSubmits(u64 timeout_ns = 2'000'000'000ull);
 int RecordingError();
 
 std::string Report();
+/// The emitter's and the submitter's positions now (a stall's report; any thread).
+std::string HangReport();
 
 } // namespace SecondSon::Gpu::Vk::Emit

@@ -143,6 +143,7 @@ struct CommandProcessor::Queue {
     bool blocked = false;
     u64 block_t0 = 0, block_poll = 0; ///< diagnostics: when and on what the queue blocked
     bool block_held = false;          ///< a held fence would meet the wait when it blocked
+    bool fence_full = false;          ///< a fence waits for a slot (every one held): the packet is retried
     u64 active_seq = 0;               ///< the seq of the submission at depth 1
     u8 order_state = 0; ///< R9 REA-3 order, the next submission: 1 counted as held, 2 as released
 };
@@ -260,7 +261,7 @@ bool CommandProcessor::QueueFaulted(u32 queue) const {
 
 bool CommandProcessor::QueueBlocked(u32 queue) const {
     const Queue* q = Q(queue);
-    return q && q->blocked;
+    return q && (q->blocked || q->fence_full);
 }
 
 u64 CommandProcessor::BlockedPoll(u32 queue) const {
@@ -281,6 +282,26 @@ u32 CommandProcessor::PendingSubmissions(u32 queue) const {
 u64 CommandProcessor::SubmittedWork(u32 queue) const {
     const Queue* q = Q(queue);
     return q ? q->work_seq : 0;
+}
+
+std::string CommandProcessor::QueueReport() const {
+    std::string s;
+    for (u32 i = 0; i < kNumQueues; ++i) {
+        const Queue* q = Q(i);
+        if (q == nullptr || (q->work_seq == 0 && q->fence_count == 0)) {
+            continue;
+        }
+        s += fmt::format("; q{}: work {} done {}, pending {} depth {}, blocked {} on {:#x}{}, fences held {}", i,
+                         q->work_seq, q->work_done, q->count, q->depth, q->blocked, q->block_poll,
+                         q->block_held ? " (a held fence meets it)" : "", q->fence_count);
+        if (q->fence_count != 0) {
+            const FenceOp& h = q->fences[q->fence_head];
+            const FenceOp& t = q->fences[(q->fence_head + q->fence_count - 1) % kMaxFences];
+            s += fmt::format(" (first after {} at {:#x} -> {:#x}, last after {} at {:#x})", h.after_seq, h.packet_addr,
+                             h.addr, t.after_seq, t.packet_addr);
+        }
+    }
+    return s;
 }
 
 u64 CommandProcessor::CompletedWork(u32 queue) const {
@@ -549,6 +570,7 @@ StepStatus CommandProcessor::Fail(Queue& q, CpErrorKind kind, u64 addr, u8 opcod
     }
     q.depth = 0; // the submission is dropped
     q.blocked = false;
+    q.fence_full = false;
     q.faulted = true;
     q.carry_need = q.carry_have = 0;
     inline_marker_ = 0; // a marker of the dropped stream must not flag the next one's user data
@@ -611,7 +633,7 @@ StepStatus CommandProcessor::Step(u32 queue) {
     }
     const u32 saved = f.pos;
     f.pos += pk.dwords;
-    if (observer_ != nullptr && !q.blocked) { // once per packet, not per retry of a blocked wait
+    if (observer_ != nullptr && !q.blocked && !q.fence_full) { // once per packet, not per retry of a blocked one
         observer_->BeforePacket(q.id, addr, p);
     }
     const u64 t0 = options_.packet_ticks ? __rdtsc() : 0;
@@ -2174,6 +2196,20 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
 }
 
 StepStatus CommandProcessor::Fence(Queue& q, FenceOp& op) {
+    if (options_.mode != Mode::Shadow && q.fence_count == kMaxFences) {
+        // every slot held: the queue waits for the GPU as the hardware's would - the packet stays next and is retried
+        // once completed work released the oldest (dropping the submission instead lost the game's work after it: the
+        // 10-26 hang, queue 1 kMaxFences ahead of a GPU 8 batches behind with the async compute lane)
+        if (!q.fence_full) {
+            q.fence_full = true;
+            if (stats_.fences_full_waits++ == 0) {
+                SSPC_LOG(GPU, Info, "command processor: queue {} has {} fences held - it waits for the GPU to complete "
+                                    "the work before them (first time)", q.id, kMaxFences);
+            }
+        }
+        return StepStatus::Blocked;
+    }
+    q.fence_full = false;
     ++stats_.fences;
     op.after_seq = q.work_seq > q.work_done ? q.work_seq : 0;
     if (options_.mode == Mode::Shadow) {
@@ -2181,10 +2217,6 @@ StepStatus CommandProcessor::Fence(Queue& q, FenceOp& op) {
         return StepStatus::Packet;
     }
     if (op.after_seq != 0 || q.fence_count != 0) { // GPU work before it, or an earlier fence still held
-        if (q.fence_count == kMaxFences) {
-            return Fail(q, CpErrorKind::FenceQueueFull, op.packet_addr, 0, 0,
-                        fmt::format("{} fences held waiting for the GPU", kMaxFences));
-        }
         op.after_seq = q.work_seq;
         op.deferred = true;
         q.fences[(q.fence_head + q.fence_count++) % kMaxFences] = op;

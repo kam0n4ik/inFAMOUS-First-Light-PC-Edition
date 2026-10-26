@@ -710,6 +710,7 @@ void Executor::Note(u32 queue, u64 seq) {
         cur_.queues.push_back(queue);
     }
     cur_.work[queue] = std::max(cur_.work[queue], seq);
+    noted_max_[queue] = std::max(noted_max_[queue], seq);
     aq_q_last_[queue] = {cur_.value, cur_.pool_lane};
     if (prof_queues_ && queue != prof_queue_) {
         ProfQueue(queue); // (before the command's barriers and uploads: they count to its queue)
@@ -1351,6 +1352,9 @@ void Executor::Flush() {
         if (aq_wait_lane != 0) {
             wait_on(timeline_.LaneHandle(), aq_wait_lane);
         }
+        cur_.w_bind = bind_sem != VK_NULL_HANDLE ? bind_value : 0;
+        cur_.w_main = aq_wait_main;
+        cur_.w_lane = aq_wait_lane;
         job.n_cb = n_cb;
         for (u32 i = 0; i < n_cb; ++i) {
             job.cbis[i] = cbis[i];
@@ -1419,6 +1423,9 @@ void Executor::Flush() {
                                .value = aq_wait_lane,
                                .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
         }
+        cur_.w_bind = bind_sem != VK_NULL_HANDLE ? bind_value : 0;
+        cur_.w_main = aq_wait_main;
+        cur_.w_lane = aq_wait_lane;
         VkLatencySubmissionPresentIdNV latency{}; // (NVIDIA Reflex: the GPU work of the frame being recorded)
         const VkSubmitInfo2 si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
                                .pNext = cur_.lane != 0 ? nullptr : Reflex::SubmitChain(VideoOut::NextFlipId(), latency),
@@ -1544,6 +1551,62 @@ void Executor::R11EarlySubmitCheck() {
     Flush();
 }
 
+void Executor::HangCheck(u64 main_v, u64 lane_v) {
+    // neither semaphore moved while a batch in flight is not done: the GPU waits for what no submission signals, or
+    // the batches were never submitted - logged once a stall, after 3 s
+    const bool waiting = std::any_of(in_flight_.begin(), in_flight_.end(), [](const Batch& b) { return !b.done; });
+    const u64 now = GS::Ticks();
+    if (!waiting || main_v != hang_main_ || lane_v != hang_lane_) {
+        hang_main_ = main_v;
+        hang_lane_ = lane_v;
+        hang_t_ = now;
+        hang_logged_ = false;
+        return;
+    }
+    if (hang_logged_ || GS::TicksToNs(now - hang_t_) < 3'000'000'000ull) {
+        return;
+    }
+    hang_logged_ = true;
+    LogStall("neither semaphore moved for 3 s with a batch in flight not done");
+}
+
+void Executor::LogStall(std::string_view why) {
+    const u64 main_v = timeline_.QueryMain(), lane_v = timeline_.QueryLane();
+    u64 bind_v = 0;
+    if (const VkSemaphore s = buffers_.BindTimeline(); s != VK_NULL_HANDLE) {
+        Fn().vkGetSemaphoreCounterValue(ctx_.Device(), s, &bind_v);
+    }
+    std::string work;
+    for (u32 q = 0; q < Cp::kNumQueues; ++q) {
+        if (noted_max_[q] != 0 || reported_max_[q] != 0) {
+            work += fmt::format(" q{} {}/{}", q, noted_max_[q], reported_max_[q]);
+        }
+    }
+    SSPC_LOG(GPU, Error, "native backend: {}: {} batches in flight; main semaphore {}, lane {}, binds {} (last submitted "
+                         "{}); completed {}; last submitted main v{} lane v{}; open {} v{} pool lane {} commands {}; work "
+                         "noted/reported by queue{}; {}",
+             why, in_flight_.size(), main_v, lane_v, bind_v, buffers_.LastBindValue(), timeline_.CompletedCached(),
+             aq_last_main_, aq_last_lane_, open_, cur_.value, cur_.pool_lane, commands_, work, Emit::HangReport());
+    u32 n = 0;
+    for (const Batch& b : in_flight_) {
+        if (n++ == 64) {
+            break;
+        }
+        std::string qs;
+        for (const u32 q : b.queues) {
+            qs += fmt::format(" q{}:{}{}", q, b.work[q], b.aq_unreported.test(q) ? " (unreported)" : "");
+        }
+        const auto& st = r11_submit_t_[b.value & (r11_submit_t_.size() - 1)];
+        const char* sub = !r11_async_ || b.submit_t1 != 0               ? "direct"
+                          : st[1].load(std::memory_order_acquire) != 0 ? "yes"
+                                                                        : "NO";
+        SSPC_LOG(GPU, Error, "  v{} {} (pool {}) done {} submitted {}: waits main {} lane {} binds {}; main min {}, "
+                             "kept main {}, after all {}, images {}, overflow {}; queues{}",
+                 b.value, b.lane != 0 ? "lane" : "main", b.pool_lane, b.done, sub, b.w_main, b.w_lane, b.w_bind,
+                 b.aq_wait_main_min, b.aq_main, b.aq_wait_all, b.aq_images, b.aq_overflow, qs);
+    }
+}
+
 void Executor::Poll() {
     if (r11_async_ && !r11_async_fail_reported_ && r11_async_fail_.load(std::memory_order_acquire) != 0) {
         // R11 SSPC_R11_ASYNC_SUBMIT: the submitter thread's refused submission reported here (the executor's thread)
@@ -1594,6 +1657,7 @@ void Executor::Poll() {
             free_.push_back(std::move(in_flight_.front()));
             in_flight_.pop_front();
         }
+        HangCheck(main_v, lane_v);
     }
     while (!aq_ && !in_flight_.empty() && in_flight_.front().value <= completed) {
         Batch b = std::move(in_flight_.front());
@@ -1718,6 +1782,9 @@ void Executor::Retire(Batch& b) {
 }
 
 void Executor::Complete(u32 queue, u64 seq) {
+    if (queue < Cp::kNumQueues) {
+        reported_max_[queue] = std::max(reported_max_[queue], seq);
+    }
     if (defer_completions_) {
         std::scoped_lock lock{completions_mu_};
         completions_.emplace_back(queue, seq);

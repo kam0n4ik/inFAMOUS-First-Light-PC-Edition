@@ -534,7 +534,7 @@ private:
     /// CC-2: a mapped compute queue has work its processor can step now (not blocked on a wait)
     bool ComputeReady() const {
         for (u32 q = Cp::kGraphicsQueue + 1; q < Cp::kNumQueues; ++q) {
-            if (mapped_[q] && cp_->PendingSubmissions(q) != 0 && cp_->BlockedPoll(q) == 0) {
+            if (mapped_[q] && cp_->PendingSubmissions(q) != 0 && !cp_->QueueBlocked(q)) {
                 return true;
             }
         }
@@ -1533,6 +1533,13 @@ void Backend::Loop() {
                         first_cp_error_ = cp_->LastError().Text();
                         SSPC_LOG(GPU, Error, "native backend: the command processor stopped a submission: {}",
                                  first_cp_error_);
+                        // what the processor and the executor hold now (the 10-26 hang: 128 fences held on queue 1,
+                        // the GPU idle) - the executor drained first (it is thread 2's otherwise)
+                        if (parallel_) {
+                            parallel_->Drain(DrainReason::Synchronize);
+                        }
+                        executor_->LogStall("the command processor stopped a submission");
+                        SSPC_LOG(GPU, Error, "native backend: the command processor's queues{}", cp_->QueueReport());
                     }
                 }
                 break;
