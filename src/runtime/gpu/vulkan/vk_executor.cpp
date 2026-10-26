@@ -3719,6 +3719,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
     const u64 gb_epoch = images_.Epoch();
     u32 lod_bits = 0;
     std::memcpy(&lod_bits, &lod, 4);
+    lod_bits ^= AnisotropyOverride() << 24; // (the kept samplers' key: [Graphics] anisotropy makes others)
     if (gb_mode_ == GbMode::Unread) {
         char v[16] = {};
         const DWORD n = GetEnvironmentVariableA("SSPC_NATIVE_GBUFFER_BIND", v, sizeof(v));

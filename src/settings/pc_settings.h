@@ -49,6 +49,18 @@ struct PcSettings {
     // [Graphics] the game's rain shadow maps (src/engine/render/rain_shadows.h); both backends. "original" (the game's
     // own) | "off" (the rain kinds take the game's wetness-0 path: nothing is covered from the rain)
     std::string rain_shadows = "original";
+    // [Graphics] anisotropic filtering of the game's anisotropic samplers (native backend; vk_image_cache.h): "game"
+    // (each sampler's own ratio, mostly 4x) | "2" | "4" | "8" | "16"
+    std::string anisotropy = "game";
+    // [Graphics] the game's anti-aliasing (native backend; src/engine/render/render_resolution.h): "game" (SMAA T2x,
+    // FXAA when the game finds its GPU slow) | "t2x" | "fxaa" | "off"; with an upscaler "game" / "t2x" act as "fxaa"
+    std::string anti_aliasing = "game";
+    // [Graphics] the game's shadow map sizes (src/engine/render/shadow_quality.h); both backends, from the next start.
+    // "original" (sun 2048, rain 1024) | "low" (1024 / 512) | "high" (4096 / 2048)
+    std::string shadow_quality = "original";
+    // [Graphics] the city's high-resolution texture packs (src/engine/render/texture_quality.h); both backends, from
+    // the next start. "high" (the 4 nearest blocks, the game's) | "medium" (2) | "low" (none: half-size textures)
+    std::string texture_quality = "high";
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"
     std::string upscale_quality = "quality"; // "native" | "quality" | "balanced" | "performance" | "ultra"

@@ -18,6 +18,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   <a href="#cpu-native-x86-64-and-avx">CPU and AVX</a> ·
   <a href="#building-from-source">Building</a> ·
   <a href="#where-the-project-is">Status</a> ·
+  <a href="#launcher">Launcher</a> ·
   <a href="#pc-settings">PC settings</a> ·
   <a href="#known-issues">Known issues</a> ·
   <a href="#reports">Reports</a>
@@ -47,7 +48,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
 - **DLSS, FSR 3.1, FSR 3.1 frame generation and NVIDIA Reflex inside the game's frame.** Motion vectors, depth and jitter are taken from the game. The HUD is drawn afterwards at full resolution.
 - **The engine's own functions, rebuilt and proven.** 18 render functions of the engine (G-buffer and shadow passes, materials, the constant update engine) have SecondSonPC implementations. They are hand-written or produced by the project's static recompiler (Ghidra P-code → C++, AVX), and each is verified call by call against the original in the running game: 0 mismatches over tens of millions of calls.
 - **PC-native around the game.**
-  - Settings live inside the game's own menu.
+  - A launcher opens before the game: every PC setting, the launch profile and Play ([Launcher](#launcher)). The same settings live inside the game's own menu.
   - Keyboard and mouse are supported, and every button prompt is redrawn for keyboard, Xbox or PlayStation.
   - The mouse turns the camera directly, as in a PC game: no stick emulation, dead zone, acceleration or speed cap ([Native mouse camera](#native-mouse-camera)).
   - Any resolution and aspect ratio from 4:3 to 32:9, with Hor+, an unstretched HUD, an FOV setting and movies kept 16:9 ([Resolutions and aspect ratios](#resolutions-and-aspect-ratios)).
@@ -65,8 +66,8 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
 
    | File | What |
    |---|---|
-   | `SecondSonPC.exe` | the runtime |
-   | `play.cmd` | starts the game with every improvement that is on for players, after backing up the saves |
+   | `SecondSonPC.exe` | the runtime; started on its own it opens the [launcher](#launcher) first |
+   | `play.cmd` | starts the game at once, without the launcher, with every improvement that is on for players, after backing up the saves |
    | `play_experimental.cmd` | `play.cmd` plus faster experiments (REA-3 + AQ + R10's MAIN_FREE + R11's AQ_IMAGES and AQ_ORDER_EPOCH, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md), [R10_PACING.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_PACING.md), [R11_NEON.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_NEON.md)): +17 % FPS on the owner's save and +9 % in a fight against `play.cmd`, but a lower 1 % low in Neon Dash |
    | `SecondSonPC.toml` | defaults: window, language, keys, PC settings |
    | `data\static_templates.txt` | the data the shader preparation predicts the game's shaders from |
@@ -76,17 +77,18 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
    | `SecondSonPC-README.txt` | these steps in short |
 
 3. **The Visual C++ runtime.** Install the [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it is not installed yet.
-4. **Start `play.cmd`.**
+4. **Start `SecondSonPC.exe`** and press **Играть** (Play) in the launcher. `play.cmd` still works and starts the game at once with the standard profile.
    - On the first start a console window prepares the game's shaders: they are compiled before the game starts. This happens once: on the development PC (6 cores / 12 threads) it took 5.5 minutes from an empty cache, about 13 400 pipelines. Later starts skip it in under two seconds.
    - It runs again only after a driver or SecondSonPC update.
-5. **PC settings:** in the game, open **Esc (Options) → Settings → "Additional settings"**.
+5. **PC settings:** in the launcher, or in the game: **Esc (Options) → Settings → "Additional settings"**.
 
 Where things are kept:
 
 | Path | What |
 |---|---|
 | `userdata\` (in the game's folder) | saves; `play.cmd` copies them to `userdata\savedata_backups\<date_time>` before every start |
-| `%LOCALAPPDATA%\SecondSonPC\settings.toml` | your changes from the in-game settings window (they override `SecondSonPC.toml`) |
+| `%LOCALAPPDATA%\SecondSonPC\settings.toml` | your changes from the launcher and the in-game settings window, one file for both (they override `SecondSonPC.toml`) |
+| `%LOCALAPPDATA%\SecondSonPC\launcher.toml` | the launcher's own choices: launch profile, close after Play |
 | `cache\shaders\` | prepared shaders and the driver's pipeline cache (about 1.6 GB; safe to delete, it is prepared again) |
 | `logs\SecondSonPC.log` | the log; attach it to a bug report |
 
@@ -288,6 +290,14 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 
 **October 2026, the last week** (all in `main`):
 
+- **A launcher and four more graphics settings** ([Launcher](#launcher)).
+  - `SecondSonPC.exe` started on its own opens a launcher window: every PC setting by section, the launch profile (`play.cmd` or `play_experimental.cmd`), the video card, processor and memory, and Play. It is SecondSonPC's own code (Direct2D and DirectWrite, no browser engine), and it is part of `SecondSonPC.exe`: no console window flashes up before it.
+  - **Graphics → "Shadow quality"**: the size of the sun's shadow maps, 2048 in the game. *High* 4096 (rain's 2048), sharper shadow edges, about +75 MiB of video memory; *Low* 1024 (rain's 512). From the next start: the game creates those maps once.
+  - **Graphics → "Texture quality"**: the game streams full-size textures for the 4 city blocks around the player. *Medium* for 2, *Low* for none: less video memory (−45 MiB on the test route) and less disk reading, blurrier close up. There is no level above the game's. From the next start.
+  - **Graphics → "Anisotropic filtering"** (live): *as in the game* (4x for most materials), 2x, 4x, 8x or 16x. Roads, walls and roofs at an angle get sharper at 16x; shadows, the HUD and full-screen effects are not touched.
+  - **Graphics → "Anti-aliasing"** (live): *as in the game* (SMAA T2x, and under GPU load the game switches itself to FXAA), *SMAA T2x* always, *FXAA*, or *Off*.
+  - What each of them costs in FPS is still being measured. All four apply on the native backend; settings self-test: 196 checks, 0 failures.
+
 - **R12 — weather, local lights and reflections** (reports: [R12_WEATHER.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_WEATHER.md), [R12_WEATHER_PROFILE.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_WEATHER_PROFILE.md), [R12_LIGHTS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_LIGHTS.md), [R12_REFLECTIONS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_REFLECTIONS.md), [R12_RAIN_SHADOWS.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r12-20261026/docs/R12_RAIN_SHADOWS.md)). Medians on the development PC, vertical sync off, no frame limit:
   - **Where the weather's cost is.** The game picks its time of day (sky, rain, wetness) when a world loads, from the mission and the story's progress; it cannot be switched live. Every city time of day is wet. Wetness costs 4.5 % FPS at dusk and 9.8 % in rain by day, and almost all of it is the **rain shadow maps**: a view from above, about 1 000 depth draws a frame, which the game uses to keep the ground dry under bridges and roofs. The wet-surface pass itself is one full-screen draw, 0.4 ms on the GPU.
   - **Graphics → "Rain shadows"** (new, live): *Original* (default) or *Off — nothing is sheltered from the rain*. Off, nothing is drawn into those maps: about 1 000 draws a frame less in wet weather, and the ground under bridges, roofs and in passages is as wet as the open street. Rain, fog and puddles in the open do not change. This trades picture for speed; its FPS is still being measured.
@@ -413,14 +423,35 @@ The native engine work replaces individual engine functions with SecondSonPC's i
 
 **Why it gives no FPS by itself.** These functions run on the game's job threads, while the frame waits for command processing, async compute and the GPU. What R5–R7 deliver is an engine whose render path increasingly runs on code the project owns. Using the engine's knowledge to cut command processor work began in R8 (the native G-buffer draw, the CUE snapshot channel). Details: [`NATIVE_ENGINE_RECONSTRUCTION.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_RECONSTRUCTION.md), [`NATIVE_ENGINE_R7_RESULTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_R7_RESULTS.md).
 
+## Launcher
+
+`SecondSonPC.exe` started without arguments opens the launcher; **Играть** (Play) starts the game with what is chosen there. It is in Russian for now.
+
+<p align="center">
+  <img src=".github/readme/launcher-home.png" alt="The launcher: Play, the launch profile, the PC's configuration" width="880">
+</p>
+
+- **Home**: Play, the launch profile and whether the game's folder is found. *Standard* is `play.cmd`'s preset, *Experimental* is `play_experimental.cmd`'s. Before every start the saves are copied to `userdata\savedata_backups\<date_time>`, as `play.cmd` does.
+- **Display, Graphics, Effects, Controls, Audio, Advanced**: the same settings as the in-game window, saved to the same `settings.toml`, so a change in one shows in the other. Settings that need a restart and settings that are unavailable say so; Advanced ends with the closed Experiments section.
+- The game's own art (`sce_sys\pic0.png` of your copy) is the home page's background; it is read from the game's folder, not shipped.
+- `play.cmd` and any command line with arguments start the game at once, without the launcher.
+
+<p align="center">
+  <img src=".github/readme/launcher-graphics.png" alt="The launcher's Graphics page: shadow, reflection and texture quality, anisotropic filtering" width="880">
+</p>
+
+<p align="center">
+  <img src=".github/readme/launcher-controls.png" alt="The launcher's Controls page: mouse settings" width="880">
+</p>
+
 ## PC settings
 
-The PC options live inside the game's own menu: **Esc (Options) → Settings → "Additional settings"**. This is the line that used to read "HDR Rendering — Unavailable"; the string is replaced as it is read, and the game's files are not changed.
+The PC options are in the [launcher](#launcher) and inside the game's own menu: **Esc (Options) → Settings → "Additional settings"**. This is the line that used to read "HDR Rendering — Unavailable"; the string is replaced as it is read, and the game's files are not changed.
 
 - There are eight pages: **Graphics, Display, Controls, Keys, Audio, Game, Advanced, Experiments**.
 - **Experiments** lists the runtime's switches by group: the command processor, Vulkan recording, pipelines and memory, GPU queues and frame pacing, processor threads, R10's draws from the engine's data, the system libraries, R12's particles and weather, and R12's stand tools (diagnostics, off). Each says what it does, what it measured and whether `play.cmd` or `play_experimental.cmd` turns it on. Switches that are off by default are listed too, so every one of them can be tried. The launcher's value is the default; what a player changes is saved in their settings file and applies from the next start, because those subsystems read it once at start. "Reset this page" returns to the launcher's values. The log marks every changed one with `EXPERIMENT`.
 - The window works with keyboard, mouse and gamepad navigation, with prompts for the last device used.
-- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, motion blur and its strength, reflection quality, rain shadows, vertical sync, frame-rate limit, mouse and motion settings, volume.
+- Changes apply immediately where the subsystem allows it: upscaler and quality, sharpness, frame generation, Reflex, smoke quality, particle resolution, motion blur and its strength, reflection quality, rain shadows, anisotropic filtering, anti-aliasing, vertical sync, frame-rate limit, mouse and motion settings, volume. Shadow quality and texture quality apply from the next start.
 - **Display**:
   - vertical sync is On (FIFO), Off (IMMEDIATE) or Off without tearing (MAILBOX);
   - the frame-rate limit is 30, 40, 50, 60, 90, 120, 144, 165, 240 or unlimited;
@@ -536,6 +567,7 @@ Vulkan 1.3 driver
 - **GPU loss once with early submission.** In one of three 30-minute runs with `SSPC_R11_EARLY_SUBMIT=256` the driver reset the GPU after 18.5 minutes (`VK_ERROR_DEVICE_LOST`). Its exact repeat, another run and a run without it were clean, and the cause is not known. Such resets also happened on that PC before R11. If it happens to you, turn off "Early batch submission (R11)" on the Experiments page: that is R10's behaviour.
 - **Not tested in R11:** flying, cut-scenes, vertical sync switches together with DLSS / FSR frame generation, gamepad navigation of the new rows, two monitors.
 - **R12 is still under its final check.** The experimental switches above are off by default; their comparison with R11 over every scene is running. "Rain shadows: Off" has not yet been checked frame by frame. Not tested in R12: flying, cut-scenes, light from Delsin's powers (none on the routes), harbour and village with the particle sort.
+- **The launcher and the new graphics settings** are new: the launcher is in Russian only, and the FPS cost of shadow quality, texture quality, anisotropic filtering and anti-aliasing is not measured yet. If something looks wrong, set them back to *as in the game*.
 - There is no full-campaign compatibility guarantee.
 
 ## Roadmap
@@ -576,6 +608,8 @@ Vulkan 1.3 driver
 - [x] Live vertical sync (FIFO / IMMEDIATE / MAILBOX), more frame limits, window mode with roll-back (R11)
 - [x] Motion blur on / off and its strength (R11)
 - [x] Reflection quality and rain shadows in Graphics (R12)
+- [x] A launcher before the game; shadow quality, texture quality, anisotropic filtering and anti-aliasing in Graphics
+- [ ] The launcher in English
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
 - [x] Native mouse camera (no stick emulation)
 - [x] Any resolution and aspect ratio (4:3 to 32:9, Hor+, HUD, FOV, movies 16:9)

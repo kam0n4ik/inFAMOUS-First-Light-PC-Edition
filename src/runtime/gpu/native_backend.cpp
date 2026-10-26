@@ -2894,6 +2894,13 @@ void SetFpsCounter(bool on) {
     Vk::SetFpsCounterShown(on);
 }
 
+void SetAnisotropy(const std::string& level) {
+    const u32 n = level == "2" ? 2 : level == "4" ? 4 : level == "8" ? 8 : level == "16" ? 16 : 0;
+    Vk::SetAnisotropyOverride(n);
+    SSPC_LOG(GPU, Info, "native backend: anisotropic filtering {}",
+             n == 0 ? std::string("as the game") : fmt::format("{}x", n));
+}
+
 bool SetPresentMode(const std::string& present_mode) {
     return g_backend != nullptr && g_backend->SetPresentMode(present_mode);
 }

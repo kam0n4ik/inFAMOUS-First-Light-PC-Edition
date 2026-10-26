@@ -8,6 +8,7 @@
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -41,7 +42,18 @@ constexpr VkAccessFlags2 kWriteAccess = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS
                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
                                         VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
 
+std::atomic<u32> g_aniso_override{0}; // [Graphics] anisotropy (0: the game's own)
+
 } // namespace
+
+void SetAnisotropyOverride(u32 level) {
+    g_aniso_override.store(level == 2 || level == 4 || level == 8 || level == 16 ? level : 0,
+                           std::memory_order_relaxed);
+}
+
+u32 AnisotropyOverride() {
+    return g_aniso_override.load(std::memory_order_relaxed);
+}
 
 ImageCache::ImageCache(DeviceContext& ctx, GuestBuffers& guest) : ctx_(ctx), guest_(guest) {
     const auto& f = Fn();
@@ -1010,9 +1022,17 @@ VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, 
     caps.max_anisotropy = 16.0f;
     caps.custom_border_color = ctx_.Caps().custom_border_color;
     caps.max_lod_bias = 15.0f;
-    const SamplerParams p = BuildSamplerParams(s, is_depth, caps);
+    SamplerParams p = BuildSamplerParams(s, is_depth, caps);
     if (!p.supported) {
         return VK_NULL_HANDLE;
+    }
+    // [Graphics] anisotropy: only the S#s the game itself filters anisotropically (AnisoLinear minification with a
+    // ratio; the game clears the ratio of single-level textures), never point / comparison / unnormalized ones
+    const u32 aniso = AnisotropyOverride();
+    const bool aniso_override = aniso != 0 && p.anisotropy_enable && s.MinFilter() == 3 && s.MaxAniso() != 0 &&
+                                !p.compare_enable && !s.ForceUnnormalized();
+    if (aniso_override) {
+        p.max_anisotropy = std::min(static_cast<float>(aniso), caps.max_anisotropy);
     }
     std::array<float, 4> border{};
     if (p.border_color == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT) {
@@ -1028,6 +1048,9 @@ VkSampler ImageCache::Sampler(const Gpu::Shader::SamplerDesc& s, bool is_depth, 
         u32 b = 0;
         std::memcpy(&b, &extra_lod_bias, 4);
         key = Mix(key, 0xB1A5000000000000ull | b);
+    }
+    if (aniso_override) {
+        key = Mix(key, 0xA150000000000000ull | aniso);
     }
     if (const auto it = samplers_.find(key); it != samplers_.end()) {
         return it->second;

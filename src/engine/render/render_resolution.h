@@ -74,13 +74,25 @@ bool InstallRenderSwitch(u64 eboot_base);
 /// Asks for `size` (clamped to the started size) at the game's next frame. false: the switch is not installed.
 bool RequestRenderSize(RenderSize size);
 
-/// The game's temporal anti-aliasing (SMAA T2x) off while `off` is set: its camera jitter and two-frame blend would
-/// take the place of the upscaler's own jitter and smear its input. CameraJitter 0x472810 runs every frame: while the
-/// T2x flag (0xda07f9) is set it moves the main camera's (0x7f2d2b8) frustum window by +-0.5/width, -+0.5/height
-/// in turn (Camera::SetFrustumWindow 0x581a50); pass 32's setup (0x1929c0) blends the frame with the previous one when
-/// the flag is set. An entry probe runs it, then clears the flag and gives the camera its centred window again
-/// (Camera::ResetFrustumWindow 0x581a10) - the scene unjittered, the resolve a single frame (SMAA 1x).
+/// The game's anti-aliasing. CameraJitter 0x472810 (every frame, from 0x1901a0) picks it: SMAA T2x (flag 0xda07f9)
+/// while the game's GPU timer (0x196ef0, 1000 = 33.3 ms) stays under a frame at 30 FPS, else FXAA; then the
+/// scripts' DISABLE_SMAA (0xe87c85) and two more of its masks clear the flag. While the flag is set it moves the main
+/// camera's (0x7f2d2b8) frustum window by +-0.5/width, -+0.5/height in turn (Camera::SetFrustumWindow 0x581a50) and
+/// pass 32 (0x1929c0: tone mapping, then the anti-aliasing into 0xf1d4b0) resolves SMAA with the previous frame
+/// (0x472010); without it pass 32 runs FXAA 3.11 (0x1a71f0). 0x1901a0 then sets 0xe86e3d (= 0x1d0cbd5 && !T2x), with
+/// which pass 32 tone-maps straight into 0xf1d4b0 and runs no anti-aliasing at all.
+///   entry probe on 0x472810: "t2x" restarts the game's re-evaluation (0x7e00964 = 0) with the flag set, so only
+///     the game's masks clear it; "fxaa" / "off" clear the flag after it and give the camera its centred window
+///     again (Camera::ResetFrustumWindow 0x581a10) - the scene unjittered
+///   entry probe on 0x1929c0: "off" sets 0xe86e3d (read only there and by pass 33 0x195840, which runs only with
+///     0x1d0cbd5)
+/// Install in the loader's window (the native backend).
 bool InstallTemporalAaControl(u64 eboot_base);
+/// An upscaler jitters the scene: the game's T2x (its jitter and two-frame blend would smear the upscaler's input) is
+/// off - "game" / "t2x" become "fxaa" (the upscaler's input as before), "off" stays.
 void SetTemporalAaOff(bool off);
+/// [Graphics] antiAliasing: "game" (the game's own choice) | "t2x" | "fxaa" | "off"; from the game's next frame.
+/// Anything else = "game".
+void SetAntiAliasing(const std::string& mode);
 
 } // namespace SecondSon::Engine::Render

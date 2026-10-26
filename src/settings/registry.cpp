@@ -138,6 +138,29 @@ constexpr Choice kRainShadows[] = { // (R12 rain; docs/R12_RAIN_SHADOWS.md)
     {"original", "Original", "Исходные"},
     {"off", "Off (nothing covered from the rain)", "Выключены (ничто не укрыто от дождя)"},
 };
+constexpr Choice kAnisotropy[] = {
+    {"game", "As in the game (mostly 4x)", "Как в игре (в основном 4x)"},
+    {"2", "2x", "2x"},
+    {"4", "4x", "4x"},
+    {"8", "8x", "8x"},
+    {"16", "16x", "16x"},
+};
+constexpr Choice kAntiAliasing[] = {
+    {"game", "As in the game (SMAA T2x, FXAA when slow)", "Как в игре (SMAA T2x, при нагрузке FXAA)"},
+    {"t2x", "SMAA T2x", "SMAA T2x"},
+    {"fxaa", "FXAA", "FXAA"},
+    {"off", "Off", "Выключено"},
+};
+constexpr Choice kShadowQualities[] = {
+    {"low", "Low (1024)", "Низкое (1024)"},
+    {"original", "Original (2048)", "Исходное (2048)"},
+    {"high", "High (4096)", "Высокое (4096)"},
+};
+constexpr Choice kTextureQualities[] = {
+    {"low", "Low (half-size city textures)", "Низкое (текстуры города в половинном размере)"},
+    {"medium", "Medium (full size on 2 nearest blocks)", "Среднее (полный размер на 2 ближайших кварталах)"},
+    {"high", "High (as in the game, 4 blocks)", "Высокое (как в игре, 4 квартала)"},
+};
 constexpr Choice kUpscalers[] = {
     {"off", "Off (Render scale)", "Выключено (масштаб рендеринга)"},
     {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
@@ -605,6 +628,74 @@ void Build(Registry& r) {
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.rain_shadows; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.rain_shadows = std::get<std::string>(x); },
     });
+    // ------------------------------------------------------------------ Graphics: texture filtering
+    v.push_back(Desc{
+        .id = "graphics.anisotropy", .table = "Graphics", .key = "anisotropy", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kAnisotropy,
+        .en = "Anisotropic filtering", .ru = "Анизотропная фильтрация",
+        .help_en = "The sharpness of textures seen at an angle (roads, walls, roofs into the distance). The game asks "
+                   "4x for most of its materials (2x for some); higher keeps the distance sharper. Only the textures "
+                   "the game itself filters anisotropically change; shadows, the HUD and full-screen effects do not. "
+                   "Applies at once.",
+        .help_ru = "Чёткость текстур под углом (дороги, стены, крыши вдаль). Игра просит 4x для большинства "
+                   "материалов (для части — 2x); выше — даль остаётся чётче. Меняются только текстуры, которые игра "
+                   "сама фильтрует анизотропно; тени, интерфейс и полноэкранные эффекты — нет. Применяется сразу.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.anisotropy; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.anisotropy = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.antiAliasing", .table = "Graphics", .key = "antiAliasing", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::RenderScale, .choices = kAntiAliasing,
+        .en = "Anti-aliasing", .ru = "Сглаживание",
+        .help_en = "The game's own anti-aliasing of edges. As in the game: SMAA T2x (edges plus a blend with the "
+                   "previous frame), and FXAA when the game finds its GPU slower than 30 FPS. SMAA T2x: always (a "
+                   "scene's script can still turn it off). FXAA: a softer single-frame filter, a little faster. Off: "
+                   "sharp but jagged edges. With DLSS / FSR the upscaler anti-aliases: this then chooses between FXAA "
+                   "on its input and none. Applies at once.",
+        .help_ru = "Собственное сглаживание краёв игры. «Как в игре» — SMAA T2x (края плюс смешивание с прошлым "
+                   "кадром), а FXAA — когда игра считает, что видеокарта не успевает 30 FPS. «SMAA T2x» — всегда "
+                   "(скрипт сцены всё равно может его выключить). «FXAA» — мягче, по одному кадру, чуть быстрее. "
+                   "«Выключено» — чёткие, но зубчатые края. С DLSS / FSR сглаживает апскейлер: тогда здесь выбор "
+                   "между FXAA на его входе и ничем. Применяется сразу.",
+        .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
+        .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.anti_aliasing; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.anti_aliasing = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.shadowQuality", .table = "Graphics", .key = "shadowQuality", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Restart, .choices = kShadowQualities, .en = "Shadow quality",
+        .ru = "Качество теней",
+        .help_en = "The size of the game's shadow maps: the sun's (2048x2048 in the game, shared by its four "
+                   "cascades) and the rain's cover maps (1024). High: 4096 - sharper shadow edges, more GPU time and "
+                   "64 MiB more GPU memory. Low: 1024 - softer, blockier shadows, less GPU time. Takes effect at the "
+                   "next start.",
+        .help_ru = "Размер теневых карт игры: солнца (в игре 2048×2048, общая для четырёх каскадов) и карт укрытий от "
+                   "дождя (1024). «Высокое» — 4096: чётче края теней, больше работы видеокарты и на 64 МиБ больше "
+                   "видеопамяти. «Низкое» — 1024: мягче и крупнее тени, меньше работы видеокарты. Действует со "
+                   "следующего запуска.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.shadow_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.shadow_quality = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.textureQuality", .table = "Graphics", .key = "textureQuality", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Restart, .choices = kTextureQualities, .en = "Texture quality",
+        .ru = "Качество текстур",
+        .help_en = "The city's textures: the game loads a full-size set (about 47 MB each) for the 4 city blocks "
+                   "nearest to the camera and half-size ones elsewhere. Medium: full size on the 2 nearest. Low: half "
+                   "size everywhere - less GPU memory and disk reading when moving through the city, blurrier "
+                   "surfaces up close. Characters and effects are not affected. There is no set above the game's. "
+                   "Takes effect at the next start.",
+        .help_ru = "Текстуры города: игра загружает полноразмерный набор (около 47 МБ каждый) для 4 ближайших к "
+                   "камере кварталов, а в остальных — половинного размера. «Среднее» — полный размер на 2 ближайших. "
+                   "«Низкое» — половинный размер везде: меньше видеопамяти и чтения с диска при движении по городу, "
+                   "поверхности вблизи размытее. Персонажи и эффекты не меняются. Набора лучше, чем в игре, нет. "
+                   "Действует со следующего запуска.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.texture_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.texture_quality = std::get<std::string>(x); },
+    });
     // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; depth of
     // field: see kMissing; R11_POSTFX.md)
     // ------------------------------------------------------------------ Upscaling & frame generation
@@ -721,23 +812,8 @@ void Build(Registry& r) {
         u32 cap;
     };
     constexpr Missing kMissing[] = {
-        {"graphics.textures", "Texture quality", "Качество текстур",
-         "The game loads one set of textures; another quality needs replaced resources or filtering in the backend "
-         "(not researched).",
-         "Игра загружает один набор текстур; другое качество требует подмены ресурсов или фильтрации в бэкенде "
-         "(не исследовано).",
-         0},
-        {"graphics.anisotropy", "Anisotropic filtering", "Анизотропная фильтрация",
-         "Possible in SecondSonPC's backend through its samplers (P4.6); not on the bridge.",
-         "Реализуемо в собственном бэкенде через его семплеры (P4.6); не в мосте.", 0},
-        {"graphics.shadows", "Shadow quality", "Качество теней",
-         "The game sets its shadow map sizes; changing them is a game or backend patch (not researched).",
-         "Размер теневых карт задаёт игра; изменение — патч игры или бэкенда (не исследовано).", 0},
         {"graphics.effects", "Effects quality", "Качество эффектов",
          "The game has no such option; not researched.", "В игре нет такого параметра; не исследовано.", 0},
-        {"graphics.antiAliasing", "Anti-aliasing", "Сглаживание",
-         "The game does its own anti-aliasing; a separate option needs backend work (P4.6+).",
-         "Сглаживание выполняет сама игра; отдельная настройка требует работы в бэкенде (P4.6+).", 0},
         {"graphics.depthOfField", "Depth of field", "Глубина резкости",
          "The game's bokeh depth of field has its own off switch, but switching it (even with a forced radius) "
          "changed nothing seen in play; not offered until a scene shows it (R11_POSTFX.md).",

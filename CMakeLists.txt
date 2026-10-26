@@ -44,6 +44,8 @@ add_library(sspc_runtime STATIC
     src/engine/render/weather.cpp
     src/engine/render/reflections.cpp
     src/engine/render/rain_shadows.cpp
+    src/engine/render/shadow_quality.cpp
+    src/engine/render/texture_quality.cpp
     src/engine/ui/game_menu.cpp
     src/engine/render/display_plan.cpp
     src/engine/render/render_resolution.cpp
@@ -340,6 +342,25 @@ set_source_files_properties(${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.c
 target_sources(sspc_runtime PRIVATE ${SSPC_PC_SETTINGS_SOURCES} src/ui/menu_controller.cpp src/ui/prompt_service.cpp)
 target_link_libraries(sspc_runtime PUBLIC d2d1 dwrite windowscodecs ole32)
 target_sources(shadps4 PRIVATE ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/settings_host.cpp) # the bridge's live settings
+
+# The launcher (src/launcher/app.h): the window SecondSonPC.exe opens when started without arguments - the PC settings
+# above, the launch profile, Play. Direct2D on its window (hardware), the DWM frame, DXGI for the video card.
+set(SSPC_LAUNCHER_SOURCES
+    src/launcher/app.cpp
+    src/launcher/canvas.cpp
+    src/launcher/icons.cpp
+    src/launcher/launch.cpp
+    src/launcher/system_info.cpp
+    src/launcher/ui.cpp
+    src/launcher/window.cpp
+)
+set_source_files_properties(${SSPC_LAUNCHER_SOURCES}
+                            PROPERTIES COMPILE_OPTIONS "-Wno-missing-designated-field-initializers")
+target_sources(sspc_runtime PRIVATE ${SSPC_LAUNCHER_SOURCES})
+target_link_libraries(sspc_runtime PUBLIC dwmapi dxgi dxguid shell32)
+# A windows program (no console flashing up before the launcher); the game makes its console itself (main.cpp)
+set_target_properties(shadps4 PROPERTIES WIN32_EXECUTABLE ON)
+target_link_options(shadps4 PRIVATE /ENTRY:mainCRTStartup)
 
 # The standalone tests (sspc_settings_tests, sspc_engine_tests, sspc_native_engine_tests: the PC settings, and the
 # reconstructed engine code against the game's eboot.bin) are not in this tree: tag archive/tests-20261023.

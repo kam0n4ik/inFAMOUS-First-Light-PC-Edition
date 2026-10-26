@@ -1,4 +1,8 @@
 // SecondSonPC — entry point.
+//   SecondSonPC.exe                the launcher (src/launcher/app.h): settings, the launch profile, Play
+//   SecondSonPC.exe --launcher [args]   the same; its Play passes [args] to the game
+//   SecondSonPC.exe --no-launcher [options]   the game at once (play.cmd, the launcher's Play, automated runs:
+//                                  any argument but --launcher starts the game too)
 //   SecondSonPC.exe [--lang <locale>] [--loader sspc|shadps4] [options]
 //     --lang <locale>          overrides [Language] system for this run
 //     --loader sspc|shadps4    sspc: SecondSonPC's own Loader (Phase 1);
@@ -106,6 +110,7 @@
 #include "bridge/shadps4/gcn_decoder_check.h"
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
+#include "launcher/app.h"
 #include "engine/render/display_plan.h"
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/cp_replay.h"
@@ -124,6 +129,20 @@ int Fail(const std::string& message) {
     std::fprintf(stderr, "SecondSonPC: %s\n", message.c_str());
     MessageBoxA(nullptr, message.c_str(), "SecondSonPC", MB_ICONERROR | MB_OK);
     return 1;
+}
+
+/// The exe is a windows program (the launcher opens without a console): the game, the tools and the self-tests get a
+/// console of their own here, as a console program had one - unless their output goes to a file or a pipe.
+void EnsureConsole() {
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    const DWORD type = out != nullptr && out != INVALID_HANDLE_VALUE ? GetFileType(out) : FILE_TYPE_UNKNOWN;
+    if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE || !AllocConsole()) {
+        return;
+    }
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONIN$", "r", stdin);
 }
 
 std::wstring QuoteArg(const std::wstring& s) {
@@ -255,6 +274,10 @@ void PlanGameDisplay(SecondSon::App::Config& config) {
 
 int main(int argc, char* argv[]) {
     using namespace SecondSon;
+    if (argc < 2 || std::string_view(argv[1]) == "--launcher" || std::string_view(argv[1]) == "--launcher-shot") {
+        return Launcher::Run(argc, argv); // the launcher's window; its Play starts this exe with --no-launcher
+    }
+    EnsureConsole();
     SetConsoleOutputCP(CP_UTF8);
     if (argc >= 2 && std::string_view(argv[1]) == "--exceptions-child") {
         return Bridge::RunExceptionsChild(argc, argv); // P3.4 self-test: a fatal exception in a child process
@@ -314,6 +337,8 @@ int main(int argc, char* argv[]) {
             ++i; // read above, before the command line (it is the defaults the command line overrides)
         } else if (arg == "--no-user-settings") {
             // read above
+        } else if (arg == "--no-launcher") {
+            // the game at once (the launcher's Play, play.cmd): read by main's first lines
         } else if (arg == "--no-counter") {
             config->import_counter = false;
         } else if (arg == "--window" && has_value) {

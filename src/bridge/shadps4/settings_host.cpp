@@ -64,8 +64,8 @@ void ApplyUpscaling(bool at_start) {
     const Engine::Render::RenderSize rs = upscaling
                                               ? Engine::Render::RenderSizeForScale(Up::ScaleOf(us.quality))
                                               : Engine::Render::SceneSizeForRenderScale();
-    // the game's SMAA T2x (its own camera jitter, a two-frame blend) off while an upscaler jitters the scene;
-    // SSPC_UPSCALE_GAME_TAA=1 keeps it (diagnostics)
+    // the game's SMAA T2x (its own camera jitter, a two-frame blend) off while an upscaler jitters the scene ([Graphics]
+    // antiAliasing then picks FXAA or none on its input); SSPC_UPSCALE_GAME_TAA=1 keeps it (diagnostics)
     static const bool keep_taa = [] {
         char gt[4] = {};
         return GetEnvironmentVariableA("SSPC_UPSCALE_GAME_TAA", gt, sizeof(gt)) == 1 && gt[0] == '1';
@@ -161,6 +161,14 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Render::Reflections::SetQuality(c.pc.reflection_quality); // at the game's next frame
             } else if (d->id == "graphics.rainShadows") {
                 Engine::Render::RainShadows::SetMode(c.pc.rain_shadows); // at the game's next frame
+            } else if (d->id == "graphics.antiAliasing") {
+                if (!bridge_presenter) {
+                    Engine::Render::SetAntiAliasing(c.pc.anti_aliasing); // at the game's next frame
+                }
+            } else if (d->id == "graphics.anisotropy") {
+                if (!bridge_presenter) {
+                    Gpu::Native::SetAnisotropy(c.pc.anisotropy); // the samplers made from the next draw on
+                }
             } else if (d->id == "graphics.renderScale" && !bridge_presenter) {
                 Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(c.pc.render_scale));
                 upscaling = true; // (the scene size switches at the game's next frame, as the upscalers')

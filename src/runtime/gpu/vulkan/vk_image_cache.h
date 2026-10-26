@@ -35,6 +35,12 @@ namespace SecondSon::Gpu::Vk {
 class Diagnostics;
 class BufferCache;
 
+/// [Graphics] anisotropy: 0 = the game's own (each S#'s ratio), else 2 / 4 / 8 / 16 for the S#s the game samples
+/// anisotropically (AnisoLinear minification, a ratio above 1x, normalized, not a depth comparison). Any thread; the
+/// samplers made from then on (ImageCache::Sampler keys the level, so the game's own ones stay cached).
+void SetAnisotropyOverride(u32 level);
+u32 AnisotropyOverride();
+
 class DeviceContext;
 class GuestBuffers;
 

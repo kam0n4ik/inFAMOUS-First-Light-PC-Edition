@@ -75,6 +75,8 @@
 #include "engine/render/post_effects.h"
 #include "engine/render/weather.h"
 #include "engine/render/rain_shadows.h"
+#include "engine/render/shadow_quality.h"
+#include "engine/render/texture_quality.h"
 #include "engine/render/reflections.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
@@ -815,6 +817,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         }
         Lifecycle::AddExitStep(Lifecycle::Stage::Devices, "native GPU backend", [] { Gpu::Native::Stop(); });
         Gpu::Native::SetFpsCounter(cfg.show_fps); // [Display] showFps (F10 and the settings switch it later)
+        Gpu::Native::SetAnisotropy(cfg.pc.anisotropy); // [Graphics] anisotropy (the settings switch it later)
         {
             // the settings menu: what the upscaling rows can do with this GPU (known now the device exists)
             namespace Cap = Settings::Capability;
@@ -911,6 +914,12 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // R12 reflections (both backends; docs/R12_REFLECTIONS.md): the game's own unless [Graphics] reflectionQuality
     // (SSPC_REFLECTION_QUALITY); diagnostics SSPC_R12_REFL_STATS / _DIAG
     Engine::Render::Reflections::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.reflection_quality);
+    // shadow map sizes (both backends; engine/render/shadow_quality.h): the game's own unless [Graphics] shadowQuality
+    // (written before the game makes its targets; before rain_shadows probes the update 0x43b7b0)
+    Engine::Render::ShadowQuality::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.shadow_quality);
+    // the city's high-resolution texture packs (both backends; engine/render/texture_quality.h): the game's own unless
+    // [Graphics] textureQuality
+    Engine::Render::TextureQuality::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.texture_quality);
     // R12 rain shadows (both backends; docs/R12_RAIN_SHADOWS.md): the game's own unless [Graphics] rainShadows
     // (SSPC_RAIN_SHADOWS); diagnostics SSPC_R12_RAIN_STATS / _DIST / _HOOK
     Engine::Render::RainShadows::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.rain_shadows);
@@ -929,6 +938,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
             Engine::Render::SetHudLayout(cfg.pc.hud_safe_area, cfg.pc.hud_area);
             Engine::Render::SetFovPercent(cfg.pc.fov);
             Engine::Render::InstallFovControl(linker.GetModule(eboot_index)->Base());
+            Engine::Render::SetAntiAliasing(cfg.pc.anti_aliasing); // [Graphics] antiAliasing
             Engine::Render::InstallTemporalAaControl(linker.GetModule(eboot_index)->Base());
             Engine::Render::InstallRenderSwitch(linker.GetModule(eboot_index)->Base());
             Bridge::ApplyUpscaling(true);

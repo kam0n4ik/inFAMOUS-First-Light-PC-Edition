@@ -5,7 +5,8 @@ rem the native command processor preset, the city preset, the second Vulkan reco
 rem F1 (no pipeline cache freezes), F3 (no vertex heap re-imports), R10's own audio and system libraries and R11's
 rem early batch submission.
 rem Saves: userdata\ here, copied to userdata\savedata_backups\<date_time> before every start.
-rem Arguments are passed on to SecondSonPC.exe.
+rem Arguments are passed on to SecondSonPC.exe. The game starts at once: SecondSonPC.exe started on its own opens the
+rem launcher first (its Play applies this same preset).
 cd /d "%~dp0"
 if not exist "%~dp0eboot.bin" (
     echo eboot.bin is not in this folder - put SecondSonPC into the game's folder ^(README.md, Installation^).
@@ -52,4 +53,4 @@ if defined SSPC_PLAY_EXPERIMENTAL (
 )
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set STAMP=%%i
 if exist "%~dp0userdata\home" if defined STAMP xcopy /e /i /q /y "%~dp0userdata\home" "%~dp0userdata\savedata_backups\%STAMP%" >nul
-start "" /wait /d "%~dp0" "%~dp0SecondSonPC.exe" %*
+start "" /wait /d "%~dp0" "%~dp0SecondSonPC.exe" --no-launcher %*

@@ -468,6 +468,9 @@ void SettingsMenu::RebuildRows() {
         AddHeader("Picture", "Картинка");
         setting("graphics.renderScale");
         setting("graphics.fov");
+        setting("graphics.textureQuality");
+        setting("graphics.anisotropy");
+        setting("graphics.antiAliasing");
         AddHeader("Frame generation", "Генерация кадров");
         setting("upscaling.frameGeneration");
         setting("upscaling.frameGenMultiplier");
@@ -478,6 +481,7 @@ void SettingsMenu::RebuildRows() {
         AddHeader("Effects", "Эффекты"); // (R11 postfx: the game's own post-processing)
         setting("graphics.motionBlur");
         setting("graphics.motionBlurStrength");
+        setting("graphics.shadowQuality");
         setting("graphics.reflectionQuality"); // (R12 refl)
         setting("graphics.rainShadows");       // (R12 rain)
         const size_t before = rows_.size();

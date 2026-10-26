@@ -305,7 +305,7 @@ void ServiceChecks(const CheckFn& check, const fs::path& dir) {
     const Desc& vol = *Find("audio.volume");
     const Desc& inv = *Find("input.invertY");
     const Desc& pm = *Find("display.presentMode");
-    const Desc& rs = *Find("graphics.textures");
+    const Desc& rs = *Find("graphics.effects");
     const Desc& sens = *Find("input.mouseSensitivity");
 
     check(g, "live change applied and recorded",
@@ -904,12 +904,15 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
           menu.CurrentPage() == Ui::Page::Graphics && menu.FocusedId() == "upscaling.upscaler", menu.FocusedId());
     const auto graphics = menu.ListedIds();
     check(g, "Graphics: not implemented settings and the bridge's presenter rows are not listed",
-          contains(graphics, "graphics.renderScale") && !contains(graphics, "graphics.textures") &&
+          contains(graphics, "graphics.renderScale") && !contains(graphics, "graphics.effects") &&
+              contains(graphics, "graphics.textureQuality") &&
               !contains(graphics, "graphics.fsr") && !contains(graphics, "upscaling.output") &&
               !contains(graphics, "upscaling.frameGenMultiplier") && contains(graphics, "graphics.smokeQuality") &&
               contains(graphics, "info.render") && contains(graphics, "graphics.motionBlur") &&
               contains(graphics, "graphics.motionBlurStrength") && contains(graphics, "graphics.reflectionQuality") &&
-              contains(graphics, "graphics.rainShadows") && !contains(graphics, "graphics.filmGrain") &&
+              contains(graphics, "graphics.rainShadows") && contains(graphics, "graphics.anisotropy") &&
+              contains(graphics, "graphics.antiAliasing") && contains(graphics, "graphics.shadowQuality") &&
+              !contains(graphics, "graphics.filmGrain") &&
               !contains(graphics, "graphics.depthOfField"),
           fmt::format("{} rows", graphics.size()));
 
@@ -1281,6 +1284,151 @@ void RainShadowChecks(const CheckFn& check, const fs::path& dir) {
           s.Current().pc.rain_shadows == "original" && !s.IsOverridden(*rs), "");
 }
 
+// [Graphics] anisotropy (the native backend's samplers; vk_image_cache.h)
+void AnisotropyChecks(const CheckFn& check, const fs::path& dir) {
+    const auto g = "Settings.anisotropy";
+    const auto defaults = TestConfig();
+    const Desc* an = Find("graphics.anisotropy");
+    check(g, "anisotropic filtering exists, a live choice in [Graphics] of the native backend",
+          an && an->apply == Apply::Live && an->type == Type::Choice && an->table == "Graphics" &&
+              an->key == "anisotropy" && an->category == Category::Graphics && an->needs == Capability::RenderScale,
+          "");
+    if (!an) {
+        return;
+    }
+    check(g, "levels: the game's own, 2x, 4x, 8x, 16x",
+          an->choices.size() == 5 && an->choices[0].value == "game" && an->choices[1].value == "2" &&
+              an->choices[2].value == "4" && an->choices[3].value == "8" && an->choices[4].value == "16",
+          "");
+    {
+        Service bridge;
+        bridge.Init(defaults, {}, defaults, dir / "anisotropy_bridge.toml", Capability::Window | Capability::LiveVolume);
+        check(g, "not available on the bridge (greyed with its reason)", !bridge.Available(*an).available, "");
+    }
+    Service s;
+    const auto file = dir / "anisotropy.toml";
+    std::error_code ec;
+    fs::remove(file, ec);
+    s.Init(defaults, {}, defaults, file, Capability::Window | Capability::LiveVolume | Capability::RenderScale);
+    std::vector<std::string> applied;
+    s.AddApplier([&applied](const App::Config&, std::span<const Desc* const> changed) {
+        for (const auto* d : changed) {
+            applied.emplace_back(d->id);
+        }
+    });
+    check(g, "default: the game's own",
+          std::get<std::string>(s.Get(*an)) == "game" && defaults.pc.anisotropy == "game" && !s.IsOverridden(*an), "");
+    check(g, "16x: applied live, an unknown value refused",
+          s.Set(*an, Value{std::string("16")}) == SetResult::Ok && s.Current().pc.anisotropy == "16" &&
+              applied == std::vector<std::string>{"graphics.anisotropy"} &&
+              s.Set(*an, Value{std::string("32")}) == SetResult::Invalid,
+          s.Current().pc.anisotropy);
+    const bool flushed = s.Flush(5000);
+    Overrides on_disk;
+    const auto rep = LoadUserFile(file, on_disk);
+    auto restarted = defaults;
+    ApplyOverrides(restarted, on_disk);
+    check(g, "saved and restored at the next start",
+          flushed && rep.status == LoadReport::Status::Loaded && restarted.pc.anisotropy == "16",
+          fmt::format("{} keys", on_disk.size()));
+    s.ResetCategory(Category::Graphics);
+    check(g, "reset Graphics: back to the game's own", s.Current().pc.anisotropy == "game" && !s.IsOverridden(*an),
+          "");
+}
+
+// [Graphics] antiAliasing (the game's SMAA T2x / FXAA / none; render_resolution.h)
+void AntiAliasingChecks(const CheckFn& check, const fs::path& dir) {
+    const auto g = "Settings.antiAliasing";
+    const auto defaults = TestConfig();
+    const Desc* aa = Find("graphics.antiAliasing");
+    check(g, "anti-aliasing exists, a live choice in [Graphics] of the native backend",
+          aa && aa->apply == Apply::Live && aa->type == Type::Choice && aa->table == "Graphics" &&
+              aa->key == "antiAliasing" && aa->category == Category::Graphics && aa->needs == Capability::RenderScale,
+          "");
+    if (!aa) {
+        return;
+    }
+    check(g, "levels: the game's own, SMAA T2x, FXAA, off",
+          aa->choices.size() == 4 && aa->choices[0].value == "game" && aa->choices[1].value == "t2x" &&
+              aa->choices[2].value == "fxaa" && aa->choices[3].value == "off",
+          "");
+    Service s;
+    const auto file = dir / "anti_aliasing.toml";
+    std::error_code ec;
+    fs::remove(file, ec);
+    s.Init(defaults, {}, defaults, file, Capability::Window | Capability::LiveVolume | Capability::RenderScale);
+    std::vector<std::string> applied;
+    s.AddApplier([&applied](const App::Config&, std::span<const Desc* const> changed) {
+        for (const auto* d : changed) {
+            applied.emplace_back(d->id);
+        }
+    });
+    check(g, "default: the game's own",
+          std::get<std::string>(s.Get(*aa)) == "game" && defaults.pc.anti_aliasing == "game" && !s.IsOverridden(*aa),
+          "");
+    check(g, "off: applied live, an unknown value refused",
+          s.Set(*aa, Value{std::string("off")}) == SetResult::Ok && s.Current().pc.anti_aliasing == "off" &&
+              applied == std::vector<std::string>{"graphics.antiAliasing"} &&
+              s.Set(*aa, Value{std::string("msaa")}) == SetResult::Invalid,
+          s.Current().pc.anti_aliasing);
+    const bool flushed = s.Flush(5000);
+    Overrides on_disk;
+    const auto rep = LoadUserFile(file, on_disk);
+    auto restarted = defaults;
+    ApplyOverrides(restarted, on_disk);
+    check(g, "saved and restored at the next start",
+          flushed && rep.status == LoadReport::Status::Loaded && restarted.pc.anti_aliasing == "off",
+          fmt::format("{} keys", on_disk.size()));
+    s.ResetCategory(Category::Graphics);
+    check(g, "reset Graphics: back to the game's own",
+          s.Current().pc.anti_aliasing == "game" && !s.IsOverridden(*aa), "");
+}
+
+// [Graphics] shadowQuality (the game's shadow map sizes, from the next start; shadow_quality.h)
+void ShadowQualityChecks(const CheckFn& check, const fs::path& dir) {
+    const auto g = "Settings.shadowQuality";
+    const auto defaults = TestConfig();
+    const Desc* sq = Find("graphics.shadowQuality");
+    check(g, "shadow quality exists, a [Graphics] choice from the next start, on either backend",
+          sq && sq->apply == Apply::Restart && sq->type == Type::Choice && sq->table == "Graphics" &&
+              sq->key == "shadowQuality" && sq->category == Category::Graphics && sq->needs == 0,
+          "");
+    if (!sq) {
+        return;
+    }
+    check(g, "levels: low, original, high",
+          sq->choices.size() == 3 && sq->choices[0].value == "low" && sq->choices[1].value == "original" &&
+              sq->choices[2].value == "high",
+          "");
+    const Desc* tq = Find("graphics.textureQuality");
+    check(g, "texture quality: a [Graphics] choice low / medium / high (the game's) from the next start",
+          tq && tq->apply == Apply::Restart && tq->key == "textureQuality" && tq->needs == 0 &&
+              tq->choices.size() == 3 && tq->choices[0].value == "low" && tq->choices[1].value == "medium" &&
+              tq->choices[2].value == "high" && defaults.pc.texture_quality == "high",
+          "");
+    Service s;
+    const auto file = dir / "shadow_quality.toml";
+    std::error_code ec;
+    fs::remove(file, ec);
+    s.Init(defaults, {}, defaults, file, Capability::Window | Capability::LiveVolume);
+    check(g, "default: the game's own (original)",
+          std::get<std::string>(s.Get(*sq)) == "original" && defaults.pc.shadow_quality == "original" &&
+              !s.IsOverridden(*sq),
+          "");
+    check(g, "high: accepted, an unknown value refused",
+          s.Set(*sq, Value{std::string("high")}) == SetResult::Ok && s.Current().pc.shadow_quality == "high" &&
+              s.Set(*sq, Value{std::string("ultra")}) == SetResult::Invalid,
+          s.Current().pc.shadow_quality);
+    const bool flushed = s.Flush(5000);
+    Overrides on_disk;
+    const auto rep = LoadUserFile(file, on_disk);
+    auto restarted = defaults;
+    ApplyOverrides(restarted, on_disk);
+    check(g, "saved and restored at the next start",
+          flushed && rep.status == LoadReport::Status::Loaded && restarted.pc.shadow_quality == "high",
+          fmt::format("{} keys", on_disk.size()));
+}
+
 void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     std::error_code ec;
     std::filesystem::create_directories(scratch, ec);
@@ -1290,6 +1438,9 @@ void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     PostFxChecks(check, scratch);
     ReflectionChecks(check, scratch);
     RainShadowChecks(check, scratch);
+    AnisotropyChecks(check, scratch);
+    AntiAliasingChecks(check, scratch);
+    ShadowQualityChecks(check, scratch);
     ConfigChecks(check, scratch);
     BindingChecks(check);
     KeyboardMouseChecks(check);

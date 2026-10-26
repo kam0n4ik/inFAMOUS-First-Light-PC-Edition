@@ -168,24 +168,61 @@ namespace {
 
 constexpr ProbeSite kCameraJitterSite{{0x472810, 0x1ed, 0xaf06825055bbe18dull}, 17};
 constexpr GuestFunction kResetWindow{0x581a10, 0x34, 0x26b44a8bd1f71035ull}; // Camera::ResetFrustumWindow
+constexpr ProbeSite kPass32Site{{0x1929c0, 0x42e, 0xcd353017f8e6ce48ull}, 20};
 constexpr u64 kTemporalAaFlag = 0xda07f9; // byte: SMAA T2x on (camera jitter + two-frame resolve)
+constexpr u64 kReevaluate = 0x7e00964;    // int: frames since T2x last switched (the timer is read from 1 on)
+constexpr u64 kDisableSmaa = 0xe87c85;    // byte: the scripts' DISABLE_SMAA override
+constexpr u64 kNoAa = 0xe86e3d;           // byte: pass 32 tone-maps into its output, no anti-aliasing
 constexpr u64 kMainCamera = 0x7f2d2b8;    // Camera*
 constexpr u64 kCameraWindow = 0x5ac;      // float left, bottom, right, top of the frustum window
 
+enum class AaMode : u32 { Game, T2x, Fxaa, Off };
+
 using CameraJitterFn = SSPC_SYSV_ABI void (*)(u64 ctx);
+using Pass32Fn = SSPC_SYSV_ABI void (*)(u64 ctx);
 using ResetWindowFn = SSPC_SYSV_ABI void (*)(u64 camera);
 CameraJitterFn g_camera_jitter = nullptr;
+Pass32Fn g_pass32 = nullptr;
 ResetWindowFn g_reset_window = nullptr;
 u64 g_base = 0;
-std::atomic<bool> g_taa_off{false};
+std::atomic<bool> g_taa_off{false};              // an upscaler jitters the scene
+std::atomic<u32> g_aa_mode{u32(AaMode::Game)}; // [Graphics] antiAliasing
 std::atomic<u64> g_taa_cleared{0};
+u8 g_last_flag = 0xff; // (the game's thread only: its own T2x / FXAA switches, logged)
+u32 g_switches_logged = 0;
+
+AaMode EffectiveAa() {
+    const auto mode = static_cast<AaMode>(g_aa_mode.load(std::memory_order_relaxed));
+    if (g_taa_off.load(std::memory_order_relaxed)) {
+        return mode == AaMode::Off ? AaMode::Off : AaMode::Fxaa;
+    }
+    return mode;
+}
+
+SSPC_SYSV_ABI void Pass32Probe(u64 ctx) {
+    if (EffectiveAa() == AaMode::Off) {
+        *reinterpret_cast<volatile u8*>(g_base + kNoAa) = 1; // (0x1901a0 writes it again at the next frame)
+    }
+    g_pass32(ctx);
+}
 
 SSPC_SYSV_ABI void CameraJitterProbe(u64 ctx) {
+    const AaMode mode = EffectiveAa();
+    auto* flag = reinterpret_cast<volatile u8*>(g_base + kTemporalAaFlag);
+    if (mode == AaMode::T2x) {
+        *reinterpret_cast<volatile s32*>(g_base + kReevaluate) = 0; // (no timer this frame: the flag is kept)
+        *flag = 1;
+    }
     g_camera_jitter(ctx);
-    if (!g_taa_off.load(std::memory_order_relaxed)) {
+    if (mode == AaMode::Game && *flag != g_last_flag && g_switches_logged < 32) {
+        ++g_switches_logged;
+        SSPC_LOG(Engine, Info, "Anti-aliasing: the game switched to {}{}", *flag != 0 ? "SMAA T2x" : "FXAA",
+                 *reinterpret_cast<const volatile u8*>(g_base + kDisableSmaa) != 0 ? " (DISABLE_SMAA)" : "");
+    }
+    g_last_flag = *flag;
+    if (mode != AaMode::Fxaa && mode != AaMode::Off) {
         return;
     }
-    auto* flag = reinterpret_cast<volatile u8*>(g_base + kTemporalAaFlag);
     if (*flag != 0) {
         *flag = 0;
         g_taa_cleared.fetch_add(1, std::memory_order_relaxed);
@@ -216,13 +253,28 @@ bool InstallTemporalAaControl(u64 eboot_base) {
     g_base = eboot_base;
     g_reset_window = reinterpret_cast<ResetWindowFn>(eboot_base + kResetWindow.rva);
     g_camera_jitter = reinterpret_cast<CameraJitterFn>(original);
-    SSPC_LOG(Engine, Info, "Temporal AA control: entry probe on CameraJitter 0x472810 (SMAA T2x {})",
-             g_taa_off.load() ? "off: the upscaler jitters the scene" : "the game's");
+    void* pass32 = InstallEntryProbe(eboot_base, kPass32Site, reinterpret_cast<const void*>(&Pass32Probe), error,
+                                     reinterpret_cast<void**>(&g_pass32));
+    if (pass32 == nullptr) {
+        SSPC_LOG(Engine, Error, "Anti-aliasing: pass 32's probe not installed (\"off\" acts as FXAA): {}", error);
+    } else {
+        g_pass32 = reinterpret_cast<Pass32Fn>(pass32);
+    }
+    static constexpr const char* kNames[] = {"the game's", "SMAA T2x", "FXAA", "off"};
+    SSPC_LOG(Engine, Info, "Anti-aliasing control: entry probes on CameraJitter 0x472810 and pass 32 0x1929c0 ({}{})",
+             kNames[static_cast<u32>(EffectiveAa())],
+             g_taa_off.load() ? ": the upscaler jitters the scene" : "");
     return true;
 }
 
 void SetTemporalAaOff(bool off) {
     g_taa_off.store(off, std::memory_order_relaxed);
+}
+
+void SetAntiAliasing(const std::string& mode) {
+    const AaMode m = mode == "t2x" ? AaMode::T2x : mode == "fxaa" ? AaMode::Fxaa : mode == "off" ? AaMode::Off
+                                                                                            : AaMode::Game;
+    g_aa_mode.store(static_cast<u32>(m), std::memory_order_relaxed);
 }
 
 RenderSize CurrentRenderSize() {

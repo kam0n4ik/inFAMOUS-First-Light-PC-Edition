@@ -8,7 +8,7 @@
 //                                              Full motion (camera and objects): current minus previous position in
 //                                              UV of the render size, y down (reprojection of the previous frame: error
 //                                              3.1-3.5 against 16-22 without or with the other sign).
-//   tone mapping / SMAA / motion blur (pass 32) the finished scene, RGBA8 at render size
+//   tone mapping + SMAA T2x / FXAA (pass 32)    the finished scene, RGBA8 at render size
 //   UI (pass 34)                                draws into that scene with the scene depth target, which it overwrites
 //   post                                         the display buffer: the scene sampled and scaled, then the UI on top
 // So: depth and motion are copied when the velocity pass ends (before the UI pass changes the depth), and at the first

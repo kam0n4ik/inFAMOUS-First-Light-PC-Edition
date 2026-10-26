@@ -92,6 +92,9 @@ bool Running();
 void SetFrameGen(bool on);
 /// [Display] showFps: the presenter's FPS counter shown or hidden (at start and while the game runs; any thread).
 void SetFpsCounter(bool on);
+/// [Graphics] anisotropy: "game" (each sampler's own ratio) | "2" | "4" | "8" | "16" for the game's anisotropic
+/// samplers; the samplers made from then on (at start and while the game runs; any thread). Anything else = "game".
+void SetAnisotropy(const std::string& level);
 /// FrameBreak FB-2: [Display] frameRateLimit while the game runs (VideoOut::ParsePacing; the spin kept). false: unknown.
 bool SetFrameLimit(const std::string& limit);
 /// R11 display: [Display] presentMode while the game runs ("Fifo" | "Immediate" | "Mailbox"); the presenter recreates
