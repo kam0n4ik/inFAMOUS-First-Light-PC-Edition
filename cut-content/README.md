@@ -2,6 +2,9 @@
 
 **English** · [Русский](README.ru.md)
 
+> [!WARNING]
+> **Spoilers.** This page discusses the whole story of inFAMOUS Second Son, the ending choices included, and the voice lines and videos here give away plot points. If you have not finished the game, finish it first.
+
 Everything below was found in the game's own files: `eboot.bin`, the packages in `art\cache\*.xpps`, the voice archives in `art\cache\psarc\*.psarc` and the videos in `art\movies`. The build examined is **"retail 0212.1422 i3_eu ship"**, the European retail release (CUSA00004). The game's internal name is **i3**, inFAMOUS 3.
 
 "Unused" here means that nothing refers to the file or text: neither the game's code nor any mission's data. References were searched for both by name and by the hash of the name (h·101). That is strong evidence of cut content, but not absolute proof: in rare cases the game builds a name at run time.
