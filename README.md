@@ -15,6 +15,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   <a href="#requirements">Requirements</a> ·
   <a href="#what-makes-it-different">Advantages</a> ·
   <a href="#online-missions-add-ons-and-trophies">Online, DLC, trophies</a> ·
+  <a href="cut-content/README.md">Cut content</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="#cpu-native-x86-64-and-avx">CPU and AVX</a> ·
   <a href="#building-from-source">Building</a> ·
@@ -457,6 +458,10 @@ The game was made for PlayStation Network: online missions, add-ons bought in th
 
 These are new and not yet played through from start to end: if a Paper Trail or Cole's Legacy mission does not open, or a trophy shows no notice, open an issue with `logs\SecondSonPC.log`.
 
+## Cut content
+
+**[Вырезанный материал / Cut content →](cut-content/README.md)** What the retail game still carries from its development, found while porting it: the Akuran gang that was Russian, Blast Cores, a third ending choice, Hank's daughter, a Surveillance Van activity, an XP system, Story and Challenge modes, cut powers and trophies, two unused USTV news broadcasts, build modes (Demo, Kiosk, Beta, Review) and debug worlds. With the voice lines in English and the official Russian dub, and the unused videos. Written in Russian, with an English summary.
+
 ## Launcher
 
 `SecondSonPC.exe` started without arguments opens the launcher; **Играть** (Play) starts the game with what is chosen there. It is in Russian for now.
@@ -674,7 +679,7 @@ Do not submit game dumps or any proprietary game content.
 
 ## Legal notice
 
-This is an independent, unofficial project and is not affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment or Sucker Punch Productions. inFAMOUS and inFAMOUS: Second Son are trademarks and/or copyrighted works of their respective owners. No original game content is distributed by this repository; users must supply their own legally obtained game files.
+This is an independent, unofficial project and is not affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment or Sucker Punch Productions. inFAMOUS and inFAMOUS: Second Son are trademarks and/or copyrighted works of their respective owners. Apart from the short research clips in `cut-content\` (unused voice lines and videos, documented there), no original game content is distributed by this repository; users must supply their own legally obtained game files.
 
 Third-party components remain under their own licences. These include shadPS4 (GPL-2.0) and its libraries; the NVIDIA DLSS SDK, Streamline and Reflex; and the AMD FidelityFX SDK, whose licence texts are in `licenses\` of the release package. The Roboto fonts are under the OFL / Apache 2.0.
 
