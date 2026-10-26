@@ -14,6 +14,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   <a href="#installation">Installation</a> ·
   <a href="#requirements">Requirements</a> ·
   <a href="#what-makes-it-different">Advantages</a> ·
+  <a href="#online-missions-add-ons-and-trophies">Online, DLC, trophies</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="#cpu-native-x86-64-and-avx">CPU and AVX</a> ·
   <a href="#building-from-source">Building</a> ·
@@ -54,7 +55,7 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   - Any resolution and aspect ratio from 4:3 to 32:9, with Hor+, an unstretched HUD, an FOV setting and movies kept 16:9 ([Resolutions and aspect ratios](#resolutions-and-aspect-ratios)).
   - Audio goes out through WASAPI; cutscene video is decoded natively.
   - `play.cmd` backs up your saves before every start.
-- **What PSN gave, without PSN.** The game is signed in from the start (as `t.me/cloudeluxe`), and the shut-down Paper Trail server is answered locally, so the online Paper Trail missions open. The pre-order and promotion add-ons on the disc are unlocked (Cole's Legacy: Cole's jacket and its missions; the Penny Arcade, Exist, Jos, Skeleton and Handprint vests). Trophies are earned and kept on your PC, with a notice and the platinum ([What is new](#what-is-new)).
+- **What PSN gave, without PSN.** The game is signed in from the start (as `t.me/cloudeluxe`), and the shut-down Paper Trail server is answered locally, so the online Paper Trail missions open. The pre-order and promotion add-ons on the disc are unlocked (Cole's Legacy: Cole's jacket and its missions; the Penny Arcade, Exist, Jos, Skeleton and Handprint vests). Trophies are earned and kept on your PC, with a notice and the platinum ([Online missions, add-ons and trophies](#online-missions-add-ons-and-trophies)).
 - **No PS4 firmware.** The system libraries the game imports are implemented by the project (336 of 417 natively, the rest from the shadPS4 core linked in). Only your own copy of the game is needed.
 - **Measured, not guessed.** Every change is decided by an interleaved A/B on the same build, and experiments that lost are documented too: [135 reports](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/REPORTS.md).
 
@@ -293,12 +294,8 @@ shadPS4 is also what the build is assembled on: its CMake target, its third-part
 
 **October 2026, the last week** (all in `main`):
 
-- **Online missions, add-ons and trophies.**
-  - **Online ("Paper Trail")**: the game always sees a player signed in to the network, as `t.me/cloudeluxe`. The only server the game talks to, `api.infamouspapertrail.com` (Paper Trail, shut down by Sony), is answered by SecondSonPC itself: every step of the six cases that was done on the website counts as done, and the in-game steps are the game's own. So the "Paper Trail" missions under "Evidence" should open instead of asking you to connect to PSN, and their rewards (the Paper Trail vests) can be earned. No other request leaves the PC: the game's other network library stays offline.
-  - **Add-ons**: the pre-order and promotion add-ons were unlock keys; their content is on the disc. Every key the game asks for is now owned: Cole's Legacy (Cole's jacket and its missions) and the Penny Arcade, Exist, Jos, Skeleton and Handprint vests.
-    - **Where to put them on:** pause the game (Esc, or Options on a controller) and open **"Special items"** (Russian: «Особые предметы»), next to the powers on the character page. In the list: *Cole's Jacket* («Куртка Коула»), *Penny Arcade*, *JOS*, *iam8bit*, *Collector's Edition* (the Handprint vest), and the game's own vests. The add-on vests are there from the start; the game's district vests come with the story and with freed districts ("New vest available").
-  - **Trophies**: all 48 can be earned. They are kept in `userdata\home\trophies\CUSA00004.txt` (the game reads them back at every start), the platinum comes with the last one, and each trophy shows a notice at the top left of the game with its icon from the game's trophy file. The names are the game's internal English ones: the trophy texts are encrypted with the console's key.
-  - Also: the REA-3 safe reset waits up to 20 ms for a late position label (was 2 ms), so a frame held up by new shaders no longer triggers it.
+- **Online missions, add-ons and trophies** ([details](#online-missions-add-ons-and-trophies)): the game is signed in, the Paper Trail missions answered locally, the add-ons on the disc (Cole's jacket and missions, the promotion vests) unlocked, and all 48 trophies can be earned, with a notice and the platinum.
+- **REA-3 safe reset**: it waits up to 20 ms for a late position label (was 2 ms), so a frame held up by new shaders no longer triggers it.
 
 - **Fixed: the game hanging with the experimental switches** (the async compute lane with early or threaded submission). The log said `too many fences held on queue 1 … 128 fences held waiting for the GPU`, after 2 to 20 minutes of play. The GPU was not stuck: the game's compute queue had run 128 completion fences ahead of a GPU a few batches behind, and at that limit the command processor dropped the queue's whole submission, so the game waited for work that never came. The queue now waits for the GPU there and goes on, as the console's does. If the command processor ever stops a submission again, the log carries every batch in flight, what each waits for and the state of each queue.
 
@@ -434,6 +431,30 @@ The native engine work replaces individual engine functions with SecondSonPC's i
 | Shadow pass, instanced shadow draw, shadow UVs | `0x43d590`, `0x43d480`, `0x451700` | 17.5 M native shadow draws, 4.4 M UV calls, 0 mismatches |
 
 **Why it gives no FPS by itself.** These functions run on the game's job threads, while the frame waits for command processing, async compute and the GPU. What R5–R7 deliver is an engine whose render path increasingly runs on code the project owns. Using the engine's knowledge to cut command processor work began in R8 (the native G-buffer draw, the CUE snapshot channel). Details: [`NATIVE_ENGINE_RECONSTRUCTION.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_RECONSTRUCTION.md), [`NATIVE_ENGINE_R7_RESULTS.md`](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/NATIVE_ENGINE_R7_RESULTS.md).
+
+## Online missions, add-ons and trophies
+
+The game was made for PlayStation Network: online missions, add-ons bought in the store, trophies. SecondSonPC gives all three without PSN and without sending anything anywhere.
+
+**Online: the "Paper Trail" missions**
+- The game always sees a player signed in to the network, under the name `t.me/cloudeluxe`. There is nothing to turn on.
+- Paper Trail was an online story: six cases, part of them done on a website, part in the game, with rewards (vests). Its server, `api.infamouspapertrail.com`, was shut down by Sony. SecondSonPC answers the game's requests itself: every website step counts as done, and the in-game steps are the game's own progress.
+- So the "Paper Trail" missions under **"Evidence"** should open instead of the "Connect to PSN" message.
+- That is the only server the game talks to. Everything else stays offline: the game's other network library sees no connection.
+
+**Add-ons (DLC)**
+- The pre-order and promotion add-ons were unlock keys: their content is already on the game's disc. SecondSonPC tells the game that every key it asks for is owned.
+- Unlocked: **Cole's Legacy** (Cole's jacket and its missions) and the **Penny Arcade, Exist, Jos, Skeleton** and **Handprint** vests.
+- **Where to put them on:** pause the game (Esc, or Options on a controller) and open **"Special items"** (Russian: «Особые предметы»), next to the powers on the character page. In the list: *Cole's Jacket* («Куртка Коула»), *Penny Arcade*, *JOS*, *iam8bit*, *Collector's Edition* (the Handprint vest), and the game's own vests. The add-on vests are there from the start; the game's district vests come with the story and with freed districts ("New vest available").
+
+**Trophies**
+- All 48 trophies can be earned, the platinum included: it comes on its own with the last one.
+- Each trophy shows a notice at the top left of the game for 6 seconds, with its icon from the game's own trophy file.
+- Earned trophies are kept in `userdata\home\trophies\CUSA00004.txt`, one line `<number> <time>` each, and the game reads them back at every start. A line `<number> 0` is a trophy added by hand: its notice is shown at the next start.
+- The names are the game's internal English ones, and grades (bronze, silver, gold) are not shown: the trophy texts are encrypted with the console's key.
+- Trophies earned with builds before this one were not kept. The game gives a trophy again when its condition is met again.
+
+These are new and not yet played through from start to end: if a Paper Trail or Cole's Legacy mission does not open, or a trophy shows no notice, open an issue with `logs\SecondSonPC.log`.
 
 ## Launcher
 
