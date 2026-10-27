@@ -1,0 +1,964 @@
+[
+ {
+  "hook": "game_menu",
+  "constant": "kOpenedSite (pausing screen opened)",
+  "ss": {
+   "rva": "0x27db10",
+   "size": "0xd0",
+   "fnv1a64": "8109e3344cdd9cf3",
+   "prologue": 17
+  },
+  "fl": {
+   "rva": "0x2e75a0",
+   "size": "0xe2",
+   "fnv1a64": "2a2ccf44d65abfae",
+   "padded_size": "0xf0",
+   "fnv1a64_padded": "2f5311b472047cde",
+   "prologue": 17,
+   "prologue_instructions": [
+    "0x2e75a0: 55 push rbp",
+    "0x2e75a1: 4889e5 mov rbp, rsp",
+    "0x2e75a4: 4156 push r14",
+    "0x2e75a6: 53 push rbx",
+    "0x2e75a7: 4889fb mov rbx, rdi",
+    "0x2e75aa: 80bb4706000000 cmp byte ptr [rbx + 0x647], 0"
+   ]
+  },
+  "evidence": "same body: test/set active byte, kind -> sound-pause counter inc (SS 0x4879b0 / FL 0x535850), element stride imul 0x950 -> 0x920; fuzzy ratio 0.909",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_menu",
+  "constant": "kClosedSite (pausing screen closed)",
+  "ss": {
+   "rva": "0x27e210",
+   "size": "0xdf",
+   "fnv1a64": "33ff129a2ada5846",
+   "prologue": 16
+  },
+  "fl": {
+   "rva": "0x2e7ad0",
+   "size": "0xfa",
+   "fnv1a64": "59fc0e5d56670225",
+   "padded_size": "0x100",
+   "fnv1a64_padded": "d77aed3257f042fd",
+   "prologue": 17,
+   "prologue_instructions": [
+    "0x2e7ad0: 55 push rbp",
+    "0x2e7ad1: 4889e5 mov rbp, rsp",
+    "0x2e7ad4: 4156 push r14",
+    "0x2e7ad6: 53 push rbx",
+    "0x2e7ad7: 4889fb mov rbx, rdi",
+    "0x2e7ada: 80bb4706000000 cmp byte ptr [rbx + 0x647], 0"
+   ]
+  },
+  "evidence": "same body: active byte cleared, kind -> counter dec (SS 0x4879d0 / FL 0x535870)",
+  "confidence": "certain",
+  "note": "FL prologue is 17, not 16 (FL pushes r14+rbx where SS pushed rbx+rax)"
+ },
+ {
+  "hook": "game_menu",
+  "constant": "kScreenActive (u8)",
+  "ss": "0x61b",
+  "fl": "0x647",
+  "evidence": "SS 0x27db1a: cmp byte ptr [rbx + 0x61b], 0 | FL 0x2e75aa: cmp byte ptr [rbx + 0x647], 0",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_menu",
+  "constant": "kScreenKind (u32, SOUND_PAUSE_KIND)",
+  "ss": "0x620",
+  "fl": "0x64c",
+  "evidence": "SS 0x27db60: mov esi, dword ptr [rbx + 0x620] | FL 0x2e75f0: mov esi, dword ptr [rbx + 0x64c]",
+  "confidence": "certain",
+  "note": "reflection table: SS 0xd1b2d0 {\"SOUND_PAUSE_KIND\", offset 0x620} / FL 0xe10820 {same name, 0x64c}; same type hash 0x61ee5153abc8ef96 and count 0xa (enum 0..9; the consumer clamps <= 9 in both)"
+ },
+ {
+  "hook": "game_menu",
+  "constant": "screen +0x610 (element index)",
+  "ss": "0x610",
+  "fl": "0x5d4",
+  "evidence": "SS 0x27db6b: movsxd rax, dword ptr [rbx + 0x610] | FL 0x2e75fb: movsxd rax, dword ptr [rbx + 0x5d4]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_menu",
+  "constant": "element stride",
+  "ss": "0x950",
+  "fl": "0x920",
+  "evidence": "SS 0x27db78: imul rdi, rax, 0x950 | FL 0x2e7608: imul rdi, rax, 0x920",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_menu",
+  "constant": "element array global (qword)",
+  "ss": "0xd9de60",
+  "fl": "0xe97058",
+  "evidence": "SS 0x27db7f: add rdi, qword ptr [rip + 0xb202da] | FL 0x2e760f: add rdi, qword ptr [rip + 0xbafa42]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_menu",
+  "constant": "kSettingsKind",
+  "ss": "7",
+  "fl": "7 (unverified)",
+  "evidence": "ctor default: SS 0x27d849 mov dword [rbx+0x620], 7 | FL 0x2e7244 mov dword [rbx+0x64c], 7 (the only immediate write of the field in either eboot); otherwise set from menu data through the SOUND_PAUSE_KIND property",
+  "confidence": "likely",
+  "note": "data-driven; confirm with the existing \"pausing screen ... opened (kind N)\" log line on FL"
+ },
+ {
+  "hook": "game_menu",
+  "constant": "DumpScreen tail window",
+  "ss": "[0x600..0x640]",
+  "fl": "[0x5c0..0x680] suggested",
+  "evidence": "FL ctor writes the screen fields at 0x5c8..0x670 (SS 0x5f8..0x648)",
+  "confidence": "certain",
+  "note": "diagnostics only"
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kFrameBeginSite",
+  "ss": {
+   "rva": "0x1f0be0",
+   "size": "0x5aa",
+   "fnv1a64": "6273d28a515609b7",
+   "prologue": 20
+  },
+  "fl": {
+   "rva": "0x237670",
+   "size": "0x5aa",
+   "fnv1a64": "13ecaea8b414b6f9",
+   "padded_size": "0x5b0",
+   "fnv1a64_padded": "d79d3bf7acd54631",
+   "prologue": 20,
+   "prologue_instructions": [
+    "0x237670: 55 push rbp",
+    "0x237671: 4889e5 mov rbp, rsp",
+    "0x237674: 4157 push r15",
+    "0x237676: 4156 push r14",
+    "0x237678: 4155 push r13",
+    "0x23767a: 4154 push r12",
+    "0x23767c: 53 push rbx",
+    "0x23767d: 4881ec88000000 sub rsp, 0x88"
+   ]
+  },
+  "evidence": "319/319 instructions, mnemonic ratio 1.0; the only operand change is options +0x6f8 -> +0x7a8",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kConfigureTarget (RenderTarget::Configure)",
+  "ss": {
+   "rva": "0x300b00",
+   "size": "0x2bb",
+   "fnv1a64": "4489645ef331292a"
+  },
+  "fl": {
+   "rva": "0x382420",
+   "size": "0x2c3",
+   "fnv1a64": "cb8210727671d826",
+   "padded_size": "0x2d0",
+   "fnv1a64_padded": "af04659ba41c4da2"
+  },
+  "evidence": "FrameBegin SS 0x1f0ecd call 0x300b00 | FL 0x23795d call 0x382420 (3 calls each); exact masked match",
+  "confidence": "certain",
+  "note": "SS pins 0x2bb (ends inside \"pop r15\"); FL size is the whole body"
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kConfigureSceneTargets",
+  "ss": {
+   "rva": "0x18e210",
+   "size": "0x2f9",
+   "fnv1a64": "804f07e3bc802864"
+  },
+  "fl": {
+   "rva": "0x1bc1d0",
+   "size": "0x2ba",
+   "fnv1a64": "4d6fb6a99a3129fa",
+   "padded_size": "0x2c0",
+   "fnv1a64_padded": "b3636aa28b9b55ea"
+  },
+  "evidence": "FrameBegin SS 0x1f102b call 0x18e210 | FL 0x237abb call 0x1bc1d0; mnemonic ratio 0.984",
+  "confidence": "certain",
+  "note": "SS pins 0x2f9 (past its own end into the next function); FL size is the body"
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kSceneTargets (object)",
+  "ss": "0xe682b0",
+  "fl": "0xf84740",
+  "evidence": "SS 0x1f1024: lea rdi, [rip + 0xc77285] | FL 0x237ab4: lea rdi, [rip + 0xd4cc85]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device global (VideoOut / FrameBegin)",
+  "ss": "0xf1bcd0",
+  "fl": "0x11362d0",
+  "evidence": "SS 0x1f0dc2: lea rdi, [rip + 0xd2af07] | FL 0x237852: lea rdi, [rip + 0xefea77]",
+  "confidence": "certain",
+  "note": "base of the flag below"
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kQuarterHeightFlag",
+  "ss": "0x1d0cbd5",
+  "fl": "0x1f271d5",
+  "evidence": "SS 0x1f0dc2: lea rdi, [rip + 0xd2af07] (+0xdf0f05) | FL 0x237852: lea rdi, [rip + 0xefea77] (+0xdf0f05)",
+  "confidence": "certain",
+  "note": "read as cmp byte [rdi+0xdf0f05], rdi = device global (FrameBegin SS 0x1f0df2 / FL 0x237882)"
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f14",
+  "ss": "0xdf0f14",
+  "fl": "0xdf0f14",
+  "evidence": "SS 0x1f0d82: mov dword ptr [r13 + 0xdf0f14], ecx | FL 0x237812: mov dword ptr [r13 + 0xdf0f14], ecx",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f1c",
+  "ss": "0xdf0f1c",
+  "fl": "0xdf0f1c",
+  "evidence": "SS 0x1f0d98: mov dword ptr [r13 + 0xdf0f1c], eax | FL 0x237828: mov dword ptr [r13 + 0xdf0f1c], eax",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f24",
+  "ss": "0xdf0f24",
+  "fl": "0xdf0f24",
+  "evidence": "SS 0x1f0dd4: mov dword ptr [r13 + 0xdf0f24], eax | FL 0x237864: mov dword ptr [r13 + 0xdf0f24], eax",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f2c",
+  "ss": "0xdf0f2c",
+  "fl": "0xdf0f2c",
+  "evidence": "SS 0x1f0e00: mov dword ptr [r13 + 0xdf0f2c], esi | FL 0x237890: mov dword ptr [r13 + 0xdf0f2c], esi",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f34",
+  "ss": "0xdf0f34",
+  "fl": "0xdf0f34",
+  "evidence": "SS 0x1f0e5b: mov dword ptr [r13 + 0xdf0f34], edx | FL 0x2378eb: mov dword ptr [r13 + 0xdf0f34], edx",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f3c",
+  "ss": "0xdf0f3c",
+  "fl": "0xdf0f3c",
+  "evidence": "SS 0x1f0e78: mov dword ptr [r13 + 0xdf0f3c], ecx | FL 0x237908: mov dword ptr [r13 + 0xdf0f3c], ecx",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f44",
+  "ss": "0xdf0f44",
+  "fl": "0xdf0f44",
+  "evidence": "SS 0x1f0e94: mov dword ptr [r13 + 0xdf0f44], ecx | FL 0x237924: mov dword ptr [r13 + 0xdf0f44], ecx",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f4c",
+  "ss": "0xdf0f4c",
+  "fl": "0xdf0f4c",
+  "evidence": "SS 0x1f0eaa: mov dword ptr [r13 + 0xdf0f4c], ecx | FL 0x23793a: mov dword ptr [r13 + 0xdf0f4c], ecx",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f54",
+  "ss": "0xdf0f54",
+  "fl": "0xdf0f54",
+  "evidence": "SS 0x1f0ebf: mov dword ptr [r13 + 0xdf0f54], edx | FL 0x23794f: mov dword ptr [r13 + 0xdf0f54], edx",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f5c",
+  "ss": "0xdf0f5c",
+  "fl": "0xdf0f5c",
+  "evidence": "SS 0x1f0e47: mov dword ptr [r13 + 0xdf0f5c], esi | FL 0x2378d7: mov dword ptr [r13 + 0xdf0f5c], esi",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f64",
+  "ss": "0xdf0f64",
+  "fl": "0xdf0f64",
+  "evidence": "SS 0x1f0da6: mov dword ptr [r13 + 0xdf0f64], esi | FL 0x237836: mov dword ptr [r13 + 0xdf0f64], esi",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f6c",
+  "ss": "0xdf0f6c",
+  "fl": "0xdf0f6c",
+  "evidence": "SS 0x1f0db4: mov dword ptr [r13 + 0xdf0f6c], esi | FL 0x237844: mov dword ptr [r13 + 0xdf0f6c], esi",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device size table +0xdf0f74",
+  "ss": "0xdf0f74",
+  "fl": "0xdf0f74",
+  "evidence": "SS 0x1f0de4: mov dword ptr [r13 + 0xdf0f74], esi | FL 0x237874: mov dword ptr [r13 + 0xdf0f74], esi",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device +0x8c4 (display target 1)",
+  "ss": "0x8c4",
+  "fl": "0x8c4",
+  "evidence": "SS 0x1f0eb8: lea rdi, [r13 + 0x8c4] | FL 0x237948: lea rdi, [r13 + 0x8c4]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device +0x1050 (= 0x20a*8, display target 2)",
+  "ss": "0x1050",
+  "fl": "0x1050",
+  "evidence": "SS 0x1f0ee0: lea rdi, [r13 + 0x1050] | FL 0x237970: lea rdi, [r13 + 0x1050]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device +0x17e0 (= 0x2fc*8, display target 3)",
+  "ss": "0x17e0",
+  "fl": "0x17e0",
+  "evidence": "SS 0x1f0c46: lea r15, [r13 + 0x17e0] | FL 0x2376d6: lea r15, [r13 + 0x17e0]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "device +0xC / +0x10 (render w/h)",
+  "ss": "0xc/0x10",
+  "fl": "0xc/0x10",
+  "evidence": "FL 0x2369d7 holds the same mov [rbx+0xC] / [rbx+0x10] bytes as SS 0x1eff47",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kScreenWidth",
+  "ss": "0x1d0ccc0",
+  "fl": "0x1f272c0",
+  "evidence": "SS 0x1f03ea: lea r12, [rip + 0x1b1c8cf] | FL 0x236e7a: lea r12, [rip + 0x1cf043f]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kScreenHeight",
+  "ss": "0x1d0ccc4",
+  "fl": "0x1f272c4",
+  "evidence": "SS 0x1f03e3: lea r15, [rip + 0x1b1c8da] | FL 0x236e73: lea r15, [rip + 0x1cf044a]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kMarginX",
+  "ss": "0x1d0ccc8",
+  "fl": "0x1f272c8",
+  "evidence": "SS 0x1f0480: lea rsi, [rip + 0x1b1c840] | FL 0x236f10: lea rsi, [rip + 0x1cf03b0]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kMarginY",
+  "ss": "0x1d0cccc",
+  "fl": "0x1f272cc",
+  "evidence": "SS 0x1f04ab: lea rdx, [rip + 0x1b1c81a] | FL 0x236f3b: lea rdx, [rip + 0x1cf038a]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "kRenderSizeSite / kDisplaySite / kScreenSite",
+  "ss": "0x1eff47/0x1eff55/0x1f03f8",
+  "fl": "0x2369d7/0x2369e5/0x236e88",
+  "evidence": "each byte pattern unique in FL text; screen site stores [r15]=0x1f272c4 (h), [r12]=0x1f272c0 (w)",
+  "confidence": "certain",
+  "note": "already in render_resolution.cpp"
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "VideoOut init / margin recompute (comments)",
+  "ss": "0x1eff00 / 0x1f2a60 / 0x1f2b60",
+  "fl": "0x236990 / 0x239500 / 0x239600",
+  "evidence": "function starts holding the kMarginX lea (FL 0x2395aa / 0x2396aa)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (switch/HUD)",
+  "constant": "options global (FrameBegin)",
+  "ss": "0xefacf8",
+  "fl": "0x1112cf0",
+  "evidence": "SS 0x1f104e: lea rax, [rip + 0xd09ca3] | FL 0x237ade: lea rax, [rip + 0xedb20b]",
+  "confidence": "certain",
+  "note": "options +0x6f8 -> +0x7a8 there"
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "kSetFovSite (Camera::SetFov)",
+  "ss": {
+   "rva": "0x580580",
+   "size": "0xc1",
+   "fnv1a64": "ef658398f5aad2a4",
+   "prologue": 17
+  },
+  "fl": {
+   "rva": "0x65af10",
+   "size": "0xaf",
+   "fnv1a64": "30d2052b9c584467",
+   "padded_size": "0xb0",
+   "fnv1a64_padded": "4d23c01aa9fd2fb5",
+   "prologue": 17,
+   "prologue_instructions": [
+    "0x65af10: 55 push rbp",
+    "0x65af11: 4889e5 mov rbp, rsp",
+    "0x65af14: 53 push rbx",
+    "0x65af15: 50 push rax",
+    "0x65af16: 4889fb mov rbx, rdi",
+    "0x65af19: c5f82e8390050000 vucomiss xmm0, dword ptr [rbx + 0x590]"
+   ]
+  },
+  "evidence": "same 15 call sites in the same order (14 call + 1 jmp; SS 0x14f512 <-> FL 0x172fa9); FL body = SS body from 0x58059b on",
+  "confidence": "certain",
+  "note": "FL has no \"vmovss [rbx+0x5d4],xmm0; mov dword [rbx+0x5dc],0\" head (why the fuzzy match looked off); the probe (scale xmm0) works the same"
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "camera +0x590 (fov)",
+  "ss": "0x590",
+  "fl": "0x590",
+  "evidence": "SS 0x5805a9: vmovss dword ptr [rbx + 0x590], xmm0 | FL 0x65af27: vmovss dword ptr [rbx + 0x590], xmm0",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "camera +0x5a4 (tan(fov/2))",
+  "ss": "0x5a4",
+  "fl": "0x5a4",
+  "evidence": "SS 0x5805be: vmovss dword ptr [rbx + 0x5a4], xmm0 | FL 0x65af3c: vmovss dword ptr [rbx + 0x5a4], xmm0",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "camera +0x5a0 (aspect*tan)",
+  "ss": "0x5a0",
+  "fl": "0x5a0",
+  "evidence": "SS 0x5805d1: vmovss dword ptr [rbx + 0x5a0], xmm0 | FL 0x65af4f: vmovss dword ptr [rbx + 0x5a0], xmm0",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "camera +0x598",
+  "ss": "0x598",
+  "fl": "0x598",
+  "evidence": "SS 0x580624: vmovss dword ptr [rbx + 0x598], xmm0 | FL 0x65afa2: vmovss dword ptr [rbx + 0x598], xmm0",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "camera +0x5d4 / +0x5dc (SS only)",
+  "ss": "0x5d4/0x5dc",
+  "fl": "not written by FL SetFov",
+  "evidence": "FL 0x65af10 listing",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "kPlayerSetFovReturn",
+  "ss": "0x14f517",
+  "fl": "0x172fae",
+  "evidence": "SS 0x14f512 call 0x580580 | FL 0x172fa9 call 0x65af10, both after vmovss xmm0,[c+0x468]; vaddss xmm0,[c+0x358]",
+  "confidence": "certain",
+  "note": "FL caller = camera update 0x171c00 (SS 0x14ddd0)"
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "controller +0x468 (base fov)",
+  "ss": "0x468",
+  "fl": "0x468",
+  "evidence": "SS 0x14f4fd: vmovss xmm0, dword ptr [r13 + 0x468] | FL 0x172f94: vmovss xmm0, dword ptr [r15 + 0x468]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (FOV)",
+  "constant": "controller +0x358 (fov offset)",
+  "ss": "0x358",
+  "fl": "0x358",
+  "evidence": "SS 0x14f509: vaddss xmm0, xmm0, dword ptr [r13 + 0x358] | FL 0x172fa0: vaddss xmm0, xmm0, dword ptr [r15 + 0x358]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kCameraJitterSite",
+  "ss": {
+   "rva": "0x472810",
+   "size": "0x1ed",
+   "fnv1a64": "af06825055bbe18d",
+   "prologue": 17
+  },
+  "fl": {
+   "rva": "0x51c840",
+   "size": "0x205",
+   "fnv1a64": "1403a59b70323dd4",
+   "padded_size": "0x210",
+   "fnv1a64_padded": "9171d6eaf61316cc",
+   "prologue": 17,
+   "prologue_instructions": [
+    "0x51c840: 55 push rbp",
+    "0x51c841: 4889e5 mov rbp, rsp",
+    "0x51c844: 4157 push r15",
+    "0x51c846: 4156 push r14",
+    "0x51c848: 4155 push r13",
+    "0x51c84a: 4154 push r12",
+    "0x51c84c: 53 push rbx",
+    "0x51c84d: 4883ec18 sub rsp, 0x18"
+   ]
+  },
+  "evidence": "only caller SS 0x1901a4 / FL 0x1be204 (frame fn SS 0x1901a0 / FL 0x1be200); ratio 0.96",
+  "confidence": "certain",
+  "note": "SS pins 0x1ed (to the stack-check call); FL body 0x205"
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kResetWindow (Camera::ResetFrustumWindow)",
+  "ss": {
+   "rva": "0x581a10",
+   "size": "0x34",
+   "fnv1a64": "26b44a8bd1f71035"
+  },
+  "fl": {
+   "rva": "0x65c210",
+   "size": "0x34",
+   "fnv1a64": "ba919ade99796653",
+   "padded_size": "0x40",
+   "fnv1a64_padded": "9785fa8593023163"
+  },
+  "evidence": "identical instructions; window constant SS 0xae45a0 / FL 0xbd3050 = (-1,-1,1,1)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kPass32Site",
+  "ss": {
+   "rva": "0x1929c0",
+   "size": "0x42e",
+   "fnv1a64": "cd353017f8e6ce48",
+   "prologue": 20
+  },
+  "fl": {
+   "rva": "0x1c0b40",
+   "size": "0x54c",
+   "fnv1a64": "bec00e949ba22471",
+   "padded_size": "0x550",
+   "fnv1a64_padded": "62be687699432de1",
+   "prologue": 20,
+   "prologue_instructions": [
+    "0x1c0b40: 55 push rbp",
+    "0x1c0b41: 4889e5 mov rbp, rsp",
+    "0x1c0b44: 4157 push r15",
+    "0x1c0b46: 4156 push r14",
+    "0x1c0b48: 4155 push r13",
+    "0x1c0b4a: 4154 push r12",
+    "0x1c0b4c: 53 push rbx",
+    "0x1c0b4d: 4881ec28080000 sub rsp, 0x828"
+   ]
+  },
+  "evidence": "reads the no-AA byte: SS 0x192c59 or al,[r14+0x1eb8d] | FL 0x1c0e26 or al,[r14+0x1f31d] (the only other readers are pass 33 SS 0x1958b5/0x195936, FL 0x1c3bc5/0x1c3c46); same frame/epilogue",
+  "confidence": "certain",
+  "note": "fuzzy candidate 0x1c1a20 was wrong; FL adds code (sub rsp 0x818 -> 0x828)"
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kTemporalAaFlag",
+  "ss": "0xda07f9",
+  "fl": "0xe9c829",
+  "evidence": "SS 0x472862: lea r15, [rip + 0x92df90] | FL 0x51c892: lea r15, [rip + 0x97ff90]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kReevaluate",
+  "ss": "0x7e00964",
+  "fl": "0x806be14",
+  "evidence": "SS 0x47283a: mov eax, dword ptr [rip + 0x798e124] | FL 0x51c86a: mov eax, dword ptr [rip + 0x7b4f5a4]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kDisableSmaa",
+  "ss": "0xe87c85",
+  "fl": "0xfae035",
+  "evidence": "SS 0x4728f6: lea rax, [rip + 0xa151a3] (+0x1e5) | FL 0x51c92d: lea rax, [rip + 0xa914dc] (+0x225)",
+  "confidence": "certain",
+  "note": "SS mov al,[rax+0x1e5] | FL mov al,[rax+0x225] (0x4728fd / 0x51c934)"
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kNoAa",
+  "ss": "0xe86e3d",
+  "fl": "0xfa3a5d",
+  "evidence": "SS 0x1901b7: lea rdx, [rip + 0xcd80f2] (+0x1eb8d) | FL 0x1be217: lea rdx, [rip + 0xdc6522] (+0x1f31d)",
+  "confidence": "certain",
+  "note": "writer SS 0x1901d0 mov [rdx+0x1eb8d],cl | FL 0x1be230 mov [rdx+0x1f31d],cl; rdx = scene-targets object"
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kMainCamera",
+  "ss": "0x7f2d2b8",
+  "fl": "0x81a41f8",
+  "evidence": "SS 0x472909: lea rax, [rip + 0x7a9e8d0] (+0x1c0d8) | FL 0x51c940: lea rax, [rip + 0x7c6b579] (+0x1c338)",
+  "confidence": "certain",
+  "note": "SS mov rdi,[rax+0x1c0d8] | FL mov rdi,[rax+0x1c338] (also frame fn SS 0x190283 / FL 0x1be2e3)"
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "kCameraWindow camera +0x5ac",
+  "ss": "0x5ac",
+  "fl": "0x5ac",
+  "evidence": "SS 0x581a21: vmovups xmmword ptr [rbx + 0x5ac], xmm0 | FL 0x65c221: vmovups xmmword ptr [rbx + 0x5ac], xmm0",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "Camera::BuildProjection (upscaler)",
+  "ss": {
+   "rva": "0x581c90",
+   "size": "0x156",
+   "fnv1a64": "b53b4b80073dd4df"
+  },
+  "fl": {
+   "rva": "0x65c470",
+   "size": "0x156",
+   "fnv1a64": "c56996e8f2c21ae1",
+   "padded_size": "0x160",
+   "fnv1a64_padded": "df564577f14b40e9"
+  },
+  "evidence": "unique exact masked match of the whole SS body",
+  "confidence": "certain",
+  "note": "not hooked; vk_executor_upscale.cpp reads its fields"
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "camera +0x584 (near)",
+  "ss": "0x584",
+  "fl": "0x584",
+  "evidence": "SS 0x581cac: vmovss xmm4, dword ptr [rdi + 0x584] | FL 0x65c48c: vmovss xmm4, dword ptr [rdi + 0x584]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "camera +0x588 (far)",
+  "ss": "0x588",
+  "fl": "0x588",
+  "evidence": "SS 0x581cb4: vmovss xmm5, dword ptr [rdi + 0x588] | FL 0x65c494: vmovss xmm5, dword ptr [rdi + 0x588]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "camera +0x5a4 (tan(fov/2), BuildProjection)",
+  "ss": "0x5a4",
+  "fl": "0x5a4",
+  "evidence": "SS 0x581cc4: vdivss xmm9, xmm8, dword ptr [rdi + 0x5a4] | FL 0x65c4a4: vdivss xmm9, xmm8, dword ptr [rdi + 0x5a4]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "Camera::SetFrustumWindow (comment)",
+  "ss": "0x581a50",
+  "fl": "0x65c250",
+  "evidence": "jitter SS 0x4729db call 0x581a50 | FL 0x51ca12 call 0x65c250",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "frame fn / jitter caller (comment, \"0x1901a0\")",
+  "ss": "0x1901a0",
+  "fl": "0x1be200",
+  "evidence": "identical 0x4c-byte body",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "render_resolution (anti-aliasing)",
+  "constant": "GPU timer (comment)",
+  "ss": "0x196ef0",
+  "fl": "0x1c5e80",
+  "evidence": "jitter SS 0x47285d / FL 0x51c88d call",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kIntegrateSite (camera integrator)",
+  "ss": {
+   "rva": "0x14d6f0",
+   "size": "0x593",
+   "fnv1a64": "724cebb9e1f76f99",
+   "prologue": 17
+  },
+  "fl": {
+   "rva": "0x171410",
+   "size": "0x612",
+   "fnv1a64": "40e7fea5cb4aa405",
+   "padded_size": "0x620",
+   "fnv1a64_padded": "cdb926d086374d7d",
+   "prologue": 17,
+   "prologue_instructions": [
+    "0x171410: 55 push rbp",
+    "0x171411: 4889e5 mov rbp, rsp",
+    "0x171414: 4157 push r15",
+    "0x171416: 4156 push r14",
+    "0x171418: 4155 push r13",
+    "0x17141a: 4154 push r12",
+    "0x17141c: 53 push rbx",
+    "0x17141d: 4883e4e0 and rsp, 0xffffffffffffffe0"
+   ]
+  },
+  "evidence": "only caller FL 0x1720c7 (camera update 0x171c00); same argument registers (rdi cam, rsi params, rdx params2, rcx, r8/r9 out, xmm0 yaw, xmm1 pitch); ratio 0.921",
+  "confidence": "certain",
+  "note": "SS pins 0x593 (one padding nop); prologue includes \"and rsp,-32\" as in SS"
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kCameraAngles camera +0x330",
+  "ss": "0x330",
+  "fl": "0x330",
+  "evidence": "SS 0x14da47: vmovups xmm0, xmmword ptr [rbx + 0x330] | FL 0x1717e7: vmovups xmm0, xmmword ptr [rbx + 0x330]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kCameraLocks camera +0x7c0",
+  "ss": "0x7c0",
+  "fl": "0x7d0",
+  "evidence": "SS 0x14e5ce mov eax,[r13+0x7c0]; test al,1 / al,2 after the pad +0x70 call | FL 0x1738f8 mov eax,[r12+0x7d0]; same tests after the pad +0x70 call (FL moved the stick read into helper 0x1738a0, rdi = the same camera)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kOptions",
+  "ss": "0xefacf8",
+  "fl": "0x1112cf0",
+  "evidence": "SS 0x14e5f3: lea rax, [rip + 0xdac6fe] | FL 0x173916: lea rax, [rip + 0xf9f3d3]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "options +0x6d5 / +0x6d6 (camera x/y inversion)",
+  "ss": "0x6d5/0x6d6",
+  "fl": "0x785/0x786",
+  "evidence": "SS 0x14e5fa cmp byte [rax+0x6d5] / 0x14e626 [rax+0x6d6] | FL 0x17391d [rax+0x785] / 0x17393d [rax+0x786]; pad getter SS 0x24cba3 movzx word [rax+0x6d5] | FL 0x2a91c3 [rax+0x785]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "options second inversion pair (getter B)",
+  "ss": "0x6d7/0x6d8",
+  "fl": "0x787/0x788",
+  "evidence": "SS 0x24cc33 [rax+0x6d7] | FL 0x2a9253 [rax+0x787]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kPitchLimits in params (arg 2)",
+  "ss": "params+0x1c0",
+  "fl": "params+0x1c0",
+  "evidence": "0x14c270/0x16ff90: SS 0x14c2cc [rsi+0x1c0] | FL 0x16ffec [rsi+0x1c0]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kPitchLimits in params2 (arg 3)",
+  "ss": "params2+0x1c0",
+  "fl": "params2+0x1d0",
+  "evidence": "SS 0x14c2ae [r13(=rdx)+0x1c0] | FL 0x16ffce [r13+0x1d0]; stick fn SS 0x14c135 [params2+0x1c0] | FL 0x16fe5b [params2+0x1d0]",
+  "confidence": "certain",
+  "note": "params and params2 no longer share a layout in FL: p1 = params+0x1c0, p2 = params2+0x1d0"
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kPitchLimitsAuto params2+0x210",
+  "ss": "params2+0x210",
+  "fl": "params2+0x220",
+  "evidence": "SS 0x14c2be [r13+0x210] | FL 0x16ffde [r13+0x220]",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "stick / automatic camera helpers (comments)",
+  "ss": "0x14a810 / 0x14c270",
+  "fl": "0x16e470 / 0x16ff90",
+  "evidence": "integrator SS 0x14d99d / 0x14d9c2 | FL 0x17173d / 0x171762",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "camera update (comment)",
+  "ss": "0x14ddd0",
+  "fl": "0x171c00",
+  "evidence": "holds the SetFov call and the only integrator call",
+  "confidence": "certain",
+  "note": "FL split the SS update into helpers (stick read 0x1738a0)"
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "pad vtable (comment)",
+  "ss": "0xcddf70",
+  "fl": "0xdd2358",
+  "evidence": "ctor lea SS 0x24ea46 -> 0xcddf60 (+0x10) | FL 0x2ab00a -> 0xdd2348 (+0x10); slots 0..26 equal bodies",
+  "confidence": "certain",
+  "note": "FL inserts 2 virtual slots after +0xd0"
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kVtableSlotA / kOriginalA",
+  "ss": "0xcde080 / 0x24cb80",
+  "fl": "0xdd2478 / 0x2a91a0",
+  "evidence": "slot +0x110 -> +0x120; getter body equal except options +0x785",
+  "confidence": "certain",
+  "note": "SSPC_MOUSE_PROBE diagnostics"
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "kVtableSlotB / kOriginalB",
+  "ss": "0xcde088 / 0x24cc10",
+  "fl": "0xdd2480 / 0x2a9230",
+  "evidence": "slot +0x118 -> +0x128; getter body equal except options +0x787",
+  "confidence": "certain",
+  "note": "SSPC_MOUSE_PROBE diagnostics"
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "pad vtable +0x70 stick read (comment)",
+  "ss": "0x24d740",
+  "fl": "0x2a9bb0",
+  "evidence": "slot 14 in both, bodies equal; called at FL 0x1738f5",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "mouse_camera",
+  "constant": "watch offsets pad +0x14/+0x18/+0x1c/+0xd4",
+  "ss": "0x14/0x18/0x1c/0xd4",
+  "fl": "same (stick state +0x14 checked)",
+  "evidence": "+0x70 reader uses [state+rcx*4+0x14] identically; +0xd4 not checked",
+  "confidence": "likely",
+  "note": "SSPC_MOUSE_WATCH diagnostics"
+ },
+ {
+  "hook": "game_fixes",
+  "constant": "kStrongRva",
+  "ss": "0x1be900",
+  "fl": "0x1fe540",
+  "evidence": "23-byte pattern verbatim, unique in FL text",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_fixes",
+  "constant": "kWeakRva",
+  "ss": "0x1be8a2",
+  "fl": "0x1fe4e2",
+  "evidence": "19-byte pattern verbatim, unique (weak release SS 0x1be820 / FL 0x1fe460)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_fixes",
+  "constant": "kWeakDone",
+  "ss": "0x1be8cd",
+  "fl": "0x1fe50d",
+  "evidence": "same layout (+0x3fc40): jne -> done 0x1fe50d, je -> destroy 0x1fe504, fallthrough -> notify 0x1fe4f5 (decoded)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_fixes",
+  "constant": "kWeakDestroy",
+  "ss": "0x1be8c4",
+  "fl": "0x1fe504",
+  "evidence": "same layout (+0x3fc40): jne -> done 0x1fe50d, je -> destroy 0x1fe504, fallthrough -> notify 0x1fe4f5 (decoded)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_fixes",
+  "constant": "kWeakNotify",
+  "ss": "0x1be8b5",
+  "fl": "0x1fe4f5",
+  "evidence": "same layout (+0x3fc40): jne -> done 0x1fe50d, je -> destroy 0x1fe504, fallthrough -> notify 0x1fe4f5 (decoded)",
+  "confidence": "certain",
+  "note": ""
+ },
+ {
+  "hook": "game_fixes",
+  "constant": "rsp alignment at the weak site",
+  "ss": "16-aligned",
+  "fl": "16-aligned",
+  "evidence": "FL 0x1fe460: push rbp + 5 pushes + sub rsp,0x28 (identical to SS) -> rsp % 16 == 0 at 0x1fe4e2",
+  "confidence": "certain",
+  "note": ""
+ }
+]
