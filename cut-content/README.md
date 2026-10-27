@@ -55,7 +55,7 @@ A cut scene from the **first mission** survives whole: Delsin touches a core and
 
 ### The ending: a third choice and "the band back together"
 
-- The "Kill Augustine" mission once depended on a choice about Hank: *"Mission Kill Augustine is not available because you chose to spare Hank."* The final game has no such condition.
+- **The ending once depended on Hank, not on karma.** Two unused texts: *"Mission Kill Augustine is not available because you chose to spare Hank"* and *"Mission Expose Augustine is not available because you chose to kill Hank."* The choice "Kill Hank / Spare Hank" is in the game, but in the final version the karma level decides which ending you get.
 - A line about a **third choice** (`m_cb_thirdchoice`): *"Oh, no no, this is a big decision. Come on, I gotta get my head on straight."*
 - It looks like **Eugene and Fetch helped** in the final fight: *"Hey, I heard you were getting the band back together."*, *"I'm with you big guy, me and all my friends."*, *"Hey Smokes, need some help?"*, *"You're lucky I was available."*
 - Unused lines of the evil ending: *"Sic semper tyrannus…bitch."*, *"Guess it's time to go home."*, *"Now…I'll stop."* And Augustine: *"Those people deserved a REAL hero."*
@@ -105,6 +105,10 @@ Voiced lines for **Hank's daughter**, who is not in the game: *"Dad? Daddy? Let'
 - A hint *"A D.U.P. Informant has hidden a hard drive in the area. Use your phone to locate it."*: a cut kind of hidden item.
 - A hint *"Press … from behind for a stealthy takedown."*: stealth takedowns.
 - A **playtest** objective, `u_banner_playtest_03_chase`: *"Catch Fetch and drain her powers."*
+- An older **Space Needle** mission: *"Go to the base of the Space Needle"*, *"Find the elevators at the base of the Space Needle"*, *"Go to the rooftop"*, and the fail message *"You fell off the Space Needle"*.
+- Unused objectives: *"Check on Reggie before exploring the Conduit's lair"*, *"Help the escaped conduit"*, *"Open the back of the dealer truck"*, *"Get aboard the bus"*.
+- Delsin asks Eugene to help in the streets (`m_help2`): *"Hey Eugene, I know you're probably busy wrestling with your demons, but those guys in the D.U.P. vests really need a little…"*
+- Loading-screen trivia: *"Henry 'Hank' Daughtry has six toes on his right foot"*; *"The series 'D.U.P. Miami' is currently the third highest rated show on television."*
 
 ## District activities
 
@@ -171,16 +175,50 @@ The game's videos (`.bsf`) are plain H.264 streams. Of its 159 videos, five are 
 
 <img src="images/ustv_cb02_salmon_bay.jpg" width="49%"> <img src="images/ustv_cb02_delsin.jpg" width="49%">
 
-**A second cut broadcast, `v_ustv_cb01`.** Only the anchor's voice is left, in English and Russian (51 s); there is no video. In every broadcast the game uses, audio and video match in length to within a tenth of a second; here it is 51 s against 44 s, so cb01 and cb02 are two different broadcasts.
+**The anchor's voice, `v_ustv_cb01`: the tribe was killed, and Delsin was blamed.** Only the voice of this broadcast is left, in English and Russian (51 s), and it tells a story the final game does not:
+
+> *"We're showing you now the first images coming into our studio from the small Native American reservation town of Salmon Bay, Washington, the scene of a gruesome attack earlier today. Initial reports are that the **entire Akomish tribe was wiped out** during this violent rampage, which apparently erupted without warning and tragically left no survivors. The D.U.P.'s rapid response team reports that all evidence points to the massacre being the handiwork of a Bio-terrorist using smoke powers. Specifically, they named 23-year-old **Delsin Rowe**, a former member of the Akomish tribe, and according to D.U.P. head Brooke Augustine, the mastermind behind the reign of terror currently gripping Seattle."*
+
+In the final game Augustine wounds the tribe; here the whole tribe dies and Augustine frames Delsin for it. The cb02 video (aerial pictures of a destroyed Salmon Bay, then Delsin's photo) shows the same story, but the two are not one file: in every broadcast the game uses, audio and video match in length to within a tenth of a second, and here it is 51 s against 44 s, so they are likely two versions of the report. *(The quotes from voice lines without subtitles in this section are automatic transcriptions (Whisper); the names are corrected to their known spelling. Listen to the files for the exact words.)*
 - 🔊 [`audio/news_cb01_en.mp3`](audio/news_cb01_en.mp3) · [`audio/news_cb01_ru.mp3`](audio/news_cb01_ru.mp3)
-- 🎞 [`video/ustv_cb02_plus_cb01_voice_en.mp4`](video/ustv_cb02_plus_cb01_voice_en.mp4) (and `_ru`): **an edit made for convenience**, the cb02 picture with the cb01 voice. They were never together in the game.
+- 🎞 [`video/ustv_cb02_plus_cb01_voice_en.mp4`](video/ustv_cb02_plus_cb01_voice_en.mp4) (and `_ru`): **an edit made for convenience**, the cb02 picture with the cb01 voice.
+
+### Trailer and demo soundtracks
+
+The videos of the E3 and Gamescom trailers are gone, but their **audio tracks are still in the game's voice archives**, made for the show-floor and demo builds:
+
+| File | What it is |
+|---|---|
+| 🔊 [`audio/trailer_e3_2013_en.mp3`](audio/trailer_e3_2013_en.mp3) | **The E3 2013 demo, 4 min 10 s.** Reggie: *"Do you have any idea how embarrassing it is for me to keep arresting my own brother over and over again?"* An earlier plan: *"Alright, I got this whole thing figured out. We hit the town… and then we're back home to save some lives."* |
+| 🔊 [`audio/trailer_gamescom_en.mp3`](audio/trailer_gamescom_en.mp3) | **The Gamescom 2013 trailer**, Fetch's: *"My name is Abigail Walker, but my friends and enemies call me Fetch."* |
+| 🔊 [`audio/trailer_ps4_launch_en.mp3`](audio/trailer_ps4_launch_en.mp3) | **The PS4 launch trailer**: *"This fast healing stuff is gonna come in real handy."* |
+| 🔊 [`audio/demo_preview_intro_en.mp3`](audio/demo_preview_intro_en.mp3) · [`_ru`](audio/demo_preview_intro_ru.mp3) | **The demo's intro, 2 min 5 s, dubbed in Russian too.** A condensed early version of the opening: Reggie arrests Delsin, Hank's escape, *"I'm one of them, man"*, and a different talk about a cure: *"Shooting smoke out of your fingertips isn't exactly normal, man." — "Just because it's not normal doesn't mean that it needs a cure."* |
+
+### The D.U.P.'s loudspeakers
+
+**Propaganda.** Sixteen recorded loudspeaker announcements, "a quick reminder from your friends at the D.U.P.", that the game never plays:
+> *"It is better to falsely accuse 50 innocent people if it means the capture of one Bio-terrorist than it is to accuse no one."*
+> *"Report your suspicions and be a hero, or remain silent and be a corpse. Please choose wisely."*
+> *"They want to kill your friends, your neighbors, and your family pets."*
+> *"If you dissent, the Bio-terrorists win."*
+> *"We live in the country that wiped out polio, leprosy, and malaria. Together, we can and must wipe out the Bio-terrorist cancer… Be part of the cure."*
+> *"It's not snitching if you're saving lives."*
+> *"As you approach this checkpoint, please remove any gloves, rings, hats, shoes, socks, watches, and bodily piercings… under provisions of the 2011 Vancouver Security Pact…"*
+
+🔊 [`audio/dup_propaganda_en.mp3`](audio/dup_propaganda_en.mp3) · [`audio/dup_propaganda_ru.mp3`](audio/dup_propaganda_ru.mp3), 5 min each
+
+**District announcements**, for when Delsin attacks the D.U.P.: *"The assembly of more than five citizens is considered a potential threat to public safety"*, *"To date, we have detained over 100 of your fellow citizens"*, *"Now deploying retaliatory shock troops to affected area"*, *"Command post failure detected."* 🔊 [`audio/dup_announcements_en.mp3`](audio/dup_announcements_en.mp3) · [`_ru`](audio/dup_announcements_ru.mp3)
+
+**Gene scanners with threat levels:** *"Please place your hand on the scanner… Processing… Warning: positive scan, level four. Possible genetic carrier. Detain subject for further testing"*, then level three, level two, and *"WARNING, ALL PERSONNEL. LEVEL ONE, PRIME CONDUIT DETECTED. LETHAL FORCE IS AUTHORIZED."* 🔊 [`audio/dup_scanners_en.mp3`](audio/dup_scanners_en.mp3) · [`_ru`](audio/dup_scanners_ru.mp3)
+
+**News and radio:** reporter **Kurt Wyatt** *"from the scene of a massive battle between the D.U.P. and a small group of Bio-terrorists"*; a car radio in the first mission on *"the spectacular decommissioning of the five-twenty bridge"*, blown up so the Bio-terrorists could not leave the city; the loudspeaker countdown *"decommission sequence to commence in three, two, one"*. 🔊 [`audio/news_and_radio_en.mp3`](audio/news_and_radio_en.mp3) · [`_ru`](audio/news_and_radio_ru.mp3)
 
 Contact sheets of all the videos are in [`images/`](images/).
 
 ## Beta, demo, debug
 
 - **Build modes.** The code lists the modes the game could be built in: *Normal, Focus, Demo, Floor, Sampler, Preview, Kiosk, Taste, Beta, Retail, Review, Moderator*. So there were show-floor builds (Floor, Kiosk), demos (Demo, Sampler, Taste), a beta and press builds (Review).
-- **Videos of which only the names are left:** `v_e3_trailer`, `v_e3_countdown`, `v_e3_logo_loop`, `v_gamescom_trailer`, `v_gamescom_countdown`, `v_ps4_launch_trailer`, `v_demo_preview_intro`, `v_zeke_date`. They look like trailers and countdowns for show builds; `v_zeke_date` is some video with Zeke. The files are not in the game.
+- **Trailers for show builds:** `v_e3_trailer`, `v_e3_countdown`, `v_e3_logo_loop`, `v_gamescom_trailer`, `v_gamescom_countdown`, `v_ps4_launch_trailer`, `v_demo_preview_intro`, `v_zeke_date`. The videos are not in the game, but the audio of most of them is: see [Trailer and demo soundtracks](#trailer-and-demo-soundtracks).
 - **A debug load menu** (`load_menu_catalog.log`): test worlds `combat_test_world_01`, `x_parkour_test`, `dup_control_room`, `djm_xn_world`, `testscene2`, and sets `i3_experiments`, `char_viz`, `ctw1`, `djm_xn_story`, `rc`. Their packages are not in the retail build. The code keeps `DebugMenu`, `DevMenu` and a `TeleportToMark`.
 - **"batman"** is the internal name of the videos of Augustine in the control room (`v_ctn_batman_controlroom`, `v_batman`).
 - **A PC version was never planned.** The code has no DirectX, XInput, Steam or Windows. Its key table (Escape…Num /, mouse) belongs to the developers' tools. The PS4 mouse library is linked, but the game never calls it.
