@@ -37,7 +37,12 @@ namespace {
 namespace L = Layout;
 
 // --- what the probes are installed on (eboot.bin of CUSA00004; tools/native-reconstruction/function_hashes.py) ------
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// (First Light: its whole body - research/fl_sites_perf.md; Second Son's pin is a prefix of its body)
+constexpr ProbeSite kSubmitFrameSite{{L::kSubmitFrame, 0xb84, 0x8713c77ffc3af1a0ull}, 20};
+#else
 constexpr ProbeSite kSubmitFrameSite{{L::kSubmitFrame, 0xb51, 0x4a5ea347de017770ull}, 20};
+#endif
 constexpr ProbeSite kResetSite{{L::kContextReset, 0x164, 0xa8a9df2ac8bb0624ull}, 20};
 constexpr ProbeSite kReserveSite{{L::kDcbReserve, 0xb1, 0x4a5898f412269a7full}, 18};
 constexpr ProbeSite kSetterSites[4] = {
@@ -800,7 +805,11 @@ u32 EnvU32(const char* name, u32 fallback) {
 // frame+0x20 * 2 + frame+0x17dc, 1, (s32) [0x1d20384]); nothing writes the list or those fields in between. Its frame
 // (push rbp; mov rbp, rsp; five pushes; sub rsp, 0x1888; no other stack adjustment): at the call rbp = the slot of the
 // return address + 0x18b8; flags at rbp-0x187c, frame at rbp-0x1870.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+constexpr u64 kStep4Return = 0x239177; // (First Light: call 0x239172 -> the sceGnmSubmitDone thunk; the same frame)
+#else
 constexpr u64 kStep4Return = 0x1f26e7;
+#endif
 constexpr u64 kStep4Rbp = 0x18b8; ///< rbp - the return address' slot
 constexpr u64 kListCount = 0x38, kListDcbs = 0x1838, kListSizes = 0x838, kFlags = 0x187c, kFrameArg = 0x1870;
 constexpr u32 kListMax = 512; ///< the stack arrays' size

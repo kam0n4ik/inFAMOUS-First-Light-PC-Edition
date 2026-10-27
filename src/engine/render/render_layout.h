@@ -8,8 +8,17 @@
 
 namespace SecondSon::Engine::Render::Layout {
 
+// First Light (SSPC_PRODUCT_FIRST_LIGHT): the globals and functions that moved have First Light's values below, each
+// paired with Second Son's instruction by instruction (research/fl_sites_perf.md of the First Light repo, all
+// "certain"); the offsets inside the objects are the same in both games. Only the CITY-OPT tags and the early frame
+// submission run on First Light (bridge/shadps4/bootstrap.cpp); what else reads this file is Second Son's only.
+
 // --- Frame object (DAT_00f1bcd0; SubmitFrame 0x1f1e30, AcquireContext 0x1f2c60) ------------------------------------
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+inline constexpr u64 kFrame = 0x11362d0;
+#else
 inline constexpr u64 kFrame = 0xf1bcd0;
+#endif
 inline constexpr u64 kFrameVideoOut = 0x14;      ///< s32: the VideoOut handle SubmitFrame flips on
 inline constexpr u64 kFrameDisplayPair = 0x20;   ///< s32: display buffers 2n, 2n+1 (the flip's buffer: n * 2 + half)
 inline constexpr u64 kFrameArenaPairs = 0x28;    ///< 5 x {base[2], current, end, size u32, half u32}, stride 0x30
@@ -28,8 +37,13 @@ inline constexpr u64 kFrameAcquired = 0xdf0ef0; ///< s32: slots acquired this fr
 inline constexpr u64 kFrameRecorded = 0xdf0ef4; ///< s32: slots recorded this frame (atomic)
 
 // --- GPU labels and the async compute queue (P5.4; SubmitFrame 0x1f1e30, compute queue 0x168b70 / 0x1691e0 / 0x1695e0)
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+inline constexpr u64 kLabelArray = 0xf2e0b0;
+inline constexpr u64 kComputeQueue = 0x7f9a3a0;
+#else
 inline constexpr u64 kLabelArray = 0xe17e80;   ///< u64*: the engine's labels, 8 bytes each, the value in the low 32 bits
 inline constexpr u64 kComputeQueue = 0x7d3cf10; ///< the particles' async compute queue object (main loop 0x29c8d0)
+#endif
 inline constexpr u64 kQueueSubmitted = 0x1b88;  ///< u32: the value its last submission's RELEASE_MEM writes
 inline constexpr u64 kQueueLabelIndex = 0x1b8c; ///< s32: its label in kLabelArray
 // its command buffer (0x1691e0 / 0x169020 / 0x169660; the per-frame reset 0x169660 starts it anew)
@@ -37,8 +51,13 @@ inline constexpr u64 kQueueCbStart = 0x1b7c;    ///< u32: offset (dwords) of the
 inline constexpr u64 kQueueReadLabel = 0x1b80;  ///< s32: label in kLabelArray - the offset each submission's end has
                                                 ///< reached on the GPU (its second RELEASE_MEM); the overflow handler
                                                 ///< 0x169020 reuses the space below it, the reset writes 0
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+inline constexpr u64 kSubmitMode = 0x1f642a8;
+inline constexpr u64 kSubmitFlipArg = 0x1f642a4;
+#else
 inline constexpr u64 kSubmitMode = 0x1d20388;    ///< s32: where SubmitFrame calls sceGnmSubmitDone (0: before its wait)
 inline constexpr u64 kSubmitFlipArg = 0x1d20384; ///< s32: the flip argument SubmitFrame passes
+#endif
 
 // --- Render context R (0xDE90 bytes, vtable 0xcd14f8; Init 0x11efc0, Reset 0x11f050) --------------------------------
 inline constexpr u64 kContextSize = 0xde90;
@@ -74,11 +93,20 @@ inline constexpr u64 kCueDcb = 0xc090;    ///< Gnm::CommandBuffer* (= G)
 inline constexpr u64 kCueLayout = 0xc180; ///< 8 x user-data layout table pointer
 
 // --- Pass table (0xcd79d0: 41 x {setup, begin, end}) --------------------------------------------------------------
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+inline constexpr u64 kPassTable = 0xdcb6f0; // (First Light has 42 passes: its pass loop runs to 0x2a)
+inline constexpr u32 kPassCount = 42;
+#else
 inline constexpr u64 kPassTable = 0xcd79d0;
 inline constexpr u32 kPassCount = 41;
+#endif
 
 // --- Functions ----------------------------------------------------------------------------------------------------
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+inline constexpr u64 kSubmitFrame = 0x2388c0;
+#else
 inline constexpr u64 kSubmitFrame = 0x1f1e30;   ///< (Frame*, u32 flags): sorts the contexts, EOP, submit + flip
+#endif
 inline constexpr u64 kContextReset = 0x11f050;  ///< (R*): empties the DCB and the constant caches
 inline constexpr u64 kDcbReserve = 0x11eed0;    ///< (cb, dwords, R*): the DCB's out-of-space callback
 inline constexpr u64 kSetTextures = 0x16d10;    ///< (CUE*, stage, slot, count, T#[count] of 32 bytes)

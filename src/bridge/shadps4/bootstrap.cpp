@@ -888,8 +888,14 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // its own code runs
     const bool engine_hooks = App::kProduct.all_engine_hooks;
     if (!engine_hooks) {
-        SSPC_LOG(Loader, Info, "engine hooks of Second Son only (effects quality, CITY-OPT tags, early submit, native "
-                 "engine) not tried on {}: the game's own code runs", App::kProduct.game);
+        SSPC_LOG(Loader, Info, "engine hooks of Second Son only (effects quality, REA-3, native engine) not tried on {}: "
+                 "the game's own code runs; the CITY-OPT tags and the early frame submission have its sites (each off "
+                 "unless its switch)", App::kProduct.game);
+        // (First Light: render_layout.h, draw_runs.cpp and frame_trace.cpp have its sites for these two)
+        if (native_gpu) {
+            Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
+        }
+        Engine::Render::DrawRuns::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
     }
     if (engine_hooks) {
         Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());

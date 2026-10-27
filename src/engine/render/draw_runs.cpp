@@ -63,6 +63,15 @@ struct alignas(64) StagesCount {
 std::array<StagesCount, 2> g_stages_count{};
 
 // the same sites as the draw census (draw_census.cpp): prologues checked in Ghidra, bodies pinned by hash
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light: the same functions, instruction for instruction, the same prologue bytes (research/fl_sites_perf.md)
+constexpr ProbeSite kSites[3] = {
+    {{0x1d37d0, 0x225, 0xd96cfca90b4ae8d1ull}, 20}, // Second Son's 0x1a1960
+    {{0x4daec0, 0x106, 0x016f2f7320500621ull}, 17}, // 0x43d480
+    {{0x1d35e0, 0x1e4, 0x830ebf5c9918bef1ull}, 17}, // 0x1a1770
+};
+constexpr ProbeSite kMaterialSite = {{0x4e7f80, 0x15f, 0x21cc639a945ecdb2ull}, 17}; // 0x448640
+#else
 constexpr ProbeSite kSites[3] = {
     {{0x1a1960, 0x225, 0xea1442f922a0a0ecull}, 20}, // mesh draw (param_1, context R, mesh instance)
     {{0x43d480, 0x106, 0xaffc4c64777b1e37ull}, 17}, // shadow casters' draw (param_1, R, records, count, mesh)
@@ -74,6 +83,7 @@ constexpr ProbeSite kSites[3] = {
 // CITY-OPT Phase 6: the mesh pass's material setup (param_1, context R, material) - the PS's descriptors of the draws
 // after it (docs/CITY_ENGINE_RESOURCES.md); prologue checked in Ghidra (17 bytes, no RIP operand, no branch into it)
 constexpr ProbeSite kMaterialSite = {{0x448640, 0x15f, 0x22c6fc74651c7374ull}, 17};
+#endif
 
 using Fn = SSPC_SYSV_ABI void (*)(u64, u64, u64, u64, u64, u64);
 std::array<Fn, 3> g_orig{};
@@ -393,6 +403,24 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     }
     g_on = true;
     g_gbuffer = sites == 3;
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    // First Light: the tags only. The native G-buffer, R10's draws and R7's path read the engine's material and draw
+    // structures, whose fields moved on First Light (research/fl_sites_perf.md) and are not mapped
+    if (R7::GBufferPath()) {
+        SSPC_LOG(Engine, Warning, "SSPC_R7_NATIVE_RENDER: not on First Light (its material fields are not mapped) - its "
+                                  "draws stay the game's");
+        R7::SetGBufferPath(false);
+    }
+    for (const char* name : {"SSPC_NATIVE_GBUFFER", "SSPC_R10_NATIVE_DRAWS"}) {
+        if (char e[16] = {}; GetEnvironmentVariableA(name, e, sizeof(e)) > 0 && e[0] != '0' && std::string_view(e) != "off") {
+            SSPC_LOG(Engine, Warning, "{} ignored on First Light: its engine structures are not mapped", name);
+        }
+    }
+    SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_CITY_ENGINE_OPT={} - First Light's mesh draws (0x1d37d0) and shadow "
+                              "casters' draws (0x4daec0){} tagged for the command processor's runs", v,
+             g_gbuffer ? " and instanced mesh draws (0x1d35e0)" : "");
+    return true;
+#endif
     if (R7::GBufferPath() && !g_gbuffer) {
         SSPC_LOG(Engine, Error, "SSPC_R7_NATIVE_RENDER: the G-buffer path needs 0x1a1770's probe "
                                 "(SSPC_CITY_ENGINE_GBUFFER_RUNS=1) - its draws stay the game's");
