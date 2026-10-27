@@ -38,7 +38,11 @@ KindInfo Info(PictureKind k) {
 #else
     case PictureKind::kTouchPrint256: return {256, 256, 0xf2e47d05c6d25ba6ull, 9};
 #endif
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    case PictureKind::kDpad256: return {256, 256, 0xca0feb34307ca774ull, 9}; // First Light's own wheel
+#else
     case PictureKind::kDpad256: return {256, 256, 0xd6349daad5d0602eull, 9};
+#endif
     case PictureKind::kDpadKarma256: return {256, 256, 0x4cd4970d746fdd34ull, 9};
     case PictureKind::kDpad64: return {64, 64, 0x226c536031f7fbddull, 7};
     case PictureKind::kDiscTriangle128: return {128, 128, 0x11b1d5b54a980384ull, 8};
@@ -451,7 +455,11 @@ bool DrawDpad(Image& im, const Input::Settings& layout) {
             a.colour = {225, 225, 225};
         }
     }
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    const float clear = 0.34f * W; // (First Light's highlighted arm reaches 0.32 of the wheel)
+#else
     const float clear = 0.31f * W;
+#endif
     for (u32 y = 0; y < im.h; ++y) {
         for (u32 x = 0; x < im.w; ++x) {
             const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
