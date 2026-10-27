@@ -126,7 +126,6 @@ DLSS and FSR need the vendors' SDKs in `third_party\upscalers`, laid out as in [
 
 ## Known issues
 
-- **Silhouettes of characters.** Cut-outs of characters' shapes from an earlier frame are seen on the ground and on characters, bright or dark, after cutscenes. Not fixed yet: the fast clear handling added for it never runs on First Light (the game does not use colour fast clears), so the cause is still being looked for.
 - **The PC settings from the game's menu.** Esc → Settings → "Additional settings" is not mapped on First Light yet; F1 opens the PC settings.
 - **Effects quality settings** (smoke, particles, shadows, textures, reflections, rain, post-effects) act through Second Son's engine hooks and do nothing on First Light yet.
 - **Shader translation:** about 200 of First Light's shader programs are not prepared ahead (sampling without a sampler descriptor); they compile when first seen.
