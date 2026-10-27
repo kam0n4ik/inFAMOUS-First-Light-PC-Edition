@@ -6,6 +6,22 @@ The original PlayStation 4 game runs on Windows; its executable and data are lef
 
 > **Status: early, the game reaches gameplay.** First Light starts, plays its intro and cutscenes, and is played in the open world. On the development PC (Ryzen 5 5500, RTX 2060 6 GB, 720p window) the first sessions ran at about 35–45 FPS; there is no reproducible benchmark yet, so no FPS figure here is a promise. See [Known issues](#known-issues).
 
+<p align="center">
+  <img src=".github/readme/first-light-banner.jpg" alt="inFAMOUS: First Light — PC Edition" width="100%">
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a> ·
+  <a href="#requirements">Requirements</a> ·
+  <a href="#how-it-relates-to-second-son">Shared runtime</a> ·
+  <a href="#frame-rate">Frame rate</a> ·
+  <a href="#building-from-source">Building</a> ·
+  <a href="#known-issues">Known issues</a> ·
+  <a href="https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition">Second Son — PC Edition</a>
+</p>
+
+---
+
 ## How it relates to Second Son
 
 This repository is the Second Son runtime with First Light's own parts added; nothing of it is a renamed copy. The product is chosen at build time (`SSPC_PRODUCT=FirstLight|SecondSon`, `build.ps1 -Product`), and one tree builds both `FirstLightPC.exe` and `SecondSonPC.exe`, so a fix in the shared runtime reaches both games.
