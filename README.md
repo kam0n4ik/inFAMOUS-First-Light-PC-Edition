@@ -60,7 +60,7 @@ Second Son's engine-specific optimisations (effects quality, CITY-OPT engine tag
    | `FirstLightPC-README.txt` | these steps in short |
 
 3. **The Visual C++ runtime.** Install the [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it is not installed yet.
-4. **Start `FirstLightPC.exe`** and press **Играть** (Play) in the launcher; `play.cmd` still starts the game at once. On the first start a console window prepares the game's shaders (about 3.5 minutes on 6 cores / 12 threads, about 13 200 pipelines, once); later starts skip it.
+4. **Start `FirstLightPC.exe`** and press **Play** in the launcher; `play.cmd` still starts the game at once. On the first start a console window prepares the game's shaders (about 3.5 minutes on 6 cores / 12 threads, about 13 200 pipelines, once); later starts skip it.
 5. **PC settings:** in the launcher, or **F1** in the game: resolution and aspect ratio, FOV, the frame-rate limit (up to unlimited), anti-aliasing, mouse and keys.
 
 | Path | What |
@@ -72,7 +72,7 @@ Second Son's engine-specific optimisations (effects quality, CITY-OPT engine tag
 
 ## Launcher
 
-`FirstLightPC.exe` started without arguments opens the inFAMOUS PC Launcher from `Launcher\`, the same launcher Second Son uses: it finds the game from its folder and shows First Light's own art and colours. **Играть** (Play) starts the game with what is chosen there. It is in Russian for now.
+`FirstLightPC.exe` started without arguments opens the inFAMOUS PC Launcher from `Launcher\`, the same launcher Second Son uses: it finds the game from its folder and shows First Light's own art and colours. **Play** starts the game with what is chosen there. It is in English and Russian: it follows Windows' display language, and Settings → Launcher switches it.
 
 <p align="center">
   <img src=".github/readme/launcher-home.jpg" alt="The launcher's home page: Play, the launch profile, the shader cache" width="880">
