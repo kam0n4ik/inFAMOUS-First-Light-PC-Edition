@@ -1,5 +1,6 @@
 // SecondSonPC — the launcher's window (app.h Run): a frameless Win32 window with the system's resize borders, snap
 // and shadow, drawn by the Canvas each time something changed; or one frame offscreen into a PNG. Own code.
+#include "app/product.h"
 #include "launcher/app.h"
 
 #include <windows.h>
@@ -39,7 +40,7 @@ std::wstring Wide(const std::string& s) {
 }
 
 void ShowError(const std::string& message) {
-    MessageBoxW(nullptr, Wide(message).c_str(), L"SecondSonPC", MB_ICONERROR | MB_OK);
+    MessageBoxW(nullptr, Wide(message).c_str(), std::wstring(App::kProduct.wide_name).c_str(), MB_ICONERROR | MB_OK);
 }
 
 struct Window {
@@ -328,7 +329,7 @@ int RunWindow(LauncherApp& app) {
     const int ww = std::min(static_cast<int>(kWidth * w.scale), static_cast<int>(work.right - work.left));
     const int wh = std::min(static_cast<int>(kHeight * w.scale), static_cast<int>(work.bottom - work.top));
     const int x = work.left + (work.right - work.left - ww) / 2, y = work.top + (work.bottom - work.top - wh) / 2;
-    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"SecondSonPC",
+    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, std::wstring(App::kProduct.wide_name).c_str(),
                                 WS_POPUP | WS_THICKFRAME | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
                                 x, y, ww, wh, nullptr, nullptr, inst, &w);
     if (hwnd == nullptr) {

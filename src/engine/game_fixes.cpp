@@ -3,7 +3,9 @@
 
 #include <atomic>
 #include <cstring>
+#include <string>
 
+#include <fmt/format.h>
 #include <windows.h>
 
 #include "base/log.h"
@@ -24,13 +26,21 @@ namespace {
 // 16:15, 17:35). Fixed: both counts change in one atomic 64-bit operation, and only the release whose operation
 // leaves (0, 0) destroys. Before calling through a vtable it is checked to be inside the game's image (an object
 // already back in its pool: logged, not called).
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light: the same bytes, once each in its text; the weak release 0x1fe460 has Second Son's frame (rsp 16-aligned
+// at the site), research/fl_sites.md §6
+constexpr u64 kStrongRva = 0x1fe540;
+constexpr u64 kWeakRva = 0x1fe4e2;
+constexpr u64 kWeakDone = 0x1fe50d, kWeakDestroy = 0x1fe504, kWeakNotify = 0x1fe4f5;
+#else
 constexpr u64 kStrongRva = 0x1be900;
+constexpr u64 kWeakRva = 0x1be8a2; // inside 0x1be820, after its mutex is taken
+constexpr u64 kWeakDone = 0x1be8cd, kWeakDestroy = 0x1be8c4, kWeakNotify = 0x1be8b5;
+#endif
 constexpr u8 kStrongOriginal[23] = {0xF0, 0xFF, 0x4F, 0x10, 0x83, 0x7F, 0x10, 0x00, 0x75, 0x06, 0x83, 0x7F,
                                     0x14, 0x00, 0x74, 0x01, 0xC3, 0x48, 0x8B, 0x07, 0xFF, 0x60, 0x10};
-constexpr u64 kWeakRva = 0x1be8a2; // inside 0x1be820, after its mutex is taken
 constexpr u8 kWeakOriginal[19] = {0xF0, 0x41, 0xFF, 0x4E, 0x14, 0x41, 0x83, 0x7E, 0x14, 0x00,
                                   0x75, 0x1F, 0x41, 0x83, 0x7E, 0x10, 0x00, 0x74, 0x0F};
-constexpr u64 kWeakDone = 0x1be8cd, kWeakDestroy = 0x1be8c4, kWeakNotify = 0x1be8b5;
 
 u64 g_base = 0;
 std::atomic<u32> g_pooled{0};
@@ -106,7 +116,8 @@ bool Mapped(const u8* at, u32 size) {
 }
 
 void InstallRefcount(u64 base) {
-    constexpr const char* kName = "the engine's reference counting (eboot 0x1be900 / 0x1be8a2)";
+    const std::string name = fmt::format("the engine's reference counting (eboot {:#x} / {:#x})", kStrongRva, kWeakRva);
+    const char* kName = name.c_str();
     char v[8] = {};
     if (GetEnvironmentVariableA("SSPC_FIX_REFCOUNT_RACE", v, sizeof(v)) == 1 && v[0] == '0') {
         SSPC_LOG(Engine, Warning, "game fix off (SSPC_FIX_REFCOUNT_RACE=0): {}", kName);

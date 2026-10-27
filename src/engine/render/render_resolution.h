@@ -73,6 +73,8 @@ void SetFovPercent(u32 percent);
 bool InstallRenderSwitch(u64 eboot_base);
 /// Asks for `size` (clamped to the started size) at the game's next frame. false: the switch is not installed.
 bool RequestRenderSize(RenderSize size);
+/// The switch went in (InstallRenderSwitch verified this eboot's FrameBegin): the upscalers and frame generation need it.
+bool RenderSwitchInstalled();
 
 /// The game's anti-aliasing. CameraJitter 0x472810 (every frame, from 0x1901a0) picks it: SMAA T2x (flag 0xda07f9)
 /// while the game's GPU timer (0x196ef0, 1000 = 33.3 ms) stays under a frame at 30 FPS, else FXAA; then the

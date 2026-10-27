@@ -12,4 +12,8 @@ using BridgeExport = Loader::ProviderEntry;
 
 std::span<const BridgeExport> BridgeExports();
 
+/// BridgeExports() and the hand-written entries for the imports only inFAMOUS: First Light has
+/// (bridge_exports_first_light.cpp): what the binding table is built from.
+std::span<const BridgeExport> AllBridgeExports();
+
 } // namespace SecondSon::Bridge

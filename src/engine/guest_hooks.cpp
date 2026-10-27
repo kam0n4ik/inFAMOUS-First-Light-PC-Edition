@@ -55,24 +55,26 @@ void AddPristineCode(u64 address, const void* data, u64 size) {
 
 bool VerifyGuestFunction(u64 module_base, const GuestFunction& f, std::string& error) {
     const u64 at = module_base + f.rva;
-    Cpu::RestoreRedZoneEntries(at, std::min<u64>(16, f.size)); // (the red-zone vzeroupper entry, fs_patcher.h)
     for (const Pristine& p : g_pristine) {
         if (at < p.address || at + f.size > p.address + p.bytes.size()) {
             continue;
         }
         const u8* code = p.bytes.data() + (at - p.address);
-        if (std::memcmp(code, reinterpret_cast<const void*>(at), std::min<u32>(16, f.size)) != 0) {
-            error = fmt::format("eboot+{:#x}: its entry was rewritten by the static CPU patcher", f.rva);
-            return false;
-        }
         const u64 h = HashBytes(code, f.size);
         if (h != f.fnv1a64) {
+            // (before any change to the live code: on another executable the CPU patcher's work stays as it is)
             error = fmt::format("eboot+{:#x} ({} bytes): hash {:#018x}, expected {:#018x} (another game version)",
                                 f.rva, f.size, h, f.fnv1a64);
             return false;
         }
+        Cpu::RestoreRedZoneEntries(at, std::min<u64>(16, f.size)); // (the red-zone vzeroupper entry, fs_patcher.h)
+        if (std::memcmp(code, reinterpret_cast<const void*>(at), std::min<u32>(16, f.size)) != 0) {
+            error = fmt::format("eboot+{:#x}: its entry was rewritten by the static CPU patcher", f.rva);
+            return false;
+        }
         return true;
     }
+    Cpu::RestoreRedZoneEntries(at, std::min<u64>(16, f.size)); // (no pristine copy: the live code is hashed)
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
         reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize < at + f.size) {

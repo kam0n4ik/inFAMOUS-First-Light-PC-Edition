@@ -20,15 +20,23 @@ namespace SecondSon::Engine::Render {
 
 namespace {
 
-// 0x1eff47: mov dword [rbx+0xC], 0x780 ; mov dword [rbx+0x10], 0x438 (render width / height of the PS4 build).
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light's VideoOut init: the same code as Second Son's, 0x46a90 further (tools/sigmap.py; each pattern below is
+// in First Light's text once)
+constexpr u64 kRenderSizeSite = 0x2369d7;
+constexpr u64 kDisplaySite = 0x2369e5;
+constexpr u64 kScreenSite = 0x236e88;
+#else
 constexpr u64 kRenderSizeSite = 0x1eff47;
+constexpr u64 kDisplaySite = 0x1eff55;
+constexpr u64 kScreenSite = 0x1f03f8;
+#endif
+// 0x1eff47: mov dword [rbx+0xC], 0x780 ; mov dword [rbx+0x10], 0x438 (render width / height of the PS4 build).
 constexpr u8 kRenderSizeBytes[14] = {0xC7, 0x43, 0x0C, 0x80, 0x07, 0x00, 0x00,
                                      0xC7, 0x43, 0x10, 0x38, 0x04, 0x00, 0x00};
 // 0x1eff55: mov dword [rbx], 0x780 ; mov dword [rbx+4], 0x438 (display width / height)
-constexpr u64 kDisplaySite = 0x1eff55;
 constexpr u8 kDisplayBytes[13] = {0xC7, 0x03, 0x80, 0x07, 0x00, 0x00, 0xC7, 0x43, 0x04, 0x38, 0x04, 0x00, 0x00};
 // 0x1f03f8: mov dword [r15], 0x438 ; mov dword [r12], 0x780 (the screen size 0x1d0ccc4 / 0x1d0ccc0)
-constexpr u64 kScreenSite = 0x1f03f8;
 constexpr u8 kScreenBytes[15] = {0x41, 0xC7, 0x07, 0x38, 0x04, 0x00, 0x00, 0x41,
                                  0xC7, 0x04, 0x24, 0x80, 0x07, 0x00, 0x00};
 
@@ -166,6 +174,18 @@ bool InstallRenderResolution(u64 eboot_base) {
 
 namespace {
 
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light (research/fl_sites.md §4): the same functions; the three globals read as base + displacement have new
+// displacements as well as new bases
+constexpr ProbeSite kCameraJitterSite{{0x51c840, 0x205, 0x1403a59b70323dd4ull}, 17};
+constexpr GuestFunction kResetWindow{0x65c210, 0x34, 0xba919ade99796653ull};
+constexpr ProbeSite kPass32Site{{0x1c0b40, 0x54c, 0xbec00e949ba22471ull}, 20};
+constexpr u64 kTemporalAaFlag = 0xe9c829;
+constexpr u64 kReevaluate = 0x806be14;
+constexpr u64 kDisableSmaa = 0xfae035;
+constexpr u64 kNoAa = 0xfa3a5d;
+constexpr u64 kMainCamera = 0x81a41f8;
+#else
 constexpr ProbeSite kCameraJitterSite{{0x472810, 0x1ed, 0xaf06825055bbe18dull}, 17};
 constexpr GuestFunction kResetWindow{0x581a10, 0x34, 0x26b44a8bd1f71035ull}; // Camera::ResetFrustumWindow
 constexpr ProbeSite kPass32Site{{0x1929c0, 0x42e, 0xcd353017f8e6ce48ull}, 20};
@@ -174,6 +194,7 @@ constexpr u64 kReevaluate = 0x7e00964;    // int: frames since T2x last switched
 constexpr u64 kDisableSmaa = 0xe87c85;    // byte: the scripts' DISABLE_SMAA override
 constexpr u64 kNoAa = 0xe86e3d;           // byte: pass 32 tone-maps into its output, no anti-aliasing
 constexpr u64 kMainCamera = 0x7f2d2b8;    // Camera*
+#endif
 constexpr u64 kCameraWindow = 0x5ac;      // float left, bottom, right, top of the frustum window
 
 enum class AaMode : u32 { Game, T2x, Fxaa, Off };
@@ -261,8 +282,8 @@ bool InstallTemporalAaControl(u64 eboot_base) {
         g_pass32 = reinterpret_cast<Pass32Fn>(pass32);
     }
     static constexpr const char* kNames[] = {"the game's", "SMAA T2x", "FXAA", "off"};
-    SSPC_LOG(Engine, Info, "Anti-aliasing control: entry probes on CameraJitter 0x472810 and pass 32 0x1929c0 ({}{})",
-             kNames[static_cast<u32>(EffectiveAa())],
+    SSPC_LOG(Engine, Info, "Anti-aliasing control: entry probes on CameraJitter {:#x} and pass 32 {:#x} ({}{})",
+             kCameraJitterSite.function.rva, kPass32Site.function.rva, kNames[static_cast<u32>(EffectiveAa())],
              g_taa_off.load() ? ": the upscaler jitters the scene" : "");
     return true;
 }
@@ -294,11 +315,21 @@ namespace {
 // (RenderTarget::Configure 0x300b00) and every scene target (ConfigureSceneTargets 0x18e210 on 0xe682b0). Their memory
 // was allocated at start from the table of maxima (+0xdf0f7c, AllocateTarget 0x300a90 -> 0x2ffeb0): a size up to the
 // one the game started with fits without new memory.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light (research/fl_sites.md §2): FrameBegin is Second Son's instruction for instruction; the device's offsets
+// (+0xdf0f14 ... +0xdf0f7c) are the same
+constexpr ProbeSite kFrameBeginSite{{0x237670, 0x5aa, 0x13ecaea8b414b6f9ull}, 20};
+constexpr GuestFunction kConfigureTarget{0x382420, 0x2c3, 0xcb8210727671d826ull};
+constexpr GuestFunction kConfigureSceneTargets{0x1bc1d0, 0x2ba, 0x4d6fb6a99a3129faull};
+constexpr u64 kSceneTargets = 0xf84740;
+constexpr u64 kQuarterHeightFlag = 0x1f271d5;
+#else
 constexpr ProbeSite kFrameBeginSite{{0x1f0be0, 0x5aa, 0x6273d28a515609b7ull}, 20};
 constexpr GuestFunction kConfigureTarget{0x300b00, 0x2bb, 0x4489645ef331292aull};
 constexpr GuestFunction kConfigureSceneTargets{0x18e210, 0x2f9, 0x804f07e3bc802864ull};
 constexpr u64 kSceneTargets = 0xe682b0; // ConfigureSceneTargets' object
 constexpr u64 kQuarterHeightFlag = 0x1d0cbd5;
+#endif
 constexpr u64 kSizeTable = 0xdf0f14; // device offset: the size classes' current w, h (u32 pairs)
 
 using FrameBeginFn = SSPC_SYSV_ABI void (*)(u64 device, u32 arg);
@@ -318,10 +349,17 @@ std::vector<DiagSwitch> g_diag;
 
 // The HUD's margins in screen units (0x1d0ccc8 x, 0x1d0cccc y), as the game computes them from the Display Area ratio
 // at start (0x1f0407) and on a system change (0x1f2a60, 0x1f2b60): (size - size * ratio) / 2, at least 16.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+constexpr u64 kScreenWidth = 0x1f272c0; // First Light: the device global + 0xdf0ff0, as Second Son's
+constexpr u64 kScreenHeight = 0x1f272c4;
+constexpr u64 kMarginX = 0x1f272c8;
+constexpr u64 kMarginY = 0x1f272cc;
+#else
 constexpr u64 kScreenWidth = 0x1d0ccc0;
 constexpr u64 kScreenHeight = 0x1d0ccc4;
 constexpr u64 kMarginX = 0x1d0ccc8;
 constexpr u64 kMarginY = 0x1d0cccc;
+#endif
 std::atomic<u32> g_safe_area{100};  // %
 std::atomic<u32> g_hud_aspect{0};   // the HUD area's width / height * 1000, 0: the whole screen
 
@@ -437,8 +475,8 @@ bool InstallRenderSwitch(u64 eboot_base) {
         }
         SSPC_LOG(Engine, Warning, "DIAGNOSTIC: SSPC_DIAG_RES_SWITCH='{}' ({} switches)", env, g_diag.size());
     }
-    SSPC_LOG(Engine, Info, "Render resolution switch: entry probe on FrameBegin 0x1f0be0 (up to {}x{})",
-             g_started.width, g_started.height);
+    SSPC_LOG(Engine, Info, "Render resolution switch: entry probe on FrameBegin {:#x} (up to {}x{})",
+             kFrameBeginSite.function.rva, g_started.width, g_started.height);
     return true;
 }
 
@@ -450,6 +488,10 @@ bool RequestRenderSize(RenderSize size) {
     }
     g_requested.store(u64{size.width} << 32 | size.height, std::memory_order_release);
     return true;
+}
+
+bool RenderSwitchInstalled() {
+    return g_frame_begin != nullptr;
 }
 
 void SetHudLayout(u32 safe_area_percent, std::string_view area) {
@@ -466,8 +508,14 @@ namespace {
 // Camera::SetFov(camera, vertical FOV in radians) 0x580580: stores the angle (+0x590), tan(angle / 2) (+0x5a4) and
 // aspect * tan (+0x5a0) and rebuilds the projection. The player camera's update 0x14ddd0 calls it every frame with its
 // controller's angle (+0x468 + +0x358: the base FOV and its aim / sprint offset) - the call returning to 0x14f517.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light (research/fl_sites.md §3): the same 15 callers; its SetFov no longer stores +0x5d4 / +0x5dc (unused here)
+constexpr ProbeSite kSetFovSite{{0x65af10, 0xaf, 0x30d2052b9c584467ull}, 17};
+constexpr u64 kPlayerSetFovReturn = 0x172fae;
+#else
 constexpr ProbeSite kSetFovSite{{0x580580, 0xc1, 0xef658398f5aad2a4ull}, 17};
 constexpr u64 kPlayerSetFovReturn = 0x14f517;
+#endif
 constexpr float kMaxFov = 2.6f; // rad (149 degrees)
 
 using SetFovFn = SSPC_SYSV_ABI void (*)(u64 camera, float vfov);
@@ -494,8 +542,8 @@ bool InstallFovControl(u64 eboot_base) {
     }
     g_fov_base = eboot_base;
     g_set_fov = reinterpret_cast<SetFovFn>(original);
-    SSPC_LOG(Engine, Info, "Field of view: entry probe on Camera::SetFov 0x580580 (player camera {} %)",
-             g_fov_percent.load());
+    SSPC_LOG(Engine, Info, "Field of view: entry probe on Camera::SetFov {:#x} (player camera {} %)",
+             kSetFovSite.function.rva, g_fov_percent.load());
     return true;
 }
 

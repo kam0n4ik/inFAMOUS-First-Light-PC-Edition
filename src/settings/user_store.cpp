@@ -1,4 +1,5 @@
 // SecondSonPC — the user settings file (see user_store.h).
+#include "app/product.h"
 #include "settings/user_store.h"
 
 #include <algorithm>
@@ -147,7 +148,7 @@ std::filesystem::path DefaultUserFile() {
     if (n == 0 || n >= MAX_PATH) {
         return {};
     }
-    return std::filesystem::path(buf) / "SecondSonPC" / "settings.toml";
+    return std::filesystem::path(buf) / App::kProduct.wide_name / "settings.toml";
 }
 
 bool ParseUserText(std::string_view text, Overrides& out, std::vector<std::string>& warnings,
@@ -258,8 +259,8 @@ LoadReport LoadUserFile(const std::filesystem::path& file, Overrides& out, KeptK
 
 std::string SerializeUserFile(const Overrides& overrides, const KeptKeys& kept) {
     std::string out =
-        "# SecondSonPC user settings, written by the PC settings (the game's Settings screen, Esc, then \"Additional\n"
-        "# Settings\"). They override SecondSonPC.toml (the defaults); delete a line to use its value again.\n";
+        "# " SSPC_PRODUCT_NAME " user settings, written by the PC settings (the game's Settings screen, Esc, then \"Additional\n"
+        "# Settings\"). They override " SSPC_PRODUCT_NAME ".toml (the defaults); delete a line to use its value again.\n";
     // tables in registry order, then the kept keys' own tables; each table's lines: the overrides in registry order,
     // then its kept keys (unless a setting now written has the same key)
     std::vector<std::pair<std::string, std::vector<std::string>>> tables;

@@ -14,7 +14,11 @@ namespace SecondSon::Ui::PromptTextures {
 namespace {
 
 constexpr Location kLocations[] = {
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+#include "ui/prompt_textures_table_first_light.inc"
+#else
 #include "ui/prompt_textures_table.inc"
+#endif
 };
 
 struct KindInfo {

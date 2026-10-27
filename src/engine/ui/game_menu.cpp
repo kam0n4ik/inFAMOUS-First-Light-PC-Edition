@@ -56,11 +56,23 @@ void Snapshot(u64 base, u64 size, const std::string& dir, unsigned second) {
 
 // ---- the game's pausing screens
 
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light's same two functions (research/fl_sites.md §1); the screen's fields are 0x2c further. The close
+// function pushes r14 and rbx (Second Son's rbx and rax): its prologue is 17 bytes as well.
+constexpr ProbeSite kOpenedSite{{0x2e75a0, 0xe2, 0x2a2ccf44d65abfaeull}, 17};
+constexpr ProbeSite kClosedSite{{0x2e7ad0, 0xfa, 0x59fc0e5d56670225ull}, 17};
+constexpr u64 kScreenActive = 0x647;
+constexpr u64 kScreenKind = 0x64c; // SOUND_PAUSE_KIND in the game's reflection table
+constexpr int kSettingsKind = 7;   // the constructor's default, as Second Son's; not measured on First Light yet
+constexpr u32 kDumpFrom = 0x5c0, kDumpTo = 0x680;
+#else
 constexpr ProbeSite kOpenedSite{{0x27db10, 0xd0, 0x8109e3344cdd9cf3ull}, 17};
 constexpr ProbeSite kClosedSite{{0x27e210, 0xdf, 0x33ff129a2ada5846ull}, 16};
 constexpr u64 kScreenActive = 0x61b; // u8: the screen counts as open (both functions test and flip it)
 constexpr u64 kScreenKind = 0x620;   // u32
 constexpr int kSettingsKind = 7;     // the settings screen Esc / Options opens during play (measured 2026-10-15)
+constexpr u32 kDumpFrom = 0x600, kDumpTo = 0x640;
+#endif
 
 using ScreenFn = SSPC_SYSV_ABI void (*)(u64 screen);
 ScreenFn g_opened = nullptr;
@@ -85,10 +97,11 @@ void DumpScreen(const char* what, u64 screen) {
     for (u32 i = 0; i < 0x80; ++i) {
         head += fmt::format("{:02x}", p[i]);
     }
-    for (u32 i = 0x600; i < 0x640; ++i) {
+    for (u32 i = kDumpFrom; i < kDumpTo; ++i) {
         tail += fmt::format("{:02x}", p[i]);
     }
-    SSPC_LOG(Engine, Info, "game menu {} {:#x}: [0..80] {} [600..640] {}", what, screen, head, tail);
+    SSPC_LOG(Engine, Info, "game menu {} {:#x}: [0..80] {} [{:x}..{:x}] {}", what, screen, head, kDumpFrom, kDumpTo,
+             tail);
 }
 
 SSPC_SYSV_ABI void OpenedProbe(u64 screen) {
@@ -140,7 +153,8 @@ bool Install(u64 image_base) {
     }
     g_closed = reinterpret_cast<ScreenFn>(closed);
     g_installed.store(true, std::memory_order_release);
-    SSPC_LOG(Engine, Info, "game menu: the game's pausing screens are observed (eboot 0x27db10 / 0x27e210)");
+    SSPC_LOG(Engine, Info, "game menu: the game's pausing screens are observed (eboot {:#x} / {:#x})",
+             kOpenedSite.function.rva, kClosedSite.function.rva);
     return true;
 }
 

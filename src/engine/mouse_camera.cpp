@@ -25,8 +25,14 @@ namespace {
 
 // The pad class (vtable 0xcddf70): slots +0x110 (0x24cb80) and +0x118 (0x24cc10) give a stick as x*|x|, y*|y| with
 // the options' inversion flags (two sets: 0x6d5/0x6d6 and 0x6d7/0x6d8) - void (pad*, int stick, float* x, float* y).
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light's pad vtable (0xdd2358) has two more slots: the same getters are at +0x120 / +0x128
+constexpr u64 kVtableSlotA = 0xdd2478, kOriginalA = 0x2a91a0;
+constexpr u64 kVtableSlotB = 0xdd2480, kOriginalB = 0x2a9230;
+#else
 constexpr u64 kVtableSlotA = 0xcde080, kOriginalA = 0x24cb80;
 constexpr u64 kVtableSlotB = 0xcde088, kOriginalB = 0x24cc10;
+#endif
 
 using Getter = SSPC_SYSV_ABI void (*)(void* pad, int stick, float* x, float* y);
 
@@ -291,16 +297,29 @@ void InstallWatch(u64 base) {
 // velocities out, yaw input, pitch input): a yaw / pitch velocity with acceleration limits (0x14a810 / 0x14c270), then
 // angle += (old + new velocity) / 2 * dt from the camera's angles at +0x330 (yaw, pitch; rad). An entry probe on the
 // integrator adds the mouse to those angles before it runs: an angle per count, the stick at rest.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light (research/fl_sites.md §5): the integrator 0x171410 takes the same arguments; the camera's locks, the
+// second params' limits and the options' inversion bytes moved (the stick read, the locks and the inversion are in a
+// helper of their own there, 0x1738a0)
+constexpr ProbeSite kIntegrateSite{{0x171410, 0x612, 0x40e7fea5cb4aa405ull}, 17};
+constexpr u64 kCameraLocks = 0x7d0;
+constexpr u64 kPitchLimits = 0x1c0, kPitchLimits2 = 0x1d0;
+constexpr u64 kPitchLimitsAuto = 0x220;
+constexpr u64 kOptions = 0x1112cf0;
+constexpr u64 kInvertX = 0x785, kInvertY = 0x786;
+#else
 constexpr ProbeSite kIntegrateSite{{0x14d6f0, 0x593, 0x724cebb9e1f76f99ull}, 17};
-constexpr u64 kCameraAngles = 0x330;  // float yaw, pitch
 constexpr u64 kCameraLocks = 0x7c0;   // u32: bit 0 the yaw input is off, bit 1 the pitch input (cut-scenes, moves)
 // float min, max in both params: the stick's limits (0x14a810 at 0x14c111: the narrower of the two). The second
 // params' +0x210 ([-0.15, +0.20] rad on foot) narrows them only for the automatic camera (0x14c270, blended in by
 // camera +0x498) - the stick goes past it (SSPC_MOUSE_CAMERA=observe on the stand, 10-24: a full stick down for 3 s
 // reached -1.45 rad, up past +0.6)
-constexpr u64 kPitchLimits = 0x1c0;
+constexpr u64 kPitchLimits = 0x1c0, kPitchLimits2 = 0x1c0;
 constexpr u64 kPitchLimitsAuto = 0x210;
 constexpr u64 kOptions = 0xefacf8;    // the game's options: +0x6d5 / +0x6d6 the camera's x / y inversion (bytes)
+constexpr u64 kInvertX = 0x6d5, kInvertY = 0x6d6;
+#endif
+constexpr u64 kCameraAngles = 0x330;  // float yaw, pitch
 // mouse right = the stick right = yaw input > 0 = the yaw falls; mouse up = the stick up = pitch input > 0 = the
 // pitch falls (SSPC_MOUSE_CAMERA=observe on the stand, 10-24: a full stick for 0.3 s turned 0.27 rad, the stick of a
 // slow mouse - 60 counts in 1 s - 0.002 rad)
@@ -332,7 +351,7 @@ SSPC_SYSV_ABI void IntegrateProbe(u64 camera, u64 params, u64 params2, u64 arg3,
     auto* current = reinterpret_cast<float*>(camera + kCameraAngles);
     const u32 locks = *reinterpret_cast<const u32*>(camera + kCameraLocks);
     const auto* p1 = reinterpret_cast<const float*>(params + kPitchLimits);
-    const auto* p2 = reinterpret_cast<const float*>(params2 + kPitchLimits);
+    const auto* p2 = reinterpret_cast<const float*>(params2 + kPitchLimits2);
     const auto* p3 = reinterpret_cast<const float*>(params2 + kPitchLimitsAuto);
     // (as the stick: the narrower of the two; crossed limits meet at the lower one)
     const float lo = std::max(p1[0], p2[0]), hi = std::max(lo, std::min(p1[1], p2[1]));
@@ -341,8 +360,8 @@ SSPC_SYSV_ABI void IntegrateProbe(u64 camera, u64 params, u64 params2, u64 arg3,
         double dx = 0.0, dy = 0.0;
         Input::Player1().TakeCameraCounts(dx, dy);
         const auto* options = reinterpret_cast<const u8*>(g_base + kOptions);
-        dx = options[0x6d5] != 0 ? -dx : dx;
-        dy = options[0x6d6] != 0 ? -dy : dy;
+        dx = options[kInvertX] != 0 ? -dx : dx;
+        dy = options[kInvertY] != 0 ? -dy : dy;
         if ((locks & 1) == 0 && dx != 0.0) {
             mouse_yaw = dx * kYawPerCount;
             current[0] = WrapAngle(static_cast<float>(current[0] + mouse_yaw));
@@ -416,7 +435,7 @@ void InstallDirectCamera(u64 base) {
     g_integrate = reinterpret_cast<IntegrateFn>(original);
     g_direct = mode != "observe";
     std::thread(&ReportCamera).detach();
-    SSPC_LOG(Engine, Info, "Mouse camera: entry probe on the camera integrator 0x14d6f0 ({})",
+    SSPC_LOG(Engine, Info, "Mouse camera: entry probe on the camera integrator {:#x} ({})", kIntegrateSite.function.rva,
              g_direct ? "the mouse turns the camera directly" : "observing the stick (SSPC_MOUSE_CAMERA=observe)");
 }
 

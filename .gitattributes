@@ -4,3 +4,6 @@ patches/** -text
 *.cmd text eol=crlf
 # the player's notes beside play.cmd
 game/*.txt text eol=crlf
+# First Light's notes and defaults beside play.cmd
+game-first-light/*.txt text eol=crlf
+game-first-light/*.toml text eol=crlf

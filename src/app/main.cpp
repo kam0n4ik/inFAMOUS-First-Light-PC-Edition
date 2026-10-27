@@ -102,6 +102,7 @@
 #include "app/config.h"
 #include "runtime/gpu/gcn/gcn_inventory.h"
 #include "app/paths.h"
+#include "app/product.h"
 #include "base/crash.h"
 #include "base/lifecycle.h"
 #include "base/log.h"
@@ -126,8 +127,9 @@
 namespace {
 
 int Fail(const std::string& message) {
-    std::fprintf(stderr, "SecondSonPC: %s\n", message.c_str());
-    MessageBoxA(nullptr, message.c_str(), "SecondSonPC", MB_ICONERROR | MB_OK);
+    const std::string product(SecondSon::App::kProduct.name);
+    std::fprintf(stderr, "%s: %s\n", product.c_str(), message.c_str());
+    MessageBoxA(nullptr, message.c_str(), product.c_str(), MB_ICONERROR | MB_OK);
     return 1;
 }
 
@@ -289,7 +291,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> errors;
     auto config = App::LoadConfig(App::RootDir(), errors);
     if (!config) {
-        std::string message = "SecondSonPC.toml (" + (App::RootDir() / "SecondSonPC.toml").string() + "):";
+        std::string message = App::ProductFile(".toml") + " (" + (App::RootDir() / App::ProductFile(".toml")).string() + "):";
         for (const auto& e : errors) {
             message += "\n  " + e;
         }
@@ -676,8 +678,12 @@ int main(int argc, char* argv[]) {
         return Fail("--fault-test checks the first-chance recorder's own handlers, which --native exceptions replaces; "
                     "run it without (the dispatcher has its own self-test: --selftest --native exceptions)");
     }
-    if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
-        return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
+    // --predict-shaders has a log of its own: the game starts it (PrepareShaders) while its own log is open, and two
+    // processes truncating and writing one file lose the game's first lines
+    const auto log_file =
+        config->logs_dir / App::ProductFile(config->predict_shaders.empty() ? ".log" : ".shaders.log");
+    if (!Log::Init(log_file, config->log_level)) {
+        return Fail("cannot open " + log_file.string());
     }
     // PC settings: what the user file gave, then the owner of the settings for the menu (capabilities: bootstrap).
     if (user_settings) {

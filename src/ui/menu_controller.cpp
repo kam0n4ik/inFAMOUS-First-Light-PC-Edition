@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <wincodec.h>
 
+#include "app/product.h"
 #include "base/log.h"
 #include "engine/render/render_resolution.h"
 #include "engine/ui/game_menu.h"
@@ -350,7 +351,7 @@ MenuEnv BuildEnv() {
     const bool bridge = (st.opt.capabilities & Settings::Capability::BridgePresenter) != 0;
     env.backend_label = bridge ? std::string(env.ru ? "мост shadPS4 (--gpu-backend bridge)"
                                                     : "shadPS4 bridge (--gpu-backend bridge)")
-                               : std::string(env.ru ? "собственный Vulkan SecondSonPC" : "SecondSonPC's own Vulkan");
+                               : std::string(env.ru ? "собственный Vulkan " SSPC_PRODUCT_NAME : SSPC_PRODUCT_NAME "'s own Vulkan");
     env.displays = st.displays;
     env.display_labels = st.display_labels;
     env.primary_label = st.primary_label;
@@ -1156,7 +1157,7 @@ void MenuController::Open() {
         st.fsr_why = std::filesystem::is_regular_file(std::filesystem::path(exe).parent_path() / L"amd_fidelityfx_vk.dll",
                                                       ec)
                          ? std::string{}
-                         : std::string("amd_fidelityfx_vk.dll is not next to SecondSonPC.exe");
+                         : std::string("amd_fidelityfx_vk.dll is not next to " SSPC_PRODUCT_NAME ".exe");
     }
     st.held_nav.reset();
     st.menu->SetEnv(BuildEnv());
@@ -1228,8 +1229,9 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
         OnTrophyEvent();
         return EventRoute::Consumed;
     }
-    // F1 only for development (SSPC_DEV_F1=1), or when the game's screens cannot be seen (another eboot)
-    const bool f1_opens = st.dev_f1 || !Engine::GameMenu::Installed();
+    // F1 only for development (SSPC_DEV_F1=1), or when the game's screens cannot be seen (another eboot) or its
+    // Settings list was not measured on this game
+    const bool f1_opens = st.dev_f1 || !Engine::GameMenu::Installed() || !App::kProduct.settings_entry_measured;
     if (!open && st.entry_shown) {
         const bool on_item = AdditionalItemChosen(Gpu::MenuFocus::Latest());
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && on_item &&

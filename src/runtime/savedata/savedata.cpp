@@ -68,6 +68,18 @@ struct TitleId {
 struct MountPoint {
     char data[16];
 };
+struct Fingerprint {
+    char data[65];
+    char pad[15];
+};
+struct TransferringMount {
+    s32 user_id;
+    s32 pad0;
+    const TitleId* title_id;
+    const DirName* dir_name;
+    const Fingerprint* fingerprint;
+    u8 reserved[32];
+};
 struct Mount2 {
     s32 user_id;
     s32 pad0;
@@ -137,6 +149,7 @@ struct SearchResult {
 static_assert(sizeof(Mount2) == 64 && sizeof(MountResult) == 64 && sizeof(Param) == 1328 && sizeof(Icon) == 56 &&
               sizeof(Delete) == 64 && sizeof(SearchCond) == 64 && sizeof(SearchInfo) == 48 &&
               sizeof(SearchResult) == 56);
+static_assert(sizeof(TransferringMount) == 64 && sizeof(Fingerprint) == 80);
 
 template <size_t N>
 std::string_view Text(const char (&s)[N]) {
@@ -280,7 +293,8 @@ bool RestoreBackup(const fs::path& save) {
 
 // ---- the API
 
-u32 MountLocked(const Mount2* m, MountResult* result) {
+// title: another game's saves (sceSaveDataTransferringMount, read only); empty: this game's
+u32 MountLocked(const Mount2* m, MountResult* result, std::string_view title = {}) {
     if (m->user_id < 0) {
         return kInvalidLoginUser;
     }
@@ -314,7 +328,7 @@ u32 MountLocked(const Mount2* m, MountResult* result) {
     Instance inst;
     inst.dir_name = dir_name;
     inst.user_id = m->user_id;
-    inst.save_path = TitlePath(m->user_id, g_settings.title_dir) / dir_name;
+    inst.save_path = TitlePath(m->user_id, title.empty() ? std::string_view(g_settings.title_dir) : title) / dir_name;
     inst.mount_point = "/savedata" + std::to_string(slot);
     inst.read_only = read_only;
     std::error_code ec;
@@ -467,6 +481,31 @@ SSPC_SYSV_ABI u32 SaveMount2(const Mount2* mount, MountResult* result) {
     const u32 r = MountLocked(mount, result);
     SSPC_LOG(SaveData, Info, "sceSaveDataMount2 {} mode {:#x} -> {:#x}{}", Text(mount->dir_name->data),
              mount->mount_mode, r, r == kOk ? fmt::format(" ({})", Text(result->mount_point.data)) : "");
+    return r;
+}
+
+// Another title's save, read only (inFAMOUS: First Light asks for its other regions' and Second Son's): the save of
+// that title id in the same user's savedata folder, if the player put one there; NOT_FOUND otherwise. The fingerprint
+// is not checked (no PSN entitlements on the PC Edition).
+SSPC_SYSV_ABI u32 SaveTransferringMount(const TransferringMount* mount, MountResult* result) {
+    std::scoped_lock lock{g_mutex};
+    if (!g_initialized) {
+        return kNotInitialized;
+    }
+    if (mount == nullptr || mount->title_id == nullptr || mount->dir_name == nullptr || result == nullptr) {
+        return kParameter;
+    }
+    const std::string title(Text(mount->title_id->data));
+    if (title.empty() || title.find_first_of("/\.:") != std::string::npos) {
+        return kParameter;
+    }
+    Mount2 m{};
+    m.user_id = mount->user_id;
+    m.dir_name = mount->dir_name;
+    m.mount_mode = kModeRdonly;
+    const u32 r = MountLocked(&m, result, title);
+    SSPC_LOG(SaveData, Info, "sceSaveDataTransferringMount {} {} -> {:#x}{}", title, Text(mount->dir_name->data), r,
+             r == kOk ? fmt::format(" ({})", Text(result->mount_point.data)) : "");
     return r;
 }
 
@@ -687,6 +726,7 @@ const Runtime::Export kExports[] = {
     SD("TywrFKCoLGY", "sceSaveDataInitialize3", Initialize3),
     SD("yKDy8S5yLA0", "sceSaveDataTerminate", Terminate),
     SD("0z45PIH+SNI", "sceSaveDataMount2", SaveMount2),
+    SD("WAzWTZm1H+I", "sceSaveDataTransferringMount", SaveTransferringMount),
     SD("BMR4F-Uek3E", "sceSaveDataUmount", SaveUmount),
     SD("S1GkePI17zQ", "sceSaveDataDelete", SaveDelete),
     SD("dyIhnXq-0SM", "sceSaveDataDirNameSearch", DirNameSearch),

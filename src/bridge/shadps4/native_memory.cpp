@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <windows.h>
@@ -434,11 +436,24 @@ bool InstallNativeMemory(const App::Config& cfg, s32 sdk_version, u32 psf_attrib
     GetSystemInfo(&system);
     const u64 granularity = system.dwAllocationGranularity;
     const u32 build = HostWindowsBuild();
-    Memory::Layout layout = Memory::GameLayout(HostRegions(granularity), static_cast<u32>(sdk_version), build,
-                                               granularity, cfg.extra_dmem_mib, cfg.extra_fmem_mib);
-    layout.commit = cfg.memory_commit_on_demand ? Memory::CommitMode::OnDemand : Memory::CommitMode::Upfront;
+    // The free regions are a snapshot: another thread of the process (a driver's, 2026-10-27: 0x3000 bytes at
+    // 0xb870000 right after the CUDA part of DLSS started) may allocate inside one before it is reserved. Create
+    // checks every range before it reserves any, so a refused snapshot leaves nothing behind: a fresh one is taken.
+    constexpr int kAttempts = 5;
+    Memory::Layout layout;
+    std::unique_ptr<Memory::VirtualMemory> vm;
     std::string error;
-    auto vm = Memory::VirtualMemory::Create(layout, &error);
+    for (int attempt = 1; attempt <= kAttempts && vm == nullptr; ++attempt) {
+        layout = Memory::GameLayout(HostRegions(granularity), static_cast<u32>(sdk_version), build, granularity,
+                                    cfg.extra_dmem_mib, cfg.extra_fmem_mib);
+        layout.commit = cfg.memory_commit_on_demand ? Memory::CommitMode::OnDemand : Memory::CommitMode::Upfront;
+        error.clear();
+        vm = Memory::VirtualMemory::Create(layout, &error);
+        if (vm == nullptr && attempt < kAttempts) {
+            SSPC_LOG(Memory, Warning, "--native memory: attempt {} of {} to take the guest address space: {} - the "
+                     "host's free regions are read again", attempt, kAttempts, error);
+        }
+    }
     if (vm == nullptr) {
         SSPC_LOG(Memory, Critical, "--native memory: SecondSonPC's memory manager cannot take the guest address space: {}",
                  error);

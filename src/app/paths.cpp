@@ -1,4 +1,5 @@
 // SecondSonPC — install layout. Called from a pre-main initializer: no logging, no other statics.
+#include "app/product.h"
 #include "app/paths.h"
 
 #include <string>
@@ -24,7 +25,7 @@ std::filesystem::path ExecutableDir() {
 }
 
 [[noreturn]] void Fatal(const std::wstring& message) {
-    MessageBoxW(nullptr, message.c_str(), L"SecondSonPC", MB_ICONERROR | MB_OK);
+    MessageBoxW(nullptr, message.c_str(), std::wstring(kProduct.wide_name).c_str(), MB_ICONERROR | MB_OK);
     ExitProcess(1);
 }
 
@@ -36,7 +37,7 @@ const std::filesystem::path& RootDir() {
         auto dir = exe_dir;
         for (int depth = 0; depth < 5 && !dir.empty(); ++depth) {
             std::error_code ec;
-            if (std::filesystem::is_regular_file(dir / "SecondSonPC.toml", ec)) {
+            if (std::filesystem::is_regular_file(dir / ProductFile(".toml"), ec)) {
                 return dir;
             }
             if (dir == dir.parent_path()) {

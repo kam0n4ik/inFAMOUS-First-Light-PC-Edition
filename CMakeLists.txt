@@ -9,6 +9,20 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR "SecondSonPC requires clang-cl: guest code calls the host with the SysV ABI")
 endif()
 
+# The game this build is for (src/app/product.h): one runtime, two products. SecondSon -> SecondSonPC.exe (CUSA00004),
+# FirstLight -> FirstLightPC.exe (CUSA00897). Set before the bridge so that its sources see the same definition.
+set(SSPC_PRODUCT "SecondSon" CACHE STRING "The game of this build: SecondSon or FirstLight")
+set_property(CACHE SSPC_PRODUCT PROPERTY STRINGS SecondSon FirstLight)
+if(SSPC_PRODUCT STREQUAL "SecondSon")
+    set(SSPC_PRODUCT_EXE SecondSonPC)
+elseif(SSPC_PRODUCT STREQUAL "FirstLight")
+    set(SSPC_PRODUCT_EXE FirstLightPC)
+    add_compile_definitions(SSPC_PRODUCT_FIRST_LIGHT=1)
+else()
+    message(FATAL_ERROR "SSPC_PRODUCT must be SecondSon or FirstLight, not '${SSPC_PRODUCT}'")
+endif()
+message(STATUS "SecondSonPC runtime: product ${SSPC_PRODUCT} -> ${SSPC_PRODUCT_EXE}.exe")
+
 # TEMPORARY (Phase 0-4): build on top of the shadPS4 core. Removed in Phase 5 (see docs/AUDIT.md).
 option(SSPC_SHADPS4_BRIDGE "Temporary bootstrap on the shadPS4 core" ON)
 if(NOT SSPC_SHADPS4_BRIDGE)

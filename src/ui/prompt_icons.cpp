@@ -795,7 +795,8 @@ std::optional<AtlasInfo> Locate(std::string_view f, std::string* why) {
             return fail("the atlas's data lies outside the file");
         }
         if (Fnv1a(reinterpret_cast<const u8*>(f.data()) + data, kAtlasBytes) != kOriginalAtlasFnv) {
-            return fail("the atlas is not the one of version 01.07 (another game version or a modified file)");
+            return fail(std::string("the atlas is not the one of version ") + kAtlasVersion +
+                        " (another game version or a modified file)");
         }
         info.data_offset = data;
         found = true;

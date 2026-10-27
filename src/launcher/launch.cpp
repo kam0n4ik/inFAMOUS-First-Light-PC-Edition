@@ -11,6 +11,7 @@
 #include <ctime>
 #include <fstream>
 
+#include "app/product.h"
 #include "settings/user_store.h"
 
 namespace SecondSon::Launcher {
@@ -19,6 +20,38 @@ namespace {
 
 using Var = std::pair<std::string_view, std::string_view>;
 
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+// First Light's play.cmd, in its order: Second Son's without what acts on Second Son's engine (NATIVE_GBUFFER,
+// CITY_PERFORMANCE's engine parts, early submission) and without R11_EARLY_SUBMIT (not measured on First Light yet)
+constexpr Var kStandard[] = {
+    {"SSPC_CP_MODE", "native"},
+    {"SSPC_CITY_PERFORMANCE", "1"},
+    {"SSPC_CITY_ENGINE_OPT", "0"},
+    {"SSPC_CITY_ENGINE_GBUFFER_RUNS", "0"},
+    {"SSPC_P54_EARLY_SUBMIT", "0"},
+    {"SSPC_REA_MERGE_RUNS", "1"},
+    {"SSPC_CP_ROUND_NODRAIN", "1"},
+    {"SSPC_P411_ASYNC_ACQUIRE", "1"},
+    {"SSPC_ASYNC_PIPELINES", "1"},
+    {"SSPC_P53_FRONTEND_THREAD", "1"},
+    {"SSPC_CP_ASYNC_WRITES", "1"},
+    {"SSPC_CP_ASYNC_FLIP", "1"},
+    {"SSPC_VK_EMIT_THREAD", "1"},
+    {"SSPC_VK_EMIT_BATCH", "1"},
+    {"SSPC_CP_RING", "128"},
+    {"SSPC_R9_PCACHE", "1"},
+    {"SSPC_R9_HEAP_WINDOW", "1"},
+    {"SSPC_R10_AJM", "native"},
+    {"SSPC_R10_SYSRT", "native"},
+};
+// the asynchronous compute lane (REA_DEFER_WAIT_B is a Second Son engine hook)
+constexpr Var kExperimental[] = {
+    {"SSPC_FB_ASYNC_COMPUTE", "1"},
+    {"SSPC_R10_AQ_MAIN_FREE", "1"},
+    {"SSPC_R11_AQ_IMAGES", "1"},
+    {"SSPC_R11_AQ_ORDER_EPOCH", "1"},
+};
+#else
 // play.cmd, in its order
 constexpr Var kStandard[] = {
     {"SSPC_CP_MODE", "native"},
@@ -48,6 +81,7 @@ constexpr Var kExperimental[] = {
     {"SSPC_R11_AQ_IMAGES", "1"},
     {"SSPC_R11_AQ_ORDER_EPOCH", "1"},
 };
+#endif
 
 void PutEnv(std::string_view name, std::string_view value) {
     // _putenv_s changes the CRT's copy and the process's (the child's environment); "" removes the variable
@@ -147,9 +181,9 @@ bool SaveLauncherState(const LauncherState& s, std::string& error) {
         return false;
     }
     const std::string text = fmt::format(
-        "# SecondSonPC launcher: the launch profile and what the launcher does after a start (written by the "
+        "# {} launcher: the launch profile and what the launcher does after a start (written by the "
         "launcher)\nprofile = \"{}\"\ncloseAfterLaunch = {}\n",
-        s.profile == Profile::Experimental ? "experimental" : "standard", s.close_after_launch ? "true" : "false");
+        App::kProduct.name, s.profile == Profile::Experimental ? "experimental" : "standard", s.close_after_launch ? "true" : "false");
     return Settings::WriteFileAtomic(file, text, error);
 }
 
@@ -160,8 +194,9 @@ std::filesystem::path GameDir() {
 std::string CheckGame(const std::filesystem::path& game_dir) {
     std::error_code ec;
     if (game_dir.empty() || !std::filesystem::is_regular_file(game_dir / L"eboot.bin", ec)) {
-        return "Не найден eboot.bin игры — положите SecondSonPC в папку игры или укажите её в SecondSonPC.toml, "
-               "[Game] path (README, «Установка»).";
+        return fmt::format("Не найден eboot.bin игры — положите {0} в папку игры или укажите её в {0}.toml, "
+                           "[Game] path (README, «Установка»).",
+                           App::kProduct.name);
     }
     const std::wstring self = ExePath().filename().wstring();
     const DWORD me = GetCurrentProcessId();
@@ -178,7 +213,7 @@ std::string CheckGame(const std::filesystem::path& game_dir) {
         }
         CloseHandle(snap);
         if (running) {
-            return "SecondSonPC.exe уже запущен.";
+            return fmt::format("{}.exe уже запущен.", App::kProduct.name);
         }
     }
     return {};
@@ -221,7 +256,7 @@ std::string StartGame(std::span<const std::string> args, GameProcess& out) {
     const std::wstring dir = GameDir().wstring();
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, dir.c_str(),
                         &si, &pi)) {
-        return fmt::format("Windows не запустил SecondSonPC.exe (ошибка {}).", GetLastError());
+        return fmt::format("Windows не запустил {}.exe (ошибка {}).", App::kProduct.name, GetLastError());
     }
     CloseHandle(pi.hThread);
     out.process = pi.hProcess;

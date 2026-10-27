@@ -1,5 +1,6 @@
 // SecondSonPC — own logger. Synchronous: every line is flushed, so the log survives crashes.
 #include "base/log.h"
+#include "app/product.h"
 
 #include <array>
 #include <atomic>
@@ -40,8 +41,9 @@ bool Init(const std::filesystem::path& file, Level level) {
     }
     SYSTEMTIME st;
     GetLocalTime(&st);
-    const auto header = fmt::format("SecondSonPC log, session started {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
-                                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    const auto header = fmt::format("{} log, session started {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
+                                    App::kProduct.name, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                                    st.wSecond);
     std::fwrite(header.data(), 1, header.size(), g_file);
     std::fflush(g_file);
     return true;

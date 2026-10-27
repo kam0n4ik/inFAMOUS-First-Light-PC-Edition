@@ -46,6 +46,7 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 
+#include "app/product.h"
 #include "app/config.h"
 #include "base/crash.h"
 #include "base/lifecycle.h"
@@ -338,7 +339,7 @@ void InstallLifecycle() {
 [[noreturn]] void Fatal(std::string_view message) {
     SSPC_LOG(Bridge, Critical, "{}", message);
     Log::Flush();
-    MessageBoxA(nullptr, std::string(message).c_str(), "SecondSonPC", MB_ICONERROR | MB_OK);
+    MessageBoxA(nullptr, std::string(message).c_str(), std::string(App::kProduct.name).c_str(), MB_ICONERROR | MB_OK);
     Lifecycle::Exit(1, "a start-up failure");
 }
 
@@ -580,7 +581,7 @@ void RunPhase0Loader(const App::Config& cfg, Core::Linker& linker, const std::st
     if (!cfg.reloc_snapshot.empty()) {
         // Names for the snapshot only (classification); resolution is shadPS4's.
         static Loader::Bindings names;
-        names.Build(SelectExports(cfg, true), BridgeExports(),
+        names.Build(SelectExports(cfg, true), AllBridgeExports(),
                     Loader::BindingOptions{.import_counter = false, .classify_only = true});
         InstallSnapshotHook(cfg,
                             [&cfg, &linker] {
@@ -732,7 +733,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Loader::BindingOptions options;
     options.import_counter = cfg.import_counter && !cfg.selftest;
     options.bridged_groups = cfg.bridged_groups;
-    if (!bindings.Build(SelectExports(cfg, false), BridgeExports(), options)) {
+    if (!bindings.Build(SelectExports(cfg, false), AllBridgeExports(), options)) {
         Fatal("binding table is inconsistent, see SecondSonPC.log");
     }
     // The direct memory functions and the bridge's accounting of mapped direct memory switch
@@ -883,50 +884,65 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // races in the game's own code the PC's timing exposes (docs/GAME_FIXES.md)
     Engine::GameFixes::Install(linker.GetModule(eboot_index)->Base());
     Engine::MouseCamera::Install(linker.GetModule(eboot_index)->Base());
-    Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
-    Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (FrameBreak FB-3)
-    Gpu::R8::Verify::Frame::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (R8-V3)
-    Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
-    Engine::Render::DrawCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (CITY-OPT diagnostics)
-    Engine::Render::LightCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (R12 diagnostics)
-    Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
-    Engine::Render::Trace::InstallCriticalComputeFromEnvironment(linker.GetModule(eboot_index)->Base());
-    if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)
-        Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
-        // (REA-3: the gate goes through SecondSonPC's Gnm driver too)
-        Engine::Render::Trace::InstallDeferComputeWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
-        // (R11: the labels' wake-ups come from SecondSonPC's command processor)
-        Engine::Render::Trace::InstallLabelWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
-    } else if (char es[4] = {}; GetEnvironmentVariableA("SSPC_P54_EARLY_SUBMIT", es, sizeof(es)) == 1 && es[0] == '1') {
-        SSPC_LOG(Loader, Warning, "SSPC_P54_EARLY_SUBMIT=1 ignored: only SecondSonPC's GPU backend (--gpu-backend "
-                 "sspc) hands frames on early");
+    // the other hooks have Second Son's sites only (App::Product::all_engine_hooks): another game does not try them,
+    // its own code runs
+    const bool engine_hooks = App::kProduct.all_engine_hooks;
+    if (!engine_hooks) {
+        SSPC_LOG(Loader, Info, "engine hooks of Second Son only (effects quality, CITY-OPT tags, early submit, native "
+                 "engine) not tried on {}: the game's own code runs", App::kProduct.game);
     }
-    Engine::Render::NativeDraw::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
-    // CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT, off by default): the engine's mesh/shadow draws tagged for the processor's runs
-    Engine::Render::DrawRuns::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
-    // Smoke Quality and Particle Resolution (both backends): the game's own unless [Graphics] smokeQuality /
-    // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
-    Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
-                               cfg.pc.particle_resolution);
-    // R12 weather (diagnostics, SSPC_R12_WEATHER only): the stand's reproducible weather states (docs/R12_WEATHER.md)
-    Engine::Render::Weather::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
-    // R11 post effects (both backends): the game's own unless [Graphics] motionBlur / motionBlurStrength (SSPC_POSTFX_*;
-    // film grain and depth of field only SSPC_POSTFX_FILM_GRAIN / SSPC_POSTFX_DOF; docs/R11_POSTFX.md)
-    Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),
-                                    {.motion_blur = cfg.pc.motion_blur,
-                                     .motion_blur_strength = cfg.pc.motion_blur_strength});
-    // R12 reflections (both backends; docs/R12_REFLECTIONS.md): the game's own unless [Graphics] reflectionQuality
-    // (SSPC_REFLECTION_QUALITY); diagnostics SSPC_R12_REFL_STATS / _DIAG
-    Engine::Render::Reflections::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.reflection_quality);
-    // shadow map sizes (both backends; engine/render/shadow_quality.h): the game's own unless [Graphics] shadowQuality
-    // (written before the game makes its targets; before rain_shadows probes the update 0x43b7b0)
-    Engine::Render::ShadowQuality::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.shadow_quality);
-    // the city's high-resolution texture packs (both backends; engine/render/texture_quality.h): the game's own unless
-    // [Graphics] textureQuality
-    Engine::Render::TextureQuality::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.texture_quality);
-    // R12 rain shadows (both backends; docs/R12_RAIN_SHADOWS.md): the game's own unless [Graphics] rainShadows
-    // (SSPC_RAIN_SHADOWS); diagnostics SSPC_R12_RAIN_STATS / _DIST / _HOOK
-    Engine::Render::RainShadows::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.rain_shadows);
+    if (engine_hooks) {
+        Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+        // (FrameBreak FB-3)
+        Engine::ClockProbe::StartFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
+        Gpu::R8::Verify::Frame::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir); // (R8-V3)
+        Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+        // (CITY-OPT diagnostics)
+        Engine::Render::DrawCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+        Engine::Render::LightCensus::InstallFromEnvironment(linker.GetModule(eboot_index)->Base()); // (R12 diagnostics)
+        Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
+        Engine::Render::Trace::InstallCriticalComputeFromEnvironment(linker.GetModule(eboot_index)->Base());
+        if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)
+            Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
+            // (REA-3: the gate goes through SecondSonPC's Gnm driver too)
+            Engine::Render::Trace::InstallDeferComputeWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
+            // (R11: the labels' wake-ups come from SecondSonPC's command processor)
+            Engine::Render::Trace::InstallLabelWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
+        } else if (char es[4] = {};
+                   GetEnvironmentVariableA("SSPC_P54_EARLY_SUBMIT", es, sizeof(es)) == 1 && es[0] == '1') {
+            SSPC_LOG(Loader, Warning, "SSPC_P54_EARLY_SUBMIT=1 ignored: only SecondSonPC's GPU backend (--gpu-backend "
+                     "sspc) hands frames on early");
+        }
+        Engine::Render::NativeDraw::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
+        // CITY-OPT Phase 5 (SSPC_CITY_ENGINE_OPT, off by default): the engine's mesh/shadow draws tagged for the
+        // processor's runs
+        Engine::Render::DrawRuns::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
+        // Smoke Quality and Particle Resolution (both backends): the game's own unless [Graphics] smokeQuality /
+        // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
+        Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
+                                   cfg.pc.particle_resolution);
+        // R12 weather (diagnostics, SSPC_R12_WEATHER only): the stand's reproducible weather states
+        // (docs/R12_WEATHER.md)
+        Engine::Render::Weather::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
+        // R11 post effects (both backends): the game's own unless [Graphics] motionBlur / motionBlurStrength
+        // (SSPC_POSTFX_*; film grain and depth of field only SSPC_POSTFX_FILM_GRAIN / SSPC_POSTFX_DOF;
+        // docs/R11_POSTFX.md)
+        Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),
+                                        {.motion_blur = cfg.pc.motion_blur,
+                                         .motion_blur_strength = cfg.pc.motion_blur_strength});
+        // R12 reflections (both backends; docs/R12_REFLECTIONS.md): the game's own unless [Graphics] reflectionQuality
+        // (SSPC_REFLECTION_QUALITY); diagnostics SSPC_R12_REFL_STATS / _DIAG
+        Engine::Render::Reflections::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.reflection_quality);
+        // shadow map sizes (both backends; engine/render/shadow_quality.h): the game's own unless [Graphics]
+        // shadowQuality (written before the game makes its targets; before rain_shadows probes the update 0x43b7b0)
+        Engine::Render::ShadowQuality::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.shadow_quality);
+        // the city's high-resolution texture packs (both backends; engine/render/texture_quality.h): the game's own
+        // unless [Graphics] textureQuality
+        Engine::Render::TextureQuality::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.texture_quality);
+        // R12 rain shadows (both backends; docs/R12_RAIN_SHADOWS.md): the game's own unless [Graphics] rainShadows
+        // (SSPC_RAIN_SHADOWS); diagnostics SSPC_R12_RAIN_STATS / _DIST / _HOOK
+        Engine::Render::RainShadows::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.rain_shadows);
+    }
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
     // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {
@@ -941,8 +957,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
             Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(cfg.pc.render_scale));
             Engine::Render::SetHudLayout(cfg.pc.hud_safe_area, cfg.pc.hud_area);
             Engine::Render::SetFovPercent(cfg.pc.fov);
-            Engine::Render::InstallFovControl(linker.GetModule(eboot_index)->Base());
             Engine::Render::SetAntiAliasing(cfg.pc.anti_aliasing); // [Graphics] antiAliasing
+            Engine::Render::InstallFovControl(linker.GetModule(eboot_index)->Base());
             Engine::Render::InstallTemporalAaControl(linker.GetModule(eboot_index)->Base());
             Engine::Render::InstallRenderSwitch(linker.GetModule(eboot_index)->Base());
             Bridge::ApplyUpscaling(true);
@@ -957,7 +973,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // Native Engine Reconstruction (docs/NATIVE_ENGINE_RECONSTRUCTION.md; SSPC_NATIVE_ENGINE, off by default):
     // reconstructed engine functions replace the game's own. Installed last, so a function another switch already
     // hooked no longer hashes and is left alone.
-    NativeEngine::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
+    if (engine_hooks) {
+        NativeEngine::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
+    }
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }
@@ -1348,8 +1366,8 @@ int RunPredictShaders(const App::Config& cfg, const std::string& game) {
     // the console shows where it is: a line per phase, rewritten in place five times a second
     Gpu::Static::PredictProgress progress;
     po.progress = &progress;
-    SetConsoleTitleW(L"SecondSonPC — подготовка шейдеров");
-    std::printf("SecondSonPC: подготовка шейдеров игры (все шейдеры из файлов игры компилируются до её запуска)\n");
+    SetConsoleTitleW((std::wstring(App::kProduct.wide_name) + L" — подготовка шейдеров").c_str());
+    std::printf(SSPC_PRODUCT_NAME ": подготовка шейдеров игры (все шейдеры из файлов игры компилируются до её запуска)\n");
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<bool> stop{false};
     std::thread printer([&] {
@@ -1404,8 +1422,8 @@ int RunPredictShaders(const App::Config& cfg, const std::string& game) {
         std::printf("\r%-110s\rSecondSonPC: все шейдеры уже скомпилированы - запуск игры\n", "");
     } else {
         std::printf("\n\nSecondSonPC: %s\n\n", summary.c_str());
-        std::printf(ok ? "SecondSonPC: шейдеры скомпилированы за %.0f с - запуск игры\n"
-                       : "SecondSonPC: подготовка шейдеров не удалась (%.0f с) - игра запустится как раньше\n",
+        std::printf(ok ? SSPC_PRODUCT_NAME ": шейдеры скомпилированы за %.0f с - запуск игры\n"
+                       : SSPC_PRODUCT_NAME ": подготовка шейдеров не удалась (%.0f с) - игра запустится как раньше\n",
                     s);
     }
     std::fflush(stdout);

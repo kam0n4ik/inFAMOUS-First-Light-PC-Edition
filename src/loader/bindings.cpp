@@ -17,9 +17,23 @@ namespace SecondSon::Loader {
 
 namespace {
 
+// The game of this build (app/product.h) and the other game the runtime serves: an export only the other game imports
+// is not bound here, and an export neither imports is a key typo.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+const ImportInfo kImportTable[] = {
+#include "loader/generated/import_table_cusa00897.inc"
+};
+const ImportInfo kOtherGameImports[] = {
+#include "loader/generated/import_table.inc"
+};
+#else
 const ImportInfo kImportTable[] = {
 #include "loader/generated/import_table.inc"
 };
+const ImportInfo kOtherGameImports[] = {
+#include "loader/generated/import_table_cusa00897.inc"
+};
+#endif
 
 std::string Key(std::string_view nid, std::string_view library, std::string_view module) {
     std::string k;
@@ -235,12 +249,22 @@ bool Bindings::Build(std::span<const Runtime::Export> natives, std::span<const P
     for (const auto& row : kImportTable) {
         imported.emplace(Key(row.nid, row.library, row.module), true);
     }
+    std::unordered_map<std::string, bool> other_game;
+    for (const auto& row : kOtherGameImports) {
+        other_game.emplace(Key(row.nid, row.library, row.module), true);
+    }
     for (const auto& n : natives) {
-        if (!imported.contains(Key(n.nid, n.library, n.module))) {
-            SSPC_LOG(Loader, Error, "export {} ({}/{} {}) is not imported by the game", n.name,
-                     n.library, n.module, n.nid);
-            ok = false;
+        const auto key = Key(n.nid, n.library, n.module);
+        if (imported.contains(key)) {
+            continue;
         }
+        if (other_game.contains(key)) {
+            SSPC_LOG(Loader, Debug, "export {} ({}/{}): only the other game imports it", n.name, n.library, n.module);
+            continue;
+        }
+        SSPC_LOG(Loader, Error, "export {} ({}/{} {}) is not imported by either game", n.name, n.library, n.module,
+                 n.nid);
+        ok = false;
     }
 
     by_address_.clear();

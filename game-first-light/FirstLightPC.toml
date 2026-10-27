@@ -1,0 +1,116 @@
+# FirstLightPC configuration: inFAMOUS: First Light (CUSA00897) on the SecondSonPC runtime.
+# The keys are SecondSonPC.toml's; a misspelt table or key is an error at start-up. Paths may be absolute or relative
+# to this file's folder. The in-game PC settings window saves the user's changes to
+# %LOCALAPPDATA%\FirstLightPC\settings.toml, which overrides this file (Second Son's own file is not read).
+
+[Game]
+path = "."                         # the game's folder (eboot.bin, sce_module, sce_sys): this one. Read only
+
+[Language]
+system = "ru-RU"                   # "en-US" (PS4 id 1) | "ru-RU" (PS4 id 8): First Light has Russian text and voices
+
+[System]
+name = ""                          # sceSystemServiceParamGetString(SystemName)
+enterButton = "cross"              # "cross" | "circle"
+
+[Console]                          # the emulated PS4 (the game sees these)
+neoMode = false                    # PS4 Pro (sceKernelIsNeoMode, memory budget)
+devKit = false
+extraDirectMemoryMiB = 0
+extraFlexibleMemoryMiB = 0
+
+[Paths]
+userData = "userdata"              # /savedata0 -> userdata\home\<user>\savedata\CUSA00897\<dir>
+logs = "logs"                      # FirstLightPC.log, calls.json, bridge_shadps4.log
+
+[ShaderCache]                      # translated shaders and pipelines kept between runs
+enabled = true
+dir = 'cache\shaders'              # <dir>\CUSA00897\...; FirstLightPC.exe --clear-shader-cache empties it
+predictAll = true                  # data\static_templates.txt (Second Son's templates): ~89% of the layouts First Light used in a session
+
+[Display]
+width = 1280
+height = 720
+fullscreen = false                 # F11 toggles while playing
+fullscreenMode = "borderless"      # "borderless" | "exclusive"
+vblankFrequency = 60
+presentMode = "mailbox"            # "mailbox" | "fifo" (vsync) | "immediate"
+showFps = true                     # FPS counter overlay at start-up (F10 toggles)
+monitor = ""
+resolution = "auto"                # First Light's own sites of the resolution patch
+aspectRatio = "auto"
+hudSafeArea = 100
+hudArea = "full"
+
+[Audio]
+volume = 100
+device = ""
+
+[Input]                            # keyboard/mouse controller
+mouseSensitivity = 1.0
+invertY = false
+mouseDeadzone = 0.10               # the right stick from the mouse (SSPC_MOUSE_CAMERA=0); by default the mouse turns the camera directly
+captureMouse = true
+motionSensitivity = 1.0
+sideways = "right-up"
+
+[Keyboard]                         # action = "Key" or ["Key", "Mouse Left", ...]; [] = unbound (SDL scancode names)
+cross = "Space"
+circle = "E"
+square = "V"
+triangle = "F"
+l1 = "Q"
+r1 = "R"
+l2 = "Mouse Right"
+r2 = "Mouse Left"
+l3 = "Left Shift"
+r3 = ["Mouse Middle", "Z"]
+options = ["Return", "Escape"]
+touchPad = "Tab"
+dpadUp = "Up"
+dpadDown = "Down"
+dpadLeft = "Left"
+dpadRight = "Right"
+moveForward = "W"
+moveBack = "S"
+moveLeft = "A"
+moveRight = "D"
+walk = "Left Ctrl"
+releaseMouse = "Escape"
+motionMode = "G"
+shake = "X"
+touchDrag = "T"
+touchTwoFingers = "C"
+
+[Graphics]
+fsr = false
+sharpening = true
+sharpness = 88
+renderScale = "auto"
+fov = 100                          # percent of the game's FOV (First Light's Camera::SetFov 0x65af10)
+
+[Gamepad]
+vibration = 100
+cameraSensitivity = 1.0
+invertCameraX = false
+invertCameraY = false
+menuButton = "off"
+
+[Interface]
+language = "auto"
+scale = 100
+prompts = "auto"
+
+[Log]
+level = "info"
+bridgeFilter = "*:info"
+
+[Debug]
+vulkanValidation = false
+vulkanCrashDiagnostic = false
+inputLog = false
+crashDump = true                   # minidump of the first execute fault -> logs\crash
+
+[Trace]
+importCounter = true               # calls of every bound import -> logs\calls.json
+dumpIntervalSeconds = 10

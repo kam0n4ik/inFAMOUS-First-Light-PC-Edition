@@ -850,9 +850,15 @@ void Executor::UpscaleFrameGenInputs(s32 frame, CachedImage* display) {
     src.jitter_y = u.flip_jitter ? u.flip_jy * u.jitter_sign_y : 0.0f;
     src.mv_scale_x = u.mv_sign * static_cast<float>(rw);
     src.mv_scale_y = u.mv_sign * static_cast<float>(rh);
-    // the game's camera (Camera::BuildProjection 0x581c90: near +0x584, far +0x588, tan(fov/2) +0x5a4)
+    // the game's camera (Camera::BuildProjection 0x581c90: near +0x584, far +0x588, tan(fov/2) +0x5a4; First Light's
+    // 0x65c470 has the same fields, its camera pointer is at 0x81a41f8)
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    constexpr u64 kMainCamera = 0x81a41f8;
+#else
+    constexpr u64 kMainCamera = 0x7f2d2b8;
+#endif
     if (const u64 base = Engine::GuestImageBase(); base != 0) {
-        const u64 camera = *reinterpret_cast<const u64*>(base + 0x7f2d2b8);
+        const u64 camera = *reinterpret_cast<const u64*>(base + kMainCamera);
         if (camera != 0) {
             src.camera_near = *reinterpret_cast<const float*>(camera + 0x584);
             src.camera_far = *reinterpret_cast<const float*>(camera + 0x588);

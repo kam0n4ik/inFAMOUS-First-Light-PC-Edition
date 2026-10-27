@@ -60,6 +60,18 @@ void ApplyUpscaling(bool at_start) {
         us.backend = Up::Backend::Off; // (the runtime's: the menu keeps the choice)
         Up::SetSettings(us);
     }
+    // the scene size, the game's T2x and frame generation's camera are the engine hooks' of this eboot: without the
+    // render size switch (another game or version) an upscaler would only stretch the scene and frame generation
+    // would read a camera that is not there
+    if ((us.backend != Up::Backend::Off || us.frame_gen != Up::FrameGen::Off) &&
+        !Engine::Render::RenderSwitchInstalled()) {
+        const std::string why = "the game's render size switch is not installed (another game or version)";
+        SSPC_LOG(Loader, Warning, "Upscaling and frame generation: {} - off", why);
+        Up::UpdateStatus([&](Up::Status& st) { st.reason = why; });
+        us.backend = Up::Backend::Off;
+        us.frame_gen = Up::FrameGen::Off;
+        Up::SetSettings(us);
+    }
     const bool upscaling = us.backend != Up::Backend::Off;
     const Engine::Render::RenderSize rs = upscaling
                                               ? Engine::Render::RenderSizeForScale(Up::ScaleOf(us.quality))

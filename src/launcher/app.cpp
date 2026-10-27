@@ -1,6 +1,7 @@
 // SecondSonPC — the launcher's pages (app.h). Layout, sizes and texts: the HTML mockup
 // (styles.css, app.js); values, ranges and availability: the settings registry and a Settings::Service of its own on the
 // user settings file. Own code.
+#include "app/product.h"
 #include "launcher/app.h"
 
 #include <windows.h>
@@ -2060,7 +2061,7 @@ struct LauncherApp::Impl {
         c.FillRect({b, b + kTitleH - 1, W - 2 * b, 1}, kBorder);
         c.Icon(IconPath("mark"), {b + 12, b + (kTitleH - 1 - 18) / 2, 18, 18}, WithAlpha(kAccent, 0.95f), 0, true);
         const float lh = LineOf(13);
-        c.Text("SecondSonPC", {b + 12 + 18 + 10, b + (kTitleH - 1 - lh) / 2, 200, lh}, F(13, 600, 0.01f), kText, lh,
+        c.Text(std::string(SecondSon::App::kProduct.name), {b + 12 + 18 + 10, b + (kTitleH - 1 - lh) / 2, 200, lh}, F(13, 600, 0.01f), kText, lh,
                Align::Left, false);
         const std::string_view icons[3] = {"win-min", "win-max", "win-close"};
         for (int i = 0; i < 3; ++i) {
@@ -2092,7 +2093,7 @@ struct LauncherApp::Impl {
         // .nav-brand
         const float l11 = 11 * 1.15f, l16 = 16 * 1.15f;
         c.Text("inFAMOUS", {x + 10, y + 4, w, l11}, Fd(11, 400, 0.04f), kMuted, l11, Align::Left, false);
-        c.Text("SECOND SON", {x + 10, y + 4 + l11, w, l16}, Fd(16, 800, 0.06f), kText, l16, Align::Left, false);
+        c.Text(std::string(SecondSon::App::kProduct.brand), {x + 10, y + 4 + l11, w, l16}, Fd(16, 800, 0.06f), kText, l16, Align::Left, false);
         c.Text("PC EDITION", {x + 10, y + 4 + l11 + l16, w, l11}, Fd(11, 600, 0.08f), kAccent, l11, Align::Left,
                false);
         y += 4 + l11 + l16 + l11 + 14;

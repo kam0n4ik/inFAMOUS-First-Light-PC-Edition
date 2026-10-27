@@ -9,6 +9,7 @@
 
 #include <fmt/format.h>
 
+#include "app/product.h"
 #include "input/binding_rules.h"
 #include "settings/experiments.h"
 #include "settings/registry.h"
@@ -106,7 +107,7 @@ const Group kGroups[] = {
     {"Movement", "Движение", kMoveActions},
     {"Controller buttons", "Кнопки контроллера", kButtonActions},
     {"Touch pad and motion", "Сенсорная панель и наклон", kTouchActions},
-    {"SecondSonPC", "SecondSonPC", kPcActions},
+    {SSPC_PRODUCT_NAME, SSPC_PRODUCT_NAME, kPcActions},
 };
 
 constexpr std::string_view kDisplayIds[] = {"display.fullscreen", "display.fullscreenMode", "display.width",
@@ -536,14 +537,14 @@ void SettingsMenu::RebuildRows() {
                 }
             }
         }
-        AddInfo("SecondSonPC hotkeys", "Горячие клавиши SecondSonPC", "info.hotkeys");
+        AddInfo(SSPC_PRODUCT_NAME " hotkeys", "Горячие клавиши " SSPC_PRODUCT_NAME, "info.hotkeys");
         break;
     case Page::Audio:
         AddCategory(Category::Audio);
         break;
     case Page::Game:
         AddCategory(Category::Game);
-        AddHeader("SecondSonPC interface", "Интерфейс SecondSonPC");
+        AddHeader(SSPC_PRODUCT_NAME " interface", "Интерфейс " SSPC_PRODUCT_NAME);
         AddCategory(Category::Interface);
         break;
     case Page::Advanced:
@@ -776,7 +777,7 @@ std::vector<SettingsMenu::Option> SettingsMenu::WindowModeOptions() const {
         // [Display] fullscreenMode = "exclusive" from a file: kept while chosen, not offered (no Vulkan exclusive mode:
         // SDL's full screen at the desktop's display mode, as borderless, minimized on Alt+Tab)
         out.push_back({.value = "exclusive",
-                       .label = std::string(T("Exclusive (SecondSonPC.toml)", "Эксклюзивный (SecondSonPC.toml)")),
+                       .label = std::string(T("Exclusive (" SSPC_PRODUCT_NAME ".toml)", "Эксклюзивный (" SSPC_PRODUCT_NAME ".toml)")),
                        .ok = false,
                        .why = std::string(T("no exclusive mode in the renderer: the display's mode is not changed, "
                                             "the window covers it as borderless and minimizes on Alt+Tab",
@@ -1369,8 +1370,8 @@ void SettingsMenu::OnCaptureInput(Input::InputCode input) {
     capture_.reset();
     if (Input::IsReservedInput(input)) {
         status_ = fmt::format("{}: {}", BindingText(input),
-                              T("a SecondSonPC hotkey (F10 FPS, F11 full screen) - not assigned",
-                                "горячая клавиша SecondSonPC (F10 FPS, F11 полный экран) — не назначена"));
+                              T("a " SSPC_PRODUCT_NAME " hotkey (F10 FPS, F11 full screen) - not assigned",
+                                "горячая клавиша " SSPC_PRODUCT_NAME " (F10 FPS, F11 полный экран) — не назначена"));
         status_warn_ = true;
         return;
     }
@@ -1767,8 +1768,8 @@ std::string SettingsMenu::HelpText(size_t row, Color& color) const {
               "размере, не меньше 1080 строк); окно масштабирует готовый кадр."));
     } else if (r.kind == Row::Kind::ResetPage) {
         add(fmt::format("{} «{}» {}", T("Every setting of", "Все настройки раздела"), PageLabel(page_, env_.ru),
-                        T("goes back to its default (SecondSonPC.toml). Asks first.",
-                          "вернутся к значениям по умолчанию (SecondSonPC.toml). Сначала спросит подтверждение.")));
+                        T("goes back to its default (" SSPC_PRODUCT_NAME ".toml). Asks first.",
+                          "вернутся к значениям по умолчанию (" SSPC_PRODUCT_NAME ".toml). Сначала спросит подтверждение.")));
     } else if (r.tag == "cmd.clear_shaders") {
         add(T("The translated shaders, the list of known pipelines and the Vulkan pipeline cache are deleted at the "
               "next start: that start and the first visit of every place compile again.",
@@ -1791,17 +1792,17 @@ std::string SettingsMenu::HelpText(size_t row, Color& color) const {
               "Разрешение 3D-сцены сейчас → разрешение игры (её интерфейс и выходной кадр). Масштаб рендеринга или "
               "апскейлер рендерят сцену меньше; апскейлер восстанавливает полную картинку."));
     } else if (r.tag == "info.settings") {
-        add(T("Every change is saved at once to this file, over SecondSonPC.toml's defaults. Delete a line there to use "
+        add(T("Every change is saved at once to this file, over " SSPC_PRODUCT_NAME ".toml's defaults. Delete a line there to use "
               "the default again; keys this version does not know are kept.",
-              "Каждое изменение сразу сохраняется в этот файл поверх умолчаний SecondSonPC.toml. Удалите строку в нём, "
+              "Каждое изменение сразу сохраняется в этот файл поверх умолчаний " SSPC_PRODUCT_NAME ".toml. Удалите строку в нём, "
               "чтобы вернуть значение по умолчанию; неизвестные этой версии ключи сохраняются."));
     } else if (r.tag == "info.device") {
         add(T("The device used last: it decides the button icons in the game's hints (Game - Button hints).",
               "Последнее использованное устройство: по нему выбираются значки кнопок в подсказках игры (Игра → "
               "Подсказки кнопок)."));
     } else if (r.tag == "info.hotkeys") {
-        add(T("These keys are SecondSonPC's and cannot be assigned to the game's actions.",
-              "Эти клавиши принадлежат SecondSonPC и не назначаются действиям игры."));
+        add(T("These keys are " SSPC_PRODUCT_NAME "'s and cannot be assigned to the game's actions.",
+              "Эти клавиши принадлежат " SSPC_PRODUCT_NAME " и не назначаются действиям игры."));
     }
     if (const std::string why = Inactive(row); !why.empty()) {
         add(why);
@@ -2369,8 +2370,8 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
             no = T("Restore", "Вернуть");
         } else {
             mtitle = fmt::format("{} «{}»?", T("Reset", "Сбросить раздел"), PageLabel(page_, env_.ru));
-            text = std::string(T("Every setting of this page goes back to its default (SecondSonPC.toml).",
-                                 "Все настройки раздела вернутся к значениям по умолчанию (SecondSonPC.toml)."));
+            text = std::string(T("Every setting of this page goes back to its default (" SSPC_PRODUCT_NAME ".toml).",
+                                 "Все настройки раздела вернутся к значениям по умолчанию (" SSPC_PRODUCT_NAME ".toml)."));
             yes = T("Reset", "Сбросить");
             no = T("Cancel", "Отмена");
         }

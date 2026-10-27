@@ -116,6 +116,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/shader_translator_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/host_shaders_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp
+        ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/bridge_exports_first_light.cpp
     )
     target_sources(shadps4 PRIVATE ${SSPC_R10_SYSRT_BRIDGE_SOURCES}) # R10 sysrt (cmake/r10/sysrt.cmake)
     target_link_libraries(shadps4 PRIVATE ${runtime_target})
@@ -123,7 +124,7 @@ function(sspc_attach_bootstrap runtime_target)
     set_source_files_properties(${_sspc_shad_dir}/src/video_core/cache_storage.cpp TARGET_DIRECTORY shadps4
         PROPERTIES COMPILE_DEFINITIONS "SSPC_SHADER_CACHE_GENERATION=\"${SSPC_SHADER_CACHE_GENERATION}\"")
     set_target_properties(shadps4 PROPERTIES
-        OUTPUT_NAME SecondSonPC
+        OUTPUT_NAME ${SSPC_PRODUCT_EXE}
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
         EXCLUDE_FROM_ALL OFF
     )

@@ -1,5 +1,6 @@
-# Builds SecondSonPC.exe and the folder that goes into the game's folder (README.md, Building from source).
-#   powershell -ExecutionPolicy Bypass -File build.ps1 [-Config RelWithDebInfo] [-Fresh] [-NoPackage]
+# Builds FirstLightPC.exe (or, with -Product SecondSon, SecondSonPC.exe from the same shared runtime) and the folder
+# that goes into the game's folder (README.md, Building from source).
+#   powershell -ExecutionPolicy Bypass -File build.ps1 [-Product FirstLight|SecondSon] [-Config RelWithDebInfo] [-Fresh] [-NoPackage]
 #                                                      [-VsPath <Visual Studio / Build Tools>] [-LlvmPath <LLVM\bin>]
 # Steps:
 #   1. third_party\shadPS4: the pinned shadPS4 commit with its submodules (cloned once; patches\shadps4 are applied by
@@ -9,10 +10,13 @@
 #      Build Tools found by vswhere (or -VsPath).
 #   3. CMake + Ninja with clang-cl and lld-link (LLVM 20 or later; -LlvmPath, PATH, C:\Program Files\LLVM\bin, or the
 #      clang of Visual Studio).
-#   4. dist\SecondSonPC: SecondSonPC.exe, its DLLs and fonts from build\bin plus everything in game\ - the files to put
-#      into the game's folder - and dist\SecondSonPC-win64.zip of the same.
+#   4. dist\<exe name>: the executable, its DLLs and fonts from build\bin plus the product's game folder (First Light:
+#      game-first-light\ and game\data, the shader templates both games share; Second Son: game\) - the files to put
+#      into the game's folder - and dist\<exe name>-win64.zip of the same.
+#   Each product has its own build folder: build\ (First Light), build-secondson\ (Second Son).
 # DLSS / FSR need the vendors' SDKs in third_party\upscalers (README.md); without them the build has no upscalers.
 param(
+    [ValidateSet("FirstLight", "SecondSon")] [string]$Product = "FirstLight",
     [string]$Config = "RelWithDebInfo",
     [switch]$Fresh,
     [switch]$NoPackage,
@@ -21,7 +25,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
-$bld = Join-Path $root "build"
+$name = if ($Product -eq "SecondSon") { "SecondSonPC" } else { "FirstLightPC" }
+$bld = Join-Path $root $(if ($Product -eq "SecondSon") { "build-secondson" } else { "build" })
 $shad = Join-Path $root "third_party\shadPS4"
 $shadCommit = "0fe263a4760dfbfa973366890061749b4af0de97" # docs/PATCHES.md: the patches are made against it
 $log = Join-Path $bld "build.log"
@@ -84,22 +89,27 @@ foreach ($tool in "cmake", "ninja") {
 Write-Host "== $(& $clang --version | Select-Object -First 1)"
 
 if ($Fresh -or -not (Test-Path (Join-Path $bld "build.ninja"))) {
-    Invoke-Logged "configure" ("cmake -S `"$root`" -B `"$bld`" -G Ninja -DCMAKE_BUILD_TYPE=$Config " +
+    Invoke-Logged "configure" ("cmake -S `"$root`" -B `"$bld`" -G Ninja -DCMAKE_BUILD_TYPE=$Config -DSSPC_PRODUCT=$Product " +
         "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_LINKER_TYPE=LLD " +
         "-DCMAKE_RC_COMPILER=rc.exe -DCMAKE_MT=mt.exe" + $(if ($Fresh) { " --fresh" } else { "" }))
 }
 Invoke-Logged "build" "cmake --build `"$bld`" --target shadps4 --parallel $([Environment]::ProcessorCount)"
-$exePath = Join-Path $bld "bin\SecondSonPC.exe"
+$exePath = Join-Path $bld "bin\$name.exe"
 Get-Item $exePath | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String | Write-Host
 if ($NoPackage) { return }
 
 # 4. the folder for the game's folder
-$dist = Join-Path $root "dist\SecondSonPC"
+$dist = Join-Path $root "dist\$name"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force $dist | Out-Null
 Copy-Item $exePath, (Join-Path $bld "bin\*.dll") $dist
 Copy-Item -Recurse (Join-Path $bld "bin\fonts") $dist
-Copy-Item -Recurse (Join-Path $root "game\*") $dist
+if ($Product -eq "SecondSon") {
+    Copy-Item -Recurse (Join-Path $root "game\*") $dist
+} else {
+    Copy-Item -Recurse (Join-Path $root "game-first-light\*") $dist
+    Copy-Item -Recurse (Join-Path $root "game\data") $dist
+}
 # the vendors' licences of the upscaler DLLs shipped beside the executable
 $ups = Join-Path $root "third_party\upscalers"
 foreach ($l in @(@("ngx\LICENSE.txt", "NVIDIA-DLSS-SDK.txt"), @("ffx-api\LICENSE.txt", "AMD-FidelityFX-SDK.txt"),
@@ -113,7 +123,7 @@ foreach ($l in @(@("ngx\LICENSE.txt", "NVIDIA-DLSS-SDK.txt"), @("ffx-api\LICENSE
 # LibAtrac9 (MIT), compiled into the executable by SecondSonPC's own AJM (src/runtime/audio/ajm.cpp)
 New-Item -ItemType Directory -Force (Join-Path $dist "licenses") | Out-Null
 Copy-Item (Join-Path $root "third_party\LibAtrac9\LICENSE") (Join-Path $dist "licenses\LibAtrac9.txt")
-$zip = Join-Path $root "dist\SecondSonPC-win64.zip"
+$zip = Join-Path $root "dist\$name-win64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip
 Write-Host "== $dist (copy its contents into the game's folder, the one with eboot.bin)"

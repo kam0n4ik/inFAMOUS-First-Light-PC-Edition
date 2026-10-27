@@ -8,6 +8,7 @@
 #include <fmt/format.h>
 #include <toml.hpp>
 
+#include "app/product.h"
 #include "runtime/language.h"
 #include "settings/registry.h"
 #include "settings/toml_value.h"
@@ -153,7 +154,7 @@ private:
 std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<std::string>& errors) {
     Config c;
     c.root = root;
-    c.file = root / "SecondSonPC.toml";
+    c.file = root / ProductFile(".toml");
 
     toml::value data;
     try {
@@ -177,9 +178,9 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
         c.game_dir = std::move(canon); // ("." -> the folder's own name: the shader cache is kept per game folder name)
     }
     if (!std::filesystem::is_regular_file(c.game_dir / "eboot.bin")) {
-        r.Error(fmt::format("[Game] path: {} does not contain eboot.bin (put SecondSonPC into the game's folder, the "
+        r.Error(fmt::format("[Game] path: {} does not contain eboot.bin (put {} into the game's folder, the "
                             "one with eboot.bin, or give that folder here)",
-                            c.game_dir.string()));
+                            c.game_dir.string(), kProduct.name));
     }
 
     c.language_locale = "en-US";

@@ -27,6 +27,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 
+#include "app/product.h"
 #include "base/lifecycle.h"
 #include "base/log.h"
 #include "base/vram_monitor.h"
@@ -199,8 +200,9 @@ bool WriteDump(EXCEPTION_POINTERS* info, DWORD thread_id = GetCurrentThreadId())
     GetLocalTime(&t);
     CreateDirectoryW(g_dump_dir.c_str(), nullptr);
     wchar_t name[96];
-    std::swprintf(name, 96, L"\\SecondSonPC_%04u-%02u-%02u_%02u-%02u-%02u_%lu.dmp", t.wYear, t.wMonth, t.wDay,
-                  t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
+    const std::wstring product(App::kProduct.wide_name);
+    std::swprintf(name, 96, L"\\%ls_%04u-%02u-%02u_%02u-%02u-%02u_%lu.dmp", product.c_str(), t.wYear, t.wMonth,
+                  t.wDay, t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
     auto* job = new DumpJob;
     job->record = *info->ExceptionRecord;
     job->record.ExceptionRecord = nullptr; // no chained record outlives this handler

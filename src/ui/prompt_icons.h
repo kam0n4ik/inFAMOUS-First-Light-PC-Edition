@@ -46,12 +46,19 @@ struct AtlasInfo {
 };
 
 /// Finds the icon atlas by its texture id and texture descriptor (format, size, tiling) and checks that its bytes are
-/// the game's (version 01.07, the same atlas in all 15 languages); the glyph table by its records. nullopt + `why`.
+/// the game's (Second Son 01.07: the same atlas in all 15 languages; First Light 01.04: its own packing of the same
+/// codes, the same in its 3 languages); the glyph table by its records. nullopt + `why`.
 std::optional<AtlasInfo> Locate(std::string_view file, std::string* why);
 
 /// 64-bit FNV-1a (the atlas's identity check).
 u64 Fnv1a(const u8* data, u64 n);
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+constexpr u64 kOriginalAtlasFnv = 0xe4854f8aa84b0129ull;
+constexpr const char* kAtlasVersion = "First Light 01.04";
+#else
 constexpr u64 kOriginalAtlasFnv = 0x12138d8479e36e34ull;
+constexpr const char* kAtlasVersion = "01.07";
+#endif
 
 /// What a cell shows for a style: drawn (`drawn` true) or the game's own (unbound key, d-pad on Xbox, other codes).
 struct CellArt {

@@ -416,13 +416,21 @@ void BufferCache::InitDiff() {
                      v, lazy_ == 1 ? "kept back from the host" : "counted as if kept back (written back as before)");
         }
     }
-    // R12 lights: FB-7's kept-back write-back for the tiled lighting's light index list only (mode 3; FB-7 itself wins)
+    // R12 lights: FB-7's kept-back write-back for the tiled lighting's light index list only (mode 3; FB-7 itself wins).
+    // Second Son only: the shader is known by its GPU address in that game (vk_executor.cpp kR12TiledLightingCs), which
+    // in another game is some other shader's.
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_R12_LIGHT_LIST_KEEP", v, sizeof(v)) == 1 && v[0] == '1') {
+        SSPC_LOG(GPU, Warning, "R12: SSPC_R12_LIGHT_LIST_KEEP=1 ignored - it names a Second Son shader by its address");
+    }
+#else
     if (char v[4] = {}; lazy_ == 0 && diff_pipeline_ != VK_NULL_HANDLE && tracker_ != nullptr &&
                         GetEnvironmentVariableA("SSPC_R12_LIGHT_LIST_KEEP", v, sizeof(v)) == 1 && v[0] == '1') {
         lazy_ = 3;
         SSPC_LOG(GPU, Warning, "R12: SSPC_R12_LIGHT_LIST_KEEP=1 - the tiled lighting's per-tile light index list stays "
                                "in video memory (kept back from the host until a CPU access or a non-heap host reader)");
     }
+#endif
     if (diff_pipeline_ != VK_NULL_HANDLE) {
         SSPC_LOG(GPU, Info, "native backend: buffer cache: write-backs of ranges >= {} KiB write only the words the GPU "
                             "changed (a video memory shadow per range)",
