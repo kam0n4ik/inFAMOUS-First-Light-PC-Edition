@@ -117,6 +117,9 @@ Voiced lines for **Hank's daughter**, who is not in the game: *"Dad? Daddy? Let'
 | **Surveillance vans** | see above |
 | **Watchtowers** | "Watch Tower Destroyed" |
 | **Evacuation** | Police hold back a crowd at the helicopters, people wave money: *"The helicopter is already full!"*, *"I cannot take your money, the helicopters are full!"*, *"There will be more helicopters soon!"* The code keeps the crowd actions `HoldBackMob` and `WaveMoney`. 🔊 [`audio/evacuation_en.mp3`](audio/evacuation_en.mp3) |
+| **Signal jammers** | The D.U.P. jams the area and Delsin loses his map: *"Map's out, better find the jammer."*, *"I better cut the juice to the jammer, get my GPS back."* None of these lines is ever played. 🔊 [`audio/signal_jammer_en.mp3`](audio/signal_jammer_en.mp3) |
+| **Street musicians** | An evil-karma event, "Street Musician Silenced", with 20 voiced reactions from the performers: *"I just want to make people happy!"*, *"You can't suppress beauty, dude!"*, *"I'm a single mom, please!"* Neither the event nor the lines are used; the map icon survives (see below). 🔊 [`audio/street_musicians_en.mp3`](audio/street_musicians_en.mp3) |
+| **Helicopters in district fights** | *"Are you kidding me, helicopters?! What, outnumbering me a hundred to one isn't good enough for 'em?"*, *"I gotta bring those choppers down."* 🔊 [`audio/helicopters_en.mp3`](audio/helicopters_en.mp3) |
 | **Replaying districts at a higher difficulty** | *"Congratulations! You have destroyed all the D.U.P. Mobile Command Centers. The D.U.P. Command Centers can be reset to a HARDER state from the Options screen."* An option "Reset D.U.P. Mobile Command Centers" and a warning *"This will make the city much more dangerous!"* |
 
 ## Powers
@@ -161,6 +164,39 @@ The text table keeps two trophies that are not in the final game:
 - **Hard Mode**: *"Finish the game in Hard Mode"*.
 
 "Unstoppable" has three descriptions: the final *"Finish the game on Expert difficulty"*, an older *"Finish the game on Hard difficulty"* and **"Finish the game in Challenge Mode"**.
+
+## Images
+
+The UI packages store their textures as raw PS4 GPU data. We decoded all 3,845 of them (format, tiling and names are documented in the research notes).
+
+### Tutorial cards for a district system that isn't in the game
+
+The first district mission (`msn_ftp`) carries two full-screen tutorial cards. The final game never shows them, and they describe things it doesn't have: a district state called **"D.U.P. MONITORED"** and **undercover vans** shown on the map. Their text is baked into the image in English, while every real tutorial in the game is localized text. The map in the screenshot is an early version, with a different district border and icons. And "pissed off Augustine" sounds like it was never meant to ship.
+
+| | |
+|---|---|
+| ![D.U.P. Mobile Command](images/tutorial_dup_mobile_command.jpg) | ![D.U.P. Monitored](images/tutorial_dup_monitored.jpg) |
+| *"Destroying it lessens their overall influence: fewer troops, fewer APC patrols, happier citizens, pissed off Augustine."* | *"A district in this state has a lessened D.U.P. influence, but security cameras, scanning stations and undercover vans still blanket the area."* |
+
+### Map icons
+
+The map icon set, as it ships. Some of the icons belong to activities listed above that were cut: **musician** (the street musicians), **radar_jammer** (the signal jammers), **helicopter**. We can't prove from the data alone which icons the final map never shows, so treat the rest as leads.
+
+![Map icons](images/map_icons.png)
+
+### Placeholder art
+
+Among the map icons sits a 64×64 **photo of a toy school bus**, next to a plain orange `icon_bus`. Placeholder art that was never replaced:
+
+![Toy bus](images/placeholder_toy_bus.png)
+
+### Developer glyphs in the button font
+
+The font that draws the controller buttons (it ships in every language) also holds **PC mouse cursors** (arrow, hand, I-beam, move and resize), a walking man, a lightning bolt and a **"T"** key. They belong to the developers' in-game tools, not to the game:
+
+![Font atlas](images/font_atlas_dev_glyphs.png)
+
+**Not found:** icons for the cut powers (HealOther, LaserBeam, TvSummonAngel…). In the packages we decoded, the upgrade screen has only frames and borders, with no power icons at all, final or cut.
 
 ## Videos
 
