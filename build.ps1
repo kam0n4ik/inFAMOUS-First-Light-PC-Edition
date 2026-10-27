@@ -12,7 +12,8 @@
 #      clang of Visual Studio).
 #   4. dist\<exe name>: the executable, its DLLs and fonts from build\bin plus the product's game folder (First Light:
 #      game-first-light\ and game\data, the shader templates both games share; Second Son: game\) - the files to put
-#      into the game's folder - and dist\<exe name>-win64.zip of the same.
+#      into the game's folder - with Launcher\ (the Qt launcher of pc-launcher\, when its package was made) and
+#      dist\<exe name>-win64.zip of the same.
 #   Each product has its own build folder: build\ (First Light), build-secondson\ (Second Son).
 # DLSS / FSR need the vendors' SDKs in third_party\upscalers (README.md); without them the build has no upscalers.
 param(
@@ -123,6 +124,13 @@ foreach ($l in @(@("ngx\LICENSE.txt", "NVIDIA-DLSS-SDK.txt"), @("ffx-api\LICENSE
 # LibAtrac9 (MIT), compiled into the executable by SecondSonPC's own AJM (src/runtime/audio/ajm.cpp)
 New-Item -ItemType Directory -Force (Join-Path $dist "licenses") | Out-Null
 Copy-Item (Join-Path $root "third_party\LibAtrac9\LICENSE") (Join-Path $dist "licenses\LibAtrac9.txt")
+# the inFAMOUS PC Launcher (Qt, pc-launcher\): the exe without arguments opens Launcher\Launcher.exe when it is there
+$qtLauncher = Join-Path $root "pc-launcher\dist\inFAMOUS-PC-Launcher"
+if (Test-Path (Join-Path $qtLauncher "Launcher.exe")) {
+    Copy-Item -Recurse $qtLauncher (Join-Path $dist "Launcher")
+} else {
+    Write-Warning "no pc-launcher\dist\inFAMOUS-PC-Launcher (pc-launcher\README.md): the package has the built-in launcher only"
+}
 $zip = Join-Path $root "dist\$name-win64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip
