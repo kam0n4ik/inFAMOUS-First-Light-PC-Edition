@@ -395,10 +395,10 @@ private:
     void FrontEvent(u64 addr, u64 size, bool gpu);
     /// The queued frontend events of records up to `upto` (the frontend thread; thread 1 with the queue empty).
     void ApplyFrontEvents(u64 upto);
-    void NoteStageWrites(const GS::StageView& s, u64 record, bool& writes);
+    void NoteStageWrites(const GS::StageView& s, u64 record, bool& writes, bool frontend_noted = false);
     /// Stage 2, the queue not idle: a GPU write of a record not executed, or not known complete, may overlap.
     bool MayBeGpuWritten(u64 addr, u64 bytes);
-    void AddGpuWrite(u64 begin, u64 end, u64 record, u64 value);
+    void AddGpuWrite(u64 begin, u64 end, u64 record, u64 value, bool note_code = true);
     void RetireGpuWrites();
     void RebuildGpuWriteBits();
     /// Stage 2: the processor's calls queued for thread 2 tell the frontend here, in stream order (thread 2 does not).

@@ -48,8 +48,11 @@ struct StageView;
 
 namespace SecondSon::Gpu::CpProfile {
 
-/// SSPC_R8_CP_PROFILE (read once, at static initialization): 0 off, 1 timings, 2 timings + the repetition census.
-extern const u8 g_mode;
+/// SSPC_R8_CP_PROFILE (read once, by InitMode): 0 off, 1 timings, 2 timings + the repetition census.
+extern u8 g_mode;
+/// The backend's start, before its threads: g_mode from the environment (the settings' experiments are exported to it
+/// after static initialization). SSPC_R8_CP_PROFILE_CSV=1 alone means mode 1 (the experiments page's one switch).
+void InitMode();
 inline bool On() {
     return g_mode != 0;
 }
@@ -84,6 +87,7 @@ enum class Sec : u8 {
     ParDispatch,     ///< a dispatch's record
     FrontDispatch,   ///< ShaderFrontend::PrepareDispatch and the stage's copy
     FrontSync,       ///< a frontend read at an idle queue (ApplyPending) / after a drain: the executor's GPU-write check
+    FrontReadSlow,   ///< a frontend read not in its kept backing runs (BackingRun lookup / the memory manager's read)
     CbDma,           ///< ParallelCp::Dma (a DMA / WRITE_DATA report)
     CbCache,         ///< ParallelCp::CacheAction
     CbFence,         ///< ParallelCp::Fence

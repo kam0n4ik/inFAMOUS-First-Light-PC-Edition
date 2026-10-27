@@ -94,6 +94,7 @@ Where things are kept:
 | `%LOCALAPPDATA%\SecondSonPC\launcher.toml` | the launcher's own choices: launch profile, close after Play |
 | `cache\shaders\` | prepared shaders and the driver's pipeline cache (about 1.6 GB; safe to delete, it is prepared again) |
 | `logs\SecondSonPC.log` | the log; attach it to a bug report |
+| `logs\sessions\<date_time>\` | every slow frame of a session (50 ms or more), when and why: `hitches.txt`, per second `seconds.csv`, `summary.txt` at the exit; the newest 30 sessions are kept. Press **F12** when you see a stutter to mark it there |
 
 To keep SecondSonPC outside the game's folder, set `[Game] path` in `SecondSonPC.toml` to the game's folder instead of `"."`.
 

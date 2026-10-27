@@ -217,7 +217,7 @@ bool Write(const std::filesystem::path& file) {
            "gpu_done_ms,present_ms,game_idle_wait_ms,game_idle_waits,cp_ms,record_ms,sync_ms,blocked_label_ms,"
            "blocked_other_ms,empty_ms,gpu_busy_ms,draws,dispatches,batches,blocks,shaders,shader_ms,shader_disk,"
            "pipelines,pipeline_ms,module_ms,callbacks_ms,par_wait_ms,par_busy_ms,par_idle_ms,par_drains,par_records,"
-           "par_depth_mean\n";
+           "par_depth_mean,img_created,img_upload_kb,buf_upload_kb,writeback_kb,front_busy_ms,front_wait_ms\n";
     const u32 total = std::max({g_state.game_n.load(), g_state.cp_n, g_state.present_n.load()});
     const u32 first = total > kCap ? total - kCap : 0; // (the ring: the last kCap frames)
     const Row* prev = nullptr;
@@ -242,15 +242,20 @@ bool Write(const std::filesystem::path& file) {
                                dn(t.pipelines, pt.pipelines), dms(t.pipeline_ns, pt.pipeline_ns),
                                dms(t.module_ns, pt.module_ns));
             const u64 recs = dn(t.par_records, pt.par_records);
-            out << fmt::format(",{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.2f}\n", dms(t.callbacks_ns, pt.callbacks_ns),
+            out << fmt::format(",{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.2f}", dms(t.callbacks_ns, pt.callbacks_ns),
                                dms(t.par_wait_ns, pt.par_wait_ns), dms(t.par_busy_ns, pt.par_busy_ns),
                                dms(t.par_idle_ns, pt.par_idle_ns), dn(t.par_drains, pt.par_drains), recs,
                                recs != 0 ? static_cast<double>(dn(t.par_depth_sum, pt.par_depth_sum)) /
                                                static_cast<double>(recs)
                                          : 0.0);
+            out << fmt::format(",{},{},{},{},{:.3f},{:.3f}\n", dn(t.img_created, pt.img_created),
+                               dn(t.img_upload_bytes, pt.img_upload_bytes) >> 10,
+                               dn(t.buf_upload_bytes, pt.buf_upload_bytes) >> 10,
+                               dn(t.writeback_bytes, pt.writeback_bytes) >> 10,
+                               dms(t.front_busy_ns, pt.front_busy_ns), dms(t.front_wait_ns, pt.front_wait_ns));
             prev = &r;
         } else {
-            out << ",,,,,,,,,,,,,,,,,,,,,,,,,,\n";
+            out << ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,\n";
         }
     }
     return static_cast<bool>(out);

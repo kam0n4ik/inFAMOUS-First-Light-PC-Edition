@@ -29,6 +29,7 @@
 #include "runtime/gpu/backend.h"
 #include "runtime/gpu/command_processor.h"
 #include "runtime/gpu/frame_log.h"
+#include "runtime/gpu/hitch_log.h"
 #include "runtime/gpu/gnm/gnm_driver.h"
 #include "runtime/gpu/gnm/gnm_host.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -281,6 +282,7 @@ public:
     // ---- MemoryListener (the guest memory manager's threads)
     void OnUnmap(u64 addr, u64 size) override {
         Inspector::GuestMap(true);
+        HitchLog::GuestMap();
         if (Gprof::On()) {
             Gprof::Add(Gprof::Ctr::GuestUnmaps, 1);
         }
@@ -297,6 +299,7 @@ public:
     void OnRegister(u64, u64) override {}
     void OnMap(u64 addr, u64 size) override {
         Inspector::GuestMap(false);
+        HitchLog::GuestMap();
         if (Gprof::On()) {
             Gprof::Add(Gprof::Ctr::GuestMaps, 1);
         }
@@ -427,6 +430,10 @@ private:
     /// The processor's thread's part of a frame's totals (OnFlip; a flip queued to the recording thread takes it at
     /// its marker: ParallelCp::SetFlipSnapshot).
     void FlipTotalsOfProcessor(FrameLog::GpuThreadTotals& t);
+    /// The image cache's budget kept within what the OS gives the process (VK_EXT_memory_budget): lowered while the
+    /// process's video memory is over the OS budget less a margin, never below the GPU-written images (not evictable)
+    /// nor kImageBudgetFloor, raised back up to the start's budget when there is room. OnFlip, every 30 flips.
+    void AdaptImageBudget();
     /// P4.10.4: a queued timeline copy the executor refused, done as the processor would (after Synchronize): the CPU
     /// copies guest memory and the caches drop the destination. The recording thread. true: copied.
     bool CpuCopy(u64 src, u64 dst, u64 bytes);
@@ -457,6 +464,10 @@ private:
     std::unique_ptr<Vk::GuestBuffers> guest_;
     std::unique_ptr<Vk::BufferCache> buffers_; ///< the guest's buffers in video memory
     std::unique_ptr<Vk::ImageCache> images_;
+    u64 image_budget_max_ = 0; ///< the start's image budget (AdaptImageBudget never goes over it)
+    bool adapt_budget_ = true; ///< SSPC_VRAM_ADAPT (0: the start's budget stays)
+    u32 budget_flips_ = 0;
+    u64 budget_logged_ = 0;    ///< the budget last logged
     // P4.14 (before the factory: destroyed after it and its precompiler)
     std::unique_ptr<GS::ShaderDiskCache> disk_;
     std::unique_ptr<Vk::PipelineCacheFile> pcache_;
@@ -594,6 +605,7 @@ void DiagBenchAt(Vk::DeviceContext& ctx, const GS::DeviceProfile& profile, const
 
 bool Backend::Start(const Options& o, std::string& error) {
     options_ = o;
+    CpProfile::InitMode(); // (before the processor's threads; the experiments page sets its variables after main)
     Vk::ContextOptions co;
     co.device_index = o.device_index;
     co.validation = o.validation;
@@ -699,6 +711,15 @@ bool Backend::Start(const Options& o, std::string& error) {
                      budget >> 20);
         }
         images_->SetBudget(budget);
+        image_budget_max_ = budget;
+        budget_logged_ = budget;
+        if (char v[8] = {}; GetEnvironmentVariableA("SSPC_VRAM_ADAPT", v, sizeof(v)) > 0 && v[0] == '0') {
+            adapt_budget_ = false;
+        }
+        SSPC_LOG(GPU, Info, "native backend: image budget {} MiB{}", budget >> 20,
+                 adapt_budget_ && ctx_->Caps().memory_budget ? ", lowered while the process is over the OS's video "
+                                                               "memory budget (SSPC_VRAM_ADAPT)"
+                                                             : " (fixed)");
     }
     DiagBenchAt(*ctx_, profile_, o, "buffers");
     pipelines_ = std::make_unique<Vk::PipelineFactory>(*ctx_, profile_);
@@ -1055,6 +1076,9 @@ bool Backend::Start(const Options& o, std::string& error) {
     }
     FrameLog::Start();
     ShaderTrace::SetOrigin(FrameLog::StartTsc());
+    HitchLog::Start({.logs_dir = o.logs_dir,
+                     .faults = [](void* ctx) { return static_cast<const PageTracker*>(ctx)->GetStats().faults; },
+                     .faults_ctx = &tracker_});
     // R9: SSPC_R9_GPROF=1|2 - the gameplay profiler (every thread's CPU time, code samples, counters, marks)
     if (Gprof::On()) {
         Gprof::SetPoll(
@@ -1893,6 +1917,40 @@ void Backend::FlipTotalsOfProcessor(FrameLog::GpuThreadTotals& t) {
         t.par_drains = pt.drains;
         t.par_records = pt.records;
         t.par_depth_sum = pt.depth_sum;
+        t.front_busy_ns = GS::TicksToNs(pt.tf_busy_ticks);
+        t.front_wait_ns = GS::TicksToNs(pt.tf_wait_ticks);
+    }
+}
+
+void Backend::AdaptImageBudget() {
+    if (!adapt_budget_ || !ctx_->Caps().memory_budget) {
+        return;
+    }
+    const Vk::DeviceContext::Budget b = ctx_->QueryBudget();
+    if (b.device_local_budget == 0) {
+        return;
+    }
+    constexpr u64 kMiB = 1ull << 20;
+    constexpr u64 kMargin = 256 * kMiB;            // kept free under the OS's budget (the caches' 64 MiB chunks, ...)
+    constexpr u64 kImageBudgetFloor = 1024 * kMiB; // (the city route keeps ~0.85 GiB of images)
+    const u64 images = images_->Stats().bytes;
+    const u64 limit = b.device_local_budget > kMargin ? b.device_local_budget - kMargin : 0;
+    // what the images may hold for the process to be at the limit
+    const s64 room = static_cast<s64>(limit) - static_cast<s64>(b.device_local_usage);
+    u64 want = static_cast<u64>(std::max<s64>(0, static_cast<s64>(images) + room));
+    // (only uploaded textures go: 512 MiB of them stay, so a frame's textures are not uploaded again every frame)
+    const u64 floor = std::max(kImageBudgetFloor, images_->GpuWrittenBytes() + 512 * kMiB);
+    want = std::clamp(want, std::min(floor, image_budget_max_), image_budget_max_);
+    const u64 now = images_->SoftBudget();
+    if (want > now) {
+        want = std::min(want, now + 64 * kMiB); // (down at once, up slowly: the eviction frees to 90% of it)
+    }
+    images_->SetSoftBudget(want);
+    if (want + 128 * kMiB <= budget_logged_ || want >= budget_logged_ + 128 * kMiB) {
+        budget_logged_ = want;
+        SSPC_LOG(GPU, Info,
+                 "image budget {} MiB: the process's video memory {} MiB of the OS's {} MiB, images {} MiB",
+                 want / kMiB, b.device_local_usage / kMiB, b.device_local_budget / kMiB, images / kMiB);
     }
 }
 
@@ -1917,6 +1975,21 @@ void Backend::OnFlip(u64 gpu_value) {
     t.pipeline_ns = p.create_ns + p.prefetch_wait_ns; // (R9-N: a prefetched pipeline costs the frame only its wait)
     t.module_ns = p.module_ns;
     t.callbacks_ns = GS::TicksToNs(s.t_cb);
+    {
+        const auto& bs = buffers_->Stats();
+        const auto is = images_->Stats();
+        t.img_created = is.created;
+        t.img_upload_bytes = is.upload_bytes;
+        t.buf_upload_bytes = bs.upload_bytes;
+        t.writeback_bytes = bs.writeback_bytes;
+        t.img_resident_bytes = is.bytes;
+        t.buf_resident_bytes = bs.resident_bytes;
+    }
+    if (++budget_flips_ >= 30) { // (twice a second or so; this thread owns the image cache now)
+        budget_flips_ = 0;
+        AdaptImageBudget();
+    }
+    t.img_budget_bytes = images_->SoftBudget();
     FrameLog::CpFlip(gpu_value, t, t.last_unblock_tsc);
     if (StallTrace::On()) { // (P4.12: the trace's events count to the next frame from here)
         const u32 n = FrameLog::GetProgress().cp - 1;
@@ -2015,6 +2088,7 @@ void Backend::Stop() {
     CpProfile::WriteCsv(options_.logs_dir); // (SSPC_R8_CP_PROFILE_CSV=1)
     Gprof::Stop(); // (R9; the backend's threads stopped - the game's may still run, the sampler stops first)
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
+    HitchLog::Stop(); // (after the CSV: the session keeps a copy)
     StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
     R10::Latency::Stop(options_.logs_dir); // (R10: SSPC_R10_LATENCY=1)
     ShaderTrace::Stop(); // (P4.14)

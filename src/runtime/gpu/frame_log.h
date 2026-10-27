@@ -38,6 +38,12 @@ struct GpuThreadTotals {
     u64 par_records = 0;      ///< records pushed
     u64 par_depth_sum = 0;    ///< queue depth at each push (mean: / records)
     u64 last_unblock_tsc = 0; ///< (Native CP: thread 1's last met wait, carried with a flip queued to thread 2)
+    // uploads to the GPU (the image and buffer caches): textures made and filled, buffers filled, written back
+    u64 img_created = 0, img_upload_bytes = 0, buf_upload_bytes = 0, writeback_bytes = 0;
+    // P5.3D (SSPC_P53_FRONTEND_THREAD=1): the frontend thread preparing records / waiting for a GPU write to complete
+    u64 front_busy_ns = 0, front_wait_ns = 0;
+    // levels at the flip, not totals: the image cache's video memory and its budget, the buffer cache's
+    u64 img_resident_bytes = 0, img_budget_bytes = 0, buf_resident_bytes = 0;
 };
 
 /// The backend starts: time zero and the rows' storage.

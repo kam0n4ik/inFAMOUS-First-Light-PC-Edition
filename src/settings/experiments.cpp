@@ -20,6 +20,10 @@ constexpr Choice kCpRings[] = {
     {"128", "128 records (play.cmd)", "128 записей (play.cmd)"},
     {"512", "512 records", "512 записей"},
 };
+constexpr Choice kVramAdapt[] = {
+    {"", "On (default)", "Включено (по умолчанию)"},
+    {"0", "Off", "Выключено"},
+};
 constexpr Choice kWeatherStates[] = {
     {"", "Off (the game's own)", "Выключено (как в игре)"},
     {"log", "Journal only", "Только журнал"},
@@ -163,6 +167,21 @@ constexpr Experiment kExperiments[] = {
      .en = "No vertex heap re-imports (F3)", .ru = "Без повторного импорта кучи вершин (F3)",
      .help_en = "Large heaps are imported with headroom, so they are not imported again as they grow. On in play.cmd.",
      .help_ru = "Большие кучи импортируются с запасом и не импортируются заново по мере роста. Включено в play.cmd."},
+    {.env = "SSPC_VRAM_ADAPT", .group_en = kPipeEn, .group_ru = kPipeRu, .type = Type::Choice,
+     .choices = kVramAdapt, .unset_shows = "", .en = "Texture budget follows free video memory",
+     .ru = "Бюджет текстур по свободной видеопамяти",
+     .help_en = "On by default. Every 30 frames the textures uploaded from the game's memory are freed (least recently "
+                "used first; they are uploaded again when needed) while the process uses more video memory than the "
+                "OS gives it (VK_EXT_memory_budget, 256 MiB kept free; the textures' limit not below 1 GiB), and the "
+                "limit is raised back by 64 MiB steps. The GPU-written images are never touched by it. "
+                "Without it the budget stays at 40 % of video memory (max 3 GiB) and "
+                "the driver pages memory to RAM when the OS limit is passed. FPS change not measured yet.",
+     .help_ru = "Включено по умолчанию. Каждые 30 кадров освобождаются текстуры, загруженные из памяти игры (давно "
+                "не использованные — первыми; при надобности загружаются заново), пока процесс занимает больше "
+                "видеопамяти, чем ему даёт система (VK_EXT_memory_budget, запас 256 МиБ; лимит текстур не ниже "
+                "1 ГиБ), и лимит возвращается шагами по 64 МиБ. Изображения, которые рисует видеокарта, не трогаются. "
+                "Без него бюджет — 40 % видеопамяти (до 3 ГиБ), и при превышении "
+                "лимита системы драйвер выгружает память в ОЗУ. Изменение FPS ещё не замерено."},
     {.env = "SSPC_PIPE_PREFETCH", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
      .en = "Compute pipeline prefetch (R10)", .ru = "Предсборка compute-конвейеров (R10)",
      .help_en = "Experiment, off. New compute pipelines start building as soon as their dispatch is prepared. With "
@@ -323,6 +342,16 @@ constexpr Experiment kExperiments[] = {
                 "Включено в play.cmd. Выключено — как в shadPS4."},
 
     // ---- stand tools (R12 weather, docs/R12_WEATHER.md)
+    {.env = "SSPC_R8_CP_PROFILE_CSV", .group_en = kStandEn, .group_ru = kStandRu, .on = "1", .off = "0",
+     .en = "Frame profiler (stutter diagnostics)", .ru = "Профайлер кадров (диагностика фризов)",
+     .help_en = "Diagnostics, off. Every frame the command processor's threads (incl. the draw preparation thread) "
+                "record what their time went to; at exit logs\\r8_cp_profile.csv (the last 32768 frames, ~12 min) "
+                "and the report in gpu_native.txt. Costs some FPS and ~200 MB of RAM. Takes effect at the next "
+                "start.",
+     .help_ru = "Диагностика, выключено. Каждый кадр потоки обработчика команд (и поток подготовки отрисовки) "
+                "записывают, на что ушло их время; при выходе — logs\\r8_cp_profile.csv (последние 32768 кадров, "
+                "~12 мин) и отчёт в gpu_native.txt. Стоит немного FPS и ~200 МБ ОЗУ. Действует со следующего "
+                "запуска."},
     {.env = "SSPC_R12_WEATHER", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
      .choices = kWeatherStates, .unset_shows = "", .en = "Weather state for measurements",
      .ru = "Состояние погоды для замеров",

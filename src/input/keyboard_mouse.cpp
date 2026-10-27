@@ -14,6 +14,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/diag_request.h"
+#include "runtime/gpu/hitch_log.h"
 #include "runtime/gpu/r9/gprof.h"
 
 namespace SecondSon::Input {
@@ -335,6 +336,9 @@ KeyboardMouse::EventResult KeyboardMouse::OnEvent(const SDL_Event& e) {
         if (down && sc == SDL_SCANCODE_F10) {
             result.hotkey = Hotkey::ToggleFps;
             break;
+        }
+        if (down && sc == SDL_SCANCODE_F12) {
+            Gpu::HitchLog::Mark(); // (the hitch log: the player saw a stutter)
         }
         // R9 gameplay profiler (SSPC_R9_GPROF): the player marks what is happening now
         if (down && Gpu::Gprof::On()) {

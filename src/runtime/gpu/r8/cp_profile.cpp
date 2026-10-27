@@ -32,7 +32,8 @@ u8 ParseMode() {
     char v[16] = {};
     const DWORD n = GetEnvironmentVariableA("SSPC_R8_CP_PROFILE", v, sizeof(v));
     if (n == 0 || n >= sizeof(v)) {
-        return 0;
+        char c[8] = {};
+        return GetEnvironmentVariableA("SSPC_R8_CP_PROFILE_CSV", c, sizeof(c)) == 1 && c[0] == '1' ? 1 : 0;
     }
     return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
 }
@@ -83,6 +84,7 @@ constexpr std::array<Info, kSections> MakeInfo() {
     set(Sec::ParDispatch, "dispatch record", Cls::Compute);
     set(Sec::FrontDispatch, "frontend PrepareDispatch + copy", Cls::Compute);
     set(Sec::FrontSync, "frontend read: idle-queue apply / GPU-write check", Cls::Wait);
+    set(Sec::FrontReadSlow, "frontend read: not in a kept backing run (lookup / memory manager)", Cls::Compute);
     set(Sec::CbDma, "DMA / WRITE_DATA report (ParallelCp::Dma)", Cls::Compute);
     set(Sec::CbCache, "cache action", Cls::Compute);
     set(Sec::CbFence, "fence", Cls::Compute);
@@ -289,7 +291,7 @@ struct Row {
     u64 overflow;
     Census census;
 };
-constexpr u32 kMaxFrames = 8192;
+constexpr u32 kMaxFrames = 32768; ///< (~12 min at 45 FPS: a played session's stutters, not only the stand's window)
 
 struct Store {
     std::unique_ptr<Row[]> rows[3]; ///< [0] the processor's thread, [1] the recording thread, [2] the frontend thread
@@ -450,7 +452,11 @@ double RowSeconds(const Row& r) {
 
 } // namespace
 
-const u8 g_mode = ParseMode();
+u8 g_mode = 0;
+
+void InitMode() {
+    g_mode = ParseMode();
+}
 const u8 g_parts_source = [] {
     char v[16] = {};
     const DWORD n = GetEnvironmentVariableA("SSPC_R10_T2_PARTS", v, sizeof(v));
@@ -911,6 +917,9 @@ void WriteCsv(const std::filesystem::path& dir) {
             }
         }
     }
+    for (u32 s = 0; s < kSections; ++s) {
+        head += fmt::format(",tfms_{},tfn_{}", s, s); // (the frontend thread, front mode: every section)
+    }
     for (u32 k = 0; k < kPacketClasses; ++k) {
         head += fmt::format(",pkt_ms_{},pkt_n_{}", k, k);
     }
@@ -941,6 +950,12 @@ void WriteCsv(const std::filesystem::path& dir) {
                                         ok ? x.calls[s] : 0u);
                 }
             }
+        }
+        const Row& tf = g_store.rows[2][fr % kMaxFrames];
+        const bool tfok = tf.valid != 0 && tf.frame == fr;
+        for (u32 s = 0; s < kSections; ++s) {
+            line += fmt::format(",{:.4f},{}", tfok ? static_cast<double>(tf.self[s]) * ms_per_tick : 0.0,
+                                tfok ? tf.calls[s] : 0u);
         }
         for (u32 k = 0; k < kPacketClasses; ++k) {
             line += fmt::format(",{:.4f},{}", static_cast<double>(c.packet_ticks[k]) * g_every * ms_per_tick,

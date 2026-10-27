@@ -10,6 +10,7 @@
 // caller binds a null descriptor and counts the draw as incomplete.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <map>
@@ -199,6 +200,19 @@ public:
     /// Video memory the images may keep: over it, uploaded images (never the GPU-written ones - their texels exist only
     /// in video memory) whose last use completed are freed, least recently used first, down to 90% of it.
     void SetBudget(u64 bytes) { budget_ = bytes; }
+    u64 Budget() const { return budget_; }
+    /// A lower limit for the uploaded images only (the OS's video memory budget, SSPC_VRAM_ADAPT): Evict frees them
+    /// down to it, but OverBudget (the GPU-written images' write-back, the executor's eviction drains) keeps budget_.
+    void SetSoftBudget(u64 bytes) { soft_budget_ = bytes; }
+    u64 SoftBudget() const { return std::min(budget_, soft_budget_); }
+    /// The GPU-written images' bytes: what a lower budget cannot free by evicting uploaded images.
+    u64 GpuWrittenBytes() const {
+        u64 n = 0;
+        for (const auto& img : images_) {
+            n += img->gpu_written ? img->bytes : 0;
+        }
+        return n;
+    }
     /// Called before an upload records its commands (the executor ends rendering and makes earlier writes visible).
     void SetBeforeUpload(void (*hook)(void* ctx), void* ctx) {
         before_upload_ = hook;
@@ -281,6 +295,8 @@ private:
     std::multimap<u64, CachedImage*> by_address_;
     u64 max_image_size_ = 0; ///< the largest image's guest size: how far before a range an overlapping image may start
     u64 budget_ = ~0ull;
+    u64 soft_budget_ = ~0ull;
+    u64 soft_evict_frame_ = ~0ull; ///< the frame of the soft limit's last eviction step
     void Evict(u64 completed);
     u64 epoch_ = 0;
 

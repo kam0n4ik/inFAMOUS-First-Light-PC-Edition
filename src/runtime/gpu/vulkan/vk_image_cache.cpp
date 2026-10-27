@@ -119,9 +119,18 @@ ImageCache::~ImageCache() {
 }
 
 void ImageCache::Evict(u64 completed) {
-    if (stats_.bytes <= budget_) {
+    const u64 limit = std::min(budget_, soft_budget_);
+    if (stats_.bytes <= limit) {
         return;
     }
+    // over budget_: down to 90% of it at once (past it the GPU-written images are written back). Over only the soft
+    // limit: kSoftStep images a frame - each one's vkFreeMemory costs (~1800 at once stalled a frame 450 ms)
+    constexpr u32 kSoftStep = 16;
+    const bool soft = stats_.bytes <= budget_;
+    if (soft && soft_evict_frame_ == frame_) {
+        return;
+    }
+    soft_evict_frame_ = frame_;
     // candidates: images uploaded from guest memory (re-uploadable), not used by a batch still in flight
     std::vector<CachedImage*> cand;
     for (const auto& img : images_) {
@@ -129,13 +138,18 @@ void ImageCache::Evict(u64 completed) {
             cand.push_back(img.get());
         }
     }
-    std::ranges::sort(cand, [](const CachedImage* a, const CachedImage* b) { return a->last_seq < b->last_seq; });
-    const u64 target = budget_ / 10 * 9;
+    const auto older = [](const CachedImage* a, const CachedImage* b) { return a->last_seq < b->last_seq; };
+    if (soft) {
+        std::ranges::partial_sort(cand, cand.begin() + std::min<size_t>(cand.size(), kSoftStep), older);
+    } else {
+        std::ranges::sort(cand, older);
+    }
+    const u64 target = (soft ? limit : budget_) / 10 * 9; // (over budget_: as before the soft limit; it steps on)
     const auto& f = Fn();
     const VkDevice dev = ctx_.Device();
     std::vector<CachedImage*> gone;
     for (CachedImage* img : cand) {
-        if (stats_.bytes <= target) {
+        if (stats_.bytes <= target || (soft && gone.size() >= kSoftStep)) {
             break;
         }
         for (auto& [k, v] : img->views) {

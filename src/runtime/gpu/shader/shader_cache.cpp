@@ -147,7 +147,10 @@ ProgramCache::Lookup ProgramCache::Get(GuestReader& memory, u64 addr, HwStage st
         out.created = true;
     }
     ++program->addresses;
-    addresses_[key] = AddressEntry{program, epoch_, scratch_.footer.shader_hash, id.length, false, armed};
+    AddressEntry& stored = addresses_[key];
+    stored = AddressEntry{program, epoch_, scratch_.footer.shader_hash, id.length, false, armed};
+    by_addr_.try_emplace(key, &stored); // (the map's nodes are never erased: the pointer stays valid)
+    max_span_ = std::max<u64>(max_span_, u64{id.length} + kFooterBytes + kFooterSearchBytes);
     addr_lo_ = std::min(addr_lo_, addr);
     addr_hi_ = std::max(addr_hi_, addr + id.length + kFooterBytes + kFooterSearchBytes);
     out.program = program;
@@ -160,10 +163,13 @@ void ProgramCache::Invalidate(u64 addr, u64 size) {
     if (end <= addr_lo_ || addr >= addr_hi_) {
         return; // no program's code or footer there (the walk over every entry was ~1% of the GPU thread)
     }
-    for (auto& [key, entry] : addresses_) {
-        const u64 start = key >> 3;
+    // (by address: an entry overlapping the range starts at most max_span_ before it)
+    const u64 from = addr > max_span_ ? addr - max_span_ : 0;
+    for (auto it = by_addr_.lower_bound(from << 3); it != by_addr_.end() && (it->first >> 3) < end; ++it) {
+        const u64 start = it->first >> 3;
+        AddressEntry& entry = *it->second;
         // the program's code and its footer
-        if (start < end && addr < start + entry.length + kFooterBytes + kFooterSearchBytes) {
+        if (addr < start + entry.length + kFooterBytes + kFooterSearchBytes) {
             if (!entry.dirty) {
                 ++stats_.invalidations;
             }
@@ -261,6 +267,10 @@ const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32
     e.addr = addr;
     e.tracked = armed;
     e.dirty = false;
+    if (!e.indexed) {
+        e.indexed = true;
+        by_addr_.emplace(addr, &e); // (entries_ never erases: the pointer stays valid)
+    }
     lo_ = std::min(lo_, addr);
     hi_ = std::max(hi_, addr + kMaxFetchDwords * 4ull);
     return e;
@@ -271,8 +281,10 @@ void FetchCache::Invalidate(u64 addr, u64 size) {
     if (end <= lo_ || addr >= hi_) {
         return;
     }
-    for (auto& [key, e] : entries_) {
-        if (e.epoch != 0 && e.addr < end && addr < e.addr + kMaxFetchDwords * 4ull) {
+    const u64 span = kMaxFetchDwords * 4ull;
+    for (auto it = by_addr_.lower_bound(addr > span ? addr - span : 0); it != by_addr_.end() && it->first < end; ++it) {
+        Entry& e = *it->second;
+        if (e.epoch != 0 && addr < e.addr + span) {
             invalidations += e.dirty ? 0 : 1;
             e.dirty = true;
         }

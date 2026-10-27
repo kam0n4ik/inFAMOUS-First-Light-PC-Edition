@@ -642,13 +642,13 @@ void ParallelCp::OnLoad(std::span<const u32> values) {
 
 // ---- stage 2: the frontend on thread 1
 
-void ParallelCp::AddGpuWrite(u64 begin, u64 end, u64 record, u64 value) {
+void ParallelCp::AddGpuWrite(u64 begin, u64 end, u64 record, u64 value, bool note_code) {
     if (end <= begin) {
         return;
     }
     gw_.push_back({begin, end, record, value});
     Bump(fc_.gpu_writes);
-    if (frontend_ != nullptr) {
+    if (frontend_ != nullptr && note_code) {
         frontend_->GpuWrote(begin, end - begin); // (P5.2: trusted shader code under a GPU write is read again)
     }
     if (gw_.size() > fc_.gw_max.load(std::memory_order_relaxed)) {
@@ -738,12 +738,15 @@ bool ParallelCp::MayBeGpuWritten(u64 addr, u64 bytes) {
     return std::ranges::any_of(gw_, [&](const GpuWrite& w) { return addr < w.end && w.begin < addr + bytes; });
 }
 
-void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& writes) {
+void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& writes, bool frontend_noted) {
     for (const GS::BufferBinding& b : s.plan.buffers) {
         if (b.kind == GS::BufferKind::Guest) {
             if (b.written && b.status == GS::ResourceStatus::Ok && b.size != 0 && b.address != 0) {
                 // (the buffer cache keeps its GPU writes per 4 KiB page: so does this, its superset)
-                AddGpuWrite(b.address & ~(kPage - 1), (b.address + b.size + kPage - 1) & ~(kPage - 1), record, kLookup);
+                // (frontend_noted: its PrepareStage noted these writes for the code trust already - GpuWrote again
+                // walked every program address twice per dispatch over a code block: 70-140 us each in heavy scenes)
+                AddGpuWrite(b.address & ~(kPage - 1), (b.address + b.size + kPage - 1) & ~(kPage - 1), record, kLookup,
+                            !frontend_noted);
                 writes = true;
             }
         } else if (b.written || (b.kind != GS::BufferKind::Flatbuf && b.kind != GS::BufferKind::ClipPlanes)) {
@@ -1356,7 +1359,7 @@ void ParallelCp::PrepareDispatch(Record& r, u64 index) {
         exec_.PrefetchCompute(r.stage); // (R9-N SSPC_PIPE_PREFETCH: a new pipeline built while thread 2 catches up)
     }
     bool writes = false;
-    NoteStageWrites(r.stage, index, writes);
+    NoteStageWrites(r.stage, index, writes, true); // (ShaderFrontend::PrepareDispatch noted them)
     if (writes) {
         frontend_->GuestMemoryChanged(); // (Executor::NoteAccesses after the dispatch)
     }
@@ -1400,6 +1403,7 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
                 return true;
             }
         }
+        R8_CP_PROF(CpProfile::Sec::FrontReadSlow);
         const u64 block = (addr >> 20) + 1;
         const bool known_none =
             std::ranges::any_of(no_run_, [&](const auto& n) { return n.first == block && n.second == gen; });
@@ -1414,6 +1418,7 @@ bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
             no_run_[next_no_run_++ % no_run_.size()] = {block, gen};
         }
     }
+    R8_CP_PROF(CpProfile::Sec::FrontReadSlow);
     return GS::GameMemory().Read(addr, dst, bytes);
 }
 

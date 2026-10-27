@@ -88,6 +88,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/cp_shadow.cpp
     src/runtime/gpu/cp_validation.cpp
     src/runtime/gpu/frame_log.cpp
+    src/runtime/gpu/hitch_log.cpp
     src/runtime/gpu/menu_focus.cpp
     src/runtime/filesystem/content_patch.cpp
     src/runtime/gpu/inspector.cpp
@@ -112,6 +113,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/static/static_predictor.cpp
     src/runtime/gpu/vulkan/vk_buffer_cache.cpp
     src/runtime/gpu/vulkan/vk_device_context.cpp
+    src/runtime/gpu/vulkan/vk_memory_ledger.cpp
     src/runtime/gpu/vulkan/vk_emit.cpp
     src/runtime/gpu/vulkan/vk_diagnostics.cpp
     src/runtime/gpu/vulkan/vk_executor.cpp

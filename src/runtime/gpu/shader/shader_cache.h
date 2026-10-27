@@ -18,6 +18,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -159,6 +160,11 @@ private:
     /// draw were ~1.4% of the GPU thread (village); its entries are never erased, so the pointers stay valid
     std::array<std::pair<u64, AddressEntry*>, 256> addr_memo_{};
     u64 addr_lo_ = ~0ull, addr_hi_ = 0; ///< the bytes any entry covers (Invalidate: ranges outside need no walk)
+    /// the entries by key (address << 3 | stage: by address) and the longest span one covers: Invalidate walks only
+    /// those starting in [addr - max_span_, end) - the walk over every entry took 60-140 us a written dispatch over a
+    /// code block, twice per dispatch, in heavy scenes
+    std::map<u64, AddressEntry*> by_addr_;
+    u64 max_span_ = 0;
     std::unordered_map<ProgramIdentity, std::unique_ptr<Program>, ProgramIdentityHash> programs_;
     ProgramImage scratch_;
     std::vector<u32> scan_;
@@ -183,6 +189,7 @@ public:
         bool tracked = false; ///< P5.2: its bytes were write-tracked before the read that validated them
         bool dirty = false;   ///< P5.2: written since (read again at the next use)
         u64 version = 0;      ///< P5.3: bumped whenever what it holds changes (the native frontend's key)
+        bool indexed = false; ///< in by_addr_ (its address is the key's: it never changes)
     };
     const Entry& Get(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation);
     size_t Size() const { return entries_.size(); }
@@ -203,6 +210,7 @@ private:
     u64 lo_ = ~0ull, hi_ = 0; ///< the bytes any entry covers
     const Entry& GetEntry(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation, Entry& e);
     std::unordered_map<u64, Entry, U64Hash> entries_;
+    std::multimap<u64, Entry*> by_addr_; ///< the read entries by address (Invalidate: only those near the range)
     std::array<std::pair<u64, Entry*>, 256> memo_{}; ///< P4.9: entries looked up last (never erased: stable pointers)
     std::vector<u32> scratch_;
 };

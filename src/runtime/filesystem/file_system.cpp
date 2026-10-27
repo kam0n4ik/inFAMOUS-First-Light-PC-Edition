@@ -20,6 +20,7 @@
 #include <windows.h>
 
 #include "base/log.h"
+#include "runtime/gpu/hitch_log.h"
 #include "runtime/gpu/inspector.h"
 #include "runtime/gpu/r9/gprof.h"
 #include "runtime/exports.h"
@@ -771,18 +772,16 @@ std::string ThreadName() {
     return out;
 }
 
-/// A read the Performance Inspector counts (P4.8; off: the call alone).
+/// A read the hitch log, the Performance Inspector (P4.8) and the gameplay profiler (R9) count.
 template <typename F>
 s64 CountedRead(F&& read) {
     const bool insp = Gpu::Inspector::On();
-    if (!insp && !Gpu::Gprof::On()) {
-        return read();
-    }
     const auto t0 = std::chrono::steady_clock::now();
     const s64 r = read();
     const u64 bytes = r > 0 ? static_cast<u64>(r) : 0;
     const u64 ns = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    Gpu::HitchLog::FileRead(bytes, ns);
     if (insp) {
         Gpu::Inspector::FileRead(bytes, ns);
     }
