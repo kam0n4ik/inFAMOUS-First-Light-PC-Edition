@@ -12,6 +12,7 @@ The original PlayStation 4 game runs on Windows; its executable and data are lef
 
 <p align="center">
   <a href="#installation">Installation</a> ·
+  <a href="#launcher">Launcher</a> ·
   <a href="#requirements">Requirements</a> ·
   <a href="#how-it-relates-to-second-son">Shared runtime</a> ·
   <a href="#frame-rate">Frame rate</a> ·
@@ -48,7 +49,8 @@ Second Son's engine-specific optimisations (effects quality, CITY-OPT engine tag
 
    | File | What |
    |---|---|
-   | `FirstLightPC.exe` | the runtime; started on its own it opens the launcher first |
+   | `FirstLightPC.exe` | the runtime; started on its own it opens the [launcher](#launcher) first |
+   | `Launcher\` | the inFAMOUS PC Launcher (Qt): settings, saves, diagnostics, Play |
    | `play.cmd` | starts the game at once with the improvements that are on for players, after backing up the saves |
    | `play_safe.cmd` | the game without the performance switches, to compare when something looks wrong |
    | `FirstLightPC.toml` | defaults: window, language, keys, PC settings |
@@ -58,8 +60,8 @@ Second Son's engine-specific optimisations (effects quality, CITY-OPT engine tag
    | `FirstLightPC-README.txt` | these steps in short |
 
 3. **The Visual C++ runtime.** Install the [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it is not installed yet.
-4. **Start `play.cmd`.** On the first start a console window prepares the game's shaders (about 3.5 minutes on 6 cores / 12 threads, about 13 200 pipelines, once); later starts skip it.
-5. **PC settings:** **F1** in the game: resolution and aspect ratio, FOV, the frame-rate limit (up to unlimited), anti-aliasing, mouse and keys.
+4. **Start `FirstLightPC.exe`** and press **Играть** (Play) in the launcher; `play.cmd` still starts the game at once. On the first start a console window prepares the game's shaders (about 3.5 minutes on 6 cores / 12 threads, about 13 200 pipelines, once); later starts skip it.
+5. **PC settings:** in the launcher, or **F1** in the game: resolution and aspect ratio, FOV, the frame-rate limit (up to unlimited), anti-aliasing, mouse and keys.
 
 | Path | What |
 |---|---|
@@ -67,6 +69,34 @@ Second Son's engine-specific optimisations (effects quality, CITY-OPT engine tag
 | `%LOCALAPPDATA%\FirstLightPC\settings.toml` | your changes from the launcher and the in-game settings (they override `FirstLightPC.toml`) |
 | `cache\shaders\` | prepared shaders and the driver's pipeline cache (about 1.9 GB; safe to delete, it is prepared again) |
 | `logs\FirstLightPC.log` | the log; attach it to a bug report. `FirstLightPC.shaders.log` is the shader preparation's |
+
+## Launcher
+
+`FirstLightPC.exe` started without arguments opens the inFAMOUS PC Launcher from `Launcher\`, the same launcher Second Son uses: it finds the game from its folder and shows First Light's own art and colours. **Играть** (Play) starts the game with what is chosen there. It is in Russian for now.
+
+<p align="center">
+  <img src=".github/readme/launcher-home.jpg" alt="The launcher's home page: Play, the launch profile, the shader cache" width="880">
+</p>
+
+- **Settings** are the game's PC settings by section, written to `%LOCALAPPDATA%\FirstLightPC\settings.toml`, the file the game reads. What does not work on First Light yet (effects quality, Second Son's engine experiments) is shown inactive with the reason; what is done in code but not yet checked in play is marked so.
+- **Saves** lists the game's saves with their own titles, and the backups made before every start; any backup can be restored.
+- **Diagnostics** shows what was found: the game's serial and version, the folders, the runtime, the GPU; the report can be copied for a bug report.
+- The background is the game's own art (`sce_sys\pic0.png` of your copy), read from the game's folder, not shipped.
+- `play.cmd` and any command line with arguments start the game at once; `FirstLightPC.exe --launcher` opens the older built-in launcher. Without `Launcher\` the built-in one opens.
+
+<p align="center">
+  <img src=".github/readme/launcher-settings.jpg" alt="The launcher's Settings page" width="880">
+</p>
+
+<p align="center">
+  <img src=".github/readme/launcher-saves.jpg" alt="The launcher's Saves page: the game's saves and the backups" width="880">
+</p>
+
+<p align="center">
+  <img src=".github/readme/launcher-diagnostics.jpg" alt="The launcher's Diagnostics page" width="880">
+</p>
+
+The launcher's source is in `pc-launcher\` (Qt 6, [pc-launcher/README.md](pc-launcher/README.md)).
 
 ## Requirements
 
@@ -96,7 +126,7 @@ DLSS and FSR need the vendors' SDKs in `third_party\upscalers`, laid out as in [
 
 ## Known issues
 
-- **White silhouettes after a cutscene.** Bright cut-outs of characters can stay on the ground after a cutscene. Under investigation.
+- **White silhouettes after a cutscene.** Bright cut-outs of characters stayed on the ground after a cutscene: a render target the game clears with a fast clear was not cleared before it was read. Fixed in this version (the log shows `fast clear elimination`); not yet confirmed in a full playthrough.
 - **The PC settings from the game's menu.** Esc → Settings → "Additional settings" is not mapped on First Light yet; F1 opens the PC settings.
 - **Effects quality settings** (smoke, particles, shadows, textures, reflections, rain, post-effects) act through Second Son's engine hooks and do nothing on First Light yet.
 - **Shader translation:** about 200 of First Light's shader programs are not prepared ahead (sampling without a sampler descriptor); they compile when first seen.
