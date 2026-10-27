@@ -33,7 +33,11 @@ KindInfo Info(PictureKind k) {
     case PictureKind::kSideways128: return {128, 128, 0x8819943153427b7aull, 8};
     case PictureKind::kRattle1024: return {1024, 256, 0x3dfcd14efee62109ull, 11};
     case PictureKind::kRattle512: return {512, 128, 0xb4420a042a9be869ull, 10};
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    case PictureKind::kTouchPrint256: return {256, 256, 0x2cab57c0e1946abbull, 9}; // First Light's own print
+#else
     case PictureKind::kTouchPrint256: return {256, 256, 0xf2e47d05c6d25ba6ull, 9};
+#endif
     case PictureKind::kDpad256: return {256, 256, 0xd6349daad5d0602eull, 9};
     case PictureKind::kDpadKarma256: return {256, 256, 0x4cd4970d746fdd34ull, 9};
     case PictureKind::kDpad64: return {64, 64, 0x226c536031f7fbddull, 7};

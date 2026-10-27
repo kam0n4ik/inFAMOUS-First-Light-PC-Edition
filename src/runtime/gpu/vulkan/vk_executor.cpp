@@ -4605,6 +4605,71 @@ bool Executor::DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescript
     return hit;
 }
 
+// The hardware's elimination writes the clear colour into the tiles CMASK marks cleared, so the surface can be sampled.
+// A compute clear of the CMASK waits here for the target's next render pass (pending_meta_clear_); a target that is
+// cleared and then only sampled - nothing drawn into it since - would keep what was drawn before the clear (First Light:
+// the characters of the last cutscene frame stayed on the ground as white cut-outs). The elimination makes it now.
+void Executor::EliminateFastClear(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& d) {
+    if (pending_meta_clear_.empty()) {
+        return;
+    }
+    const auto& f = Fn();
+    const u32 target_mask = regs.Get(kCbTargetMask);
+    for (u32 i = 0; i < 8; ++i) {
+        const u32 base = Cp::Reg::CbColor0Base + i * Cp::Reg::CbColorStride;
+        if (((regs.Get(base + 4) >> 2) & 0x1F) == 0 || regs.Get(base) == 0 || ((target_mask >> (i * 4)) & 0xF) == 0) {
+            continue;
+        }
+        const u64 cmask = u64{regs.Get(base + 7)} << 8;
+        const auto it = cmask != 0 ? pending_meta_clear_.find(cmask) : pending_meta_clear_.end();
+        if (it == pending_meta_clear_.end() || !it->second) {
+            continue;
+        }
+        std::string err;
+        CachedImage* img = images_.Find(LayoutFromColorTarget(regs, i, d.cb_extent[i]), ImageCache::Use::ColorTarget,
+                                        cur_.cb, cur_.value, err);
+        if (img == nullptr) {
+            continue;
+        }
+        const ImageViewDesc vd = ColorTargetView(regs, i);
+        const VkImageView view = images_.View(*img, vd, false);
+        if (view == VK_NULL_HANDLE) {
+            continue;
+        }
+        if (pending_writes_) {
+            GlobalBarrier(7);
+        }
+        EndRendering();
+        images_.Transition(cur_.cb, *img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRenderingAttachmentInfo color{.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                                        .imageView = view,
+                                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        color.clearValue = ColorBufferClearValue(regs, i).value;
+        const VkRenderingInfo ri{.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                                 .renderArea = {{0, 0}, {std::max(img->layout.size.width, 1u),
+                                                         std::max(img->layout.size.height, 1u)}},
+                                 .layerCount = std::max<u32>(vd.layers, 1),
+                                 .colorAttachmentCount = 1,
+                                 .pColorAttachments = &color};
+        f.vkCmdBeginRendering(cur_.cb, &ri);
+        f.vkCmdEndRendering(cur_.cb);
+        it->second = false;
+        ++stats_.fast_clears;
+        static std::atomic<u64> n{0};
+        if (const u64 k = n.fetch_add(1, std::memory_order_relaxed); k < 16 || (k & (k - 1)) == 0) {
+            SSPC_LOG(GPU, Info,
+                     "native backend: fast clear elimination at {:#x} cleared img{} {:#x} fmt {} {}x{} (its CMASK {:#x} "
+                     "was cleared and nothing drawn into it since; {} so far)",
+                     d.packet_addr, img->id, img->layout.guest_address, img->layout.pixel_format,
+                     img->layout.size.width, img->layout.size.height, cmask, k + 1);
+        }
+    }
+}
+
 void Executor::Draw(const Cp::DrawDescriptor& d) {
     const u64 t0 = GS::Ticks();
     const GS::FineSample fine_sample(fine_counter_); // (SSPC_GPU_TIMINGS=sample:N: this draw's stage timers)
@@ -5631,6 +5696,9 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     ++commands_;
     write_run_ = false;
     if (filtered) {
+        if (mode == 2) {
+            EliminateFastClear(regs, d);
+        }
         Skipped(Skip::FilteredMode, fmt::format("CB_COLOR_CONTROL mode {}, primitive {}", mode, d.primitive_type));
         return;
     }

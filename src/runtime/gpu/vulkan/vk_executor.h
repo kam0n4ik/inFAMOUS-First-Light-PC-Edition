@@ -281,6 +281,8 @@ public:
                         std::span<const Cp::RunMember> members, std::span<const u32> member_flat = {});
     /// A draw the hardware does not draw (fast clear elimination, FMASK decompression, primitive None).
     static bool DrawFiltered(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& draw);
+    /// A fast clear elimination draw: the clears of its targets' CMASK still pending are made now.
+    void EliminateFastClear(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& draw);
     /// P4.10: the frontend's memo is told about guest memory changes from here (true) or not (false: the parallel
     /// command processor's thread, which runs the frontend, tells it in stream order itself).
     void SetMemoBumps(bool on) { memo_bumps_ = on; }
