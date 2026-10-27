@@ -701,6 +701,42 @@ void Configure(const std::filesystem::path& earned_file, const std::filesystem::
 /// Trophy `id`'s name and description as the game writes them in `language` (its text table
 /// art\cache\lang_<language>_text.xpps: "u_trophy_<key>_name\0<text>\0"); false when the game has no such text.
 bool Text(s32 id, std::string_view language, std::string& name, std::string& desc) {
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    // First Light's 25 trophies in the order of the eboot's trophy enum (Platinum, DdtComplete, Ow1Complete, ...,
+    // TkBlastWeakpointKills): the keys of their name and description. The arena challenges' trophies have no name in
+    // the text table, only the challenge's description, which is then shown as the name.
+    struct Keys {
+        const char* name;
+        const char* desc;
+    };
+    static constexpr std::array<Keys, 25> kKeys = {{
+        {"fl_platinum_name", "fl_platinum_desc"},
+        {"fl_ddt_complete_name", "fl_ddt_complete_desc"},
+        {"fl_ow1_complete_name", "fl_ow1_complete_desc"},
+        {"fl_ow2_complete_name", "fl_ow2_complete_desc"},
+        {"fl_story_complete_name", "fl_story_complete_desc"},
+        {"fl_all_lumens_name", "fl_all_lumens_desc"},
+        {"fl_all_drones_name", "fl_all_drones_desc"},
+        {"fl_all_races_name", "fl_all_races_desc"},
+        {"fl_all_graffiti_name", "fl_all_graffiti_desc"},
+        {"fl_all_upgrades_name", "fl_all_upgrades_desc"},
+        {"fl_25_challenges_name", "fl_25_challenges_desc"},
+        {"fl_50_challenges_name", "fl_50_challenges_desc"},
+        {"fl_75_challenges_name", "fl_75_challenges_desc"},
+        {"fl_all_challenges_name", "fl_all_challenges_desc"},
+        {nullptr, "ctr_challenge_score_generic_desc"}, // Ctr1aScore
+        {nullptr, "ctr_challenge_score_generic_desc"}, // Ctr1bScore
+        {nullptr, "ctr_challenge_score_generic_desc"}, // Ctr2bScore
+        {nullptr, "ctr_challenge_score_generic_desc"}, // Ctr2Score
+        {nullptr, "ctr_challenge_score_generic_desc"}, // Ctr3Score
+        {nullptr, "ctr_challenge_hack_turret_desc"},   // Ctr2aOverloadTurret
+        {nullptr, "ctr_challenge_hostage_saves_desc"}, // Ctr1aHostage
+        {nullptr, "ctr_challenge_total_score_desc"},   // Highscore
+        {nullptr, "challenge_ionic_kills_desc"},
+        {nullptr, "challenge_consec_rocket_kills_desc"},
+        {nullptr, "challenge_tkblast_weakkills_desc"},
+    }};
+#else
     // the text keys by trophy id (the eboot's trophy names, as the text table spells them)
     static constexpr std::array<const char*, 48> kKeys = {
         "platinum", "pain_builds_character", "it_takes_a_village", "your_little_secret", "redeem_fetch",
@@ -713,6 +749,7 @@ bool Text(s32 id, std::string_view language, std::string& name, std::string& des
         "carnage", "drop_everything", "frequent_flyer", "who_put_this_here", "triple_attack",
         "double_smoke_stack_attack", "cough_drop", "sure_shot", "overkill_much",
     };
+#endif
     if (id < 0 || id >= static_cast<s32>(kKeys.size())) {
         return false;
     }
@@ -738,10 +775,15 @@ bool Text(s32 id, std::string_view language, std::string& name, std::string& des
         const size_t from = at + k.size(), end = table.find('\0', from);
         return table.substr(from, end == std::string::npos ? 0 : std::min<size_t>(end - from, 256));
     };
+#if defined(SSPC_PRODUCT_FIRST_LIGHT)
+    desc = value(std::string("u_trophy_") + kKeys[id].desc);
+    name = kKeys[id].name != nullptr ? value(std::string("u_trophy_") + kKeys[id].name) : desc;
+#else
     const std::string key = std::string("u_trophy_") + kKeys[id];
     name = value(key + "_name");
     // (the one key the table spells differently: "wounded" is named, "wound" described)
     desc = value(id == 22 ? std::string("u_trophy_wound_desc") : key + "_desc");
+#endif
     return !name.empty();
 }
 

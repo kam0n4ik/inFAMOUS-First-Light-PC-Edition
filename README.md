@@ -126,12 +126,14 @@ DLSS and FSR need the vendors' SDKs in `third_party\upscalers`, laid out as in [
 
 ## Known issues
 
-- **White silhouettes after a cutscene.** Bright cut-outs of characters stayed on the ground after a cutscene: a render target the game clears with a fast clear was not cleared before it was read. Fixed in this version (the log shows `fast clear elimination`); not yet confirmed in a full playthrough.
+- **Silhouettes of characters.** Cut-outs of characters' shapes from an earlier frame are seen on the ground and on characters, bright or dark, after cutscenes. Not fixed yet: the fast clear handling added for it never runs on First Light (the game does not use colour fast clears), so the cause is still being looked for.
 - **The PC settings from the game's menu.** Esc → Settings → "Additional settings" is not mapped on First Light yet; F1 opens the PC settings.
 - **Effects quality settings** (smoke, particles, shadows, textures, reflections, rain, post-effects) act through Second Son's engine hooks and do nothing on First Light yet.
 - **Shader translation:** about 200 of First Light's shader programs are not prepared ahead (sampling without a sampler descriptor); they compile when first seen.
 - **libSceJson2** is a stub: only its allocator is called so far.
-- Saves, trophies' texts and the DLSS / FSR path have not been checked on First Light.
+- **Saves:** the game's own save and load screens (save data dialog) are SecondSonPC's, shared with Second Son, where they were checked in play; on First Light they pass the self-test, a full playthrough has not been made yet.
+- **Trophies:** their notices take the names and descriptions from the game's text table (`trophy00.trp`'s texts are encrypted). The arena challenges' 11 trophies have no name there, so their description is shown as the name.
+- The DLSS / FSR path has not been checked on First Light.
 
 ## Legal notice
 
